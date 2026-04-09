@@ -1,0 +1,21 @@
+{
+    "version": "2.0.0",
+    "tasks": [
+        {
+            "label": "Build (linux-gcc-dev)",
+            "type": "shell",
+            "command": "cmake --build --preset linux-gcc-dev",
+            "group": { "kind": "build", "isDefault": true },
+            "presentation": { "reveal": "always", "panel": "shared" },
+            "problemMatcher": "$gcc"
+        },
+        {
+            "label": "Test (linux-gcc-dev)",
+            "type": "shell",
+            "command": "ctest --preset linux-gcc-dev --output-on-failure",
+            "group": { "kind": "test", "isDefault": true },
+            "presentation": { "reveal": "always", "panel": "shared" },
+            "dependsOn": "Build (linux-gcc-dev)"
+        }
+    ]
+}

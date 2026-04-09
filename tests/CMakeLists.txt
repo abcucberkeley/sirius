@@ -9,6 +9,7 @@ target_link_libraries(sirius_tests
     PRIVATE
         sirius
         Catch2::Catch2WithMain
+        TIFF::TIFF
 )
 
 include(Catch)

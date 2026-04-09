@@ -1,10 +1,11 @@
 #include "sirius/tiff_io.hpp"
 #include <tiffio.h>
 #include <cstring>
-#include <memory>
 #include <type_traits>
 #include <stdexcept>
-#include <limits>
+#include <vector>
+#include <algorithm>
+#include <atomic>
 
 namespace sirius {
 
@@ -14,7 +15,7 @@ namespace sirius {
         // libtiff is a c library so need to handle raw pointers
         // by using a custom deleter + unique pointer
         struct TiffDeleter {
-            void operator()(TIFF* tif) const { if (tif) TIFFClose(tif); }
+            void operator()(TIFF* tif) const { TIFFClose(tif); }
         };
         using TiffPtr = std::unique_ptr<TIFF, TiffDeleter>;
 
@@ -45,6 +46,12 @@ namespace sirius {
 
             if (info.spp != 1)
                 throw std::runtime_error("Only single-channel (grayscale) TIFFs are supported.");
+
+            // validate input formats
+            if (info.fmt == SAMPLEFORMAT_IEEEFP && info.bps != 32 && info.bps != 64)
+                throw std::runtime_error("Unsupported float bit depth: " + std::to_string(info.bps));
+            if (info.fmt != SAMPLEFORMAT_IEEEFP && info.bps != 8 && info.bps != 16 && info.bps != 32)
+                throw std::runtime_error("Unsupported integer bit depth: " + std::to_string(info.bps));
 
             return info;
         }
@@ -81,17 +88,14 @@ namespace sirius {
                 if (fmt == SAMPLEFORMAT_IEEEFP) {
                     if      (bps == 32) { float v;  std::memcpy(&v, src + i*4, 4); dst[i] = static_cast<T>(v); }
                     else if (bps == 64) { double v; std::memcpy(&v, src + i*8, 8); dst[i] = static_cast<T>(v); }
-                    else throw std::runtime_error("Unsupported float bit depth: " + std::to_string(bps));
                 } else if (fmt == SAMPLEFORMAT_INT) {
                     if      (bps == 8)  { int8_t  v; std::memcpy(&v, src + i,   1); dst[i] = static_cast<T>(v); }
                     else if (bps == 16) { int16_t v; std::memcpy(&v, src + i*2, 2); dst[i] = static_cast<T>(v); }
                     else if (bps == 32) { int32_t v; std::memcpy(&v, src + i*4, 4); dst[i] = static_cast<T>(v); }
-                    else throw std::runtime_error("Unsupported signed integer bit depth: " + std::to_string(bps));
                 } else { // SAMPLEFORMAT_UINT
                     if      (bps == 8)  { dst[i] = static_cast<T>(src[i]); }
                     else if (bps == 16) { uint16_t v; std::memcpy(&v, src + i*2, 2); dst[i] = static_cast<T>(v); }
                     else if (bps == 32) { uint32_t v; std::memcpy(&v, src + i*4, 4); dst[i] = static_cast<T>(v); }
-                    else throw std::runtime_error("Unsupported unsigned integer bit depth: " + std::to_string(bps));
                 }
             }
         }
@@ -99,7 +103,7 @@ namespace sirius {
         // check if Eigen matrix type T is an exact match
         // to circumvent the slow "pixel by pixel" conversion process
         template <typename T>
-        bool isExactMatch(uint16_t bps, uint16_t fmt) {
+        constexpr bool isExactMatch(uint16_t bps, uint16_t fmt) {
             // Check Floating Point matches
             if (std::is_same_v<T, float>)    return fmt == SAMPLEFORMAT_IEEEFP && bps == 32;
             if (std::is_same_v<T, double>)   return fmt == SAMPLEFORMAT_IEEEFP && bps == 64;
@@ -136,7 +140,7 @@ namespace sirius {
                 T* rowDst = dst + row * info.width;
 
                 if (useFastPath) {
-                    std::memcpy(rowDst, buf.data(), buf.size());
+                    std::memcpy(rowDst, buf.data(), info.width * sizeof(T));
                 } else {
                     // convert to appropriate format and copy to the correct location on the Eigen dst
                     convertScanline<T>(buf.data(), rowDst, info.width, info.bps, info.fmt);
@@ -193,10 +197,9 @@ namespace sirius {
             TIFFSetField(tif, TIFFTAG_BITSPERSAMPLE, static_cast<uint16_t>(sizeof(T) * 8));
             TIFFSetField(tif, TIFFTAG_SAMPLESPERPIXEL, static_cast<uint16_t>(1));
             TIFFSetField(tif, TIFFTAG_SAMPLEFORMAT, sampleFormat<T>());
-            TIFFSetField(tif, TIFFTAG_ROWSPERSTRIP, TIFFDefaultStripSize(tif, 0));
             TIFFSetField(tif, TIFFTAG_PHOTOMETRIC, PHOTOMETRIC_MINISBLACK);
             TIFFSetField(tif, TIFFTAG_PLANARCONFIG, PLANARCONFIG_CONTIG);
-
+            
             // Setup Compression
             uint16_t tiffComp = mapCompression(comp);
             TIFFSetField(tif, TIFFTAG_COMPRESSION, tiffComp);
@@ -209,7 +212,9 @@ namespace sirius {
                     TIFFSetField(tif, TIFFTAG_PREDICTOR, PREDICTOR_FLOATINGPOINT);
                 }
             }
-
+            
+            TIFFSetField(tif, TIFFTAG_ROWSPERSTRIP, TIFFDefaultStripSize(tif, 0));
+            
             if (multiPage)
                 TIFFSetField(tif, TIFFTAG_SUBFILETYPE, FILETYPE_PAGE);
 
@@ -271,19 +276,35 @@ namespace sirius {
             } while (TIFFReadDirectory(tif.get()));
         }
 
+        if (pageCount > 65535) {
+            // Note: Technically BigTIFF allows more, but standard TIFF caps at 65535.
+            throw std::runtime_error("TIFF stack exceeds expected maximum directory count.");
+        }
+
         // Allocate the contiguous memory block once
         ImageStack<T> stack(pageCount, rows, cols);
 
         // Parallel thread pool opening individual file handles
+        std::exception_ptr ex;
+        std::atomic<bool> failed{false};
+
         #pragma omp parallel for schedule(dynamic)
         for (Eigen::Index z = 0; z < pageCount; ++z) {
-            auto localTif = openTiff(path, "r");
-            TIFFSetSubDirectory(localTif.get(), offset[z]);
-            auto info = getPageInfo(localTif.get());
-            T* dst = stack.data() + z * stack.stride();
-            if (tiled) readTiledPage<T>(localTif.get(), dst, info);
-            else       readScanlinePage<T>(localTif.get(), dst, info);
+            if (failed.load()) continue; 
+            try {
+                auto localTif = openTiff(path, "r");
+                TIFFSetSubDirectory(localTif.get(), offset[z]);
+                auto info = getPageInfo(localTif.get());
+                T* dst = stack.data() + z * stack.stride();
+                if (tiled) readTiledPage<T>(localTif.get(), dst, info);
+                else       readScanlinePage<T>(localTif.get(), dst, info);
+            } catch (...) {
+                #pragma omp critical
+                if (!ex) ex = std::current_exception();
+                failed.store(true); 
+            }
         }
+        if (ex) std::rethrow_exception(ex);
 
         return stack;
     }
@@ -307,22 +328,38 @@ namespace sirius {
 
     // Explicit instantiations
     template Image<uint8_t> readTiff(const std::string&);
+    template Image<int8_t> readTiff(const std::string&);
     template Image<uint16_t> readTiff(const std::string&);
+    template Image<int16_t> readTiff(const std::string&);
+    template Image<uint32_t> readTiff(const std::string&);
+    template Image<int32_t> readTiff(const std::string&);
     template Image<float> readTiff(const std::string&);
     template Image<double> readTiff(const std::string&);
 
     template ImageStack<uint8_t> readTiffStack(const std::string&);
+    template ImageStack<int8_t> readTiffStack(const std::string&);
     template ImageStack<uint16_t> readTiffStack(const std::string&);
+    template ImageStack<int16_t> readTiffStack(const std::string&);
+    template ImageStack<uint32_t> readTiffStack(const std::string&);
+    template ImageStack<int32_t> readTiffStack(const std::string&);
     template ImageStack<float> readTiffStack(const std::string&);
     template ImageStack<double> readTiffStack(const std::string&);
 
     template void writeTiff(const std::string&, const Image<uint8_t>&, TiffCompression);
+    template void writeTiff(const std::string&, const Image<int8_t>&, TiffCompression);
     template void writeTiff(const std::string&, const Image<uint16_t>&, TiffCompression);
+    template void writeTiff(const std::string&, const Image<int16_t>&, TiffCompression);
+    template void writeTiff(const std::string&, const Image<uint32_t>&, TiffCompression);
+    template void writeTiff(const std::string&, const Image<int32_t>&, TiffCompression);
     template void writeTiff(const std::string&, const Image<float>&, TiffCompression);
     template void writeTiff(const std::string&, const Image<double>&, TiffCompression);
 
     template void writeTiffStack(const std::string&, const ImageStack<uint8_t>&, TiffCompression);
+    template void writeTiffStack(const std::string&, const ImageStack<int8_t>&, TiffCompression);
     template void writeTiffStack(const std::string&, const ImageStack<uint16_t>&, TiffCompression);
+    template void writeTiffStack(const std::string&, const ImageStack<int16_t>&, TiffCompression);
+    template void writeTiffStack(const std::string&, const ImageStack<uint32_t>&, TiffCompression);
+    template void writeTiffStack(const std::string&, const ImageStack<int32_t>&, TiffCompression);
     template void writeTiffStack(const std::string&, const ImageStack<float>&, TiffCompression);
     template void writeTiffStack(const std::string&, const ImageStack<double>&, TiffCompression);
 
