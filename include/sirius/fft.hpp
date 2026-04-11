@@ -1,8 +1,9 @@
 #ifndef SIRIUS_FFT_HPP
 #define SIRIUS_FFT_HPP
 
-#include <Eigen/Core>
 #include <memory>
+#include <string>
+#include <Eigen/Core>
 
 namespace sirius {
 
@@ -19,7 +20,7 @@ namespace sirius {
 
     class FFT1D {
     public:
-        explicit FFT1D(Eigen::Index n, PlanRigor rigor = PlanRigor::Measure);
+        explicit FFT1D(Eigen::Index n, PlanRigor rigor = PlanRigor::Measure, bool normalize = false);
         ~FFT1D(); 
 
         // delete copy constructors
@@ -36,11 +37,16 @@ namespace sirius {
         void forward(const Eigen::VectorXcd& in, Eigen::VectorXcd& out) const;
         void inverse(const Eigen::VectorXcd& in, Eigen::VectorXcd& out) const;
 
+        // Save/load fft wisdom
+        static void loadWisdom(const std::string& path);
+        static void saveWisdom(const std::string& path);
+
     private:
         // Use Pimpl (pointer to implementation) pattern for fftw plan vars
         // otherwise, fftw details would have to be exposed to the consumer of the header
         struct Impl; // holds forward_plan, inverse_plan and Eigen index n
         std::unique_ptr<Impl> impl_;
+        bool normalize_ = false;
     };
 } // namespace sirius
 
