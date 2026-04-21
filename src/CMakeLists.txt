@@ -16,7 +16,6 @@ target_sources(sirius
         FILES
             ${PROJECT_SOURCE_DIR}/include/sirius/tiff_io.hpp
             ${PROJECT_SOURCE_DIR}/include/sirius/fft.hpp
-            ${PROJECT_SOURCE_DIR}/include/sirius/fft_buffers.hpp
     PRIVATE
         tiff_io.cpp
         fft.cpp
@@ -34,4 +33,7 @@ target_link_libraries(sirius
 if(SIRIUS_ENABLE_WARNINGS)
     target_set_warnings(sirius)
 endif()
-target_enable_sanitizers(sirius) 
+
+if(SIRIUS_ENABLE_SANITIZERS)
+    target_enable_sanitizers(sirius)
+endif()

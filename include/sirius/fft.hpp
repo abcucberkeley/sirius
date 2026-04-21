@@ -1,19 +1,16 @@
 #ifndef SIRIUS_FFT_HPP
 #define SIRIUS_FFT_HPP
 
-#include <memory>
 #include <string>
-#include <Eigen/Core>
+#include <vector>
+#include <memory>
+#include <unsupported/Eigen/CXX11/tensor>
 
 namespace sirius {
 
-    // TODO: use eigen tensor instead
-    class FFTWBuffer3D;
-
-    // Row-major complex matrix — matches FFTW's expected C-order layout for 2D plans.
-    // Prefer this over Eigen::MatrixXcd when calling FFT2D for zero-copy execution.
-    using RowMatrixXcd = Eigen::Matrix<std::complex<double>,
-                                       Eigen::Dynamic, Eigen::Dynamic, Eigen::RowMajor>;
+    // Only support eigen complex double tensors in rowmajor format for now
+    template <int Rank>
+    using TensorXcd = Eigen::Tensor<std::complex<double>, Rank, Eigen::RowMajor>;
 
     // Planning rigor controls the time FFTW spends searching for an optimal plan.
     // Higher rigor = better runtime FFT performance, but longer one-time planning cost.
@@ -26,98 +23,43 @@ namespace sirius {
         Exhaustive, // Try everything. Rarely worth it over Patient.
     };
 
-    class FFT1D {
+    class FFT {
     public:
-        explicit FFT1D(Eigen::Index n, PlanRigor rigor = PlanRigor::Measure, bool normalize = false);
-        ~FFT1D(); 
+        // dims: {n}                 for 1D
+        //       {rows, cols}        for 2D
+        //       {depth, rows, cols} for 3D
+        explicit FFT(std::vector<int> dims, int howmany=1, PlanRigor rigor = PlanRigor::Measure);
+        ~FFT();
 
         // delete copy constructors
-        FFT1D(const FFT1D&) = delete;
-        FFT1D& operator=(const FFT1D&) = delete;
+        FFT(const FFT&) = delete;
+        FFT& operator=(const FFT&) = delete;
 
-        // move ops defined in .cpp for the same reason as the destructor
-        FFT1D(FFT1D&&) noexcept;
-        FFT1D& operator=(FFT1D&&) noexcept;
+        // move constructors
+        FFT(FFT&&) noexcept;
+        FFT& operator=(FFT&&) noexcept;
 
-        // Forward and inverse FFT1D transforms.
-        // std::complex<double> is layout-compatible with fftw_complex per the C++ standard
-        // and FFTW documentation, so Eigen data is passed directly without copying.
-        void forward(Eigen::Ref<const Eigen::VectorXcd> in, Eigen::Ref<Eigen::VectorXcd> out) const;
-        void inverse(Eigen::Ref<const Eigen::VectorXcd> in, Eigen::Ref<Eigen::VectorXcd> out) const;
+        // Raw interface
+        void fft(const std::complex<double>* in, std::complex<double>* out) const;
+        void ifft(const std::complex<double>* in, std::complex<double>* out) const;
 
-        // Save/load fft wisdom
+        // Convenience functions for eigen
+        template<int Rank>
+        void fft(const TensorXcd<Rank>& in, TensorXcd<Rank>& out) const;
+
+        template<int Rank>
+        void ifft(const TensorXcd<Rank>& in, TensorXcd<Rank>& out, bool normalize = false) const;
+
+        // Load/Save wisdom from file
         static void loadWisdom(const std::string& path);
         static void saveWisdom(const std::string& path);
 
     private:
         // Use Pimpl (pointer to implementation) pattern for fftw plan vars
-        // otherwise, fftw details would have to be exposed to the consumer of the header
-        struct Impl; // holds forward_plan, inverse_plan and Eigen index n
-        std::unique_ptr<Impl> impl_;
-        bool normalize_ = false;
-    };
-
-    class FFT2D {
-    public:
-        explicit FFT2D(Eigen::Index rows, Eigen::Index cols,
-                       PlanRigor rigor = PlanRigor::Measure, bool normalize = false);
-        ~FFT2D();
-
-        // delete copy constructors
-        FFT2D(const FFT2D&) = delete;
-        FFT2D& operator=(const FFT2D&) = delete;
-
-        // move ops defined in .cpp for the same reason as the destructor
-        FFT2D(FFT2D&&) noexcept;
-        FFT2D& operator=(FFT2D&&) noexcept;
-
-        // Zero-copy path: RowMatrixXcd matches FFTW's C-order layout.
-        // Executes directly when aligned; falls back to scratch buffers when not.
-        void forward(const RowMatrixXcd& in, RowMatrixXcd& out) const;
-        void inverse(const RowMatrixXcd& in, RowMatrixXcd& out) const;
-
-        // Column-major convenience overloads — always copies due to layout conversion.
-        void forward(const Eigen::MatrixXcd& in, Eigen::MatrixXcd& out) const;
-        void inverse(const Eigen::MatrixXcd& in, Eigen::MatrixXcd& out) const;
-
-        // Wisdom is global FFTW state — these are equivalent to FFT1D::loadWisdom/saveWisdom.
-        static void loadWisdom(const std::string& path);
-        static void saveWisdom(const std::string& path);
-
-    private:
+        // otherwise fftw details would have to be exposed to the consumer of the header
         struct Impl;
         std::unique_ptr<Impl> impl_;
-        bool normalize_ = false;
     };
-
-    class FFT3D {
-    public:
-        explicit FFT3D(Eigen::Index depth, Eigen::Index rows, Eigen::Index cols,
-                       PlanRigor rigor = PlanRigor::Measure, bool normalize = false);
-        ~FFT3D();
-
-        // delete copy constructors
-        FFT3D(const FFT3D&) = delete;
-        FFT3D& operator=(const FFT3D&) = delete;
-
-        // move ops defined in .cpp for the same reason as the destructor
-        FFT3D(FFT3D&&) noexcept;
-        FFT3D& operator=(FFT3D&&) noexcept;
-
-        // Row major 3D stack, eigen doesnt support 3d
-        void forward(const FFTWBuffer3D& in, FFTWBuffer3D& out) const;
-        void inverse(const FFTWBuffer3D& in, FFTWBuffer3D& out) const;
-
-        // Wisdom is global FFTW state — these are equivalent to FFT1D::loadWisdom/saveWisdom.
-        static void loadWisdom(const std::string& path);
-        static void saveWisdom(const std::string& path);
-
-    private:
-        struct Impl;
-        std::unique_ptr<Impl> impl_;
-        bool normalize_ = false;
-    };
-
 } // namespace sirius
 
 #endif // SIRIUS_FFT_HPP
