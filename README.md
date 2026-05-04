@@ -14,13 +14,13 @@ module load python
 Configure, build and test
 ```
 # Configure
-cmake --preset linux-gcc-dev
+cmake --preset fiona-avx2-dev
 
 # Build
-cmake --build --preset linux-gcc-dev
+cmake --build --preset fiona-avx2-dev
 
 # Test
-ctest --preset linux-gcc-dev
+ctest --preset fiona-avx2-dev
 ```
 
 Check intrinsics supported
@@ -28,7 +28,7 @@ Check intrinsics supported
 lscpu | grep -i flags | tr ' ' '\n' | grep -E "sse|avx|fma" | sort -u
 ```
 
-Fiona supports avx512 so make sure to pass `-DSIRIUS_ENABLE_AVX512=ON`
+Fiona supports avx2 so make sure to pass `-DSIRIUS_ENABLE_AVX2=ON`
 
 ## TODO
 - detect/handle int overflow and use fftw_plan_guru64_dft instead of fftw_plan_many_dft
@@ -48,9 +48,9 @@ Dev install
 pip install -e .
 ```
 
-On fiona or any computer with avx512 support
+On fiona or any computer with avx2 support
 ```
-pip install -e . --config-settings cmake.args="-DSIRIUS_ENABLE_AVX512=ON"
+pip install -e . --config-settings cmake.args="-DSIRIUS_ENABLE_AVX2=ON"
 ```
 
 Run unit tests

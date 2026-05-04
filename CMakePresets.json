@@ -82,6 +82,23 @@
       }
     },
     {
+      "name": "fiona-avx2-release",
+      "displayName": "Fiona HPC (GCC, AVX2, Release)",
+      "inherits": ["linux-gcc-release"],
+      "cacheVariables": {
+        "SIRIUS_ENABLE_PYTHON_BINDINGS": "ON",
+        "SIRIUS_ENABLE_AVX2": "ON"
+      }
+    },
+    {
+      "name": "fiona-avx2-dev",
+      "displayName": "Fiona HPC (GCC, AVX2, Dev)",
+      "inherits": ["linux-gcc-dev"],
+      "cacheVariables": {
+        "SIRIUS_ENABLE_AVX2": "ON"
+      }
+    },
+    {
       "name": "linux-clang-dev",
       "displayName": "Linux (Clang) Dev",
       "inherits": ["dev"],
@@ -140,6 +157,16 @@
       "configurePreset": "linux-gcc-release"
     },
     {
+      "name": "fiona-avx2-release",
+      "inherits": ["base-build"],
+      "configurePreset": "fiona-avx2-release"
+    },
+    {
+      "name": "fiona-avx2-dev",
+      "inherits": ["base-build"],
+      "configurePreset": "fiona-avx2-dev"
+    },
+    {
       "name": "linux-clang-dev",
       "inherits": ["base-build"],
       "configurePreset": "linux-clang-dev"
@@ -174,6 +201,11 @@
       "name": "linux-clang-dev",
       "inherits": ["base-test"],
       "configurePreset": "linux-clang-dev"
+    },
+    {
+      "name": "fiona-avx2-dev",
+      "inherits": ["base-test"],
+      "configurePreset": "fiona-avx2-dev"
     }
   ]
 }
