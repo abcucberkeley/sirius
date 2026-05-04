@@ -5,16 +5,7 @@
   "dependencies": [
     "eigen3",
     "tiff",
-    "fftw3",
-    {
-      "name": "imgui",
-      "features": ["docking-experimental", "opengl3-binding", "sdl3-binding"]
-    },
-    {
-      "name": "sdl3",
-      "features": ["dbus"],
-      "platform": "linux"
-    }
+    "fftw3"
   ],
   "features": {
     "testing": {

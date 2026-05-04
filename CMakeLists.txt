@@ -25,10 +25,6 @@ if(SIRIUS_ENABLE_TESTS)
     add_subdirectory(tests)
 endif()
 
-if(SIRIUS_ENABLE_GUI)
-    add_subdirectory(app)
-endif()
-
 if(SIRIUS_ENABLE_PYTHON_BINDINGS)
     add_subdirectory(bindings)
 endif()

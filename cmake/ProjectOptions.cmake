@@ -1,6 +1,5 @@
 option(SIRIUS_ENABLE_MPI "Enable MPI" OFF)
 option(SIRIUS_ENABLE_CUDA "Enable CUDA" OFF)
-option(SIRIUS_ENABLE_GUI "Enable GUI" OFF)
 option(SIRIUS_ENABLE_PYTHON_BINDINGS "Enable nanobind python bindings" OFF)
 
 # Development related options
