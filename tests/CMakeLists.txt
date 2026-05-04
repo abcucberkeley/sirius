@@ -15,7 +15,7 @@ target_link_libraries(sirius_tests
 )
 
 include(Catch)
-catch_discover_tests(sirius_tests DISCOVERY_MODE PRE_TEST)
+catch_discover_tests(sirius_tests TEST_PREFIX "sirius::")
 
 if(SIRIUS_ENABLE_WARNINGS)
     target_set_warnings(sirius_tests)

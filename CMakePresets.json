@@ -156,6 +156,7 @@
       "name": "base-test",
       "hidden": true,
       "output": { "outputOnFailure": true },
+      "filter": { "include": { "name": "^sirius::" } },
       "execution": { "noTestsAction": "error", "stopOnFailure": false }
     },
     {

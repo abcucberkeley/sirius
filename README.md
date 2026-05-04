@@ -2,7 +2,26 @@
 Cross-platform SIM reconstruction tool that runs on the CPU, GPU and HPC.
 
 ## Development guide
-TODO
+Fiona
+```
+module load ninja
+module load cmake
+module load nvhpc
+module load gcc/13.2.0
+module load python
+```
+
+Configure, build and test
+```
+# Configure
+cmake --preset linux-gcc-dev
+
+# Build
+cmake --build --preset linux-gcc-dev
+
+# Test
+ctest --preset linux-gcc-dev
+```
 
 ## TODO
 - detect/handle int overflow and use fftw_plan_guru64_dft instead of fftw_plan_many_dft
