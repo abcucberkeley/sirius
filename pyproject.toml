@@ -35,7 +35,6 @@ wheel.packages = ["bindings/python/sirius"]
 # Setuptools-style build caching in a local directory
 build-dir = "build/{wheel_tag}"
 
-cmake.args = ["-DSIRIUS_ENABLE_PYTHON_BINDINGS=ON"]
 
 # Build stable ABI wheels for CPython 3.12+
 wheel.py-api = "cp39"

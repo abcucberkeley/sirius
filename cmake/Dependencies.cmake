@@ -39,6 +39,9 @@ FetchContent_Declare(
 )
 # fftw using offensive global names
 block()
+    # FFTW 3.3.10 declares cmake_minimum_required(VERSION 3.0); CMake 4.x
+    # removed support for <3.5, so spoof a 3.5 floor for this subtree only.
+    set(CMAKE_POLICY_VERSION_MINIMUM 3.5)
     # FFTW3 uses cmake_minimum_required(3.0), so CMP0077 defaults OLD and option()
     # ignores normal variables; NEW makes it honor our BUILD_SHARED_LIBS=OFF below.
     set(CMAKE_POLICY_DEFAULT_CMP0077 NEW)
@@ -46,13 +49,14 @@ block()
     set(BUILD_TESTS OFF) # Build tests
     set(ENABLE_OPENMP  ON) # Use OpenMP for multithreading
     set(ENABLE_THREADS OFF) # Use pthread for multithreading
-    set(ENABLE_FLOAT OFF) # single-precision
+    set(ENABLE_FLOAT OFF) # single-precision (unused; sirius uses double fftw_* API)
     set(ENABLE_LONG_DOUBLE OFF) # long-double precision
     set(ENABLE_QUAD_PRECISION OFF) # quadruple-precision
-    set(ENABLE_SSE OFF) # Compile with SSE instruction set support
-    set(ENABLE_SSE2 OFF) # Compile with SSE2 instruction set support
-    set(ENABLE_AVX OFF) # Compile with AVX instruction set support
-    set(ENABLE_AVX2 OFF) # Compile with AVX2 instruction set support
+    set(ENABLE_SSE OFF)
+    set(ENABLE_SSE2  ${SIRIUS_ENABLE_SSE2})
+    set(ENABLE_AVX   ${SIRIUS_ENABLE_AVX})
+    set(ENABLE_AVX2  ${SIRIUS_ENABLE_AVX2})
+    set(ENABLE_AVX512 ${SIRIUS_ENABLE_AVX512})
     FetchContent_MakeAvailable(fftw3)
     target_include_directories(fftw3 PUBLIC $<BUILD_INTERFACE:${fftw3_SOURCE_DIR}/api>)
     add_library(FFTW3::fftw3 ALIAS fftw3)

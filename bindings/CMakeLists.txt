@@ -26,7 +26,7 @@ nanobind_add_module(
   ${SIRIUS_BINDING_SOURCES}
 )
 
-target_link_libraries(_sirius_ext PRIVATE sirius)
+target_link_libraries(_sirius_ext PRIVATE sirius sirius_simd)
 target_include_directories(_sirius_ext PRIVATE ${PROJECT_SOURCE_DIR}/include)
 
 if(SIRIUS_ENABLE_CUDA)

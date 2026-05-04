@@ -9,6 +9,7 @@ project(SIRIUS
 list(APPEND CMAKE_MODULE_PATH "${CMAKE_CURRENT_SOURCE_DIR}/cmake")
 
 include(ProjectOptions)
+include(SIMD)
 include(Warnings)
 include(Sanitizers)
 include(StaticAnalysis)

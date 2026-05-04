@@ -32,6 +32,7 @@ target_link_libraries(sirius
         TIFF::TIFF
         OpenMP::OpenMP_CXX
         FFTW3::fftw3
+        sirius_simd
 )
 
 if(SIRIUS_ENABLE_WARNINGS)

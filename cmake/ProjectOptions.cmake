@@ -2,6 +2,15 @@ option(SIRIUS_ENABLE_MPI "Enable MPI" OFF)
 option(SIRIUS_ENABLE_CUDA "Enable CUDA" OFF)
 option(SIRIUS_ENABLE_PYTHON_BINDINGS "Enable nanobind python bindings" OFF)
 
+# scikit-build-core always builds the Python extension
+if(SKBUILD)
+    set(SIRIUS_ENABLE_PYTHON_BINDINGS ON CACHE BOOL "" FORCE)
+endif()
+option(SIRIUS_ENABLE_SSE2   "Enable SSE2 instruction set"    OFF)
+option(SIRIUS_ENABLE_AVX    "Enable AVX instruction set"     OFF)
+option(SIRIUS_ENABLE_AVX2   "Enable AVX2 + FMA instruction sets" OFF)
+option(SIRIUS_ENABLE_AVX512 "Enable AVX-512F + FMA instruction sets" OFF)
+
 # Development related options
 option(SIRIUS_ENABLE_TESTS "Enable tests" OFF)
 option(SIRIUS_ENABLE_WARNINGS "Enable extra warnings" OFF)

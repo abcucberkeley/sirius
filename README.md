@@ -23,6 +23,13 @@ cmake --build --preset linux-gcc-dev
 ctest --preset linux-gcc-dev
 ```
 
+Check intrinsics supported
+```
+lscpu | grep -i flags | tr ' ' '\n' | grep -E "sse|avx|fma" | sort -u
+```
+
+Fiona supports avx512 so make sure to pass `-DSIRIUS_ENABLE_AVX512=ON`
+
 ## TODO
 - detect/handle int overflow and use fftw_plan_guru64_dft instead of fftw_plan_many_dft
 - for tiff io separate out type dependent code to reduce binary bloat (ie define readTiffStackRaw which doesnt depend on type and then use a templated convert_stack function)
@@ -39,6 +46,11 @@ target_link_libraries(myapp PRIVATE sirius::sirius)
 Dev install
 ```
 pip install -e .
+```
+
+On fiona or any computer with avx512 support
+```
+pip install -e . --config-settings cmake.args="-DSIRIUS_ENABLE_AVX512=ON"
 ```
 
 Run unit tests
