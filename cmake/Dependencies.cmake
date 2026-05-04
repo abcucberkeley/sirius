@@ -39,7 +39,10 @@ FetchContent_Declare(
 )
 # fftw using offensive global names
 block()
-    set(BUILD_SHARED_LIBS OFF) # Build shared libraries
+    # FFTW3 uses cmake_minimum_required(3.0), so CMP0077 defaults OLD and option()
+    # ignores normal variables; NEW makes it honor our BUILD_SHARED_LIBS=OFF below.
+    set(CMAKE_POLICY_DEFAULT_CMP0077 NEW)
+    set(BUILD_SHARED_LIBS OFF)
     set(BUILD_TESTS OFF) # Build tests
     set(ENABLE_OPENMP  ON) # Use OpenMP for multithreading
     set(ENABLE_THREADS OFF) # Use pthread for multithreading
