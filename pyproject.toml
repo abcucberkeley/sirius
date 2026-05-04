@@ -2,9 +2,7 @@
 requires = [
     "scikit-build-core >=0.10",
     # TEMP: pin to nanobind master until the next release ships eigen/tensor.h.
-    # Matches the commit in ports-overlay/nanobind/portfile.cmake so the
-    # pip and vcpkg paths use identical headers. Drop the `@<sha>` once a
-    # tagged release contains the header.
+    # Drop the `@<sha>` once a tagged release contains the header.
     "nanobind @ git+https://github.com/wjakob/nanobind@a835245fa0c8f6c8d06a25713562100464e95039",
 ]
 build-backend = "scikit_build_core.build"
