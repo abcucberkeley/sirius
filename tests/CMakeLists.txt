@@ -6,6 +6,7 @@ target_sources(sirius_tests
         test_fft1d.cpp
         test_fft2d.cpp
         test_fft3d.cpp
+        test_reconstruction.cpp
 )
 
 target_link_libraries(sirius_tests
@@ -13,6 +14,11 @@ target_link_libraries(sirius_tests
         sirius
         Catch2::Catch2WithMain
         TIFF::TIFF
+)
+
+target_compile_definitions(sirius_tests
+    PRIVATE
+        SIRIUS_TEST_DATA_DIR="${PROJECT_SOURCE_DIR}/tests/data"
 )
 
 include(Catch)
