@@ -3,6 +3,9 @@ compile_commands.json
 imgui.ini
 wisdom*
 
+# Benchmark scratch space: generated TIFF datasets + on-the-fly cpp-tiff clone
+/.bench_tmp/
+
 # Prerequisites
 *.d
 

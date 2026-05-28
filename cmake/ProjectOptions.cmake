@@ -13,6 +13,7 @@ option(SIRIUS_ENABLE_AVX512 "Enable AVX-512F + FMA instruction sets" OFF)
 
 # Development related options
 option(SIRIUS_ENABLE_TESTS "Enable tests" OFF)
+option(SIRIUS_ENABLE_BENCHMARKS "Build C++ benchmarks" OFF)
 option(SIRIUS_ENABLE_WARNINGS "Enable extra warnings" OFF)
 option(SIRIUS_ENABLE_SANITIZERS "Enable sanitizers (Debug, non-MSVC)" OFF)
 option(SIRIUS_ENABLE_CLANG_TIDY "Enable clang-tidy" OFF)

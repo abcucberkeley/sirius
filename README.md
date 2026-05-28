@@ -57,3 +57,49 @@ Run unit tests
 ```
 python -m unittest discover -s bindings/tests
 ```
+
+## Benchmarks
+The TIFF benchmark compares the SIRIUS parallel reader against
+[cpp-tiff](https://github.com/abcucberkeley/cpp-tiff) at both the C++ and
+Python-binding levels; `bench_fft.py` compares the FFT against NumPy.
+
+Setup — extra deps plus the two C++ benchmark binaries. On CMake 4.x the
+`CMAKE_POLICY_VERSION_MINIMUM=3.5` flag is required: FFTW/libtiff/zlib still
+declare pre-3.5 minimums that CMake 4 rejects outright.
+```
+pip install numpy tifffile imagecodecs cpp-tiff "cmake>=3.25" ninja
+pip install -e . --config-settings=cmake.define.CMAKE_POLICY_VERSION_MINIMUM=3.5
+
+# SIRIUS C++ bench (built by SIRIUS's CMake)
+cmake --preset linux-gcc-release -DSIRIUS_ENABLE_BENCHMARKS=ON -DCMAKE_POLICY_VERSION_MINIMUM=3.5
+cmake --build --preset linux-gcc-release --target bench_tiff_sirius
+
+# cpp-tiff C++ bench (standalone; clones latest cpp-tiff, builds libcppTiff.so)
+bash benchmarks/setup_cpptiff.sh
+```
+
+Run the full ~18 GB TIFF case (all four readers; the dataset is written to the
+gitignored `./.bench_tmp/` and deleted afterwards):
+```
+python bindings/benchmarks/bench_tiff.py --shape 10000 1800 512 --repeats 3 \
+    --cpp-sirius  build/linux-gcc-release/benchmarks/bench_tiff_sirius \
+    --cpp-cpptiff .bench_tmp/cpptiff/bench_tiff_cpptiff
+```
+
+Quick correctness check on a tiny file. `--verify` reads the dataset with every
+Python reader (`sirius.read_tiff`, `cpptiff.read_tiff`) and asserts the arrays
+are bit-for-bit identical before the timed runs, raising on any shape/data
+mismatch (lossless for every supported compression). The C++ benches only report
+timing, so they are not part of this cross-check; it needs both Python readers
+importable, otherwise it warns and skips.
+```
+python bindings/benchmarks/bench_tiff.py --shape 8 64 64 --verify
+```
+`--keep` retains the dataset, `--path P` uses an explicit file, and
+`--dtype` / `--compression` vary the data (`imagecodecs` is required for
+compressed datasets such as `--compression lzw`); see `--help` for all options.
+
+FFT vs NumPy:
+```
+python bindings/benchmarks/bench_fft.py
+```
