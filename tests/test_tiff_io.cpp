@@ -210,15 +210,44 @@ TEST_CASE("Reading a TIFF as a different type converts pixels", "[tiff][io][conv
     REQUIRE(asMatrix(loaded).isApprox(ImageMatrix<float>::Constant(4, 4, 1000.0f)));
 }
 
+TEST_CASE("Partial last strip - fast path and conversion path", "[tiff][io]") {
+    // 128-col uint16: rowsPerStrip = 8192/(128*2) = 32
+    // height 33 -> 2 strips: rows 0-31 (full) + row 32 (1-row partial strip)
+    TempFile f(uniqueTempPath(".tiff"));
+    Image<uint16_t> original(33, 128);
+    asMatrix(original).setRandom();
+
+    writeTiff(f.path, original);
+
+    SECTION("fast path: T matches on-disk type") {
+        auto loaded = readTiff<uint16_t>(f.path);
+        REQUIRE(loaded.dimension(0) == 33);
+        REQUIRE(loaded.dimension(1) == 128);
+        REQUIRE(asMatrix(loaded) == asMatrix(original));
+    }
+
+    SECTION("conversion path: read as float") {
+        auto loaded = readTiff<float>(f.path);
+        REQUIRE(loaded.dimension(0) == 33);
+        REQUIRE(loaded.dimension(1) == 128);
+        for (Eigen::Index r = 0; r < 33; ++r)
+            for (Eigen::Index c = 0; c < 128; ++c)
+                REQUIRE(loaded(r, c) == static_cast<float>(original(r, c)));
+    }
+}
+
 TEST_CASE("Image dimensions are preserved exactly", "[tiff][io]") {
-    // non-square, non-power-of-two dimensions
+    // non-square, non-power-of-two dimensions; {512, 128} exercises multiple
+    // full strips (rowsPerStrip=32 for 128-col uint16); {33, 128} exercises a
+    // partial last strip (2 strips: 32 full rows + 1 partial row)
     auto [r, c] = GENERATE(table<int, int>({
         {1, 1},
         {1, 100},
         {100, 1},
         {17, 31},
         {256, 256},
-        {512, 128}
+        {512, 128},
+        {33, 128}
     }));
     INFO("Dimensions: " << r << "x" << c);
 

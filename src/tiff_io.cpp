@@ -130,32 +130,57 @@ namespace sirius {
             return false;
         }
 
-        // Scanline/strip layout: stored row-by-row, TIFFReadScanline handles both fine
+        // Reads a strip-organized TIFF page into dst.
+        //
+        // TIFFReadEncodedStrip reduces API call overhead from O(height) to
+        // O(nStrips) per page and enables one large memcpy per strip instead
+        // of many small ones. On the fast path (T matches the on-disk type
+        // exactly) each strip is decoded directly into dst with no intermediate
+        // buffer.
         template <typename T>
         void readScanlinePage(TIFF* tif, T* dst, const TiffPageInfo& info) {
-            const tmsize_t scanBytes = TIFFScanlineSize(tif);
-            if (scanBytes <= 0)
-                throw std::runtime_error("TIFF reports invalid scanline size");
-            std::vector<uint8_t> buf(static_cast<size_t>(scanBytes));
+            uint32_t rowsPerStrip = 0;
+            TIFFGetFieldDefaulted(tif, TIFFTAG_ROWSPERSTRIP, &rowsPerStrip);
 
-            // if tiff format is an exact match to the Eigen matrix, we will just memcpy
+            const tstrip_t nStrips = TIFFNumberOfStrips(tif);
+            if (nStrips == 0)
+                throw std::runtime_error("TIFF reports zero strips");
+
+            const tmsize_t maxStripBytes = TIFFStripSize(tif);
+            if (maxStripBytes <= 0)
+                throw std::runtime_error("TIFF reports invalid strip size");
+
             const bool useFastPath = isExactMatch<T>(info.bps, info.fmt);
+            const size_t bytesPerPixel = info.bps / 8;
 
-            // scanline is a row
-            for (uint32_t row = 0; row < info.height; ++row) {
+            // Conversion path only: one strip-sized buffer, allocated once.
+            std::vector<uint8_t> buf;
+            if (!useFastPath)
+                buf.resize(static_cast<size_t>(maxStripBytes));
 
-                // read row into buffer
-                if (TIFFReadScanline(tif, buf.data(), row) < 0)
-                    throw std::runtime_error("Failed to read scanline " + std::to_string(row));
-
-                // location in dst
-                T* rowDst = dst + static_cast<size_t>(row) * info.width;
+            for (tstrip_t s = 0; s < nStrips; ++s) {
+                const uint32_t startRow = s * rowsPerStrip;
+                const uint32_t validRows = std::min(rowsPerStrip, info.height - startRow);
+                // Exact decoded byte count for this strip — handles the partial
+                // last strip without relying on codec-specific padding behavior.
+                const tmsize_t stripDataBytes =
+                    static_cast<tmsize_t>(validRows) * info.width *
+                    static_cast<tmsize_t>(bytesPerPixel);
 
                 if (useFastPath) {
-                    std::memcpy(rowDst, buf.data(), static_cast<size_t>(info.width) * sizeof(T));
+                    // Decode directly into the caller's buffer — no intermediate copy.
+                    T* stripDst = dst + static_cast<size_t>(startRow) * info.width;
+                    if (TIFFReadEncodedStrip(tif, s, stripDst, stripDataBytes) < 0)
+                        throw std::runtime_error("Failed to read strip " + std::to_string(s));
                 } else {
-                    // convert to appropriate format and copy to the correct location on the Eigen dst
-                    convertScanline<T>(buf.data(), rowDst, info.width, info.bps, info.fmt);
+                    if (TIFFReadEncodedStrip(tif, s, buf.data(), maxStripBytes) < 0)
+                        throw std::runtime_error("Failed to read strip " + std::to_string(s));
+                    for (uint32_t r = 0; r < validRows; ++r) {
+                        const uint8_t* srcRow = buf.data() +
+                            static_cast<size_t>(r) * info.width * bytesPerPixel;
+                        T* dstRow = dst + static_cast<size_t>(startRow + r) * info.width;
+                        convertScanline<T>(srcRow, dstRow, info.width, info.bps, info.fmt);
+                    }
                 }
             }
         }
@@ -290,20 +315,38 @@ namespace sirius {
         Eigen::Index rows = 0;
         Eigen::Index cols = 0;
 
-        // Pass 1: walk the directory chain sequentially to grab dimensions and
-        // cache each page's on-disk offset. TIFF directories are a linked list,
-        // so repeatedly calling TIFFSetDirectory(z) would be O(n^2).
-        // TIFFSetSubDirectory(offset) is O(1).
+        // Pass 1: walk the directory chain sequentially to validate geometry
+        // and cache each page's on-disk offset. TIFF directories are a linked
+        // list, so repeatedly calling TIFFSetDirectory(z) would be O(n^2).
+        // TIFFSetSubDirectory(offset) is O(1). Validation here keeps the
+        // parallel read path free of per-page tag reads.
+        TiffPageInfo pageInfo{};
+        bool isTiled = false;
         std::vector<uint64_t> offset;
         {
             auto tif = openTiff(path, "r");
-            auto info = getPageInfo(tif.get());
-            rows = static_cast<Eigen::Index>(info.height);
-            cols = static_cast<Eigen::Index>(info.width);
+            pageInfo = getPageInfo(tif.get());
+            isTiled  = static_cast<bool>(TIFFIsTiled(tif.get()));
+            rows = static_cast<Eigen::Index>(pageInfo.height);
+            cols = static_cast<Eigen::Index>(pageInfo.width);
 
             do {
-                ++pageCount;
                 offset.push_back(TIFFCurrentDirOffset(tif.get()));
+                if (pageCount > 0) {
+                    auto pi = getPageInfo(tif.get());
+                    if (static_cast<Eigen::Index>(pi.height) != rows ||
+                        static_cast<Eigen::Index>(pi.width)  != cols)
+                        throw std::runtime_error(
+                            "TIFF stack page " + std::to_string(pageCount) +
+                            " dimensions (" + std::to_string(pi.width) + "x" +
+                            std::to_string(pi.height) + ") do not match page 0 (" +
+                            std::to_string(cols) + "x" + std::to_string(rows) + ")");
+                    if (static_cast<bool>(TIFFIsTiled(tif.get())) != isTiled)
+                        throw std::runtime_error(
+                            "TIFF stack page " + std::to_string(pageCount) +
+                            " has mixed tiled/scanline layout");
+                }
+                ++pageCount;
             } while (TIFFReadDirectory(tif.get()));
         }
 
@@ -311,45 +354,44 @@ namespace sirius {
         ImageStack<T> stack(pageCount, rows, cols);
         const Eigen::Index stride = rows * cols;
 
-        // Parallel read: each thread opens its own TIFF* (libtiff handles are
-        // not thread-safe) and jumps straight to the cached offset.
         std::exception_ptr ex;
         std::atomic<bool> failed{false};
 
-        #pragma omp parallel for schedule(dynamic)
-        for (Eigen::Index z = 0; z < pageCount; ++z) {
-            if (failed.load(std::memory_order_relaxed)) continue;
+        // Each thread opens its own handle once and reuses it across every page
+        // it processes. libtiff handles are not thread-safe (cannot be shared
+        // across threads), but a single handle can navigate between directories
+        // via TIFFSetSubDirectory without reopening the file.
+        #pragma omp parallel
+        {
+            TiffPtr localTif;
+            bool openOk = false;
             try {
-                // Tiff handle is stateful hence not thread safe
-                // therefore each thread must open its own tiff file
-                // even though it is read only
-                auto localTif = openTiff(path, "r");
-                if (!TIFFSetSubDirectory(localTif.get(), offset[z]))
-                    throw std::runtime_error(
-                        "Failed to seek to TIFF directory " + std::to_string(z));
-
-                auto info = getPageInfo(localTif.get());
-                if (static_cast<Eigen::Index>(info.height) != rows ||
-                    static_cast<Eigen::Index>(info.width)  != cols)
-                    throw std::runtime_error(
-                        "TIFF stack page " + std::to_string(z) +
-                        " dimensions (" + std::to_string(info.width) + "x" +
-                        std::to_string(info.height) + ") do not match page 0 (" +
-                        std::to_string(cols) + "x" + std::to_string(rows) + ")");
-
-                T* dst = stack.data() + z * stride;
-                // TIFFIsTiled is per-page — don't assume page 0's layout
-                // applies to every subsequent directory.
-                if (TIFFIsTiled(localTif.get()))
-                    readTiledPage<T>(localTif.get(), dst, info);
-                else
-                    readScanlinePage<T>(localTif.get(), dst, info);
+                localTif = openTiff(path, "r");
+                openOk = true;
             } catch (...) {
                 #pragma omp critical
-                {
-                    if (!ex) ex = std::current_exception();
-                }
+                { if (!ex) ex = std::current_exception(); }
                 failed.store(true, std::memory_order_relaxed);
+            }
+
+            #pragma omp for schedule(dynamic, 4)
+            for (Eigen::Index z = 0; z < pageCount; ++z) {
+                if (failed.load(std::memory_order_relaxed) || !openOk) continue;
+                try {
+                    if (!TIFFSetSubDirectory(localTif.get(), offset[z]))
+                        throw std::runtime_error(
+                            "Failed to seek to TIFF directory " + std::to_string(z));
+
+                    T* dst = stack.data() + z * stride;
+                    if (isTiled)
+                        readTiledPage<T>(localTif.get(), dst, pageInfo);
+                    else
+                        readScanlinePage<T>(localTif.get(), dst, pageInfo);
+                } catch (...) {
+                    #pragma omp critical
+                    { if (!ex) ex = std::current_exception(); }
+                    failed.store(true, std::memory_order_relaxed);
+                }
             }
         }
         if (ex) std::rethrow_exception(ex);
