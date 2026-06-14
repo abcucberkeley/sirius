@@ -26,8 +26,13 @@ set(CMAKE_CXX_EXTENSIONS OFF)
 # Symlink the build-dir compile_commands.json for IDE integration
 if(PROJECT_IS_TOP_LEVEL)
     set(CMAKE_EXPORT_COMPILE_COMMANDS ON CACHE BOOL "Generate compile_commands.json" FORCE)
-    file(CREATE_LINK
-        "${CMAKE_BINARY_DIR}/compile_commands.json"
-        "${CMAKE_SOURCE_DIR}/compile_commands.json"
-        SYMBOLIC)
+    # Silently ignore failures (e.g. Windows without Developer Mode enabled)
+    execute_process(
+        COMMAND ${CMAKE_COMMAND} -E create_symlink
+            "${CMAKE_BINARY_DIR}/compile_commands.json"
+            "${CMAKE_SOURCE_DIR}/compile_commands.json"
+        RESULT_VARIABLE _symlink_result
+        ERROR_QUIET
+        OUTPUT_QUIET
+    )
 endif()

@@ -23,14 +23,18 @@ FetchContent_Declare(
     GIT_TAG        v4.7.0
     GIT_SHALLOW    TRUE
 )
-set(tiff-tools   OFF)
-set(tiff-tests   OFF)
-set(tiff-contrib OFF)
-set(tiff-docs    OFF)
-FetchContent_MakeAvailable(libtiff)
-if(NOT TARGET TIFF::TIFF)
-    add_library(TIFF::TIFF ALIAS tiff)
-endif()
+# compatibility with cmake < 3.5 has been removed from CMake
+block()
+    set(CMAKE_POLICY_VERSION_MINIMUM 3.5)
+    set(tiff-tools   OFF)
+    set(tiff-tests   OFF)
+    set(tiff-contrib OFF)
+    set(tiff-docs    OFF)
+    FetchContent_MakeAvailable(libtiff)
+    if(NOT TARGET TIFF::TIFF)
+        add_library(TIFF::TIFF ALIAS tiff)
+    endif()
+endblock()
 
 # FFTW3
 FetchContent_Declare(
