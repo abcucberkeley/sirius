@@ -87,6 +87,10 @@ if(SIRIUS_ENABLE_PYTHON_BINDINGS)
         nanobind
         GIT_REPOSITORY https://github.com/wjakob/nanobind.git
         GIT_TAG        a835245fa0c8f6c8d06a25713562100464e95039
+        # Fix an upstream MSVC build error in the Eigen::Tensor caster
+        # (std::array<long, N> vs Eigen::Index). See the patch script for details.
+        PATCH_COMMAND  ${CMAKE_COMMAND} -P
+                       ${CMAKE_CURRENT_LIST_DIR}/patches/fix_nanobind_tensor.cmake
     )
     FetchContent_MakeAvailable(nanobind)
 endif()
