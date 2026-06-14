@@ -254,7 +254,7 @@ namespace sirius {
             TIFFSetField(tif, TIFFTAG_COMPRESSION, tiffComp);
             
             // Set predictor for better compression ratios on compressed data
-            if (tiffComp == COMPRESSION_LZW || tiffComp == COMPRESSION_DEFLATE) {
+            if (tiffComp == COMPRESSION_LZW || tiffComp == COMPRESSION_ADOBE_DEFLATE) {
                 if constexpr (std::is_integral_v<T>) {
                     TIFFSetField(tif, TIFFTAG_PREDICTOR, PREDICTOR_HORIZONTAL);
                 } else {

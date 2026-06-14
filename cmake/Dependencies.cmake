@@ -16,6 +16,34 @@ set(EIGEN_BUILD_DOC     OFF)
 set(EIGEN_BUILD_TESTING OFF)
 FetchContent_MakeAvailable(Eigen3)
 
+# zlib — provides the DEFLATE/ZIP codec for libtiff. Without it, libtiff's
+# internal find_package(ZLIB) fails and ZIP_SUPPORT is left undefined, so
+# writing a TIFF with TiffCompression::Deflate fails at encode time.
+# OVERRIDE_FIND_PACKAGE redirects that find_package(ZLIB) to this fetched copy.
+FetchContent_Declare(
+    ZLIB
+    GIT_REPOSITORY https://github.com/madler/zlib.git
+    GIT_TAG        v1.3.1
+    GIT_SHALLOW    TRUE
+    OVERRIDE_FIND_PACKAGE
+)
+block()
+    set(CMAKE_POLICY_VERSION_MINIMUM 3.5)  # zlib targets an old CMake floor
+    set(ZLIB_BUILD_EXAMPLES OFF)
+    FetchContent_MakeAvailable(ZLIB)
+    # zlib's CMake exports zlibstatic/zlib but not the canonical ZLIB::ZLIB
+    # target libtiff links against. Create it from the static lib (PIC is on
+    # for the Python extension) and ensure its headers are on the usage
+    # interface: zlib.h lives in the source tree, generated zconf.h in the
+    # build tree.
+    if(NOT TARGET ZLIB::ZLIB)
+        target_include_directories(zlibstatic PUBLIC
+            $<BUILD_INTERFACE:${zlib_SOURCE_DIR}>
+            $<BUILD_INTERFACE:${zlib_BINARY_DIR}>)
+        add_library(ZLIB::ZLIB ALIAS zlibstatic)
+    endif()
+endblock()
+
 # libtiff
 FetchContent_Declare(
     libtiff
