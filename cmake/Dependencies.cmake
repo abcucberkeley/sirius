@@ -11,6 +11,7 @@ FetchContent_Declare(
     GIT_REPOSITORY https://gitlab.com/libeigen/eigen.git
     GIT_TAG        3.4.0
     GIT_SHALLOW    TRUE
+    SYSTEM          # mark its headers as system -> excluded from warnings/analyze
 )
 set(EIGEN_BUILD_DOC     OFF)
 set(EIGEN_BUILD_TESTING OFF)
@@ -96,6 +97,16 @@ endblock()
 
 # OpenMP (provided by the host compiler)
 find_package(OpenMP REQUIRED)
+
+# toml++ : TOML parser/serializer
+FetchContent_Declare(
+    tomlplusplus
+    GIT_REPOSITORY https://github.com/marzer/tomlplusplus.git
+    GIT_TAG        v3.4.0
+    GIT_SHALLOW    TRUE
+    SYSTEM          # mark its headers as system -> excluded from warnings/analyze
+)
+FetchContent_MakeAvailable(tomlplusplus)
 
 if(SIRIUS_ENABLE_TESTS)
     FetchContent_Declare(

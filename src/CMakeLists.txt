@@ -20,9 +20,13 @@ target_sources(sirius
         FILES
             ${PROJECT_SOURCE_DIR}/include/sirius/tiff_io.hpp
             ${PROJECT_SOURCE_DIR}/include/sirius/fft.hpp
+            ${PROJECT_SOURCE_DIR}/include/sirius/sim_parameters.hpp
+            ${PROJECT_SOURCE_DIR}/include/sirius/legacy_config.hpp
     PRIVATE
         tiff_io.cpp
         fft.cpp
+        sim_parameters.cpp
+        legacy_config.cpp
 )
 
 target_link_libraries(sirius
@@ -33,6 +37,7 @@ target_link_libraries(sirius
         OpenMP::OpenMP_CXX
         FFTW3::fftw3
         sirius_simd
+        tomlplusplus::tomlplusplus
 )
 
 if(SIRIUS_ENABLE_WARNINGS)
