@@ -1,7 +1,11 @@
 #ifndef SIRIUS_FFT_UTIL_HPP
 #define SIRIUS_FFT_UTIL_HPP
 
+#include "tensor_util.hpp"
 #include <Eigen/Core>
+#include <unsupported/Eigen/CXX11/Tensor>
+#include <array>
+#include <stdexcept>
 
 namespace sirius {
 
@@ -54,9 +58,30 @@ namespace sirius {
 
         out /= static_cast<double>(n) * d;
     }
+    
+    // fftshift is just a circular roll by floor(n/2) along each axis.
+    // Shift zero-frequency component to the center of the spectrum (all axes).
+    template <typename Scalar, int Rank>
+    Eigen::Tensor<Scalar, Rank, Eigen::RowMajor>
+    fftshift(const Eigen::Tensor<Scalar, Rank, Eigen::RowMajor>& in) {
+        std::array<int, Rank> shifts{};
+        for (int a = 0; a < Rank; ++a)
+            shifts[a] = static_cast<int>(in.dimension(a) / 2);      // floor(n/2)
+        return roll(in, shifts);
+    }
 
-    // TODO: future utilities (fftshift, ifftshift, rfftfreq, nd grids, ...)
+    // Inverse of fftshift. Differs from fftshift only for odd-length axes.
+    // Corresponds to a circular roll by -floor(n/2) along each axis.
+    template <typename Scalar, int Rank>
+    Eigen::Tensor<Scalar, Rank, Eigen::RowMajor>
+    ifftshift(const Eigen::Tensor<Scalar, Rank, Eigen::RowMajor>& in) {
+        std::array<int, Rank> shifts{};
+        for (int a = 0; a < Rank; ++a)
+            shifts[a] = -static_cast<int>(in.dimension(a) / 2);     // -(floor(n/2))
+        return roll(in, shifts);
+    }
 
+    // TODO: future utilities rfftfreq, nd grids,
 } // namespace sirius
 
 #endif // SIRIUS_FFT_UTIL_HPP
