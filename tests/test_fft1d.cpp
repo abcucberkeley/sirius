@@ -416,8 +416,8 @@ TEST_CASE("FFT saveWisdom writes a file and loadWisdom reads it back", "[fft1d][
     fft2.fft(in, out);
 
     // delta input -> flat spectrum with magnitude 1
-    for (Eigen::Index f = 0; f < 128; ++f)
-        REQUIRE_THAT(std::abs(out(f)), Catch::Matchers::WithinAbs(1.0, kTol));
+    for (Eigen::Index i = 0; i < 128; ++i)
+        REQUIRE_THAT(std::abs(out(i)), Catch::Matchers::WithinAbs(1.0, kTol));
 
     std::remove(kWisdomPath.c_str());
 }

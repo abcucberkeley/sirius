@@ -12,9 +12,9 @@ TEST_CASE("Reconstruction", "[reconstruction]") {
     const path otf_path = data_dir / "otf.tif";
     const path expected_path = data_dir / "raw_proc.tif";
 
-    const auto image = readTiffStack<float>(image_path);
-    const auto otf = readTiffStack<float>(otf_path);
-    const auto expected = readTiffStack<float>(expected_path);
+    const auto image = readTiffStack<float>(image_path.string());
+    const auto otf = readTiffStack<float>(otf_path.string());
+    const auto expected = readTiffStack<float>(expected_path.string());
 
     // TODO: after implementing reconstruction, uncomment this
 
