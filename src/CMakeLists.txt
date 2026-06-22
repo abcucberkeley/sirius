@@ -23,11 +23,13 @@ target_sources(sirius
             ${PROJECT_SOURCE_DIR}/include/sirius/fft_util.hpp
             ${PROJECT_SOURCE_DIR}/include/sirius/sim_parameters.hpp
             ${PROJECT_SOURCE_DIR}/include/sirius/legacy_config.hpp
+            ${PROJECT_SOURCE_DIR}/include/sirius/otf.hpp
     PRIVATE
         tiff_io.cpp
         fft.cpp
         sim_parameters.cpp
         legacy_config.cpp
+        otf.cpp
 )
 
 target_link_libraries(sirius

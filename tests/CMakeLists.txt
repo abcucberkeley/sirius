@@ -10,6 +10,7 @@ target_sources(sirius_tests
         test_fft3d.cpp
         test_sim_parameters.cpp
         test_reconstruction.cpp
+        test_otf.cpp
 )
 
 target_link_libraries(sirius_tests
