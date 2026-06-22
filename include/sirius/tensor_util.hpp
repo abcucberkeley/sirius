@@ -4,6 +4,7 @@
 #include <Eigen/Core>
 #include <unsupported/Eigen/CXX11/Tensor>
 #include <array>
+#include <cstddef>
 #include <stdexcept>
 
 namespace sirius {
@@ -13,8 +14,8 @@ namespace sirius {
     // shifts: array of shifts for each dimension
     template <typename Scalar, int Rank>
     Eigen::Tensor<Scalar, Rank, Eigen::RowMajor>
-    roll(const Eigen::Tensor<Scalar, Rank, Eigen::RowMajor>& in, 
-         const std::array<int, Rank>& shifts)
+    roll(const Eigen::Tensor<Scalar, Rank, Eigen::RowMajor>& in,
+         const std::array<int, static_cast<std::size_t>(Rank)>& shifts)
     {
         // Comments will cover a simple 2D example
         // but the code is general for any rank tensor.
