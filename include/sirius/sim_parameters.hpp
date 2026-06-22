@@ -36,8 +36,8 @@ namespace sirius {
         double dz_psf = 0.15; // axial step size of the PSF/OTF
 
         // Output and filtering
-        double zoomfact = 2.0;
-        int z_zoom = 1;
+        double zoomfact = 2.0; // "Zoom factor" for the output grid transverse dimensions relative to the input data grid. SIM increases resolution.
+        int z_zoom = 1; // Zoom factor for the output grid axial dimension.
         double wiener = 0.01;
         double otfcutoff = 0.006;
         double background = 0.0;
@@ -49,7 +49,7 @@ namespace sirius {
         double explodefact = 1.0;
         bool fast_si = false;
         bool do_rescale = true;
-        bool equalizez = false;
+        bool equalizez = false; // True: every z uses z=0 as refence focring all planes to the same brightness. False: use each plane's own max as reference. Loses axial structure
         bool no_kz0 = true;
         bool filter_overlaps = true;
 
