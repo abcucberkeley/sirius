@@ -48,8 +48,8 @@ namespace sirius {
         ApodizationType apodize_output = ApodizationType::Triangle;
         double explodefact = 1.0;
         bool fast_si = false;
-        bool do_rescale = true;
-        bool equalizez = false; // True: every z uses z=0 as refence focring all planes to the same brightness. False: use each plane's own max as reference. Loses axial structure
+        bool do_rescale = true; // whether to perform bleach correction
+        bool equalizez = false; // ref = equalizez ? S[sidx(0, 0, 0)] : S[sidx(0, 0, z)]; where S(d, p, z) is plane sums over (ny, nx)
         bool no_kz0 = true;
         bool filter_overlaps = true;
 

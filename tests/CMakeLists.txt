@@ -11,6 +11,7 @@ target_sources(sirius_tests
         test_sim_parameters.cpp
         test_reconstruction.cpp
         test_otf.cpp
+        test_preprocess.cpp
 )
 
 target_link_libraries(sirius_tests

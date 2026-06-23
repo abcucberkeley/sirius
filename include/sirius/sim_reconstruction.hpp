@@ -2,6 +2,7 @@
 #define SIRIUS_SIM_RECONSTRUCTION_HPP
 
 #include "sirius/sim_parameters.hpp"
+#include "sirius/preprocess.hpp"
 #include <Eigen/Core>
 #include <unsupported/Eigen/CXX11/Tensor>
 
@@ -34,8 +35,8 @@ namespace sirius {
         Scalar pre_scale = 1.0 / (nx * ny * nz * p.zoomfact * p.zoomfact * p.z_zoom * p.ndirs);
         data = (data - p.background) * pre_scale;
 
-        // TODO: bleach correction
-        // bleach_correction(data, p.equalizez);
+        // Bleach correction
+        if (p.do_rescale) bleach_rescale(data, p.equalizez);
 
         // TODO: edge apodization
         // edge_apodization(data, p.napodize);
