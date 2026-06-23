@@ -75,6 +75,7 @@ namespace sirius {
         output.insert("wiener",                 p.wiener);
         output.insert("otfcutoff",              p.otfcutoff);
         output.insert("background",             p.background);
+        output.insert("apodize_input",          std::string(apodizeToString(p.apodize_input)));
         output.insert("napodize",               p.napodize);
         output.insert("suppression_radius",     p.suppression_radius);
         output.insert("suppress_singularities", p.suppress_singularities);
@@ -151,6 +152,8 @@ namespace sirius {
         p.no_kz0                 = output["no_kz0"].value_or(p.no_kz0);
         p.filter_overlaps        = output["filter_overlaps"].value_or(p.filter_overlaps);
 
+        if (auto s = output["apodize_input"].value<std::string>())
+            p.apodize_input = apodizeFromString(*s);
         if (auto s = output["apodize_output"].value<std::string>())
             p.apodize_output = apodizeFromString(*s);
 

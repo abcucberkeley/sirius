@@ -214,7 +214,6 @@ namespace sirius {
         p.wiener                 = c.wiener;
         p.otfcutoff              = c.otfcutoff;
         p.background             = c.constbkgd;
-        p.napodize               = c.napodize;
         p.suppression_radius     = c.suppression_radius;
         p.suppress_singularities = (c.bSuppress_singularities != 0);
         p.dampen_order0          = c.bDampenOrder0;
@@ -224,6 +223,21 @@ namespace sirius {
         p.equalizez              = c.equalizez;
         p.no_kz0                 = c.bNoKz0;
         p.filter_overlaps        = c.bFilteroverlaps;
+
+        // Legacy decodes the input apodization from napodize at runtime in
+        // apodizationDriver(): >0 => edge ("triangle") blend of that width,
+        // exactly -1 => cosine window, anything else (0 or other negatives)
+        // => no apodization.
+        if (c.napodize > 0) {
+            p.apodize_input = ApodizationType::Triangle;
+            p.napodize      = c.napodize;
+        } else if (c.napodize == -1) {
+            p.apodize_input = ApodizationType::Cosine;
+            p.napodize      = 0;            // width is meaningless for the cosine window
+        } else {
+            p.apodize_input = ApodizationType::None;
+            p.napodize      = 0;
+        }
 
         switch (c.apodizeoutput) {
             case 0: p.apodize_output = ApodizationType::None;     break;

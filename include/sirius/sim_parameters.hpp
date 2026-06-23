@@ -41,7 +41,8 @@ namespace sirius {
         double wiener = 0.01;
         double otfcutoff = 0.006;
         double background = 0.0;
-        int napodize = 10;
+        ApodizationType apodize_input = ApodizationType::Triangle;
+        int napodize = 10; // Triangle border width (pixels); unused otherwise
         int suppression_radius = 10;
         bool suppress_singularities = true;
         bool dampen_order0 = false;

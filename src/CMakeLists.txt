@@ -25,6 +25,7 @@ target_sources(sirius
             ${PROJECT_SOURCE_DIR}/include/sirius/legacy_config.hpp
             ${PROJECT_SOURCE_DIR}/include/sirius/otf.hpp
             ${PROJECT_SOURCE_DIR}/include/sirius/preprocess.hpp
+            ${PROJECT_SOURCE_DIR}/include/sirius/constants.hpp
     PRIVATE
         tiff_io.cpp
         fft.cpp

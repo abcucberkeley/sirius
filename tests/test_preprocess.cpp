@@ -4,6 +4,7 @@
 #include "sirius/preprocess.hpp"
 
 using namespace sirius;
+using Catch::Matchers::WithinAbs;
 using Catch::Matchers::WithinRel;
 
 namespace {
@@ -77,4 +78,50 @@ TEST_CASE("bleach_rescale leaves a dark section untouched (no divide-by-zero)", 
     bleach_rescale(s, false);
     CHECK_THAT(sectionSum(s, 0, 0, 0), WithinRel(40.0, 1e-12)); // anchor: factor 1
     CHECK(sectionSum(s, 0, 1, 0) == 0.0);                       // dark: skipped, no NaN
+}
+
+TEST_CASE("edge_apodization blends opposite edges (exact 2x2, napodize=1)", "[preprocess]") {
+    // Hand-computed: x-pass blends rows then y-pass blends cols, fact(0) =
+    // 1 - sin(pi/4) = 0.2928932188. See the kernel math in the reference.
+    auto s = makeStack(1, 1, 1, 2, 2);
+    s(0, 0, 0, 0, 0) = 1.0; s(0, 0, 0, 0, 1) = 2.0;
+    s(0, 0, 0, 1, 0) = 3.0; s(0, 0, 0, 1, 1) = 4.0;
+
+    edge_apodization(s, 1);
+
+    CHECK_THAT(s(0, 0, 0, 0, 0), WithinAbs(1.4393398282, 1e-9));
+    CHECK_THAT(s(0, 0, 0, 0, 1), WithinAbs(2.1464466094, 1e-9));
+    CHECK_THAT(s(0, 0, 0, 1, 0), WithinAbs(2.8535533906, 1e-9));
+    CHECK_THAT(s(0, 0, 0, 1, 1), WithinAbs(3.5606601718, 1e-9));
+}
+
+TEST_CASE("edge_apodization leaves a constant image unchanged", "[preprocess]") {
+    // Opposite edges are equal -> diff is zero everywhere -> no change.
+    auto s = makeStack(1, 1, 1, 3, 3);
+    fillSection(s, 0, 0, 0, 5.0);
+    edge_apodization(s, 1);
+    for (int y = 0; y < 3; ++y)
+        for (int x = 0; x < 3; ++x)
+            CHECK_THAT(s(0, 0, 0, y, x), WithinAbs(5.0, 1e-12));
+}
+
+TEST_CASE("edge_apodization is a no-op for napodize <= 0", "[preprocess]") {
+    auto s = makeStack(1, 1, 1, 2, 2);
+    s(0, 0, 0, 0, 0) = 1.0; s(0, 0, 0, 0, 1) = 2.0;
+    s(0, 0, 0, 1, 0) = 3.0; s(0, 0, 0, 1, 1) = 4.0;
+    const Stack before = s;
+    edge_apodization(s, 0);
+    for (int y = 0; y < 2; ++y)
+        for (int x = 0; x < 2; ++x)
+            CHECK(s(0, 0, 0, y, x) == before(0, 0, 0, y, x));
+}
+
+TEST_CASE("cosine_apodization applies a separable sine window", "[preprocess]") {
+    // 2x2: every factor is sin(pi*(i+0.5)/2) = sin(pi/4); product = 0.5.
+    auto s = makeStack(1, 1, 1, 2, 2);
+    fillSection(s, 0, 0, 0, 1.0);
+    cosine_apodization(s);
+    for (int y = 0; y < 2; ++y)
+        for (int x = 0; x < 2; ++x)
+            CHECK_THAT(s(0, 0, 0, y, x), WithinAbs(0.5, 1e-12));
 }

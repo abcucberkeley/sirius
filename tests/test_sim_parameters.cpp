@@ -314,6 +314,34 @@ TEST_CASE("fromLegacy converts apodizeoutput int to enum", "[legacy][convert]") 
     REQUIRE(convert(2) == ApodizationType::Triangle);
 }
 
+TEST_CASE("fromLegacy maps napodize sign to apodize_input", "[legacy][convert]") {
+    auto convert = [](int napodize) {
+        LegacyReconConfig c;
+        c.napodize = napodize;
+        return fromLegacy(c);
+    };
+    SECTION("negative napodize selects the cosine window, width cleared") {
+        SIMParameters p = convert(-1);
+        REQUIRE(p.apodize_input == ApodizationType::Cosine);
+        REQUIRE(p.napodize == 0);
+    }
+    SECTION("zero napodize selects none") {
+        SIMParameters p = convert(0);
+        REQUIRE(p.apodize_input == ApodizationType::None);
+        REQUIRE(p.napodize == 0);
+    }
+    SECTION("napodize < -1 selects none (only -1 means cosine)") {
+        SIMParameters p = convert(-2);
+        REQUIRE(p.apodize_input == ApodizationType::None);
+        REQUIRE(p.napodize == 0);
+    }
+    SECTION("positive napodize selects triangle and keeps the width") {
+        SIMParameters p = convert(15);
+        REQUIRE(p.apodize_input == ApodizationType::Triangle);
+        REQUIRE(p.napodize == 15);
+    }
+}
+
 TEST_CASE("fromLegacy rejects invalid apodizeoutput", "[legacy][convert]") {
     LegacyReconConfig c;
     c.apodizeoutput = 5;

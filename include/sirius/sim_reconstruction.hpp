@@ -3,27 +3,24 @@
 
 #include "sirius/sim_parameters.hpp"
 #include "sirius/preprocess.hpp"
+#include "sirius/otf.hpp"
+
 #include <Eigen/Core>
 #include <unsupported/Eigen/CXX11/Tensor>
 
 namespace sirius {
     template <typename Scalar>
     Eigen::Tensor<Scalar, 3, Eigen::RowMajor>
-    reconstruct(Eigen::Tensor<Scalar, 3, Eigen::RowMajor>& data,
-                Eigen::Tensor<Scalar, 3, Eigen::RowMajor>& otf,
+    reconstruct(Eigen::Tensor<Scalar, 5, Eigen::RowMajor>& data,
+                const OTFRadiallyAveraged& otf,
                 const SIMParameters& p)
     {
-        // Assume ndirs, nphases, nz, ny, nx format
-        // TODO: Any other input needs an adapter first
-        Eigen::Index ndirs = data.dimension(0);
-        Eigen::Index nphases = data.dimension(1);
-        Eigen::Index nz = data.dimension(2);
-        Eigen::Index ny = data.dimension(3);
-        Eigen::Index nx = data.dimension(4);
-        Scalar total_n = static_cast<Scalar>(data.size());
-
-        // Assume OTF has the same dimensions as data for now (most general)
-        // TODO: Radially averaged OTF ie (m, nr, nz) and other common formats need to be supported
+        using Index = Eigen::Index;
+        const Index ndirs   = data.dimension(0);
+        const Index nphases = data.dimension(1);
+        const Index nz      = data.dimension(2);
+        const Index ny      = data.dimension(3);
+        const Index nx      = data.dimension(4);
 
         // Background subtraction and pre-scale (compensate un-normalied ffts)
         // Reconstruction can be sensitive to background since it could affect various estimates
@@ -38,8 +35,14 @@ namespace sirius {
         // Bleach correction
         if (p.do_rescale) bleach_rescale(data, p.equalizez);
 
-        // TODO: edge apodization
-        // edge_apodization(data, p.napodize);
+        // Real-space apodization to suppress FFT edge-wraparound artifacts.
+        // Triangle blends a napodize-wide border; Cosine applies a full sine
+        // window; None skips it. (Distinct from p.apodize_output, applied later.)
+        switch (p.apodize_input) {
+            case ApodizationType::None:                                break;
+            case ApodizationType::Cosine:   cosine_apodization(data); break;
+            case ApodizationType::Triangle: edge_apodization(data, p.napodize); break;
+        }
 
         // TODO: Separate bands
         // Analytical inverse or solve lsq
