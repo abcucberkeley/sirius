@@ -8,6 +8,7 @@ target_sources(sirius_tests
         test_fft1d.cpp
         test_fft2d.cpp
         test_fft3d.cpp
+        test_real_fft.cpp
         test_sim_parameters.cpp
         test_reconstruction.cpp
         test_otf.cpp

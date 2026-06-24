@@ -1,27 +1,15 @@
 #ifndef SIRIUS_FFT_HPP
 #define SIRIUS_FFT_HPP
 
+#include <memory>
+#include <complex>
 #include <string>
 #include <vector>
-#include <memory>
-#include <unsupported/Eigen/CXX11/Tensor>
+
+#include "sirius/fft_common.hpp"
+#include "sirius/tensor_util.hpp"
 
 namespace sirius {
-
-    // Only support eigen complex double tensors in rowmajor format for now
-    template <int Rank>
-    using TensorXcd = Eigen::Tensor<std::complex<double>, Rank, Eigen::RowMajor>;
-
-    // Planning rigor controls the time FFTW spends searching for an optimal plan.
-    // Higher rigor = better runtime FFT performance, but longer one-time planning cost.
-    // Use Estimate for exploratory work; Measure or Patient for production runs on
-    // fixed-size transforms that execute many times.
-    enum class PlanRigor {
-        Estimate,   // No measurement. Fast planning, suboptimal execution.
-        Measure,    // Measure a few strategies. Good balance (seconds of planning).
-        Patient,    // Measure many strategies. Better plan, slower to create.
-        Exhaustive, // Try everything. Rarely worth it over Patient.
-    };
 
     class FFT {
     public:

@@ -4,10 +4,24 @@
 #include <Eigen/Core>
 #include <unsupported/Eigen/CXX11/Tensor>
 #include <array>
+#include <complex>
 #include <cstddef>
 #include <stdexcept>
 
 namespace sirius {
+    // Row-major Eigen tensors, parameterized on scalar precision. The row-major
+    // layout is the project-wide convention (matches FFTW/NumPy and the contiguous
+    // last axis our FFT planners expect).
+    template <typename Real, int Rank>
+    using TensorXc = Eigen::Tensor<std::complex<Real>, Rank, Eigen::RowMajor>;
+
+    template <typename Real, int Rank>
+    using TensorXr = Eigen::Tensor<Real, Rank, Eigen::RowMajor>;
+
+    // Double complex
+    template <int Rank>
+    using TensorXcd = TensorXc<double, Rank>;
+
     // Circular shift (roll), shifts may be negative
     // This is the shared primitive behind fftshift / ifftshift
     // in: input tensor

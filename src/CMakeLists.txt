@@ -19,7 +19,10 @@ target_sources(sirius
             ${PROJECT_SOURCE_DIR}/include
         FILES
             ${PROJECT_SOURCE_DIR}/include/sirius/tiff_io.hpp
+            ${PROJECT_SOURCE_DIR}/include/sirius/tensor_util.hpp
             ${PROJECT_SOURCE_DIR}/include/sirius/fft.hpp
+            ${PROJECT_SOURCE_DIR}/include/sirius/fft_common.hpp
+            ${PROJECT_SOURCE_DIR}/include/sirius/real_fft.hpp
             ${PROJECT_SOURCE_DIR}/include/sirius/fft_util.hpp
             ${PROJECT_SOURCE_DIR}/include/sirius/sim_parameters.hpp
             ${PROJECT_SOURCE_DIR}/include/sirius/legacy_config.hpp
@@ -29,6 +32,7 @@ target_sources(sirius
     PRIVATE
         tiff_io.cpp
         fft.cpp
+        real_fft.cpp
         sim_parameters.cpp
         legacy_config.cpp
         otf.cpp
@@ -41,7 +45,7 @@ target_link_libraries(sirius
     PRIVATE
         TIFF::TIFF
         OpenMP::OpenMP_CXX
-        FFTW3::fftw3
+        ${SIRIUS_FFTW_TARGETS}
         sirius_simd
         tomlplusplus::tomlplusplus
 )

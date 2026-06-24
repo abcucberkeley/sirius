@@ -93,7 +93,19 @@ block()
     FetchContent_MakeAvailable(fftw3)
     target_include_directories(fftw3 PUBLIC $<BUILD_INTERFACE:${fftw3_SOURCE_DIR}/api>)
     add_library(FFTW3::fftw3 ALIAS fftw3)
+    # if omp is enabled, create fftw3_omp alias for the target
+    if(TARGET fftw3_omp)
+        add_library(FFTW3::fftw3_omp ALIAS fftw3_omp)
+    endif()
 endblock()
+
+# Canonical FFTW link targets: the core double-precision lib, plus the OpenMP
+# threading lib when FFTW was built with ENABLE_OPENMP. Consumers link
+# ${SIRIUS_FFTW_TARGETS} rather than repeating this conditional.
+set(SIRIUS_FFTW_TARGETS FFTW3::fftw3)
+if(TARGET FFTW3::fftw3_omp)
+    list(APPEND SIRIUS_FFTW_TARGETS FFTW3::fftw3_omp)
+endif()
 
 # OpenMP (provided by the host compiler)
 find_package(OpenMP REQUIRED)

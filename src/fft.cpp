@@ -1,10 +1,12 @@
 #include "sirius/fft.hpp"
+#include "fftw_internal.hpp"
 
 #include <mutex>
 #include <memory>
 #include <stdexcept>
-#include <numeric>
 #include <cstring>
+#include <limits>
+#include <new>
 #include <fftw3.h>
 
 // TODO: detect/handle int overflow and use
@@ -25,17 +27,8 @@ namespace sirius {
 
         // FFTW's planner modifies global state — must be serialized across all instances
         std::mutex s_planner_mutex;
-
-        // map plan rigor to fftw flags
-        unsigned int toFFTWFlag(PlanRigor r) {
-            switch (r) {
-                case PlanRigor::Estimate:   return FFTW_ESTIMATE;
-                case PlanRigor::Measure:    return FFTW_MEASURE;
-                case PlanRigor::Patient:    return FFTW_PATIENT;
-                case PlanRigor::Exhaustive: return FFTW_EXHAUSTIVE;
-            }
-            throw std::invalid_argument("Unknown PlanRigor value");
-        }
+        int s_fftw_thread_count = 1;
+        bool s_fftw_threads_initialized = false;
 
         // safe execution in case unaligned buffers with offset are passed
         void execute_safe(fftw_plan plan, int plan_alignment, int full_size, 
@@ -75,6 +68,80 @@ namespace sirius {
 
     } // anonymous namespace
 
+    namespace detail {
+        std::mutex& fftwPlannerMutex() {
+            return s_planner_mutex;
+        }
+
+        // map plan rigor to fftw flags
+        unsigned int toFFTWFlag(PlanRigor r) {
+            switch (r) {
+                case PlanRigor::Estimate:   return FFTW_ESTIMATE;
+                case PlanRigor::Measure:    return FFTW_MEASURE;
+                case PlanRigor::Patient:    return FFTW_PATIENT;
+                case PlanRigor::Exhaustive: return FFTW_EXHAUSTIVE;
+            }
+            throw std::invalid_argument("Unknown PlanRigor value");
+        }
+
+        int checkedProduct(const std::vector<int>& dims, const char* what) {
+            long long total = 1;
+            for (int d : dims) {
+                if (d <= 0)
+                    throw std::invalid_argument(std::string(what) + " dimensions must be positive");
+                if (total > std::numeric_limits<int>::max() / d)
+                    throw std::overflow_error(std::string(what) + " dimensions overflow int");
+                total *= d;
+            }
+            return static_cast<int>(total);
+        }
+
+        int checkedMultiply(int a, int b, const char* what) {
+            if (a < 0 || b < 0 || a > std::numeric_limits<int>::max() / b)
+                throw std::overflow_error(std::string(what) + " size overflows int");
+            return a * b;
+        }
+
+        // Caller must hold fftwPlannerMutex().
+        void ensureDoubleThreadsInitializedLocked() {
+            if (!s_fftw_threads_initialized) {
+                if (fftw_init_threads() == 0)
+                    throw std::runtime_error("FFTW failed to initialize double-precision threading");
+                s_fftw_threads_initialized = true;
+            }
+            fftw_plan_with_nthreads(s_fftw_thread_count);
+        }
+
+        void* checkedFftwMalloc(std::size_t bytes) {
+            if (bytes == 0) return nullptr;
+            void* p = fftw_malloc(bytes);
+            if (!p) throw std::bad_alloc();
+            return p;
+        }
+    } // namespace detail
+
+    void setFFTWThreadCount(int nthreads) {
+        if (nthreads < 1)
+            throw std::invalid_argument("FFTW thread count must be >= 1");
+
+        std::lock_guard<std::mutex> lock(s_planner_mutex);
+        s_fftw_thread_count = nthreads;
+        detail::ensureDoubleThreadsInitializedLocked();
+    }
+
+    int getFFTWThreadCount() {
+        std::lock_guard<std::mutex> lock(s_planner_mutex);
+        return s_fftw_thread_count;
+    }
+
+    void* fftwAlignedMalloc(std::size_t bytes) {
+        return detail::checkedFftwMalloc(bytes);
+    }
+
+    void fftwAlignedFree(void* p) noexcept {
+        fftw_free(p);
+    }
+
     struct FFT::Impl {
         PlanPtr forward_plan;
         PlanPtr inverse_plan;
@@ -91,17 +158,18 @@ namespace sirius {
         if (howmany < 1)
             throw std::invalid_argument("howmany must be >= 1");
         
-        int total = std::accumulate(dims.begin(), dims.end(), 1, std::multiplies<int>{});
+        int total = detail::checkedProduct(dims, "FFT");
         impl_->total_size = total;
-        impl_->full_size = total * howmany;
+        impl_->full_size = detail::checkedMultiply(total, howmany, "FFT");
 
-        FftwBuf buf_in (static_cast<fftw_complex*>(fftw_malloc(sizeof(fftw_complex) * impl_->full_size)));
-        FftwBuf buf_out(static_cast<fftw_complex*>(fftw_malloc(sizeof(fftw_complex) * impl_->full_size)));
+        FftwBuf buf_in (static_cast<fftw_complex*>(detail::checkedFftwMalloc(sizeof(fftw_complex) * impl_->full_size)));
+        FftwBuf buf_out(static_cast<fftw_complex*>(detail::checkedFftwMalloc(sizeof(fftw_complex) * impl_->full_size)));
         impl_->alignment = fftw_alignment_of(reinterpret_cast<double*>(buf_in.get()));
 
-        unsigned flags = toFFTWFlag(rigor);
+        unsigned flags = detail::toFFTWFlag(rigor);
 
         std::lock_guard<std::mutex> lock(s_planner_mutex);
+        detail::ensureDoubleThreadsInitializedLocked();
 
         impl_->forward_plan = PlanPtr(
             fftw_plan_many_dft(

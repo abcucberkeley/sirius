@@ -1,5 +1,6 @@
 build/
 prototypes/
+proto/
 compile_commands.json
 imgui.ini
 wisdom*
