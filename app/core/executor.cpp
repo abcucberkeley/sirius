@@ -74,6 +74,12 @@ namespace sirius::app {
     }
 
     namespace {
+        // The labels are (t, z, y, x) over the array's voxels, or they are
+        // not this array's labels at all.
+        bool labelsFit(const LabelVolume& labels, const Dims5& dims) noexcept {
+            return labels.t() == dims.t && labels.z() == dims.z && labels.y() == dims.y && labels.x() == dims.x;
+        }
+
         // What a parameter's path points at, not the path itself. An OTF, a
         // PSF, a flat-field image or the dataset can all be rewritten in place
         // while the pipeline still names the same file, and the step's output
@@ -124,17 +130,52 @@ namespace sirius::app {
         return upstream;
     }
 
-    std::shared_ptr<const StepOutput> Executor::load(Entry& e) const {
+    std::shared_ptr<const StepOutput> Executor::load(Entry& e, PendingRestore& pending) const {
         if (!e.arrayOnDisk || !e.output) return e.output;
-        // Reload the spilled array into a fresh StepOutput; the entry keeps
+        // A spilled array is reloaded into a fresh StepOutput; the entry keeps
         // the on-disk copy so memory can be released again later. While a
         // caller (the viewer, a paint stroke) still holds the restored output
         // it is handed out again: one object, one read, instead of the whole
-        // array coming off the disk for every refresh.
+        // array coming off the disk for every refresh. The read itself is
+        // not done here: this runs under the mutex, and a query must never
+        // block a run (or the run a query) for gigabytes of I/O.
         if (auto held = e.restored.lock()) return held;
-        auto restored = std::make_shared<StepOutput>(*e.output);
-        restored->array = readArrayFile(e.diskPath);
-        e.restored = restored;
+        pending.id = e.id;
+        pending.shell = e.output;
+        pending.path = e.diskPath;
+        return nullptr;
+    }
+
+    std::shared_ptr<const StepOutput> Executor::restore(const PendingRestore& pending) const {
+        if (!pending.shell) return nullptr;
+        std::shared_ptr<Array5> array;
+        try {
+            array = readArrayFile(pending.path);
+        } catch (const std::exception&) {
+            // The spill file is gone or truncated (a temp cleaner, a full
+            // disk): the entry is dropped so the step is recomputed instead
+            // of every query throwing.
+            std::lock_guard<std::mutex> g(mutex_);
+            auto it = entries_.find(pending.id);
+            if (it != entries_.end() && it->second && it->second->diskPath == pending.path) {
+                Entry& e = *it->second;
+                e.output = nullptr;
+                e.arrayOnDisk = false;
+                e.diskPath.clear();
+                e.bytes = 0;
+                e.restored.reset();
+            }
+            return nullptr;
+        }
+        auto restored = std::make_shared<StepOutput>(*pending.shell);
+        restored->array = std::move(array);
+        std::lock_guard<std::mutex> g(mutex_);
+        auto it = entries_.find(pending.id);
+        if (it != entries_.end() && it->second && it->second->diskPath == pending.path) {
+            // another thread may have restored it meanwhile: one copy wins
+            if (auto held = it->second->restored.lock()) return held;
+            it->second->restored = restored;
+        }
         return restored;
     }
 
@@ -142,20 +183,28 @@ namespace sirius::app {
         if (index < 0 || index >= p.size()) return nullptr;
         const Step& s = p.at(index);
         const std::string fp = fingerprint(p, index);
-        std::lock_guard<std::mutex> g(mutex_);
-        auto it = entries_.find(s.id);
-        if (it == entries_.end() || !it->second || it->second->fingerprint != fp) return nullptr;
-        Entry& e = *it->second;
-        if (!e.output) return nullptr;
-        if (e.policy == CachePolicy::Recompute && !e.output->array && !e.output->source) return nullptr;
-        return load(e);
+        PendingRestore pending;
+        {
+            std::lock_guard<std::mutex> g(mutex_);
+            auto it = entries_.find(s.id);
+            if (it == entries_.end() || !it->second || it->second->fingerprint != fp) return nullptr;
+            Entry& e = *it->second;
+            if (!e.output) return nullptr;
+            if (e.policy == CachePolicy::Recompute && !e.output->array && !e.output->source) return nullptr;
+            if (auto out = load(e, pending)) return out;
+        }
+        return restore(pending);
     }
 
     std::shared_ptr<const StepOutput> Executor::lastOutput(StepId id) const {
-        std::lock_guard<std::mutex> g(mutex_);
-        auto it = entries_.find(id);
-        if (it == entries_.end() || !it->second || !it->second->output) return nullptr;
-        return load(*it->second);
+        PendingRestore pending;
+        {
+            std::lock_guard<std::mutex> g(mutex_);
+            auto it = entries_.find(id);
+            if (it == entries_.end() || !it->second || !it->second->output) return nullptr;
+            if (auto out = load(*it->second, pending)) return out;
+        }
+        return restore(pending);
     }
 
     std::shared_ptr<LabelVolume> Executor::lastLabels(StepId id) const {
@@ -234,7 +283,21 @@ namespace sirius::app {
                                                     std::vector<StepReport>* reports,
                                                     const std::function<void(const StepReport&)>& onStep) {
         if (index < 0 || index >= p.size()) throw std::out_of_range("Executor::run: no step " + std::to_string(index));
+        // Start from the nearest fresh output at or below the target rather
+        // than from the top. A step is fresh by its fingerprint, whether or
+        // not an upstream Recompute entry still holds its array: a fresh
+        // target is served as it is instead of the upstream (and then, its
+        // array evicted by the upstream's store, the target) running again.
         std::shared_ptr<const StepOutput> current;
+        int start = -1;
+        for (int i = index; i >= 0; --i) {
+            if (i > 0 && !p.at(i).enabled) continue;
+            if (auto c = cached(p, i)) {
+                current = std::move(c);
+                start = i;
+                break;
+            }
+        }
         for (int i = 0; i <= index; ++i) {
             const Step& step = p.at(i);
             StepReport report;
@@ -242,6 +305,13 @@ namespace sirius::app {
             report.index = i;
             if (i > 0 && !step.enabled) {
                 report.state = StepReport::State::Skipped;
+                if (reports) reports->push_back(report);
+                if (onStep) onStep(report);
+                continue;
+            }
+            if (i <= start) {
+                // upstream of the output the run continues from: nothing to do
+                report.state = StepReport::State::Cached;
                 if (reports) reports->push_back(report);
                 if (onStep) onStep(report);
                 continue;
@@ -282,7 +352,11 @@ namespace sirius::app {
             // Labels carried through unless the step produced its own: a
             // volume of this step's own over the input's voxels, copied on
             // the first edit, so painting here never touches the upstream cache.
-            if (!out->labels && input.labels) out->labels = input.labels->share();
+            // Only onto the same grid: a step that resamples, deskews or
+            // reduces an axis leaves its labels null on purpose, and the
+            // input's labels indexed with the new dims would read past their
+            // buffer in every consumer (crop, export, cleanup).
+            if (!out->labels && input.labels && labelsFit(*input.labels, out->meta.dims)) out->labels = input.labels->share();
             {
                 std::lock_guard<std::mutex> g(mutex_);
                 refreshPolicies(p);
@@ -311,6 +385,12 @@ namespace sirius::app {
             refreshPolicies(p);
         }
         store(p.at(index), fingerprint(p, index), std::move(out));
+    }
+
+    void Executor::markStale(StepId id) {
+        std::lock_guard<std::mutex> g(mutex_);
+        auto it = entries_.find(id);
+        if (it != entries_.end() && it->second) it->second->fingerprint.clear();
     }
 
     void Executor::invalidate(StepId id) {
@@ -382,6 +462,12 @@ namespace sirius::app {
         if (std::memcmp(magic, kMagic, sizeof magic) != 0) throw std::runtime_error("not a cache file: " + path.string());
         Index dims[5];
         in.read(reinterpret_cast<char*>(dims), sizeof dims);
+        if (!in) throw std::runtime_error("short read from cache file " + path.string());
+        // The extents size the allocation below: a truncated or foreign file
+        // must not turn into a huge or negative request (Dims5::numel checks
+        // the product; the sign is checked here).
+        for (Index d : dims)
+            if (d <= 0) throw std::runtime_error("corrupt cache file (bad extents): " + path.string());
         auto a = std::make_shared<Array5>(Dims5{dims[0], dims[1], dims[2], dims[3], dims[4]});
         in.read(reinterpret_cast<char*>(a->data()), static_cast<std::streamsize>(a->bytes()));
         if (!in) throw std::runtime_error("short read from cache file " + path.string());

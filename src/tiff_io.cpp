@@ -818,7 +818,9 @@ namespace sirius {
     Buffer<T> TiffFile::readPages(std::size_t first, std::size_t count, const TiffReadOptions& opts,
                                   const Stream& stream) const {
         const auto& pages = impl_->info.pages;
-        if (first + count > pages.size() || count == 0)
+        // `count > pages.size() - first` rather than `first + count > size`:
+        // the sum can wrap for a count near SIZE_MAX and pass the check
+        if (count == 0 || first > pages.size() || count > pages.size() - first)
             throw std::out_of_range("Pages [" + std::to_string(first) + ", " + std::to_string(first + count) +
                                     ") requested from a TIFF with " + std::to_string(pages.size()) + " page(s)");
         const std::vector<std::uint64_t> ifds(pages.begin() + static_cast<std::ptrdiff_t>(first),

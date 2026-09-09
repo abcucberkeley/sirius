@@ -327,6 +327,7 @@ namespace sirius::app {
         // Diagnostics of the selected step: the last run's, or the
         // operation's live preview when it offers one.
         Diagnostics selectedDiagnostics() const;
+        Diagnostics diagnosticsOf(int index) const;   // the same for any step, without selecting it
         void clearCache(int index);
         void clearAllCaches();
         std::size_t cachedBytes() const;
@@ -420,6 +421,9 @@ namespace sirius::app {
         std::shared_ptr<LabelVolume> labelsOf(StepId id) const;
         // The viewed labels and the step they belong to (0 when none).
         std::shared_ptr<LabelVolume> editableLabels(StepId* id);
+        // A label edit on step `id`: every step below it consumed (or
+        // carried) the labels as they were, so their outputs are stale.
+        void staleBelow(StepId id);
         // Undo / redo of a label edit: applies `diff` to the labels of step
         // `id` if they are still the volume the edit was made on, else a
         // logged no-op (the step was re-run or removed since).

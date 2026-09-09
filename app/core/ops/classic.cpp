@@ -313,16 +313,34 @@ namespace sirius::app {
                                                      : 0.0;
                             const double dyz = z > 1 ? norm * 0.25 * (at(iz + 1, iy + 1, ix) + at(iz - 1, iy - 1, ix) - at(iz + 1, iy - 1, ix) - at(iz - 1, iy + 1, ix))
                                                      : 0.0;
-                            const std::array<double, 3> e = symmetricEigenvalues(dxx, dxy, dxz, dyy, dyz, dzz);
-                            const double l1 = e[0], l2 = e[1], l3 = e[2];
-                            if (l2 >= 0.0 || l3 >= 0.0) continue;   // a bright tube bends down across its axis
-                            const double ra = std::abs(l2) / std::max(std::abs(l3), 1e-12);
-                            const double rb = std::abs(l1) / std::max(std::sqrt(std::abs(l2 * l3)), 1e-12);
-                            const double sMag = std::sqrt(l1 * l1 + l2 * l2 + l3 * l3);
+                            double v, sMag;
+                            if (z > 1) {
+                                const std::array<double, 3> e = symmetricEigenvalues(dxx, dxy, dxz, dyy, dyz, dzz);
+                                const double l1 = e[0], l2 = e[1], l3 = e[2];
+                                if (l2 >= 0.0 || l3 >= 0.0) continue;   // a bright tube bends down across its axis
+                                const double ra = std::abs(l2) / std::max(std::abs(l3), 1e-12);
+                                const double rb = std::abs(l1) / std::max(std::sqrt(std::abs(l2 * l3)), 1e-12);
+                                sMag = std::sqrt(l1 * l1 + l2 * l2 + l3 * l3);
+                                v = (1.0 - std::exp(-ra * ra / 0.5)) * std::exp(-rb * rb / 0.5);
+                            } else {
+                                // One plane: the third eigenvalue is identically zero,
+                                // which the 3D measure reads as "no tube" (its ra,
+                                // |along| / |across|, is ~0 for a line). The 2D Frangi
+                                // measure over the two in-plane eigenvalues instead,
+                                // ordered by magnitude: a bright line bends down
+                                // across its axis and is flat along it.
+                                const double tr = dxx + dyy;
+                                const double disc = std::sqrt((dxx - dyy) * (dxx - dyy) + 4.0 * dxy * dxy);
+                                double l1 = 0.5 * (tr + disc), l2 = 0.5 * (tr - disc);
+                                if (std::abs(l1) > std::abs(l2)) std::swap(l1, l2);
+                                if (l2 >= 0.0) continue;
+                                const double rb = std::abs(l1) / std::max(std::abs(l2), 1e-12);
+                                sMag = std::sqrt(l1 * l1 + l2 * l2);
+                                v = std::exp(-rb * rb / 0.5);
+                            }
                             sVals[static_cast<std::size_t>(i)] = sMag;
                             maxS = std::max(maxS, sMag);
-                            vesselness[static_cast<std::size_t>(i)] =
-                                static_cast<float>((1.0 - std::exp(-ra * ra / 0.5)) * std::exp(-rb * rb / 0.5));
+                            vesselness[static_cast<std::size_t>(i)] = static_cast<float>(v);
                         }
                 }
                 const double c2 = 2.0 * std::max(1e-12, 0.5 * maxS) * std::max(1e-12, 0.5 * maxS);

@@ -74,7 +74,10 @@ namespace sirius::app {
                                 if (vol[i] && drop.count(vol[i])) vol[i] = 0;
                     }
                     ctx.throwIfCancelled();
-                    if (minVoxels > 0 || relabel) removeSmall(vol, n, minVoxels);
+                    // removeSmall renumbers densely as it drops; without
+                    // relabel the ids must survive, so only the drop is done.
+                    if (relabel) removeSmall(vol, n, minVoxels);
+                    else if (minVoxels > 0) dropSmall(vol, n, minVoxels);
                     ctx.throwIfCancelled();
                     labels->recomputeStats(t);
                     labels->applyFlags(rules);

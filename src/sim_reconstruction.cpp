@@ -191,8 +191,13 @@ namespace sirius {
 
             const double alpha = std::asin(p.na / p.nimm);
             zdistcutoff = static_cast<int>(std::ceil(((1.0 - std::cos(alpha)) / lambdaEm) / dkz));
-            if (zdistcutoff > static_cast<int>(nz / 2))
-                zdistcutoff = std::max(static_cast<int>(nz / 2) - 1, 0);
+            // The overlap volumes hold 2 * zdistcutoff + 1 signed planes in
+            // nz slots: with an even nz, kz = -nz/2 and kz = +nz/2 would map
+            // to the same slot and two threads would write it with different
+            // values (the reference code has that race). Keep the range
+            // strictly inside the volume.
+            if (2 * zdistcutoff + 1 > static_cast<int>(nz))
+                zdistcutoff = std::max((static_cast<int>(nz) - 1) / 2, 0);
 
             xdim = static_cast<Index>(std::lround(p.zoomfact * static_cast<double>(nx)));
             ydim = static_cast<Index>(std::lround(p.zoomfact * static_cast<double>(ny)));

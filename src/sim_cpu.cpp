@@ -257,6 +257,18 @@ namespace sirius::simdetail {
                 };
                 std::vector<Partial> partials(static_cast<std::size_t>(nblocks));
 
+                // The ramp exp(i (angleX (ix - nx/2) + angleY (iy - ny/2))) is
+                // separable: two tables, one complex multiply per sample (this
+                // runs once per bracket step of the k0 search).
+                std::vector<Cd> rampX(static_cast<std::size_t>(nx)), rampY(static_cast<std::size_t>(ny));
+                for (IndexT ix = 0; ix < nx; ++ix) {
+                    const double a = angleX * (static_cast<double>(ix) - 0.5 * static_cast<double>(nx));
+                    rampX[static_cast<std::size_t>(ix)] = cd(std::cos(a), std::sin(a));
+                }
+                for (IndexT iy = 0; iy < ny; ++iy) {
+                    const double a = angleY * (static_cast<double>(iy) - 0.5 * static_cast<double>(ny));
+                    rampY[static_cast<std::size_t>(iy)] = cd(std::cos(a), std::sin(a));
+                }
 #pragma omp parallel for schedule(static)
                 for (IndexT b = 0; b < nblocks; ++b) {
                     const IndexT begin = b * kBlock;
@@ -265,9 +277,7 @@ namespace sirius::simdetail {
                     for (IndexT i = begin; i < end; ++i) {
                         const IndexT iy = i / nx;
                         const IndexT ix = i % nx;
-                        const double angle = angleX * (static_cast<double>(ix) - 0.5 * static_cast<double>(nx)) +
-                                             angleY * (static_cast<double>(iy) - 0.5 * static_cast<double>(ny));
-                        const Cd ramp = cd(cos(angle), sin(angle));
+                        const Cd ramp = cmul(rampY[static_cast<std::size_t>(iy)], rampX[static_cast<std::size_t>(ix)]);
                         Cd acc = cd(0, 0);
                         for (IndexT z = 0; z < nz; ++z) {
                             const Cd a = ov0[z * sec + i];
@@ -379,17 +389,44 @@ namespace sirius::simdetail {
                             double angleX, double angleY,
                             IndexT zdim, IndexT ydim, IndexT xdim) override {
                 const IndexT rows = zdim * ydim;
+                if (order == 0) {
+#pragma omp parallel for schedule(static)
+                    for (IndexT r = 0; r < rows; ++r) {
+                        double* dst = out + r * xdim;
+                        const Cd* src = big + r * xdim;
+                        for (IndexT ix = 0; ix < xdim; ++ix) dst[ix] += src[ix].re;
+                    }
+                    return;
+                }
+                // The carrier exp(i (angleX (ix - xdim/2) + angleY (iy - ydim/2)))
+                // is separable: one table per axis and a complex multiply per
+                // voxel, instead of a sincos per voxel of the big grid for
+                // every side band (a fifth of a CPU reconstruction). The
+                // value is accumulateValue's to rounding; the CUDA kernel
+                // keeps the direct form, where the trig is cheap.
+                const std::vector<Cd> cx = carrierTable(angleX, xdim);
+                const std::vector<Cd> cy = carrierTable(angleY, ydim);
 #pragma omp parallel for schedule(static)
                 for (IndexT r = 0; r < rows; ++r) {
-                    const IndexT iy = r % ydim;
+                    const Cd ry = cy[static_cast<std::size_t>(r % ydim)];
                     double* dst = out + r * xdim;
                     const Cd* src = big + r * xdim;
                     for (IndexT ix = 0; ix < xdim; ++ix) {
-                        const double angle = angleX * static_cast<double>(ix - xdim / 2) +
-                                             angleY * static_cast<double>(iy - ydim / 2);
-                        dst[ix] += accumulateValue(src, ix, order, angle);
+                        const Cd carrier = cmul(ry, cx[static_cast<std::size_t>(ix)]);   // (cos, sin) of the angle
+                        dst[ix] += 2.0 * (src[ix].re * carrier.re - src[ix].im * carrier.im);
                     }
                 }
+            }
+
+            // exp(i angle (k - n / 2)) for k = 0..n-1 (integer n / 2, as the
+            // per-voxel form has it).
+            static std::vector<Cd> carrierTable(double angle, IndexT n) {
+                std::vector<Cd> table(static_cast<std::size_t>(n));
+                for (IndexT k = 0; k < n; ++k) {
+                    const double a = angle * static_cast<double>(k - n / 2);
+                    table[static_cast<std::size_t>(k)] = cd(std::cos(a), std::sin(a));
+                }
+                return table;
             }
 
             void synchronize() override {}

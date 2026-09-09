@@ -305,6 +305,7 @@ namespace sirius::app {
                         d = std::stod(j.get<std::string>());
                     } catch (...) { throw bad("an integer"); }
                 } else throw bad("an integer");
+                if (!std::isfinite(d)) throw bad("an integer");   // llround(NaN) is anything
                 return static_cast<std::int64_t>(std::llround(clampD(d)));
             }
             case ParamType::Double: {
@@ -315,6 +316,7 @@ namespace sirius::app {
                         d = std::stod(j.get<std::string>());
                     } catch (...) { throw bad("a number"); }
                 } else throw bad("a number");
+                if (!std::isfinite(d)) throw bad("a finite number");
                 return clampD(d);
             }
             case ParamType::String:
@@ -329,11 +331,20 @@ namespace sirius::app {
                 // case-insensitive match
                 std::string ls = s;
                 std::transform(ls.begin(), ls.end(), ls.begin(), [](unsigned char ch) { return static_cast<char>(std::tolower(ch)); });
+                const std::string* prefixMatch = nullptr;
+                bool ambiguous = false;
                 for (const std::string& c : spec.choices) {
                     std::string lc = c;
                     std::transform(lc.begin(), lc.end(), lc.begin(), [](unsigned char ch) { return static_cast<char>(std::tolower(ch)); });
-                    if (lc == ls || lc.rfind(ls, 0) == 0) return c;
+                    if (lc == ls) return c;
+                    // a prefix stands for a choice only when it names one choice
+                    // (an empty string is a prefix of all of them)
+                    if (!ls.empty() && lc.rfind(ls, 0) == 0) {
+                        if (prefixMatch) ambiguous = true;
+                        prefixMatch = &c;
+                    }
                 }
+                if (prefixMatch && !ambiguous) return *prefixMatch;
                 std::string opts;
                 for (const std::string& c : spec.choices) opts += (opts.empty() ? "" : ", ") + c;
                 throw std::invalid_argument("parameter '" + spec.key + "': '" + s + "' is not one of " + opts);

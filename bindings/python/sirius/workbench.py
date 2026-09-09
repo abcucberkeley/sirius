@@ -1156,14 +1156,17 @@ def _watershed(landscape: np.ndarray, mask: np.ndarray, seeds: np.ndarray) -> np
     return watershed(landscape, markers=seeds, mask=mask, connectivity=1).astype(np.uint32)
 
 
-def _remove_small(labels: np.ndarray, min_voxels: int) -> np.ndarray:
-    """``removeSmall``: drop labels with fewer than `min_voxels` voxels and
-    relabel the rest 1..n densely in id order (always, as the application does)."""
+def _remove_small(labels: np.ndarray, min_voxels: int, relabel: bool = True) -> np.ndarray:
+    """``removeSmall`` / ``dropSmall``: drop labels with fewer than `min_voxels`
+    voxels and, with `relabel`, number the rest 1..n densely in id order."""
     counts = np.bincount(labels.reshape(-1))
     keep = (counts >= max(int(min_voxels), 0)) & (counts > 0)
     keep[0] = False
     remap = np.zeros(counts.size, dtype=np.uint32)
-    remap[keep] = np.arange(1, int(keep.sum()) + 1, dtype=np.uint32)
+    if relabel:
+        remap[keep] = np.arange(1, int(keep.sum()) + 1, dtype=np.uint32)
+    else:
+        remap[keep] = np.nonzero(keep)[0].astype(np.uint32)
     return remap[labels]
 
 
@@ -1431,14 +1434,29 @@ def _frangi_volume(vol: np.ndarray, z_aspect: float, sigma_min: float, sigma_max
         else:
             dxz = np.zeros_like(w)
             dyz = np.zeros_like(w)
-        l1, l2, l3 = _symmetric_eigenvalues(dxx, dxy, dxz, dyy, dyz, dzz)
-        bright = (l2 < 0.0) & (l3 < 0.0)
-        ra = np.abs(l2) / np.maximum(np.abs(l3), 1e-12)
-        rb = np.abs(l1) / np.maximum(np.sqrt(np.abs(l2 * l3)), 1e-12)
-        s_mag = np.sqrt(l1 ** 2 + l2 ** 2 + l3 ** 2)
+        if z > 1:
+            l1, l2, l3 = _symmetric_eigenvalues(dxx, dxy, dxz, dyy, dyz, dzz)
+            bright = (l2 < 0.0) & (l3 < 0.0)
+            ra = np.abs(l2) / np.maximum(np.abs(l3), 1e-12)
+            rb = np.abs(l1) / np.maximum(np.sqrt(np.abs(l2 * l3)), 1e-12)
+            s_mag = np.sqrt(l1 ** 2 + l2 ** 2 + l3 ** 2)
+            shape = 1.0 - np.exp(-ra ** 2 / 0.5)
+        else:
+            # one plane: the third eigenvalue is identically zero, which the
+            # 3D measure reads as "no tube"; the 2D Frangi measure over the
+            # two in-plane eigenvalues, ordered by magnitude (classic.cpp)
+            tr = dxx + dyy
+            disc = np.sqrt((dxx - dyy) ** 2 + 4.0 * dxy ** 2)
+            l1, l2 = 0.5 * (tr + disc), 0.5 * (tr - disc)
+            swap = np.abs(l1) > np.abs(l2)
+            l1, l2 = np.where(swap, l2, l1), np.where(swap, l1, l2)
+            bright = l2 < 0.0
+            rb = np.abs(l1) / np.maximum(np.abs(l2), 1e-12)
+            s_mag = np.sqrt(l1 ** 2 + l2 ** 2)
+            shape = 1.0
         max_s = float(s_mag[bright].max()) if bright.any() else 0.0
         c2 = 2.0 * max(1e-12, 0.5 * max_s) ** 2
-        v = np.where(bright, (1.0 - np.exp(-ra ** 2 / 0.5)) * np.exp(-rb ** 2 / 0.5), 0.0).astype(np.float32)
+        v = np.where(bright, shape * np.exp(-rb ** 2 / 0.5), 0.0).astype(np.float32)
         v = np.where(v > 0.0, (v * (1.0 - np.exp(-s_mag ** 2 / c2))).astype(np.float32), 0.0).astype(np.float32)
         out = np.maximum(out, v)
     return out
@@ -1672,7 +1690,8 @@ def _histogram_256(v: np.ndarray) -> Tuple[np.ndarray, float, float]:
     lo, hi = float(finite.min()), float(finite.max())
     if not hi > lo:
         return np.zeros(256, dtype=np.int64), lo, lo
-    idx = np.clip(((finite.astype(np.float64) - lo) * (255.0 / (hi - lo))).astype(np.int64), 0, 255)
+    # 256 equal bins over [lo, hi], hi in the last one (labels.cpp histogramOf)
+    idx = np.clip(((finite.astype(np.float64) - lo) * (256.0 / (hi - lo))).astype(np.int64), 0, 255)
     return np.bincount(idx, minlength=256).astype(np.int64), lo, hi
 
 
@@ -1816,7 +1835,8 @@ def _rolling_ball_plane(pl: np.ndarray, radius: float) -> np.ndarray:
     y, x = out.shape
     if radius <= 0.0 or y <= 0 or x <= 0:
         return out
-    shrink = int(min(8, max(1, round(radius / 10.0))))
+    # half away from zero like C++'s lround (round() is half to even: 2.5 -> 2)
+    shrink = int(min(8, max(1, math.floor(radius / 10.0 + 0.5))))
     scaled = max(1.0, radius / shrink)
     half = max(1, int(math.floor(scaled)))
     side = 2 * half + 1
@@ -2442,18 +2462,32 @@ def step_track(a: np.ndarray, params: Dict[str, Any], meta: Dict[str, Any],
                     continue
                 cost[r, c] = d / max_distance + 0.25 * (gap - 1)
         match = _solve_assignment(cost)
-        merged = set()
+        # Applied in order. A track that was merged away has had its points
+        # moved into another one, so a later link out of it continues from
+        # where they went (tracking.cpp does the same): an object missed twice
+        # is one track, not the first link and then nothing. Only the target
+        # of a link is consumed.
+        merged_into = {k: k for k in live}
+
+        def root_of(k: int) -> int:
+            while merged_into[k] != k:
+                k = merged_into[k]
+            return k
+
+        consumed = set()
         for r, c in enumerate(match):
             if c < 0:
                 continue
-            frm, to = live[r], live[c]
-            if frm in merged or to in merged or not tracks[to] or not tracks[frm]:
+            to = live[c]
+            frm = root_of(live[r])
+            if frm == to or to in consumed or not tracks[to] or not tracks[frm]:
                 continue
             if tracks[to][0][0] <= tracks[frm][-1][0]:
                 continue
             tracks[frm].extend(tracks[to])
             tracks[to] = []
-            merged.add(to)
+            consumed.add(to)
+            merged_into[to] = frm
             gaps += 1
 
     kept = [sorted(t) for t in tracks if len(t) >= min_length]
@@ -2498,7 +2532,7 @@ def step_cleanup(a: np.ndarray, params: Dict[str, Any], meta: Dict[str, Any],
             if drop.size:
                 vol[np.isin(vol, drop)] = 0
         if min_voxels > 0 or relabel:
-            vol = _remove_small(vol, min_voxels)
+            vol = _remove_small(vol, min_voxels, relabel)
         out[t] = vol
         flags = _label_flags(vol, low_conf, outlier)
     kept = int(np.count_nonzero(np.bincount(out.reshape(-1))[1:]))

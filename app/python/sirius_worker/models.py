@@ -512,6 +512,10 @@ def install(family: str, progress: ProgressFn = None, cancelled: CancelFn = None
     if progress:
         progress(0.0, "$ " + " ".join(command))
     env = dict(os.environ)
+    # The tokens the worker holds are for the hub and for its own clients;
+    # an installer (and every setup.py it runs) has no business seeing them.
+    for secret in ("HF_TOKEN", "HUGGING_FACE_HUB_TOKEN", "HUGGINGFACE_TOKEN", "SIRIUS_TOKEN"):
+        env.pop(secret, None)
     env.setdefault("PIP_DISABLE_PIP_VERSION_CHECK", "1")
     env.setdefault("PYTHONUNBUFFERED", "1")
     proc = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1,

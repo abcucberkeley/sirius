@@ -48,5 +48,6 @@ echo "tunnel:  ssh -N -L ${SIRIUS_PORT}:$(hostname):${SIRIUS_PORT} <login-node>"
 # No --allow-install: on a shared node the worker must not run pip or conda
 # on a client's request (see ../SECURITY.md). Install the model packages into
 # the environment above when you submit the job, not from the application.
-exec python -m sirius_worker --host 0.0.0.0 --port "${SIRIUS_PORT}" --token "${SIRIUS_TOKEN}" \
-    --device "${SIRIUS_DEVICE}"
+# The token is read from $SIRIUS_TOKEN (exported above), not passed as an
+# argument: the command line of a job is visible to every user of the node.
+exec python -m sirius_worker --host 0.0.0.0 --port "${SIRIUS_PORT}" --device "${SIRIUS_DEVICE}"

@@ -46,6 +46,10 @@ namespace sirius {
             }
         }
 
+        // Nothing to roll in an empty tensor (and dims[i] == 0 below would
+        // divide by zero).
+        if (in.size() == 0) return Eigen::Tensor<Scalar, Rank, Eigen::RowMajor>(dims);
+
         // Calculate effective positive shifts for each dimension
         std::array<Eigen::Index, Rank> sh{};
         for (int i = 0; i < Rank; ++i) {

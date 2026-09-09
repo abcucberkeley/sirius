@@ -60,6 +60,7 @@ import json
 import logging
 import os
 import platform
+import select
 import socket
 import sys
 import threading
@@ -114,7 +115,13 @@ class WorkerServer:
                         "machine you are the only user of; pass --token to require a shared secret.",
                         self.host, self.port or "<auto>")
         s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        # On Winsock SO_REUSEADDR lets a second socket bind a port that is
+        # already listening (and receive the client's hello, token included);
+        # SO_EXCLUSIVEADDRUSE is the option that means what POSIX's does.
+        if hasattr(socket, "SO_EXCLUSIVEADDRUSE"):
+            s.setsockopt(socket.SOL_SOCKET, socket.SO_EXCLUSIVEADDRUSE, 1)
+        else:
+            s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         s.bind((self.host, self.port))
         s.listen(4)
         s.settimeout(0.5)
@@ -131,7 +138,8 @@ class WorkerServer:
             while not self._stop.is_set():
                 try:
                     conn, addr = self._listener.accept()
-                except TimeoutError:
+                except (socket.timeout, TimeoutError):  # noqa: UP041 -- distinct before 3.10
+                    # socket.timeout is its own OSError subclass before 3.10
                     continue
                 except OSError:
                     break
@@ -231,9 +239,17 @@ class WorkerServer:
 
     # --- one connection ----------------------------------------------------------
 
+    # A peer that connects and never completes `hello` is dropped after this
+    # long: serving is serial, so a silent connection would otherwise hold
+    # the port for everyone else.
+    HELLO_TIMEOUT = 15.0
+    # How often the connection loop looks at the stop flag while idle.
+    IDLE_POLL = 0.5
+
     def _serve_client(self, conn: socket.socket, peer: str = "?") -> None:
         conn.settimeout(None)
         send_lock = threading.Lock()
+        hello_deadline = time.monotonic() + self.HELLO_TIMEOUT
         # Nothing is served, with or without a token, until `hello` has agreed
         # on the protocol version -- and until then the peer's frames are held
         # to MAX_PREAUTH_FRAME.
@@ -251,6 +267,19 @@ class WorkerServer:
             send({"id": rid, "type": "error", "message": message})
 
         while not self._stop.is_set():
+            # Wait for the next frame without blocking in recv: a blocked recv
+            # ignores stop() (SIGTERM, the launcher) for as long as the client
+            # stays silent, and a silent pre-hello peer would hold the worker
+            # forever. Once bytes are on the wire the frame is read in full.
+            try:
+                readable, _, _ = select.select([conn], [], [], self.IDLE_POLL)
+            except (OSError, ValueError):
+                break
+            if not readable:
+                if not authenticated and time.monotonic() > hello_deadline:
+                    log.warning("client %s sent no hello within %.0f s; dropped", peer, self.HELLO_TIMEOUT)
+                    break
+                continue
             try:
                 if authenticated:
                     header, tensors = read_frame(conn)
@@ -270,7 +299,9 @@ class WorkerServer:
                 break
             rid = header.get("id")
             method = str(header.get("method", ""))
-            params = header.get("params") or {}
+            params = header.get("params")
+            if not isinstance(params, dict):
+                params = {}
             if header.get("type", "request") != "request":
                 error(rid, f"unexpected frame type '{header.get('type')}'")
                 continue
@@ -665,7 +696,9 @@ def _jsonable(obj: Any) -> Any:
     if isinstance(obj, np.generic):
         return obj.item()
     if isinstance(obj, np.ndarray):
-        return obj.tolist()
+        # tolist() gives Python floats: scrubbed like any other (encode_frame
+        # refuses NaN, and one inside a diagnostics table lost whole replies)
+        return _jsonable(obj.tolist())
     if isinstance(obj, float) and (obj != obj or obj in (float("inf"), float("-inf"))):
         return None
     return obj

@@ -320,6 +320,15 @@ namespace sirius::app {
                 row->addWidget(buildQueue(), 0);
             }
 
+            // After a view-state change: the selection and the tool state,
+            // without resetting the table (which drops a multi-row selection
+            // and the scroll position on every pan).
+            void refreshView() {
+                viewOnly_ = true;
+                refresh();
+                viewOnly_ = false;
+            }
+
             void refresh() {
                 const ViewState& vs = bridge_.wb().viewState();
                 // Label edits are refused while a run is active, painting
@@ -498,8 +507,10 @@ namespace sirius::app {
                     updating_ = false;
                     return;
                 }
-                // the model reads the stats in place; a reset is all a change needs
-                model_->setLabels(labels);
+                // the model reads the stats in place; a reset is all a change
+                // needs -- and a view-state change (pan, wheel, crosshair)
+                // needs none, only the selection synced below
+                if (!viewOnly_ || labels != shownLabels_) model_->setLabels(labels);
                 shownLabels_ = labels;
                 const int row = vs.selectedLabel ? model_->rowOf(vs.selectedLabel) : -1;
                 if (row >= 0) {
@@ -560,6 +571,7 @@ namespace sirius::app {
             LabelTableView* table_ = nullptr;
             LabelTableModel* model_ = nullptr;
             std::shared_ptr<LabelVolume> shownLabels_;
+            bool viewOnly_ = false;   // refreshing for a view-state change: the labels did not change
             FactsView* queue_ = nullptr;
             QPushButton* next_ = nullptr;
             QPushButton* undo_ = nullptr;
@@ -840,7 +852,7 @@ namespace sirius::app {
         connect(&bridge, &WorkbenchBridge::datasetChanged, this, [this] { impl_->scheduleRefresh(); });
         connect(&bridge, &WorkbenchBridge::labelsChanged, this, [this](quint64) { impl_->scheduleRefresh(); });
         connect(&bridge, &WorkbenchBridge::viewStateChanged, this, [this] {
-            if (impl_->stack->currentWidget() == impl_->segment) impl_->segment->refresh();
+            if (impl_->stack->currentWidget() == impl_->segment) impl_->segment->refreshView();
         });
         connect(&bridge, &WorkbenchBridge::runFinished, this, [this](bool, const QString&) { impl_->refresh(); });
         // What the cleanup tools may do depends on the run state.

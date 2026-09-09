@@ -1,5 +1,7 @@
 #include "core/rpc.hpp"
 
+#include "core/cancel.hpp"
+
 #include "core/errors.hpp"
 
 #include <sirius/checked_math.hpp>
@@ -399,10 +401,20 @@ namespace sirius::app {
         const auto t0 = std::chrono::steady_clock::now();
         transport_->send(rpc::encodeFrame(header, tensors));
         bool cancelSent = false;
+        // After a cancel the worker gets cancelGrace_ to answer (its job
+        // polls the flag between tiles); then the connection is given up so
+        // a hung worker cannot hold the run thread, and with it every edit
+        // and the application's exit, forever.
+        std::chrono::steady_clock::time_point cancelDeadline{};
         for (;;) {
             if (cancelled && cancelled() && !cancelSent) {
                 transport_->send(rpc::encodeFrame({{"id", nextId_++}, {"type", "request"}, {"method", "cancel"}, {"params", {{"id", id}}}}, {}));
                 cancelSent = true;
+                cancelDeadline = std::chrono::steady_clock::now() + cancelGrace_;
+            }
+            if (cancelSent && std::chrono::steady_clock::now() > cancelDeadline) {
+                transport_->close();
+                throw CancelledError();
             }
             std::optional<rpc::Message> msg = rpc::decodeFrame(inbox_);
             if (!msg) {
@@ -410,13 +422,25 @@ namespace sirius::app {
                 continue;
             }
             const json& h = msg->header;
-            if (h.value("id", std::uint64_t{0}) != id) continue;   // a stale reply
             const std::string type = h.value("type", "");
+            const auto idField = h.find("id");
+            const bool hasId = idField != h.end() && idField->is_number_unsigned();
+            if (!hasId) {
+                // an error the worker could not attribute to a request (a
+                // malformed frame, an oversize one) ends the exchange
+                if (type == "error") throw std::runtime_error("worker: " + h.value("message", std::string("unknown error")));
+                continue;
+            }
+            if (idField->get<std::uint64_t>() != id) continue;   // a stale reply
             if (type == "progress") {
                 if (progress) progress(h.value("fraction", 0.0), h.value("message", ""));
                 continue;
             }
-            if (type == "error") throw std::runtime_error("worker: " + h.value("message", std::string("unknown error")));
+            if (type == "error") {
+                const std::string message = h.value("message", std::string("unknown error"));
+                if (cancelSent && message == "cancelled") throw CancelledError();   // what we asked for
+                throw std::runtime_error("worker: " + message);
+            }
             if (type == "result") {
                 WorkerResult r;
                 r.result = h.value("result", json::object());

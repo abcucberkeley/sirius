@@ -54,7 +54,22 @@ namespace sirius::app {
                         v.errors.push_back(std::string("Cannot read the flat image: ") + e.what());
                     }
                 }
-                if (!dark.empty() && !std::filesystem::exists(dark)) v.errors.push_back("Dark image not found: " + dark);
+                if (!dark.empty()) {
+                    if (!std::filesystem::exists(dark)) v.errors.push_back("Dark image not found: " + dark);
+                    else {
+                        // read at the data's plane size in run(): a smaller
+                        // dark image would be read past its end
+                        try {
+                            const TiffInfo info = inspectTiff(dark);
+                            if (static_cast<Index>(info.width()) != input.dims.x || static_cast<Index>(info.height()) != input.dims.y)
+                                v.errors.push_back("The dark image is " + std::to_string(info.width()) + " × " +
+                                                   std::to_string(info.height()) + ", the data " + std::to_string(input.dims.x) +
+                                                   " × " + std::to_string(input.dims.y) + ".");
+                        } catch (const std::exception& e) {
+                            v.errors.push_back(std::string("Cannot read the dark image: ") + e.what());
+                        }
+                    }
+                }
                 return v;
             }
 

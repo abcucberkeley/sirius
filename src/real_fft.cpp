@@ -50,9 +50,13 @@ namespace sirius {
             }
         };
 
+        // Destruction is planner state as much as creation (see the note in
+        // fft.cpp): serialized on the planner mutex.
         struct RealPlanDeleter {
             void operator()(RealFftwTraits::Plan plan) const {
-                if (plan) RealFftwTraits::destroyPlan(plan);
+                if (!plan) return;
+                std::lock_guard<std::mutex> lock(detail::fftwPlannerMutex());
+                RealFftwTraits::destroyPlan(plan);
             }
         };
 
@@ -218,9 +222,20 @@ namespace sirius {
                                       1.0 / static_cast<double>(impl_->real_size), stream);
     }
 
+    namespace {
+        void checkTensorSize(const char* what, Eigen::Index have, int want) {
+            if (have != static_cast<Eigen::Index>(want))
+                throw std::invalid_argument(std::string("RealFFT: ") + what + " tensor holds " + std::to_string(have) +
+                                            " elements, the plan needs " + std::to_string(want));
+        }
+    } // namespace
+
     template <int Rank>
     void RealFFT::rfft(const TensorXr<double, Rank>& in,
                        TensorXc<double, Rank>& out) const {
+        // The pointer API trusts its caller; the tensor API knows the sizes.
+        checkTensorSize("input", in.size(), impl_->full_real_size);
+        checkTensorSize("output", out.size(), impl_->full_complex_size);
         rfft(in.data(), out.data());
     }
 
@@ -228,6 +243,8 @@ namespace sirius {
     void RealFFT::irfft(const TensorXc<double, Rank>& in,
                         TensorXr<double, Rank>& out,
                         bool normalize) const {
+        checkTensorSize("input", in.size(), impl_->full_complex_size);
+        checkTensorSize("output", out.size(), impl_->full_real_size);
         irfft(in.data(), out.data(), normalize);
     }
 

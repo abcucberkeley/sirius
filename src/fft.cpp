@@ -17,8 +17,13 @@ namespace sirius {
     namespace {
         // RAII for fft plan
         // Note: fftw_plan_s is a struct and fftw_plan is a pointer to that struct
+        // fftw_destroy_plan touches the planner's shared state (twiddle
+        // tables, reference counts) like plan creation does, and FFTW makes
+        // only fftw_execute thread-safe: destruction is serialized on the
+        // same mutex as creation. Never invoked while the mutex is held --
+        // the plan members are assigned only while still null.
         struct FFTWPlanDeleter {
-            void operator()(fftw_plan plan) const { fftw_destroy_plan(plan); }
+            void operator()(fftw_plan plan) const;
         };
         using PlanPtr = std::unique_ptr<fftw_plan_s, FFTWPlanDeleter>;
 
@@ -46,6 +51,13 @@ namespace sirius {
         }
 
     } // anonymous namespace
+
+    namespace {
+        void FFTWPlanDeleter::operator()(fftw_plan plan) const {
+            std::lock_guard<std::mutex> lock(s_planner_mutex);
+            fftw_destroy_plan(plan);
+        }
+    } // namespace
 
     namespace detail {
         std::mutex& fftwPlannerMutex() {

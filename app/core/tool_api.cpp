@@ -102,6 +102,7 @@ namespace sirius::app {
              [this](const json& a) {
                  const std::string kind = a.value("kind", "");
                  if (!findOperation(kind)) throw std::invalid_argument("unknown operation kind '" + kind + "'");
+                 if (!wb_.canEdit()) throw std::runtime_error("a run is in progress: cancel it or wait before editing the pipeline");
                  int at = -1;
                  if (a.contains("at") && a["at"].is_number_integer()) at = a["at"].get<int>() - 1;
                  const StepId id = wb_.addStep(kind, at);
@@ -333,14 +334,7 @@ namespace sirius::app {
              obj({{"step", stepParam()}}),
              [this](const json& a) {
                  const int i = a.contains("step") ? resolveStep(a) : wb_.selectedIndex();
-                 Diagnostics d;
-                 if (auto out = wb_.output(i); out && !out->diagnostics.empty()) d = out->diagnostics;
-                 else {
-                     const int keep = wb_.selectedIndex();
-                     const_cast<Workbench&>(wb_).select(i);
-                     d = wb_.selectedDiagnostics();
-                     const_cast<Workbench&>(wb_).select(keep);
-                 }
+                 const Diagnostics d = wb_.diagnosticsOf(i);
                  json j = {{"step", i + 1}, {"summary", d.summary}, {"footer", d.footer}, {"warnings", d.warnings}};
                  json facts = json::object();
                  for (const DiagnosticFact& f : d.facts) facts[f.key] = f.value;

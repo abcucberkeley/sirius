@@ -523,3 +523,67 @@ class TestCommandLine(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestConnectionLifecycle(unittest.TestCase):
+    """The connection loop stays answerable: stop() reaches an idle
+    connection, and a peer that never says hello does not hold the port."""
+
+    def _serve(self, server):
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        return thread
+
+    def test_stop_takes_effect_while_a_client_is_connected_and_idle(self):
+        server = WorkerServer("127.0.0.1", 0, "t", "cpu")
+        port = server.bind()
+        thread = self._serve(server)
+        client = _Client(port, "t")
+        self.assertEqual(client.hello()["type"], "result")
+        # before: the loop sat in recv and only noticed the flag on the next frame
+        server.stop()
+        thread.join(timeout=5)
+        self.assertFalse(thread.is_alive())
+        client.close()
+
+    def test_a_peer_that_never_says_hello_is_dropped_and_the_next_one_served(self):
+        server = WorkerServer("127.0.0.1", 0, "t", "cpu")
+        server.HELLO_TIMEOUT = 0.5
+        port = server.bind()
+        thread = self._serve(server)
+        try:
+            silent = socket.create_connection(("127.0.0.1", port), timeout=10)
+            self.assertEqual(silent.recv(1), b"")   # closed on us, nothing sent
+            silent.close()
+            client = _Client(port, "t")
+            self.assertEqual(client.hello()["type"], "result")
+            client.close()
+        finally:
+            server.stop()
+            thread.join(timeout=5)
+
+    def test_hello_params_of_the_wrong_type_are_an_error_not_a_crash(self):
+        server = WorkerServer("127.0.0.1", 0, "t", "cpu")
+        port = server.bind()
+        thread = self._serve(server)
+        try:
+            client = _Client(port, "t")
+            protocol.write_frame(client.sock, {"id": 1, "type": "request", "method": "hello", "params": [1, 2]})
+            header, _ = client.read()
+            self.assertEqual(header["type"], "error")   # a failed hello, which ends the connection
+            client.close()
+            again = _Client(port, "t")                   # and the server is still there for the next one
+            self.assertEqual(again.hello()["type"], "result")
+            again.close()
+        finally:
+            server.stop()
+            thread.join(timeout=5)
+
+
+class TestJsonScrubbing(unittest.TestCase):
+    def test_nan_inside_an_array_is_scrubbed_like_a_bare_float(self):
+        from sirius_worker.server import _jsonable
+        table = {"rows": [np.array([np.nan, 1.5]), (float("inf"), 2)], "n": np.int64(3)}
+        out = _jsonable(table)
+        self.assertEqual(out, {"rows": [[None, 1.5], [None, 2]], "n": 3})
+        json.dumps(out, allow_nan=False)   # what encode_frame does

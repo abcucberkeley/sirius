@@ -90,3 +90,40 @@ TEST_CASE("FFTW thread count API validates and stores planner thread count", "[r
     REQUIRE_NOTHROW(setFFTWThreadCount(1));
     REQUIRE(getFFTWThreadCount() == 1);
 }
+
+TEST_CASE("RealFFT tensor overloads refuse tensors of another size", "[real_fft]") {
+    RealFFT fft({4, 4}, 1, PlanRigor::Estimate);
+    TensorXr<double, 2> small(2, 2);
+    small.setZero();
+    TensorXc<double, 2> spectrum(4, 3);
+    // the pointer API trusts its caller; the tensor API knows the sizes
+    CHECK_THROWS_AS(fft.rfft(small, spectrum), std::invalid_argument);
+    TensorXr<double, 2> input(4, 4);
+    input.setZero();
+    TensorXc<double, 2> wrongSpectrum(4, 4);
+    CHECK_THROWS_AS(fft.rfft(input, wrongSpectrum), std::invalid_argument);
+    CHECK_THROWS_AS(fft.irfft(spectrum, small, true), std::invalid_argument);
+    CHECK_NOTHROW(fft.rfft(input, spectrum));
+}
+
+TEST_CASE("FFTW plans are created and destroyed safely from many threads", "[real_fft][threads]") {
+    // FFTW serializes only fftw_execute; the wrapper has to serialize the
+    // planner and the destroyer alike. Stitching does exactly this: one
+    // MaskedCorrelator (a RealFFT) per tile pair inside an OpenMP loop.
+    std::vector<double> errors(64, 0.0);
+#pragma omp parallel for schedule(dynamic)
+    for (int i = 0; i < 64; ++i) {
+        const int n = 4 + (i % 5) * 2;
+        RealFFT fft({n, n}, 1, PlanRigor::Estimate);
+        TensorXr<double, 2> x(n, n);
+        for (Eigen::Index k = 0; k < x.size(); ++k) x.data()[k] = static_cast<double>(k % 7);
+        TensorXc<double, 2> f(n, n / 2 + 1);
+        TensorXr<double, 2> back(n, n);
+        fft.rfft(x, f);
+        fft.irfft(f, back, true);
+        double err = 0.0;
+        for (Eigen::Index k = 0; k < x.size(); ++k) err = std::max(err, std::abs(x.data()[k] - back.data()[k]));
+        errors[static_cast<std::size_t>(i)] = err;
+    }
+    for (double e : errors) CHECK(e < 1e-9);
+}

@@ -186,9 +186,11 @@ namespace sirius::app {
         cancelledResult_ = false;
         reports_.clear();
         // The worker first: a process start or a remote handshake can take a
-        // while, and that belongs on this thread, not the GUI's.
+        // while, and that belongs on this thread, not the GUI's. A job
+        // cancelled before it got this far (the window closing) does not
+        // start a worker it will never use.
         try {
-            connectWorker();
+            if (!cancelled_.load()) connectWorker();
         } catch (const std::exception& e) {
             error_ = std::string("Worker unavailable: ") + e.what() +
                      " (Preferences ▸ Worker sets the Python interpreter; Preferences ▸ HPC the remote host).";
@@ -298,7 +300,12 @@ namespace sirius::app {
     }
 
     void Workbench::restore(const Snapshot& s) {
+        // Ids keep counting up: a step added after an undo must not get the
+        // id of the step the undo removed, whose cached output the executor
+        // still holds (and would show as the new step's).
+        const StepId next = pipeline_.peekNextId();
         pipeline_ = Pipeline::fromJson(s.pipeline);
+        pipeline_.reserveIds(next);
         selected_ = s.selected;
         viewed_ = s.viewed;
         view_ = s.view;
@@ -449,7 +456,6 @@ namespace sirius::app {
     void Workbench::openDataset(const std::string& path, const OpenOptions& options) {
         if (refuseIfRunning("open a dataset")) throw std::runtime_error("A run is in progress: cancel it or wait before opening a dataset.");
         OpenResult opened = sirius::app::openDataset(path, options);   // throws with a message
-        const Snapshot before = snapshot();
         Step& load = pipeline_.at(0);
         applyOpenOptions(load.params, path, options, opened.meta);
         if (const Operation* op = findOperation("load")) {
@@ -457,7 +463,6 @@ namespace sirius::app {
             load.params.coerce(op->info().params);
         }
         installDataset(opened.source, opened.meta, "opened " + opened.meta.format);
-        pushEdit("Open " + datasetMeta_.name, before);
         logLine("Opened " + path + " · " + datasetMeta_.shapeString() + " · " + opened.metadataSummary);
         session_.record("dataset", {{"path", path},
                                     {"dims", datasetMeta_.dims.toString()},
@@ -476,11 +481,9 @@ namespace sirius::app {
             closeDataset();
             return;
         }
-        const Snapshot before = snapshot();
         DatasetMeta meta = source->meta();
         pipeline_.at(0).params.set("path", meta.sourcePath);
         installDataset(std::move(source), std::move(meta), {});
-        pushEdit("Set dataset", before);
         notify(&Observer::datasetChanged);
         notify(&Observer::pipelineChanged);
         notify(&Observer::viewStateChanged);
@@ -494,6 +497,12 @@ namespace sirius::app {
         source_ = std::move(source);
         datasetMeta_ = std::move(meta);
         executor_.clear();
+        // A new dataset is a new session: the history entries before it
+        // would undo pipeline edits under data they were not made on, and
+        // the open itself cannot be undone (the previous source is gone).
+        history_.clear();
+        mergeFirst_.reset();
+        notify(&Observer::historyChanged);
         auto out = std::make_shared<StepOutput>();
         out->meta = datasetMeta_;
         out->source = source_;
@@ -694,6 +703,9 @@ namespace sirius::app {
         // incoming pipeline names a dataset path of its own.
         const bool keepLoad = !steps.empty() && steps.front().params.getString("path").empty();
         pipeline_.replaceSteps(steps, keepLoad);
+        // The old steps' outputs go: the incoming steps may reuse their ids,
+        // and output(index) serves a step's last output fresh or not.
+        executor_.clear();
         if (source_) executor_.seed(pipeline_, 0, loadOutput_);
         selected_ = std::min(1, pipeline_.size() - 1);
         viewed_ = pipeline_.size() - 1;
@@ -726,6 +738,7 @@ namespace sirius::app {
                 if (std::filesystem::exists(beside, ec)) s.params.set(spec.key, beside.lexically_normal().string());
             }
         }
+        const ParamSet loadBefore = pipeline_.at(0).params;
         replacePipeline(p, "Load pipeline " + std::filesystem::path(path).filename().string());
         pipelinePath_ = path;
         logLine("Loaded pipeline " + path);
@@ -743,6 +756,15 @@ namespace sirius::app {
             openDataset(resolved.string(), openOptionsFromLoadParams(pipeline_.at(0).params));
         } catch (const std::exception& e) {
             logLine("The pipeline's dataset could not be opened: " + std::string(e.what()));
+            // The data on screen is still the previous dataset: the Load
+            // step says so again, instead of naming a file that is not open
+            // while its output (the previous data) is served as fresh.
+            if (source_) {
+                pipeline_.at(0).params = loadBefore;
+                executor_.seed(pipeline_, 0, loadOutput_);
+                notifyStep(0);
+                notify(&Observer::outputsChanged);
+            }
         }
     }
 
@@ -1065,13 +1087,16 @@ namespace sirius::app {
         return d;
     }
 
-    Diagnostics Workbench::selectedDiagnostics() const {
-        if (auto out = output(selected_); out && !out->diagnostics.empty() && selected_ > 0) {
+    Diagnostics Workbench::selectedDiagnostics() const { return diagnosticsOf(selected_); }
+
+    Diagnostics Workbench::diagnosticsOf(int index) const {
+        if (index < 0 || index >= pipeline_.size()) return {};
+        if (auto out = output(index); out && !out->diagnostics.empty() && index > 0) {
             Diagnostics d = out->diagnostics;
-            if (!outputFresh(selected_)) d.warnings.insert(d.warnings.begin(), "Parameters changed since this result: run the step again.");
+            if (!outputFresh(index)) d.warnings.insert(d.warnings.begin(), "Parameters changed since this result: run the step again.");
             return d;
         }
-        return previewDiagnostics(selected_);
+        return previewDiagnostics(index);
     }
 
     void Workbench::clearCache(int index) {
@@ -1289,7 +1314,15 @@ namespace sirius::app {
         }
         current->apply(diff, forward);
         current->updateStats(diff);
+        staleBelow(id);
         notifyLabels(id);
+        notify(&Observer::outputsChanged);
+    }
+
+    void Workbench::staleBelow(StepId id) {
+        const int index = pipeline_.indexOf(id);
+        if (index < 0) return;
+        for (int j = index + 1; j < pipeline_.size(); ++j) executor_.markStale(pipeline_.at(j).id);
     }
 
     void Workbench::pushLabelCommand(const std::string& label, const std::string& mergeKey, StepId id,
@@ -1309,7 +1342,9 @@ namespace sirius::app {
         session_.record("label_edit", {{"what", label}, {"voxels", diff.indices.size()}, {"t", diff.t}});
         labels->updateStats(diff);
         pushLabelCommand(label, {}, id, labels, std::make_shared<LabelDiff>(std::move(diff)));
+        staleBelow(id);
         notifyLabels(id);
+        notify(&Observer::outputsChanged);
     }
 
     void Workbench::beginPaintStroke() {
@@ -1359,6 +1394,7 @@ namespace sirius::app {
         pushLabelCommand(erase ? "Erase labels" : "Paint label " + std::to_string(label),
                          "stroke#" + std::to_string(strokeCounter_), strokeStep_, labels,
                          std::make_shared<LabelDiff>(strokeDiff_));
+        staleBelow(strokeStep_);   // cheap; the outputsChanged notification waits for the stroke's end
         notifyLabels(strokeStep_);
     }
 
@@ -1371,6 +1407,7 @@ namespace sirius::app {
         labels->updateStats(strokeDiff_);
         strokeDiff_ = LabelDiff{};
         notifyLabels(strokeStep_);
+        notify(&Observer::outputsChanged);
     }
 
     void Workbench::fillLabel(Index z, Index y, Index x) {

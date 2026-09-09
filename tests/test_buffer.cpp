@@ -185,14 +185,33 @@ TEST_CASE("convert casts between pixel types on the host", "[buffer]") {
     convert(src, dst);
     for (Index i = 0; i < src.size(); ++i) REQUIRE(dst.data()[i] == static_cast<float>(i));
 
-    SECTION("narrowing conversions follow static_cast") {
-        Buffer<double> d(Shape{2});
+    SECTION("narrowing conversions truncate in range and saturate out of it") {
+        // static_cast is undefined for a float outside the integer's range
+        // (and wraps on MSVC) while the GPU's cvt saturates: one rule for both
+        Buffer<double> d(Shape{6});
         d.data()[0] = 3.9;
         d.data()[1] = -2.5;
-        Buffer<std::int8_t> i8(Shape{2});
+        d.data()[2] = 300.0;
+        d.data()[3] = -300.0;
+        d.data()[4] = std::numeric_limits<double>::quiet_NaN();
+        d.data()[5] = std::numeric_limits<double>::infinity();
+        Buffer<std::int8_t> i8(Shape{6});
         convert(d, i8);
         REQUIRE(i8.data()[0] == 3);
         REQUIRE(i8.data()[1] == -2);
+        REQUIRE(i8.data()[2] == 127);
+        REQUIRE(i8.data()[3] == -128);
+        REQUIRE(i8.data()[4] == 0);
+        REQUIRE(i8.data()[5] == 127);
+        Buffer<float> f(Shape{3});
+        f.data()[0] = -1.0f;
+        f.data()[1] = 70000.0f;
+        f.data()[2] = 65535.0f;
+        Buffer<std::uint16_t> u16(Shape{3});
+        convert(f, u16);
+        REQUIRE(u16.data()[0] == 0);
+        REQUIRE(u16.data()[1] == 65535);
+        REQUIRE(u16.data()[2] == 65535);
     }
     SECTION("same type is a copy") {
         Buffer<std::uint16_t> same(Shape{3, 4});

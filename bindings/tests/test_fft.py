@@ -318,3 +318,22 @@ class TestFFTWisdom(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestFFTOutputArgument(unittest.TestCase):
+    """`out` is written in place, so it must be the caller's array: an array
+    nanobind would have to convert (Fortran order, another dtype) is refused
+    rather than transformed into a temporary that is thrown away."""
+
+    def test_out_must_be_c_contiguous_complex128(self):
+        f = sirius.FFT([4, 4], 1, sirius.PlanRigor.Estimate)
+        x = _random_complex([4, 4], seed=7)
+        fortran = np.empty((4, 4), dtype=np.complex128, order="F")
+        with self.assertRaises(TypeError):
+            f.fft(x, fortran)
+        single = np.empty((4, 4), dtype=np.complex64)
+        with self.assertRaises(TypeError):
+            f.ifft(x, single)
+        ok = np.empty((4, 4), dtype=np.complex128)
+        f.fft(x, ok)
+        np.testing.assert_allclose(ok, np.fft.fft2(x), atol=1e-10)

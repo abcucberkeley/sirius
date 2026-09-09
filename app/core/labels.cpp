@@ -199,10 +199,14 @@ namespace sirius::app {
             if (it != previous.end()) {
                 s.cls = it->second.cls;
                 s.reviewed = it->second.reviewed;
+                // The mean probability came with the segmentation; a later
+                // pass without one (cleanup, crop, tracking) keeps it, as
+                // updateStats does, rather than promoting every label to 1.
+                s.confidence = it->second.confidence;
             }
             s.id = id;
             s.voxels = a.voxels;
-            s.confidence = probabilities ? a.prob / static_cast<double>(a.voxels) : 1.0;
+            if (probabilities) s.confidence = a.prob / static_cast<double>(a.voxels);
             s.bbox = {a.z0, a.z1 + 1, a.y0, a.y1 + 1, a.x0, a.x1 + 1};
             // a single plane has no z border to touch
             s.touchesBorder = a.y0 == 0 || a.y1 == y_ - 1 || a.x0 == 0 || a.x1 == x_ - 1 ||
@@ -210,6 +214,8 @@ namespace sirius::app {
             stats_.push_back(std::move(s));
         }
         statsT_ = t;
+        // the flags describe the new statistics with the rules last given
+        if (flagRules_) applyFlags(*flagRules_);
     }
 
     void LabelVolume::updateStats(const LabelDiff& diff) {
@@ -217,7 +223,6 @@ namespace sirius::app {
         if (diff.t < 0 || diff.t >= t_) throw std::out_of_range("LabelVolume::updateStats: t out of range");
         if (statsT_ != diff.t) {
             recomputeStats(diff.t);
-            if (flagRules_) applyFlags(*flagRules_);
             return;
         }
         // The labels the diff touched and the box it spans: each touched
@@ -803,9 +808,12 @@ namespace sirius::app {
                     float acc = 0.0f;
                     for (Index i = -r; i <= r; ++i) {
                         Index j = c + i;
-                        if (j < 0) j = -j;
-                        if (j >= count) j = 2 * count - j - 2;
-                        j = std::clamp<Index>(j, 0, count - 1);
+                        // mirror until inside (scipy's "mirror"), which one
+                        // reflection followed by a clamp is not when the
+                        // kernel is wider than the axis
+                        if (count == 1) j = 0;
+                        else
+                            while (j < 0 || j >= count) j = j < 0 ? -j : 2 * count - j - 2;
                         acc += tmp[static_cast<std::size_t>(base + j * stride)] * k[static_cast<std::size_t>(i + r)];
                     }
                     v[static_cast<std::size_t>(base + c * stride)] = acc;
@@ -970,6 +978,19 @@ namespace sirius::app {
         return next;
     }
 
+    std::uint32_t dropSmall(std::uint32_t* labels, Index n, Index minVoxels) {
+        std::uint32_t maxId = 0;
+        for (Index i = 0; i < n; ++i) maxId = std::max(maxId, labels[i]);
+        std::vector<Index> counts(static_cast<std::size_t>(maxId) + 1, 0);
+        for (Index i = 0; i < n; ++i) ++counts[labels[i]];
+        std::uint32_t kept = 0;
+        for (std::uint32_t id = 1; id <= maxId; ++id)
+            if (counts[id] > 0 && counts[id] >= minVoxels) ++kept;
+        for (Index i = 0; i < n; ++i)
+            if (labels[i] && counts[labels[i]] < minVoxels) labels[i] = 0;
+        return kept;
+    }
+
     // --- filters and thresholds -------------------------------------------
 
     void medianFilterPlane(float* plane, Index y, Index x, std::vector<float>& tmp) {
@@ -1044,7 +1065,10 @@ namespace sirius::app {
             }
             if (!(h.hi > h.lo)) return h;
             h.degenerate = false;
-            const double scale = 255.0 / (static_cast<double>(h.hi) - h.lo);
+            // 256 equal bins over [lo, hi] (hi lands in the last one), so a
+            // bin's centre really is (b + 0.5) / 256 of the range, as
+            // valueOf() reports it
+            const double scale = 256.0 / (static_cast<double>(h.hi) - h.lo);
             for (Index i = 0; i < n; ++i) {
                 if (!std::isfinite(values[i])) continue;
                 const int b = static_cast<int>((static_cast<double>(values[i]) - h.lo) * scale);

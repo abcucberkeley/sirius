@@ -93,8 +93,13 @@ namespace sirius::app {
 
         // --- statistics ---------------------------------------------------
         // Recomputed from the voxels; `probabilities` (same (z, y, x) as one
-        // volume, optional) gives per-label mean confidence. The statistics
-        // describe one time point, the last one computed (statsT()).
+        // volume, optional) gives per-label mean confidence -- without them a
+        // label already known keeps the confidence it had (a cleanup or a
+        // crop after a segmentation does not make every object certain),
+        // a new one starts at 1. Class and review mark are kept the same
+        // way, and the flags are refreshed with the rules of the last
+        // applyFlags(). The statistics describe one time point, the last
+        // one computed (statsT()).
         void recomputeStats(Index t, const float* probabilities = nullptr);
         // Brings the statistics up to date after an edit, touching only the
         // labels the diff changed (each is rescanned within its bounding
@@ -320,6 +325,9 @@ namespace sirius::app {
 
     // Drop components smaller than minVoxels, relabel 1..n densely.
     std::uint32_t removeSmall(std::uint32_t* labels, Index n, Index minVoxels);
+    // Drop components smaller than minVoxels; the other ids are kept as they
+    // are. Returns the label count that remains.
+    std::uint32_t dropSmall(std::uint32_t* labels, Index n, Index minVoxels);
 
     // Distinct colour for a label id (the design's 7-colour label palette, cycled).
     std::array<float, 3> labelColor(std::uint32_t id) noexcept;

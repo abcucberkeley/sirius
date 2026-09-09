@@ -127,6 +127,10 @@ namespace sirius::app {
                           const std::function<bool()>& cancelled = {});
         void close();
         bool isOpen() const noexcept;
+        // How long a cancelled call waits for the worker's answer before
+        // the connection is given up (a stuck worker must not hold the run
+        // thread forever); 15 s by default, shorter in tests.
+        void setCancelGrace(std::chrono::milliseconds grace) noexcept { cancelGrace_ = grace; }
 
     private:
         std::unique_ptr<rpc::Transport> transport_;
@@ -134,6 +138,7 @@ namespace sirius::app {
         WorkerCapabilities caps_;
         std::vector<std::byte> inbox_;
         std::uint64_t nextId_ = 1;
+        std::chrono::milliseconds cancelGrace_{15000};
     };
 
     // Launches the bundled worker as a child process on a free local port

@@ -5,6 +5,7 @@
 #include <fstream>
 #include <vector>
 
+#include <QAbstractSlider>
 #include <QAction>
 #include <QActionGroup>
 #include <QApplication>
@@ -42,6 +43,7 @@
 #include <sirius/tiff_io.hpp>
 
 #include "core/export.hpp"
+#include "qt/viewer/slice_pane.hpp"
 #include "qt/dialogs/export_dialog.hpp"
 #include "qt/dialogs/training_export_dialog.hpp"
 #include "qt/dialogs/folder_dataset_dialog.hpp"
@@ -373,6 +375,21 @@ namespace sirius::app {
             return w->inherits("QAbstractSpinBox");
         }
 
+        // The focused widget uses the key itself (a button is pressed with
+        // Space, a slider and a slice pane move with the arrows and the page
+        // keys), so the window-wide shortcut on it stands back.
+        static bool focusClaims(const QKeySequence& key) {
+            if (typingSomewhere()) return true;
+            if (key.count() != 1) return false;
+            QWidget* w = QApplication::focusWidget();
+            if (!w || !w->isEnabled()) return false;
+            const int k = key[0].key();
+            if (k == Qt::Key_Space || k == Qt::Key_Return || k == Qt::Key_Enter) return qobject_cast<QAbstractButton*>(w) != nullptr;
+            const bool navigation = k == Qt::Key_Left || k == Qt::Key_Right || k == Qt::Key_Up || k == Qt::Key_Down ||
+                                    k == Qt::Key_PageUp || k == Qt::Key_PageDown;
+            return navigation && (qobject_cast<QAbstractSlider*>(w) != nullptr || qobject_cast<SlicePane*>(w) != nullptr);
+        }
+
         static bool unmodified(const QKeySequence& key) {
             if (key.count() != 1) return false;
             return (key[0].keyboardModifiers() & ~Qt::KeypadModifier) == Qt::NoModifier;
@@ -386,8 +403,8 @@ namespace sirius::app {
             if (!tip.isEmpty()) a->setStatusTip(tip);
             if (fn) {
                 const bool guard = unmodified(key);
-                QObject::connect(a, &QAction::triggered, self, [fn, guard] {
-                    if (guard && typingSomewhere()) return;
+                QObject::connect(a, &QAction::triggered, self, [fn, guard, key] {
+                    if (guard && focusClaims(key)) return;
                     fn();
                 });
             }
@@ -978,10 +995,13 @@ namespace sirius::app {
                     wb().logLine(std::string("Pipeline sidecar: ") + e.what());
                 }
             }
-            bridge.startTask(QStringLiteral("Export"), [out, options](const WorkbenchBridge::TaskProgress& progress,
-                                                                      const WorkbenchBridge::TaskCancelled& cancelled) {
+            // The labels are copied first: the task reads them on its thread
+            // while the viewer may still paint into the step's volume.
+            std::shared_ptr<const LabelVolume> labels = out->labels ? out->labels->clone() : nullptr;
+            bridge.startTask(QStringLiteral("Export"), [out, labels, options](const WorkbenchBridge::TaskProgress& progress,
+                                                                              const WorkbenchBridge::TaskCancelled& cancelled) {
                 ArrayPtr array = out->asInput().materialize(progress);
-                exportArray(*array, out->meta, out->labels.get(), options, progress, cancelled);
+                exportArray(*array, out->meta, labels.get(), options, progress, cancelled);
             });
         }
 
@@ -1003,7 +1023,8 @@ namespace sirius::app {
                                   {"kind", wb().pipeline().at(step).kind},
                                   {"dataset", wb().hasDataset() ? wb().dataset().sourcePath : std::string()},
                                   {"pipeline", wb().pipeline().toJson()}};
-            std::shared_ptr<const LabelVolume> labels = out->labels;
+            // a copy: the task reads on its thread while the viewer may paint
+            std::shared_ptr<const LabelVolume> labels = out->labels->clone();
             bridge.startTask(QStringLiteral("Export training data"),
                              [out, labels, options](const WorkbenchBridge::TaskProgress& progress,
                                                     const WorkbenchBridge::TaskCancelled& cancelled) {

@@ -547,3 +547,15 @@ TEST_CASE("TiffInfo::image is indexed and still works on a hand-built info", "[t
     REQUIRE(&info.image(info.pages[3]) == &info.images[3]);
     REQUIRE_THROWS_AS(info.image(1), std::out_of_range);
 }
+
+TEST_CASE("readPages refuses a page count that would wrap the range", "[tifffile][cpu]") {
+    TempFile f(".tif");
+    const auto p0 = pattern(8, 8, 0), p1 = pattern(8, 8, 1);
+    writeTiffPages(f.path, {{&p0, false, 0}, {&p1, false, 0}}, false, COMPRESSION_NONE);
+    TiffFile file(f.path);
+    // first + count wrapped around SIZE_MAX and passed the old bounds check
+    CHECK_THROWS_AS(file.readPages<uint16_t>(1, std::numeric_limits<std::size_t>::max()), std::out_of_range);
+    CHECK_THROWS_AS(file.readPages<uint16_t>(3, 1), std::out_of_range);
+    CHECK_THROWS_AS(file.readPages<uint16_t>(0, 0), std::out_of_range);
+    CHECK(file.readPages<uint16_t>(1, 1).shape() == Shape{1, 8, 8});
+}

@@ -80,6 +80,9 @@ namespace sirius::app {
         // step's lazy source when a dataset is opened).
         void seed(const Pipeline& p, int index, std::shared_ptr<const StepOutput> out);
         void invalidate(StepId id);
+        // Keep the step's last output for the viewer but stop serving it as
+        // fresh (what a label edit upstream does to every step below it).
+        void markStale(StepId id);
         void clear();
         std::size_t cachedBytes() const;
         std::size_t cachedBytesOf(StepId id) const;
@@ -94,7 +97,15 @@ namespace sirius::app {
 
     private:
         struct Entry;
-        std::shared_ptr<const StepOutput> load(Entry& e) const;
+        // A spilled array that has to come off the disk: noted under the
+        // lock by load(), read without it by restore().
+        struct PendingRestore {
+            StepId id = 0;
+            std::shared_ptr<const StepOutput> shell;
+            std::filesystem::path path;
+        };
+        std::shared_ptr<const StepOutput> load(Entry& e, PendingRestore& pending) const;   // caller holds mutex_
+        std::shared_ptr<const StepOutput> restore(const PendingRestore& pending) const;    // no lock held
         void store(const Step& step, const std::string& fp, std::shared_ptr<const StepOutput> out);
         void refreshPolicies(const Pipeline& p);   // caller holds mutex_
         void evictRecomputeExcept(StepId keep);    // caller holds mutex_

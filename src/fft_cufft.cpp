@@ -53,7 +53,7 @@ namespace sirius::detail {
             }
 
             ~CufftBackend() override {
-                cuda::DeviceGuard g(device_.index);
+                cuda::DeviceGuardNoThrow g(device_.index);
                 (void)cufftDestroy(plan_);
             }
 
@@ -120,7 +120,7 @@ namespace sirius::detail {
             }
 
             ~CufftRealBackend() override {
-                cuda::DeviceGuard g(device_.index);
+                cuda::DeviceGuardNoThrow g(device_.index);
                 (void)cufftDestroy(forward_);
                 (void)cufftDestroy(inverse_);
                 (void)cudaFree(staging_);

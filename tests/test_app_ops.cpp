@@ -1547,3 +1547,136 @@ TEST_CASE("Every preset names real parameters and leaves the step runnable", "[a
     }
     CHECK(withPresets >= 1);
 }
+
+// --- regressions ----------------------------------------------------------------
+
+TEST_CASE("Frangi finds a line on a single plane", "[app][ops][classic]") {
+    // One plane: the 3D measure's third eigenvalue is identically zero and it
+    // read every line as "no tube"; the 2D measure is what a single plane needs.
+    const Dims5 dims{1, 1, 1, 48, 48};
+    const DatasetMeta meta = metaFor(dims);
+    auto data = std::make_shared<Array5>(Array5::zeros(dims));
+    for (Index y = 23; y <= 25; ++y)
+        for (Index x = 4; x < 44; ++x) data->at(0, 0, 0, y, x) = 1000.0f;
+    const Operation& op = requireOperation("classic");
+    ParamSet p = op.defaults();
+    p.set("enhance", std::string("Tubes (Frangi)"));
+    p.set("enhance_sigma", 1.0);
+    p.set("enhance_sigma_max", 3.0);
+    p.set("enhance_scales", std::int64_t{3});
+    p.set("sigma", 0.0);
+    p.set("opening", std::int64_t{0});
+    p.set("fill_holes", false);
+    p.set("method", std::string("Otsu"));
+    p.set("post", std::string("Connected components"));
+    p.set("min_voxels", std::int64_t{5});
+    Progress prog;
+    const StepOutput r = op.run(inputOf(data, meta), p, prog.ctx);
+    REQUIRE(r.labels);
+    CHECK(r.labels->at(0, 0, 24, 24) != 0);   // the middle of the line
+    CHECK(r.labels->at(0, 0, 24, 12) != 0);
+    CHECK(r.labels->at(0, 0, 5, 5) == 0);     // the background
+    CHECK(r.labels->at(0, 0, 40, 40) == 0);
+}
+
+TEST_CASE("Label cleanup keeps ids and confidences when asked", "[app][ops][cleanup]") {
+    const Dims5 dims{1, 1, 1, 8, 8};
+    const DatasetMeta meta = metaFor(dims);
+    auto data = std::make_shared<Array5>(Array5::zeros(dims));
+    auto labels = std::make_shared<LabelVolume>(1, 1, 8, 8);
+    std::uint32_t* v = labels->volume(0);
+    for (Index y = 1; y <= 3; ++y)
+        for (Index x = 1; x <= 3; ++x) v[y * 8 + x] = 5;   // nine voxels
+    for (Index y = 5; y <= 6; ++y)
+        for (Index x = 5; x <= 6; ++x) v[y * 8 + x] = 9;   // four voxels
+    v[0 * 8 + 7] = 7;                                       // a speck
+    labels->recomputeStats(0);
+    for (LabelStats& s : labels->stats())
+        if (s.id == 9) s.confidence = 0.3;   // as a segmentation model would have reported it
+    const Operation& cleanup = requireOperation("cleanup");
+    Progress prog;
+    StepInput in = inputOf(data, meta);
+    in.labels = labels;
+
+    SECTION("relabel off drops the small one and leaves the other ids alone") {
+        ParamSet cp = cleanup.defaults();
+        cp.set("min_voxels", std::int64_t{2});
+        cp.set("relabel", false);
+        cp.set("low_conf", 0.6);
+        const StepOutput out = cleanup.run(in, cp, prog.ctx);
+        REQUIRE(out.labels);
+        CHECK(out.labels->at(0, 0, 2, 2) == 5);
+        CHECK(out.labels->at(0, 0, 5, 5) == 9);
+        CHECK(out.labels->at(0, 0, 0, 7) == 0);
+        CHECK(out.labels->stats().size() == 2);
+        // the confidence survived the pass and the flag it earns is set
+        const LabelStats* nine = out.labels->statsOf(9);
+        REQUIRE(nine);
+        CHECK(nine->confidence == 0.3);
+        CHECK(std::find(nine->flags.begin(), nine->flags.end(), "low conf") != nine->flags.end());
+        const LabelStats* five = out.labels->statsOf(5);
+        REQUIRE(five);
+        CHECK(five->confidence == 1.0);
+    }
+    SECTION("relabel on numbers what is left densely") {
+        ParamSet cp = cleanup.defaults();
+        cp.set("min_voxels", std::int64_t{2});
+        cp.set("relabel", true);
+        const StepOutput out = cleanup.run(in, cp, prog.ctx);
+        REQUIRE(out.labels);
+        CHECK(out.labels->at(0, 0, 2, 2) == 1);
+        CHECK(out.labels->at(0, 0, 5, 5) == 2);
+        CHECK(out.labels->maxLabel() == 2);
+    }
+    SECTION("recomputeStats without probabilities keeps a known confidence") {
+        labels->recomputeStats(0);
+        REQUIRE(labels->statsOf(9));
+        CHECK(labels->statsOf(9)->confidence == 0.3);
+    }
+}
+
+TEST_CASE("Flat-field checks the dark image's size like the flat's", "[app][ops][flatfield]") {
+    const Dims5 dims{1, 1, 2, 4, 4};
+    const DatasetMeta meta = metaFor(dims);
+    Buffer<float> flat(Shape{4, 4});
+    for (Index i = 0; i < 16; ++i) flat.data()[i] = 2.0f;
+    Buffer<float> dark(Shape{2, 2});
+    for (Index i = 0; i < 4; ++i) dark.data()[i] = 1.0f;
+    const test::TempFile flatFile("app_ops_flat_ok", ".tif"), darkFile("app_ops_dark_small", ".tif");
+    writeTiff<float>(flatFile.str, flat.view());
+    writeTiff<float>(darkFile.str, dark.view());
+    const Operation& op = requireOperation("flatfield");
+    ParamSet p = op.defaults();
+    p.set("flat", flatFile.str);
+    REQUIRE(op.validate(p, meta).ok());
+    p.set("dark", darkFile.str);
+    const Validation v = op.validate(p, meta);
+    CHECK_FALSE(v.ok());
+    CHECK(v.firstError().find("dark") != std::string::npos);
+    // run() validates first: a 2 x 2 dark under 4 x 4 data would be read past its end
+    Progress prog;
+    auto data = std::make_shared<Array5>(Array5::filled(dims, 10.0f));
+    CHECK_THROWS(op.run(inputOf(data, meta), p, prog.ctx));
+}
+
+TEST_CASE("Deskew takes 0 as the dataset's own sheet angle", "[app][ops][deskew]") {
+    const Dims5 dims{1, 1, 6, 8, 10};
+    DatasetMeta meta = metaFor(dims, 0.1, 0.4);
+    meta.lightSheet = true;
+    meta.sheetAngleDeg = 31.8;
+    const Operation& op = requireOperation("deskew");
+    ParamSet zero = op.defaults();
+    zero.set("sheet_angle", 0.0);
+    zero.coerce(op.info().params);   // a TOML file's 0 arrives through here
+    CHECK(zero.getDouble("sheet_angle") == 0.0);   // was clamped to 1 degree
+    ParamSet explicitAngle = op.defaults();
+    explicitAngle.set("sheet_angle", 31.8);
+    CHECK(op.outputMeta(zero, meta).dims == op.outputMeta(explicitAngle, meta).dims);
+}
+
+TEST_CASE("Contrast's summary does not promise a per-channel window", "[app][ops][contrast]") {
+    const Operation& op = requireOperation("contrast");
+    const DatasetMeta meta = metaFor(Dims5{2, 1, 2, 4, 4});
+    ParamSet p = op.defaults();
+    CHECK(op.summary(p, meta).find("per channel") == std::string::npos);
+}

@@ -1574,3 +1574,220 @@ TEST_CASE("Applying a preset is an ordinary undoable parameter change", "[app][w
         CHECK_FALSE(wb.applyPreset(-1, "Filaments"));
     }
 }
+
+// --- outputs and identities across edits --------------------------------------------
+
+TEST_CASE("Labels are carried through a step only onto the same grid", "[app][executor][labels]") {
+    registerTestOps();
+    Scratch scratch;
+    Workbench wb(scratch.dir);
+    wb.setDataset(syntheticSource(1, 1, 4, 16, 16));
+    wb.setBackend(Backend::Cpu);
+    while (wb.pipeline().size() > 1) wb.removeStep(1);
+    wb.addStep("test_labels");   // 1: its own labels over the input's grid
+    wb.addStep("test_maxz");     // 2: z -> 1, a grid those labels do not fit
+    wb.addStep("test_scale");    // 3: would carry labels through, but there are none to carry
+    REQUIRE(runSync(wb)->succeeded());
+    REQUIRE(wb.output(1)->labels);
+    // Before: the executor shared the (z=4) labels onto the (z=1) output,
+    // and every consumer indexing them with the output's dims read past
+    // their buffer.
+    CHECK_FALSE(wb.output(2)->labels);
+    CHECK_FALSE(wb.output(3)->labels);
+}
+
+TEST_CASE("A step added after an undo does not inherit the undone step's output", "[app][workbench][executor]") {
+    registerTestOps();
+    Scratch scratch;
+    Workbench wb(scratch.dir);
+    wb.setDataset(syntheticSource());
+    wb.setBackend(Backend::Cpu);
+    while (wb.pipeline().size() > 1) wb.removeStep(1);
+    const StepId scale = wb.addStep("test_scale");
+    REQUIRE(runSync(wb)->succeeded());
+    REQUIRE(wb.output(1));
+    wb.undo();   // the step is gone; its cached output is still in the executor
+    REQUIRE(wb.pipeline().size() == 1);
+    const StepId added = wb.addStep("test_maxz");
+    CHECK(added != scale);   // ids keep counting, they are not reissued
+    CHECK_FALSE(wb.output(1));
+    CHECK_FALSE(wb.outputFresh(1));
+    CHECK_FALSE(wb.viewedLabels());
+}
+
+TEST_CASE("Replacing the pipeline drops the previous steps' outputs", "[app][workbench][executor]") {
+    registerTestOps();
+    Scratch scratch;
+    Workbench wb(scratch.dir);
+    wb.setDataset(syntheticSource());
+    wb.setBackend(Backend::Cpu);
+    while (wb.pipeline().size() > 1) wb.removeStep(1);
+    const StepId scale = wb.addStep("test_scale");
+    REQUIRE(runSync(wb)->succeeded());
+    REQUIRE(wb.output(1));
+    // an incoming pipeline whose second step gets the id the scale step had
+    Pipeline p;
+    p.add("test_scale");
+    p.add("test_maxz");
+    REQUIRE(p.at(2).id == scale);
+    wb.replacePipeline(p, "swap");
+    REQUIRE(wb.pipeline().size() == 3);
+    CHECK(wb.pipeline().at(2).kind == "test_maxz");
+    CHECK_FALSE(wb.output(1));
+    CHECK_FALSE(wb.output(2));   // not the scale step's array under a new name
+    CHECK(wb.outputFresh(0));    // the dataset is seeded again
+}
+
+TEST_CASE("Pipeline TOML keeps the step ids, gaps included", "[app][pipeline]") {
+    registerTestOps();
+    Pipeline p;
+    p.add("test_scale");
+    p.add("test_maxz");
+    p.add("test_scale");
+    p.remove(2);   // leaves a gap in the ids
+    const StepId a = p.at(1).id, b = p.at(2).id;
+    REQUIRE(b == a + 2);
+    test::TempFile file("ids", ".sirius.toml");
+    p.save(file.path.string());
+    // TOML integers are signed: an unsigned-only check dropped every id
+    const Pipeline loaded = Pipeline::load(file.path.string());
+    REQUIRE(loaded.size() == 3);
+    CHECK(loaded.at(1).id == a);
+    CHECK(loaded.at(2).id == b);
+}
+
+TEST_CASE("Opening a dataset starts the history over", "[app][workbench][history]") {
+    registerTestOps();
+    Scratch scratch;
+    Workbench wb(scratch.dir);
+    wb.setDataset(syntheticSource());
+    wb.addStep("test_scale");
+    REQUIRE(wb.history().canUndo());
+    // The open itself was never undoable (the previous source is gone), and
+    // the edits before it were made against other data.
+    wb.setDataset(syntheticSource(1, 1, 2, 4, 4));
+    CHECK_FALSE(wb.history().canUndo());
+    CHECK_FALSE(wb.history().canRedo());
+    CHECK(wb.dataset().dims.c == 1);
+    CHECK(wb.pipeline().size() >= 2);   // the pipeline is kept
+    CHECK(wb.outputFresh(0));
+}
+
+TEST_CASE("A label edit makes the steps below it stale", "[app][workbench][labels][executor]") {
+    registerTestOps();
+    Scratch scratch;
+    Workbench wb(scratch.dir);
+    wb.setDataset(syntheticSource(1, 1, 4, 16, 16));
+    wb.setBackend(Backend::Cpu);
+    while (wb.pipeline().size() > 1) wb.removeStep(1);
+    wb.addStep("test_labels");   // 1
+    wb.addStep("test_scale");    // 2: consumed (carried) the labels as they were
+    REQUIRE(runSync(wb)->succeeded());
+    REQUIRE(wb.outputFresh(2));
+
+    wb.view(1);
+    paintOne(wb, 1, 2, 2, 9);
+    CHECK(wb.outputFresh(1));         // the edited step itself is as fresh as before
+    CHECK_FALSE(wb.outputFresh(2));   // what it fed downstream is not
+    CHECK(wb.output(2));              // still there for the viewer, marked stale
+
+    SECTION("the next run recomputes the stale step") {
+        auto job = runSync(wb);
+        REQUIRE(job->succeeded());
+        bool ran = false;
+        for (const StepReport& r : job->reports())
+            if (r.index == 2 && r.ran()) ran = true;
+        CHECK(ran);
+        CHECK(wb.outputFresh(2));
+        CHECK(wb.output(2)->labels->at(0, 1, 2, 2) == 9);   // and it saw the correction
+    }
+    SECTION("undoing the edit is an edit too") {
+        REQUIRE(runSync(wb)->succeeded());
+        REQUIRE(wb.outputFresh(2));
+        wb.undo();
+        CHECK_FALSE(wb.outputFresh(2));
+    }
+}
+
+TEST_CASE("A fresh target is served without re-running an evicted upstream", "[app][executor]") {
+    registerTestOps();
+    Scratch scratch;
+    Executor ex(scratch.dir / "cache");
+    Pipeline p;
+    p.add("test_scale");
+    p.add("test_maxz");
+    p.setCache(1, CachePolicy::Recompute);
+    p.setCache(2, CachePolicy::Recompute);
+    auto src = syntheticSource();
+    auto load = std::make_shared<StepOutput>();
+    load->meta = src->meta();
+    load->source = src;
+    ex.seed(p, 0, load);
+    StepContext ctx;
+    ScaleOp::runs = 0;
+    REQUIRE(ex.runAll(p, ctx));
+    CHECK(ScaleOp::runs == 1);
+    // Recompute keeps only the newest array: the upstream lost its array to
+    // the target's store, the target is fresh by its fingerprint.
+    CHECK_FALSE(ex.isFresh(p, 1));
+    CHECK(ex.isFresh(p, 2));
+
+    std::vector<StepReport> reports;
+    REQUIRE(ex.runAll(p, ctx, &reports));
+    CHECK(ScaleOp::runs == 1);   // before: the upstream ran, evicted the target, and the target ran too
+    REQUIRE(reports.size() == 3);
+    CHECK(reports[1].state == StepReport::State::Cached);
+    CHECK(reports[2].state == StepReport::State::Cached);
+}
+
+TEST_CASE("A missing spill file makes the step recompute instead of throwing", "[app][executor][spill]") {
+    registerTestOps();
+    Scratch scratch;
+    Executor ex(scratch.dir / "cache");
+    Pipeline p;
+    const StepId id = p.add("test_scale");
+    p.setCache(1, CachePolicy::Disk);
+    auto src = syntheticSource();
+    auto load = std::make_shared<StepOutput>();
+    load->meta = src->meta();
+    load->source = src;
+    ex.seed(p, 0, load);
+    std::filesystem::path spill;
+    ex.setSpillObserver([&](const std::filesystem::path& file) { spill = file; });
+    StepContext ctx;
+    REQUIRE(ex.runAll(p, ctx));
+    REQUIRE(std::filesystem::exists(spill));
+    REQUIRE(ex.lastOutput(id));
+    REQUIRE(ex.lastOutput(id)->array);
+
+    std::filesystem::remove(spill);   // a temp cleaner, a full disk
+    std::shared_ptr<const StepOutput> gone;
+    CHECK_NOTHROW(gone = ex.lastOutput(id));
+    CHECK_FALSE(gone);
+    CHECK_FALSE(ex.isFresh(p, 1));
+    ScaleOp::runs = 0;
+    std::vector<StepReport> reports;
+    REQUIRE(ex.runAll(p, ctx, &reports));
+    CHECK(ScaleOp::runs == 1);
+    CHECK(reports[1].ran());
+    CHECK(ex.isFresh(p, 1));
+}
+
+TEST_CASE("A run job cancelled before it starts does not start a worker", "[app][workbench][run]") {
+    registerTestOps();
+    Scratch scratch;
+    Workbench wb(scratch.dir);
+    wb.setDataset(syntheticSource());
+    wb.setBackend(Backend::Cpu);
+    while (wb.pipeline().size() > 1) wb.removeStep(1);
+    wb.addStep("test_slow");
+    auto job = wb.createRun();
+    REQUIRE(job);
+    job->cancel();   // the window closed while the job was queued
+    job->execute();
+    CHECK(job->finished());
+    CHECK(job->wasCancelled());
+    CHECK_FALSE(job->succeeded());
+    wb.finishRun(job);
+    CHECK_FALSE(wb.running());
+}

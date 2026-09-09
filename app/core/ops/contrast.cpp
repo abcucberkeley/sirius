@@ -143,8 +143,8 @@ namespace sirius::app {
                 const double gamma = params.getDouble("gamma", 1.0);
                 char g[32];
                 std::snprintf(g, sizeof g, "γ %.2g", gamma);
-                return joinSummary({buf, params.getBool("per_channel", true) ? "per channel" : "global",
-                                    gamma != 1.0 ? g : ""});
+                // one window for every channel (there is no per-channel parameter)
+                return joinSummary({buf, gamma != 1.0 ? g : ""});
             }
 
             Validation validate(const ParamSet& params, const DatasetMeta& input) const override {

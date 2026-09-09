@@ -5,7 +5,9 @@
 // Everything can also be opened from the File menu; --run runs every
 // enabled step as soon as the window is up.
 
+#include <chrono>
 #include <filesystem>
+#include <functional>
 
 #include <QApplication>
 #include <QCommandLineParser>
@@ -86,9 +88,11 @@ int main(int argc, char** argv) {
 
     sirius::app::Workbench workbench(std::filesystem::path(sirius::app::toStd(scratch)));
     sirius::app::PreferencesDialog::applyStored(workbench);
-    sirius::app::WorkbenchBridge bridge(workbench);
     // Steps that need Python (Torch models) get a worker spawned on demand.
+    // Declared before the bridge: the bridge's destructor joins the run
+    // thread, which may be inside the launcher starting that worker.
     sirius::app::WorkerLauncher launcher;
+    sirius::app::WorkbenchBridge bridge(workbench);
     QObject::connect(&launcher, &sirius::app::WorkerLauncher::logged, &bridge,
                      [&workbench](const QString& line) { workbench.logLine("worker: " + sirius::app::toStd(line)); });
     workbench.setLocalWorkerLauncher([&launcher] { return launcher.connect(); });
@@ -114,7 +118,6 @@ int main(int argc, char** argv) {
         const QString dataset = parser.value(datasetOpt);
         QTimer::singleShot(0, &window, [&window, dataset] { window.openDatasetPath(dataset); });
     }
-    if (parser.isSet(runOpt)) QTimer::singleShot(0, &window, &sirius::app::MainWindow::runAll);
     const QStringList toolCalls = parser.values(toolOpt);
     const QStringList actions = parser.values(actionOpt);
     sirius::app::ToolApi tools(workbench);
@@ -197,48 +200,89 @@ int main(int argc, char** argv) {
         }
     };
     const bool scripted = !toolCalls.isEmpty() || !actions.isEmpty() || parser.isSet(askOpt) || parser.isSet(strokeOpt) || parser.isSet(wheelOpt) || parser.isSet(dropOpt);
+    const bool headless = scripted || parser.isSet(screenshotOpt);
+    // An interactive --run just starts; a headless one (below) also decides
+    // the exit code and when the window is grabbed.
+    if (parser.isSet(runOpt) && !headless) QTimer::singleShot(0, &window, &sirius::app::MainWindow::runAll);
     // Nobody is at the keyboard in any of these modes, so the window must not
     // ask whether to cancel a running job on the way out (see
     // MainWindow::setUnattended).
-    if (scripted || parser.isSet(screenshotOpt) || parser.isSet(quitAfterOpt)) window.setUnattended(true);
+    if (headless || parser.isSet(quitAfterOpt)) window.setUnattended(true);
     const int settle = parser.isSet(settleOpt) ? parser.value(settleOpt).toInt() : 600;
-    if (parser.isSet(screenshotOpt) || scripted) {
+    // What the process exits with: 1 when a headless run failed (or was
+    // still going when the deadline struck), 2 when it could not start.
+    int exitCode = 0;
+    // Declared here, not in the block below: the timers armed there fire
+    // inside exec(), long after the block's own locals are gone.
+    std::function<void()> grabWhenIdle;
+    bool finished = false;
+    if (headless) {
         const QString path = parser.value(screenshotOpt);
-        auto finish = [&window, &app, &bridge, &script, path, scripted, settle] {
+        // A scripted run (--tool run) blocks in a nested event loop in which
+        // the grab timer still fires; the grab waits for it up to this long
+        // so the picture shows the result rather than the middle of the run.
+        const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(600);
+        auto grab = [&window, &app, &bridge, &exitCode, path] {
+                // size report: which widget dictates the window's minimum
+            QString report = QStringLiteral("window %1x%2 min %3x%4").arg(window.width()).arg(window.height()).arg(window.minimumSizeHint().width()).arg(window.minimumSizeHint().height());
+            if (QWidget* c = window.centralWidget())
+                report += QStringLiteral(" central-min %1x%2").arg(c->minimumSizeHint().width()).arg(c->minimumSizeHint().height());
+            for (QDockWidget* d : window.findChildren<QDockWidget*>())
+                report += QStringLiteral(" %1-min %2x%3").arg(d->objectName()).arg(d->widget() ? d->widget()->minimumSizeHint().width() : -1).arg(d->widget() ? d->widget()->minimumSizeHint().height() : -1);
+            qInfo("%s", qPrintable(report));
+            window.grab().save(path);
+                // a dialog opened by --action is grabbed beside the window
+            if (QWidget* modal = QApplication::activeModalWidget()) {
+                QFileInfo fi(path);
+                modal->grab().save(fi.path() + QLatin1Char('/') + fi.completeBaseName() + QStringLiteral("-dialog.") + fi.suffix());
+            }
+                // tool windows and non-modal dialogs (the plugin manager) beside it too
+            for (QWidget* top : QApplication::topLevelWidgets())
+                if (top != &window && top->isVisible() && top->isWindow() && !qobject_cast<QMenu*>(top) &&
+                    top != QApplication::activeModalWidget() && (top->windowType() == Qt::Tool || qobject_cast<QDialog*>(top))) {
+                    QFileInfo fi(path);
+                    const QString tag = top->windowType() == Qt::Tool ? QStringLiteral("-tool.") : QStringLiteral("-dialog.");
+                    top->grab().save(fi.path() + QLatin1Char('/') + fi.completeBaseName() + tag + fi.suffix());
+                }
+            while (QWidget* modal = QApplication::activeModalWidget()) modal->close();   // let exec() return
+            if (bridge.running()) {   // a slow step must not hold the exit
+                bridge.cancelRun();
+                if (exitCode == 0) exitCode = 1;
+            }
+            app.quit();
+        };
+        grabWhenIdle = [&window, &bridge, &grabWhenIdle, grab, settle, deadline] {
+            if (bridge.running() && std::chrono::steady_clock::now() < deadline) {
+                QTimer::singleShot(settle, &window, grabWhenIdle);
+                return;
+            }
+            grab();
+        };
+        auto finish = [&window, &script, &finished, &grabWhenIdle, path, scripted, settle] {
+            if (finished) return;   // a scripted run's own runFinished lands here too
+            finished = true;
             // Arm the grab before scripting: a modal dialog opened by an
             // action runs its own event loop, in which the timer still fires.
-            if (!path.isEmpty()) QTimer::singleShot(settle, &window, [&window, &app, &bridge, path] {
-                // size report: which widget dictates the window's minimum
-                QString report = QStringLiteral("window %1x%2 min %3x%4").arg(window.width()).arg(window.height()).arg(window.minimumSizeHint().width()).arg(window.minimumSizeHint().height());
-                if (QWidget* c = window.centralWidget())
-                    report += QStringLiteral(" central-min %1x%2").arg(c->minimumSizeHint().width()).arg(c->minimumSizeHint().height());
-                for (QDockWidget* d : window.findChildren<QDockWidget*>())
-                    report += QStringLiteral(" %1-min %2x%3").arg(d->objectName()).arg(d->widget() ? d->widget()->minimumSizeHint().width() : -1).arg(d->widget() ? d->widget()->minimumSizeHint().height() : -1);
-                qInfo("%s", qPrintable(report));
-                window.grab().save(path);
-                // a dialog opened by --action is grabbed beside the window
-                if (QWidget* modal = QApplication::activeModalWidget()) {
-                    QFileInfo fi(path);
-                    modal->grab().save(fi.path() + QLatin1Char('/') + fi.completeBaseName() + QStringLiteral("-dialog.") + fi.suffix());
-                }
-                // tool windows and non-modal dialogs (the plugin manager) beside it too
-                for (QWidget* top : QApplication::topLevelWidgets())
-                    if (top != &window && top->isVisible() && top->isWindow() && !qobject_cast<QMenu*>(top) &&
-                        top != QApplication::activeModalWidget() && (top->windowType() == Qt::Tool || qobject_cast<QDialog*>(top))) {
-                        QFileInfo fi(path);
-                        const QString tag = top->windowType() == Qt::Tool ? QStringLiteral("-tool.") : QStringLiteral("-dialog.");
-                        top->grab().save(fi.path() + QLatin1Char('/') + fi.completeBaseName() + tag + fi.suffix());
-                    }
-                while (QWidget* modal = QApplication::activeModalWidget()) modal->close();   // let exec() return
-                if (bridge.running()) bridge.cancelRun();   // a slow step must not hold the exit
-                app.quit();
-            });
+            if (!path.isEmpty()) QTimer::singleShot(settle, &window, grabWhenIdle);
             if (scripted) script();
         };
         if (parser.isSet(runOpt)) {
             QObject::connect(&bridge, &sirius::app::WorkbenchBridge::runFinished, &window,
-                             [finish](bool, const QString&) { QTimer::singleShot(300, finish); });
-            QTimer::singleShot(600000, &window, finish);   // never hang a headless run
+                             [&window, &exitCode, finish](bool ok, const QString&) {
+                                 if (!ok && exitCode == 0) exitCode = 1;
+                                 QTimer::singleShot(300, &window, finish);
+                             });
+            QTimer::singleShot(0, &window, [&window, &bridge, &exitCode, finish] {
+                window.runAll();
+                if (!bridge.running()) {   // could not start: no dataset, a validation error
+                    exitCode = 2;
+                    QTimer::singleShot(300, &window, finish);
+                }
+            });
+            QTimer::singleShot(600000, &window, [&exitCode, finish] {   // never hang a headless run
+                if (exitCode == 0) exitCode = 1;
+                finish();
+            });
         } else {
             QTimer::singleShot(1200, &window, finish);
         }
@@ -247,5 +291,5 @@ int main(int argc, char** argv) {
     const int rc = QApplication::exec();
     std::error_code ec;
     std::filesystem::remove_all(std::filesystem::path(sirius::app::toStd(scratch)), ec);
-    return rc;
+    return rc != 0 ? rc : exitCode;
 }

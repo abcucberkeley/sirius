@@ -144,6 +144,15 @@ namespace sirius::app {
                                         static_cast<std::size_t>(vol) * sizeof(float));
                     if (labels && labels->shape.size() == 4) {
                         const Index lt = labels->shape[0], lz = labels->shape[1], ly = labels->shape[2], lx = labels->shape[3];
+                        // Labels are (t, z, y, x) over the output's voxels, and
+                        // every time point's reply has to agree: the copy below
+                        // is sized by this reply's shape into a volume sized by
+                        // the first one's.
+                        if (lz != od.z || ly != od.y || lx != od.x || (tCount > 1 ? lt != 1 : lt != od.t))
+                            throw std::runtime_error("the plugin's labels are " + std::to_string(lt) + "×" + std::to_string(lz) + "×" +
+                                                     std::to_string(ly) + "×" + std::to_string(lx) + " (t, z, y, x), its output " +
+                                                     std::to_string(od.t) + "×" + std::to_string(od.z) + "×" + std::to_string(od.y) +
+                                                     "×" + std::to_string(od.x));
                         if (!outLabels) outLabels = std::make_shared<LabelVolume>(tCount > 1 ? tCount : lt, lz, ly, lx);
                         for (Index t = 0; t < lt; ++t)
                             std::memcpy(outLabels->volume(tCount > 1 ? tIndex : t), labels->asUInt32() + t * lz * ly * lx,

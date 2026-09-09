@@ -28,7 +28,7 @@ namespace sirius::app {
                 info_.separableOverT = true;
                 info_.helpPage = "deskew";
                 info_.params = {
-                    doubleParam("sheet_angle", "Sheet angle", 31.8).range(1.0, 89.0, 0.1, 2).withUnit("°").withHelp("Angle between the light sheet and the coverslip (0 = the dataset's)"),
+                    doubleParam("sheet_angle", "Sheet angle", 31.8).range(0.0, 89.0, 0.1, 2).withUnit("°").withHelp("Angle between the light sheet and the coverslip (0 = the dataset's)"),
                     doubleParam("stage_step_um", "Stage step", 0.40).range(0.001, 100.0, 0.01, 3).withUnit("µm").withHelp("Stage travel between planes"),
                     boolParam("rotate_to_coverslip", "Rotate to coverslip", true),
                     choiceParam("interpolation", "Interpolation", {"linear", "cubic", "nearest"}, "linear"),

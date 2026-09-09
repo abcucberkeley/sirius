@@ -39,6 +39,12 @@ def main(argv=None) -> int:
     parser.add_argument("--allow-install", action="store_true",
                         help="let clients install model packages with pip / conda in this interpreter")
     parser.add_argument("--log-level", default="INFO", help="stderr log level")
+    # The desktop application passes this: it holds the worker's stdin open,
+    # so end-of-file there means the application is gone (crashed, killed)
+    # and the worker must not live on holding the GPU and a valid token.
+    # Not for a terminal or a batch job, where stdin is closed from the start.
+    parser.add_argument("--exit-with-parent", action="store_true",
+                        help="stop when stdin reaches end-of-file (the launching process went away)")
     args = parser.parse_args(argv)
 
     logging.basicConfig(stream=sys.stderr, level=getattr(logging, args.log_level.upper(), logging.INFO),
@@ -78,8 +84,35 @@ def main(argv=None) -> int:
             signal.signal(sig, on_signal)
         except (ValueError, OSError):
             pass
+    if args.exit_with_parent:
+        watch_parent(server)
     server.serve_forever()
     return 0
+
+
+def watch_parent(server) -> None:
+    """Stop `server` once stdin reaches end-of-file, from a daemon thread.
+
+    The read blocks for as long as the parent lives; a parent that exits or
+    crashes closes its end of the pipe. A job in flight is given a moment to
+    notice the stop flag, then the process leaves regardless: nobody is
+    waiting for its answer any more."""
+    import threading
+    import time
+
+    def run() -> None:
+        try:
+            stream = getattr(sys.stdin, "buffer", sys.stdin)
+            while stream.read(1):
+                pass
+        except (OSError, ValueError):
+            pass
+        logging.getLogger("sirius_worker").info("the launching process went away; stopping")
+        server.stop()
+        time.sleep(2.0)
+        os._exit(0)
+
+    threading.Thread(target=run, name="sirius-parent-watch", daemon=True).start()
 
 
 if __name__ == "__main__":

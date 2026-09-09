@@ -148,7 +148,7 @@ void bind_fft(nb::module_& m) {
              "Forward transform. Returns a new array with the same shape as `in`: numpy on the "
              "CPU, a sirius.Buffer on CUDA.")
         .def("fft", &PyFFT::fft_into,
-             nb::arg("in"), nb::arg("out"),
+             nb::arg("in"), nb::arg("out").noconvert(),
              "Forward transform into a preallocated output array. `out` must be complex128, "
              "C-contiguous, on the plan's device, and have the same total element count as `in`; "
              "`out` may be `in` itself.")
@@ -158,7 +158,7 @@ void bind_fft(nb::module_& m) {
              "Inverse transform. When `normalize=True`, the result is divided by the "
              "product of `dims`, so `ifft(fft(x), normalize=True)` recovers `x`.")
         .def("ifft", &PyFFT::ifft_into,
-             nb::arg("in"), nb::arg("out"), nb::arg("normalize") = false,
+             nb::arg("in"), nb::arg("out").noconvert(), nb::arg("normalize") = false,
              "Inverse transform into a preallocated output array of matching size "
              "(`out` may be `in` itself).")
 

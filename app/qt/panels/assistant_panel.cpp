@@ -661,7 +661,7 @@ namespace sirius::app {
         QWidget::resizeEvent(event);
         const int w = impl_->scroll->viewport()->width();
         for (QLabel* l : impl_->transcript->findChildren<QLabel*>()) {
-            if (l->property("bubble").toBool()) l->setMaximumWidth(static_cast<int>(w * 0.88));
+            if (l->property("class").toString() == QLatin1String("bubble")) l->setMaximumWidth(static_cast<int>(w * 0.88));
             else if (l->property("assistantText").toBool()) l->setMaximumWidth(static_cast<int>(w * 0.94));
         }
     }

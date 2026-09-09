@@ -175,7 +175,10 @@ namespace sirius::app {
                 s.params.applyDefaults(op->info().params);
                 s.params.coerce(op->info().params);
             }
-            if (sj.contains("id") && sj["id"].is_number_unsigned()) s.id = sj["id"].get<StepId>();
+            // TOML integers arrive as signed 64-bit, so is_number_unsigned()
+            // would drop every id a .sirius.toml file carries
+            if (sj.contains("id") && sj["id"].is_number_integer() && sj["id"].get<std::int64_t>() > 0)
+                s.id = sj["id"].get<StepId>();
             steps.push_back(std::move(s));
         }
         p.replaceSteps(std::move(steps), false);

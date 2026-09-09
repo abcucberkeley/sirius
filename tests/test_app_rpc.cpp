@@ -16,6 +16,7 @@
 #include <atomic>
 #include <thread>
 
+#include "core/cancel.hpp"
 #include "core/errors.hpp"
 #include "core/rpc.hpp"
 
@@ -76,6 +77,20 @@ namespace {
                         const std::string kind = h["params"].value("kind", "");
                         if (kind == "fail") {
                             send({{"id", id}, {"type", "error"}, {"message", "kaboom"}});
+                            continue;
+                        }
+                        if (kind == "fail_noid") {
+                            // what the Python worker sends for a frame it could
+                            // not attribute to a request (a protocol error)
+                            send({{"id", nullptr}, {"type", "error"}, {"message", "protocol error: bad frame"}});
+                            continue;
+                        }
+                        if (kind == "hang") {
+                            // a stuck worker: never answers, never reads its cancel
+                            while (!stop) {
+                                auto c = rpc::decodeFrame(buf);
+                                if (!c) t->receive(buf, std::chrono::milliseconds(25));
+                            }
                             continue;
                         }
                         REQUIRE(m->tensors.size() == 1);
@@ -278,9 +293,41 @@ TEST_CASE("RemoteWorker cancels a slow request", "[app][rpc]") {
         std::this_thread::sleep_for(std::chrono::milliseconds(120));
         cancel = true;
     });
-    CHECK_THROWS_WITH(rw.call("run", {{"kind", "torch_segment"}}, {{"input", "float32", {1}, in.data(), 4}}, {},
-                              [&] { return cancel.load(); }),
-                      Catch::Matchers::ContainsSubstring("cancelled"));
+    // the worker's own "cancelled" answer to our cancel is a cancellation,
+    // typed as one, not a step failure that happens to say "cancelled"
+    CHECK_THROWS_AS(rw.call("run", {{"kind", "torch_segment"}}, {{"input", "float32", {1}, in.data(), 4}}, {},
+                            [&] { return cancel.load(); }),
+                    CancelledError);
+    canceller.join();
+}
+
+TEST_CASE("An error the worker cannot attribute to a request still carries its message", "[app][rpc]") {
+    auto [client, server] = rpc::loopbackPair();
+    ScriptedWorker worker(std::move(server));
+    RemoteWorker rw(std::move(client));
+    std::vector<float> in{1.f};
+    // before: h.value("id", uint64) on a null id threw a JSON type error
+    CHECK_THROWS_WITH(rw.call("run", {{"kind", "fail_noid"}}, {{"input", "float32", {1}, in.data(), 4}}),
+                      Catch::Matchers::ContainsSubstring("bad frame"));
+}
+
+TEST_CASE("A worker that ignores a cancel is given up after the grace period", "[app][rpc][cancel]") {
+    auto [client, server] = rpc::loopbackPair();
+    ScriptedWorker worker(std::move(server));
+    RemoteWorker rw(std::move(client));
+    rw.setCancelGrace(std::chrono::milliseconds(300));
+    std::vector<float> in{1.f};
+    std::atomic<bool> cancel{false};
+    std::thread canceller([&] {
+        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+        cancel = true;
+    });
+    const auto t0 = std::chrono::steady_clock::now();
+    CHECK_THROWS_AS(rw.call("run", {{"kind", "hang"}}, {{"input", "float32", {1}, in.data(), 4}}, {},
+                            [&] { return cancel.load(); }),
+                    CancelledError);
+    CHECK(std::chrono::steady_clock::now() - t0 < std::chrono::seconds(5));
+    CHECK_FALSE(rw.isOpen());   // the connection is done: nothing waits on it any more
     canceller.join();
 }
 

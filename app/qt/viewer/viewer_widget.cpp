@@ -650,11 +650,21 @@ namespace sirius::app {
         key(QKeySequence(Qt::Key_P), [this] { wb.setTool(ViewerTool::Probe); });
         key(QKeySequence(Qt::Key_M), [this] { wb.setTool(ViewerTool::Measure); });
         key(QKeySequence(Qt::Key_R), [this] { wb.setTool(ViewerTool::Roi); });
-        key(QKeySequence(Qt::Key_Escape), [this] {
+        // Escape clears the annotations in progress -- unless a run or a
+        // task is active, when the window's Cancel action owns the key: two
+        // live shortcuts on one key are "ambiguous" to Qt and neither fires.
+        auto* escape = new QShortcut(QKeySequence(Qt::Key_Escape), q);
+        escape->setContext(Qt::WidgetWithChildrenShortcut);
+        QObject::connect(escape, &QShortcut::activated, q, [this] {
             measure.clear();
             roi = QRectF();
             pushAnnotations();
         });
+        auto armEscape = [this, escape] { escape->setEnabled(!bridge.running() && !bridge.taskRunning()); };
+        QObject::connect(&bridge, &WorkbenchBridge::runStateChanged, q, armEscape);
+        QObject::connect(&bridge, &WorkbenchBridge::taskStarted, q, armEscape);
+        QObject::connect(&bridge, &WorkbenchBridge::taskFinished, q, armEscape);
+        armEscape();
         key(QKeySequence(Qt::Key_BracketLeft), [this] {
             ViewState s = vs();
             s.brushPx = std::max(viewer::kBrushMinPx, s.brushPx - viewer::kBrushStepPx);
@@ -843,6 +853,7 @@ namespace sirius::app {
         // While a run holds the pipeline the workbench refuses label edits
         // (Workbench::canEdit): the paint tools go with it.
         QObject::connect(&bridge, &WorkbenchBridge::runStarted, q, [this] {
+            if (painting) wb.endPaintStroke();
             painting = false;
             refreshChrome();
         });
@@ -1626,6 +1637,9 @@ namespace sirius::app {
 
     void ViewerWidget::Impl::paintAt(const QPointF& v, bool erase) {
         if (!model.valid()) return;
+        // a drag that leaves the image stops painting instead of stamping
+        // along the border row or column
+        if (!xy->inside(v)) return;
         const Index x = clampIndex(v.x(), nx()), y = clampIndex(v.y(), ny());
         wb.paintLabels(curZ(), y, x, erase);
     }
@@ -1666,6 +1680,8 @@ namespace sirius::app {
                     case PaintTool::Brush:
                     case PaintTool::Erase:
                     case PaintTool::Lasso:
+                        // one stroke, one undo entry: opened here, closed on release
+                        wb.beginPaintStroke();
                         painting = true;
                         lastPaint = v;
                         paintAt(v, erase);
@@ -1766,6 +1782,7 @@ namespace sirius::app {
             roi = QRectF();
             pushAnnotations();
         }
+        if (painting) wb.endPaintStroke();
         painting = false;
     }
 

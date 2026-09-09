@@ -176,6 +176,9 @@ namespace {
         {"classic_holes_3d", "classic", {{"channel", 0}, {"method", "Otsu"}, {"sigma", 0.0}, {"opening", 0}, {"fill_holes", false}, {"fill_holes_3d", true}, {"post", "Connected components"}, {"min_voxels", 2}}},
         {"classic_expand", "classic", {{"channel", 0}, {"method", "Otsu"}, {"sigma", 0.0}, {"opening", 0}, {"fill_holes", false}, {"post", "Connected components"}, {"min_voxels", 2}, {"expand", 2.0}}},
         {"classic_rolling_ball", "classic", {{"channel", 0}, {"background", "Rolling ball"}, {"tophat", 4}, {"method", "Otsu"}, {"sigma", 0.0}, {"opening", 0}, {"fill_holes", false}, {"post", "Connected components"}, {"min_voxels", 2}}},
+        // radius 25: the ball runs on a 3x decimated copy (lround(2.5) = 3,
+        // where Python's round would say 2) -- the radius the presets use
+        {"classic_rolling_ball_25", "classic", {{"channel", 0}, {"background", "Rolling ball"}, {"tophat", 25}, {"method", "Otsu"}, {"sigma", 0.0}, {"opening", 0}, {"fill_holes", false}, {"post", "Connected components"}, {"min_voxels", 2}}},
         {"classic_skeleton", "classic", {{"channel", 0}, {"method", "Otsu"}, {"sigma", 0.0}, {"opening", 0}, {"fill_holes", false}, {"post", "Connected components"}, {"min_voxels", 2}, {"skeleton", true}}},
         // No "Anisotropic diffusion" case: every step of it evaluates exp(),
         // and the C++ standard library and NumPy do not agree in the last bit.

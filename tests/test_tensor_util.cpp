@@ -132,3 +132,13 @@ TEST_CASE("roll works for any scalar type", "[tensor_util][roll]") {
     REQUIRE(out(2) == std::complex<double>(2, -2));
     REQUIRE(out(3) == std::complex<double>(3, -3));
 }
+
+TEST_CASE("roll of an empty tensor is empty, not a division by zero", "[tensor_util][roll]") {
+    Eigen::Tensor<double, 2, Eigen::RowMajor> empty(0, 4);
+    const auto out = sirius::roll(empty, std::array<int, 2>{1, 1});
+    CHECK(out.size() == 0);
+    CHECK(out.dimension(0) == 0);
+    CHECK(out.dimension(1) == 4);
+    Eigen::Tensor<float, 1, Eigen::RowMajor> none(0);
+    CHECK(sirius::roll(none, std::array<int, 1>{3}).size() == 0);
+}

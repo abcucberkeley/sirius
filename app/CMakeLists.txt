@@ -42,6 +42,12 @@ add_executable(sirius-app WIN32 MACOSX_BUNDLE
     qt/resources/resources.qrc)
 target_include_directories(sirius-app PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
 target_link_libraries(sirius-app PRIVATE sirius::app_core sirius::qt)
+# The process code page is UTF-8 (see the manifest): the core opens files by
+# their UTF-8 bytes through the narrow Win32 APIs. The linker merges .manifest
+# sources into the executable's manifest.
+if(MSVC)
+    target_sources(sirius-app PRIVATE qt/resources/sirius-app.manifest)
+endif()
 # crypt32: DPAPI (CryptProtectData) behind qt/secret_store.cpp
 if(WIN32)
     target_link_libraries(sirius-app PRIVATE crypt32)

@@ -443,7 +443,7 @@ namespace sirius::simdetail {
 
             ~CudaSimBackend() override {
                 if (scratch_) {
-                    cuda::DeviceGuard g(device_.index);
+                    cuda::DeviceGuardNoThrow g(device_.index);
                     (void)cudaFree(scratch_);
                 }
             }

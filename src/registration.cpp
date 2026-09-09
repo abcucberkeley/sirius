@@ -185,6 +185,13 @@ namespace sirius {
 
         static std::vector<int> planDims(const std::array<Index, 3>& pad) {
             std::vector<int> dims;
+            // FFTW's batched planner takes the per-transform stride as an
+            // int, and the batch is kPlanes transforms of product(pad)
+            // samples: refuse here, with the size, before the plan is built.
+            if (product(pad) > static_cast<Index>(std::numeric_limits<int>::max()) / kPlanes)
+                throw std::invalid_argument("MaskedCorrelator: padded transform of " + std::to_string(product(pad)) +
+                                            " voxels exceeds what the FFT planner can address; "
+                                            "correlate smaller sub-volumes");
             // Drop leading singleton axes so a 2D correlation plans a 2D
             // transform instead of a depth-1 3D one.
             const int first = pad[0] > 1 ? 0 : (pad[1] > 1 ? 1 : 2);
@@ -208,16 +215,7 @@ namespace sirius {
               real(Shape{kPlanes * realN}),
               spec(Shape{kPlanes * cplxN}),
               denom(Shape{product(corrExt)}),
-              rowMax(static_cast<std::size_t>(corrExt[0] * corrExt[1])) {
-            // FFTW's batched planner takes the per-transform stride as an int,
-            // and the batch is kPlanes transforms of realN samples. Fail here
-            // with the size rather than silently overflowing inside the plan.
-            if (realN > static_cast<Index>(std::numeric_limits<int>::max()))
-                throw std::invalid_argument("MaskedCorrelator: padded transform of " +
-                                            std::to_string(realN) +
-                                            " voxels exceeds what the FFT planner can address; "
-                                            "correlate smaller sub-volumes");
-        }
+              rowMax(static_cast<std::size_t>(corrExt[0] * corrExt[1])) {}
 
         // Turn the six inverse-transform planes into the correlation map and
         // the overlap count over the cropped region only.

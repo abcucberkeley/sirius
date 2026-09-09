@@ -62,6 +62,12 @@ namespace sirius::app {
         // Replace everything but keep the Load step's parameters when `keepLoad`.
         void replaceSteps(std::vector<Step> steps, bool keepLoad);
 
+        // The id the next added step gets, and a floor for it: a pipeline
+        // rebuilt from a snapshot (undo) must not hand out the ids of steps
+        // the snapshot no longer holds -- their cached outputs still exist.
+        StepId peekNextId() const noexcept { return nextId_; }
+        void reserveIds(StepId next) noexcept { nextId_ = std::max(nextId_, next); }
+
         nlohmann::json toJson() const;
         static Pipeline fromJson(const nlohmann::json& j);
         // TOML on disk (".sirius.toml").

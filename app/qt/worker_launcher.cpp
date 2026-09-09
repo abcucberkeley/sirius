@@ -41,10 +41,17 @@ namespace sirius::app {
             QProcessEnvironment env = QProcessEnvironment::systemEnvironment();
             const QString hfToken = secrets::read(QStringLiteral("hub/token")).trimmed();
             if (!hfToken.isEmpty() && !env.contains(QStringLiteral("HF_TOKEN"))) env.insert(QStringLiteral("HF_TOKEN"), hfToken);
+            // The shared secret goes through the environment: a command line
+            // is readable by every user of the machine (ps, /proc), the
+            // environment of a process only by its owner.
+            env.insert(QStringLiteral("SIRIUS_TOKEN"), cfg.token);
             process_->setProcessEnvironment(env);
+            // --exit-with-parent: the worker holds our end of its stdin pipe
+            // and stops when it closes, so a crash here leaves no orphan
+            // holding the GPU.
             QStringList args{QStringLiteral("-m"), QStringLiteral("sirius_worker"), QStringLiteral("--host"),
                              QStringLiteral("127.0.0.1"), QStringLiteral("--port"), QStringLiteral("0"),
-                             QStringLiteral("--token"), cfg.token, QStringLiteral("--device"), cfg.device,
+                             QStringLiteral("--device"), cfg.device, QStringLiteral("--exit-with-parent"),
                              QStringLiteral("--allow-install")};   // the model hub may install packages
             {
                 std::lock_guard<std::mutex> g(launcher_.mutex_);

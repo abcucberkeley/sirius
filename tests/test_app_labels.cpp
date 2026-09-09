@@ -343,10 +343,16 @@ TEST_CASE("LabelVolume statistics and review flags", "[app][labels]") {
         vol.stats()[0].reviewed = true;
         vol.stats()[0].cls = "nucleus";
         CHECK(vol.reviewedCount() == 1);
+        const double confidence = vol.statsOf(1)->confidence;
+        REQUIRE(confidence < 1.0);   // it came from the probabilities above
         vol.recomputeStats(0);
         CHECK(vol.statsOf(1)->reviewed);
         CHECK(vol.statsOf(1)->cls == "nucleus");
-        CHECK(vol.statsOf(1)->confidence == 1.0);   // no probabilities this time
+        // no probabilities this time: the known label keeps the confidence
+        // the segmentation gave it (cleanup, crop and tracking recompute
+        // without probabilities, and used to report every label as 1.0)
+        CHECK(vol.statsOf(1)->confidence == confidence);
+        CHECK(vol.flaggedCount("low conf") == 1);
     }
     SECTION("distance seeds mark one seed per object") {
         std::vector<std::uint8_t> mask(static_cast<std::size_t>(vol.volumeSize()));
@@ -965,4 +971,26 @@ TEST_CASE("Thinning leaves a one voxel centreline with the same topology", "[app
         std::vector<std::uint8_t> none(static_cast<std::size_t>(z * y * x), 0);
         CHECK(skeletonize3D(none.data(), z, y, x) == 0);
     }
+}
+
+TEST_CASE("dropSmall drops without renumbering, removeSmall renumbers", "[app][labels]") {
+    std::vector<std::uint32_t> v{0, 5, 5, 5, 9, 9, 0, 7, 0, 5};
+    std::vector<std::uint32_t> w = v;
+    CHECK(dropSmall(v.data(), static_cast<Index>(v.size()), 2) == 2);
+    CHECK(v == std::vector<std::uint32_t>{0, 5, 5, 5, 9, 9, 0, 0, 0, 5});
+    CHECK(removeSmall(w.data(), static_cast<Index>(w.size()), 2) == 2);
+    CHECK(w == std::vector<std::uint32_t>{0, 1, 1, 1, 2, 2, 0, 0, 0, 1});
+    CHECK(dropSmall(v.data(), static_cast<Index>(v.size()), 0) == 2);   // nothing to drop
+    CHECK(v == std::vector<std::uint32_t>{0, 5, 5, 5, 9, 9, 0, 0, 0, 5});
+}
+
+TEST_CASE("The 256-bin histogram puts a bin's centre where valueOf says", "[app][labels][threshold]") {
+    // two values only: the cut of every histogram threshold lies between them
+    // and, with equal bins over [lo, hi], nearer neither end than the binning
+    // bias put it before (255 bins of width but 256 in the centre formula)
+    std::vector<float> values(1000, 0.0f);
+    for (std::size_t i = 0; i < values.size(); i += 2) values[i] = 1.0f;
+    const float t = isodataThreshold(values.data(), static_cast<Index>(values.size()));
+    CHECK(t > 0.3f);
+    CHECK(t < 0.7f);
 }

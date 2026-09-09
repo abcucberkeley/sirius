@@ -25,6 +25,32 @@ namespace sirius::cuda {
         }
     }
 
+    // The same for destructors, which must not throw: during process
+    // teardown (a static, a Python module global at interpreter exit) the
+    // runtime answers cudaErrorCudartUnloading, and a throwing destructor is
+    // std::terminate. A failed switch is ignored; the release that follows
+    // then fails quietly too.
+    class DeviceGuardNoThrow {
+    public:
+        explicit DeviceGuardNoThrow(int index) noexcept {
+            if (cudaGetDevice(&previous_) != cudaSuccess) {
+                (void)cudaGetLastError();
+                return;
+            }
+            if (previous_ != index && cudaSetDevice(index) == cudaSuccess) changed_ = true;
+            else (void)cudaGetLastError();
+        }
+        ~DeviceGuardNoThrow() {
+            if (changed_) (void)cudaSetDevice(previous_);
+        }
+        DeviceGuardNoThrow(const DeviceGuardNoThrow&) = delete;
+        DeviceGuardNoThrow& operator=(const DeviceGuardNoThrow&) = delete;
+
+    private:
+        int previous_ = 0;
+        bool changed_ = false;
+    };
+
     // RAII cudaSetDevice; restores the previous current device on scope exit
     // so library calls never leak a device change into caller code.
     class DeviceGuard {

@@ -10,6 +10,8 @@ namespace sirius::app {
     void SessionLog::start(const std::filesystem::path& path, nlohmann::json header) {
         std::lock_guard<std::mutex> g(mutex_);
         if (out_.is_open()) {
+            // the previous recording ends the way stop() ends it
+            write({{"event", "stopped"}, {"events", lines_}});
             out_.flush();
             out_.close();
         }
