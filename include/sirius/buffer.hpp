@@ -17,6 +17,13 @@
 #include "sirius/checked_math.hpp"
 #include "sirius/device.hpp"
 
+// A function both the host and the CUDA kernels call (convertScalar below).
+#ifdef __CUDACC__
+#define SIRIUS_HOST_DEVICE __host__ __device__
+#else
+#define SIRIUS_HOST_DEVICE
+#endif
+
 // Buffer<T>: owning, contiguous, row-major, typed storage on a Device.
 // BufferView<T>: non-owning pointer + Shape + Device, the currency algorithms
 // accept so they don't care who owns the memory (a Buffer, an Eigen tensor, a
@@ -37,23 +44,28 @@
 namespace sirius {
 
     namespace detail {
+        // The integer target's range, as class-static constexpr values: a
+        // constexpr scalar's value may be read from device code, a call to
+        // std::numeric_limits<T>::max() (a host constexpr function) may not.
+        template <typename To>
+        struct IntegerBounds {
+            static constexpr To lo = std::numeric_limits<To>::lowest();
+            static constexpr To hi = std::numeric_limits<To>::max();
+        };
+
         // The scalar conversion behind convert(): a floating value that does
         // not fit the integer target saturates, NaN becomes 0 -- on the CPU
         // and on the GPU alike (a plain static_cast is undefined behaviour on
         // the host and a saturating cvt instruction on the device).
         template <typename To, typename From>
-#ifdef __CUDACC__
-        __host__ __device__
-#endif
-            inline To
-            convertScalar(From v) noexcept {
+        SIRIUS_HOST_DEVICE inline To convertScalar(From v) noexcept {
             if constexpr (std::is_floating_point_v<From> && std::is_integral_v<To>) {
                 if (v != v) return To{0};
                 // the bounds as From so the comparison is exact for every To
-                constexpr From lo = static_cast<From>(std::numeric_limits<To>::lowest());
-                constexpr From hi = static_cast<From>(std::numeric_limits<To>::max());
-                if (v <= lo) return std::numeric_limits<To>::lowest();
-                if (v >= hi) return std::numeric_limits<To>::max();
+                constexpr From lo = static_cast<From>(IntegerBounds<To>::lo);
+                constexpr From hi = static_cast<From>(IntegerBounds<To>::hi);
+                if (v <= lo) return IntegerBounds<To>::lo;
+                if (v >= hi) return IntegerBounds<To>::hi;
                 return static_cast<To>(v);
             } else {
                 return static_cast<To>(v);

@@ -4,6 +4,8 @@
 
 #include <cstring>
 
+#include "sirius/buffer.hpp"   // detail::convertScalar
+
 namespace sirius::cuda {
 
     namespace {
@@ -29,7 +31,7 @@ namespace sirius::cuda {
         __global__ void convertKernel(const From* __restrict__ src, To* __restrict__ dst, std::size_t n) {
             for (std::size_t i = blockIdx.x * (std::size_t)blockDim.x + threadIdx.x; i < n;
                  i += (std::size_t)gridDim.x * blockDim.x)
-                dst[i] = detail::convertScalar<To>(src[i]);
+                dst[i] = sirius::detail::convertScalar<To>(src[i]);   // sirius::cuda has a detail namespace of its own
         }
 
         __global__ void scaleKernel(cuDoubleComplex* __restrict__ p, std::size_t n, double s) {
