@@ -55,7 +55,10 @@ namespace sirius::app {
                 mn = std::min(mn, v);
                 mx = std::max(mx, v);
             }
-            if (!(mn <= mx)) { mn = 0.0f; mx = 1.0f; }
+            if (!(mn <= mx)) {
+                mn = 0.0f;
+                mx = 1.0f;
+            }
             if (mx <= mn) mx = mn + 1.0f;
             w.dataMin = mn;
             w.dataMax = mx;
@@ -109,10 +112,8 @@ namespace sirius::app {
                     doubleParam("min", "Min", 0.0).withHelp("Values at or below map to 0"),
                     doubleParam("max", "Max", 0.0).withHelp("Values at or above map to 1; max <= min means automatic (the percentiles)"),
                     doubleParam("gamma", "Gamma", 1.0).range(0.1, 5.0, 0.05, 2),
-                    doubleParam("lo_percentile", "Auto low percentile", 0.2).range(0.0, 50.0, 0.1, 2).withUnit("%")
-                        .withHelp("Auto sets Min to this percentile of the input").asAdvanced(),
-                    doubleParam("hi_percentile", "Auto high percentile", 99.8).range(50.0, 100.0, 0.1, 2).withUnit("%")
-                        .withHelp("Auto sets Max to this percentile of the input").asAdvanced(),
+                    doubleParam("lo_percentile", "Auto low percentile", 0.2).range(0.0, 50.0, 0.1, 2).withUnit("%").withHelp("Auto sets Min to this percentile of the input").asAdvanced(),
+                    doubleParam("hi_percentile", "Auto high percentile", 99.8).range(50.0, 100.0, 0.1, 2).withUnit("%").withHelp("Auto sets Max to this percentile of the input").asAdvanced(),
                     boolParam("bake", "Bake into data", true)
                         .withHelp("The step rewrites intensities into 0..1; kept for future display-only use")
                         .asAdvanced(),
@@ -227,7 +228,10 @@ namespace sirius::app {
             lo = std::min(lo, w.lo);
             hi = std::max(hi, w.hi);
         }
-        if (!(lo < hi)) { lo = 0.0f; hi = 1.0f; }
+        if (!(lo < hi)) {
+            lo = 0.0f;
+            hi = 1.0f;
+        }
         p.set("min", static_cast<double>(lo));
         p.set("max", static_cast<double>(hi));
         return p;
@@ -241,7 +245,10 @@ namespace sirius::app {
             mn = std::min(mn, w.dataMin);
             mx = std::max(mx, w.dataMax);
         }
-        if (!(mn < mx)) { mn = 0.0f; mx = 1.0f; }
+        if (!(mn < mx)) {
+            mn = 0.0f;
+            mx = 1.0f;
+        }
         p.set("min", static_cast<double>(mn));
         p.set("max", static_cast<double>(mx));
         p.set("gamma", 1.0);

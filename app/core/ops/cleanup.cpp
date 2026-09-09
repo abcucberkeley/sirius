@@ -27,8 +27,7 @@ namespace sirius::app {
                     boolParam("remove_border", "Remove border-touching", false),
                     boolParam("relabel", "Relabel densely", true),
                     doubleParam("low_conf", "Low-confidence flag", 0.6).range(0.0, 1.0, 0.05, 2),
-                    doubleParam("size_outlier_factor", "Size outlier factor", 4.0).range(1.0, 100.0, 0.5, 1)
-                        .withHelp("Objects larger than this × the median volume are flagged as possible merges"),
+                    doubleParam("size_outlier_factor", "Size outlier factor", 4.0).range(1.0, 100.0, 0.5, 1).withHelp("Objects larger than this × the median volume are flagged as possible merges"),
                 };
             }
 

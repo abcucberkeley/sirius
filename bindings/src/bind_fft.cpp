@@ -84,7 +84,7 @@ namespace {
         void execute(BufferView<const Cplx> in, BufferView<Cplx> out, bool forward, bool normalize) const {
             nb::gil_scoped_release release;
             if (forward) fft_.fft(in, out);
-            else         fft_.ifft(in, out, normalize);
+            else fft_.ifft(in, out, normalize);
             // Device work runs on the legacy default stream; make sure it is
             // complete before Python -- or a framework stream we know nothing
             // about -- reads the result.
@@ -110,25 +110,25 @@ namespace {
 
 void bind_fft(nb::module_& m) {
     nb::enum_<PlanRigor>(m, "PlanRigor",
-            "Planning rigor for FFTW. Trades one-time planning cost for "
-            "runtime speed (no effect on cuFFT plans).")
-        .value("Estimate",   PlanRigor::Estimate)
-        .value("Measure",    PlanRigor::Measure)
-        .value("Patient",    PlanRigor::Patient)
+                         "Planning rigor for FFTW. Trades one-time planning cost for "
+                         "runtime speed (no effect on cuFFT plans).")
+        .value("Estimate", PlanRigor::Estimate)
+        .value("Measure", PlanRigor::Measure)
+        .value("Patient", PlanRigor::Patient)
         .value("Exhaustive", PlanRigor::Exhaustive)
         .export_values();
 
     nb::class_<PyFFT>(m, "FFT",
-            "Planned complex128 FFT: 1D, 2D and 3D transforms, batched via `howmany`, on the "
-            "CPU (FFTW) or a CUDA device (cuFFT). Arrays must be C-contiguous complex128 on the "
-            "plan's device: numpy for 'cpu'; sirius.Buffer, torch or cupy (anything exporting "
-            "DLPack) for 'cuda'. Both `fft` and `ifft` come in allocating and in-place variants:\n\n"
-            "    f = FFT([8, 8])\n"
-            "    y = f.fft(x)              # new array, shape matches x\n"
-            "    f.fft(x, out=y)           # no allocation; out=x transforms in place\n"
-            "    x_back = f.ifft(y, normalize=True)\n\n"
-            "    g = FFT([8, 8], device='cuda')\n"
-            "    gy = g.fft(torch_tensor)  # sirius.Buffer on the GPU (torch.from_dlpack adopts it)\n")
+                      "Planned complex128 FFT: 1D, 2D and 3D transforms, batched via `howmany`, on the "
+                      "CPU (FFTW) or a CUDA device (cuFFT). Arrays must be C-contiguous complex128 on the "
+                      "plan's device: numpy for 'cpu'; sirius.Buffer, torch or cupy (anything exporting "
+                      "DLPack) for 'cuda'. Both `fft` and `ifft` come in allocating and in-place variants:\n\n"
+                      "    f = FFT([8, 8])\n"
+                      "    y = f.fft(x)              # new array, shape matches x\n"
+                      "    f.fft(x, out=y)           # no allocation; out=x transforms in place\n"
+                      "    x_back = f.ifft(y, normalize=True)\n\n"
+                      "    g = FFT([8, 8], device='cuda')\n"
+                      "    gy = g.fft(torch_tensor)  # sirius.Buffer on the GPU (torch.from_dlpack adopts it)\n")
         .def(nb::init<std::vector<int>, int, PlanRigor, Device>(),
              nb::arg("dims"),
              nb::arg("howmany") = 1,

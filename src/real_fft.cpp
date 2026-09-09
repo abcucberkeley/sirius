@@ -62,7 +62,7 @@ namespace sirius {
 
         bool isAlignedForPlan(const void* ptr, int plan_alignment) {
             return RealFftwTraits::alignmentOf(
-                reinterpret_cast<double*>(const_cast<void*>(ptr))) == plan_alignment;
+                       reinterpret_cast<double*>(const_cast<void*>(ptr))) == plan_alignment;
         }
 
         class FftwRealBackend final : public detail::RealFftBackend {

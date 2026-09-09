@@ -234,10 +234,7 @@ TEST_CASE("Gap closing follows a chain of missed frames, not just the first link
     CHECK(r.tracks[0].last() == 4);
 
     SECTION("a chain of three gaps closes as one track too") {
-        const std::vector<std::vector<TrackObject>> six{{object(1, 0, 0, 0)}, {},
-                                                        {object(1, 0, 0, 0)}, {},
-                                                        {object(1, 0, 0, 0)}, {},
-                                                        {object(1, 0, 0, 0)}};
+        const std::vector<std::vector<TrackObject>> six{{object(1, 0, 0, 0)}, {}, {object(1, 0, 0, 0)}, {}, {object(1, 0, 0, 0)}, {}, {object(1, 0, 0, 0)}};
         const TrackResult chain = linkTracks(six, {}, voxel, options);
         REQUIRE(chain.tracks.size() == 1);
         CHECK(chain.gapsClosed == 3);

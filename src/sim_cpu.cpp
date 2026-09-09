@@ -21,12 +21,12 @@ namespace sirius::simdetail {
     namespace cpu {
 
         void scaleShift(double* data, IndexT n, double sub, double mul) {
-            #pragma omp parallel for schedule(static)
+#pragma omp parallel for schedule(static)
             for (IndexT i = 0; i < n; ++i) data[i] = (data[i] - sub) * mul;
         }
 
         void planeSums(const double* data, IndexT nplanes, IndexT planeElems, double* sums) {
-            #pragma omp parallel for schedule(static)
+#pragma omp parallel for schedule(static)
             for (IndexT p = 0; p < nplanes; ++p) {
                 const double* s = data + p * planeElems;
                 double acc = 0.0;
@@ -36,7 +36,7 @@ namespace sirius::simdetail {
         }
 
         void scalePlanes(double* data, IndexT nplanes, IndexT planeElems, const double* factors) {
-            #pragma omp parallel for schedule(static)
+#pragma omp parallel for schedule(static)
             for (IndexT p = 0; p < nplanes; ++p) {
                 double* s = data + p * planeElems;
                 const double f = factors[p];
@@ -68,13 +68,13 @@ namespace sirius::simdetail {
                 fact[static_cast<std::size_t>(i)] =
                     1.0 - std::sin((static_cast<double>(i) + 0.5) / napodize * kPi * 0.5);
 
-            #pragma omp parallel
+#pragma omp parallel
             {
                 // per-thread scratch: the top/bottom difference of every column,
                 // read from the untouched edge rows before any row is modified
                 std::vector<double> diff(static_cast<std::size_t>(nx));
 
-                #pragma omp for schedule(static)
+#pragma omp for schedule(static)
                 for (IndexT s = 0; s < nsec; ++s) {
                     double* img = data + s * ny * nx;
 
@@ -116,7 +116,7 @@ namespace sirius::simdetail {
                 xf[static_cast<std::size_t>(k)] = std::sin(kPi * (static_cast<double>(k) + 0.5) / nx);
             for (IndexT l = 0; l < ny; ++l)
                 yf[static_cast<std::size_t>(l)] = std::sin(kPi * (static_cast<double>(l) + 0.5) / ny);
-            #pragma omp parallel for schedule(static)
+#pragma omp parallel for schedule(static)
             for (IndexT s = 0; s < nsec; ++s) {
                 double* img = data + s * ny * nx;
                 for (IndexT l = 0; l < ny; ++l) {
@@ -135,7 +135,7 @@ namespace sirius::simdetail {
             // runs over contiguous voxels, which vectorizes. Summation order
             // per voxel (p ascending) matches the naive formulation.
             constexpr IndexT kBlock = 512;
-            #pragma omp parallel for schedule(static)
+#pragma omp parallel for schedule(static)
             for (IndexT i0 = 0; i0 < n; i0 += kBlock) {
                 const IndexT len = std::min(kBlock, n - i0);
                 for (int b = 0; b < nbands; ++b) {
@@ -164,13 +164,13 @@ namespace sirius::simdetail {
                                IndexT ndirs, IndexT nphases, IndexT nz,
                                IndexT planeElems, bool fastSi) override {
                 const IndexT nplanes = ndirs * nphases * nz;
-                #pragma omp parallel for schedule(static)
+#pragma omp parallel for schedule(static)
                 for (IndexT dst = 0; dst < nplanes; ++dst) {
                     const IndexT z = dst % nz;
                     const IndexT ph = (dst / nz) % nphases;
                     const IndexT d = dst / (nz * nphases);
                     const IndexT src = fastSi ? (z * ndirs + d) * nphases + ph
-                                             : (d * nz + z) * nphases + ph;
+                                              : (d * nz + z) * nphases + ph;
                     std::memcpy(frames + dst * planeElems, raw + src * planeElems,
                                 static_cast<std::size_t>(planeElems) * sizeof(double));
                 }
@@ -210,7 +210,7 @@ namespace sirius::simdetail {
                               Cd* ov0, Cd* ov1, int zdistcutoff) override {
                 const IndexT nzc = 2 * static_cast<IndexT>(zdistcutoff) + 1;
                 const IndexT rows = nzc * c.ny;
-                #pragma omp parallel for schedule(static)
+#pragma omp parallel for schedule(static)
                 for (IndexT r = 0; r < rows; ++r) {
                     const IndexT zs = r / c.ny - zdistcutoff;
                     const IndexT iy = r % c.ny;
@@ -227,7 +227,7 @@ namespace sirius::simdetail {
             void crossCorrelate(const Cd* ov0, const Cd* ov1, Cd* plane,
                                 IndexT nz, IndexT ny, IndexT nx) override {
                 const IndexT sec = ny * nx;
-                #pragma omp parallel for schedule(static)
+#pragma omp parallel for schedule(static)
                 for (IndexT i = 0; i < sec; ++i) {
                     Cd acc = cd(0, 0);
                     for (IndexT z = 0; z < nz; ++z)
@@ -252,10 +252,12 @@ namespace sirius::simdetail {
                 constexpr IndexT kBlock = 1024;
                 const IndexT sec = ny * nx;
                 const IndexT nblocks = (sec + kBlock - 1) / kBlock;
-                struct Partial { double xyRe, xyIm, sumX, sumY; };
+                struct Partial {
+                    double xyRe, xyIm, sumX, sumY;
+                };
                 std::vector<Partial> partials(static_cast<std::size_t>(nblocks));
 
-                #pragma omp parallel for schedule(static)
+#pragma omp parallel for schedule(static)
                 for (IndexT b = 0; b < nblocks; ++b) {
                     const IndexT begin = b * kBlock;
                     const IndexT end = std::min(begin + kBlock, sec);
@@ -284,8 +286,10 @@ namespace sirius::simdetail {
                 ModampSums s;
                 double xyRe = 0, xyIm = 0, sumX = 0, sumY = 0;
                 for (const Partial& p : partials) {
-                    xyRe += p.xyRe; xyIm += p.xyIm;
-                    sumX += p.sumX; sumY += p.sumY;
+                    xyRe += p.xyRe;
+                    xyIm += p.xyIm;
+                    sumX += p.sumX;
+                    sumY += p.sumY;
                 }
                 s.xy = cd(xyRe, xyIm);
                 s.sumX = sumX;
@@ -305,7 +309,7 @@ namespace sirius::simdetail {
 
                     // pass 1: stored (kx >= 0) half, scales the plus component
                     const IndexT rows = nzc * c.ny;
-                    #pragma omp parallel for schedule(static)
+#pragma omp parallel for schedule(static)
                     for (IndexT r = 0; r < rows; ++r) {
                         const IndexT z0 = r / c.ny - zdo;
                         const IndexT y1 = r % c.ny - c.ny / 2;
@@ -328,7 +332,7 @@ namespace sirius::simdetail {
                     // pass 2: mirrored (kx < 0) coordinates, scales the minus
                     // component through the values pass 1 wrote
                     if (order != 0) {
-                        #pragma omp parallel for schedule(static)
+#pragma omp parallel for schedule(static)
                         for (IndexT r = 0; r < rows; ++r) {
                             const IndexT z0 = r / c.ny - zdo;
                             const IndexT y1 = r % c.ny - c.ny / 2;
@@ -348,7 +352,7 @@ namespace sirius::simdetail {
                     // zero the |kz| planes beyond the axial support (kernel3)
                     if (c.nz - zdo > zdo + 1) {
                         const IndexT plane = c.ny * c.nxh;
-                        #pragma omp parallel for schedule(static)
+#pragma omp parallel for schedule(static)
                         for (IndexT z = zdo + 1; z < c.nz - zdo; ++z) {
                             for (IndexT i = 0; i < plane; ++i) {
                                 bre[z * plane + i] = cd(0, 0);
@@ -362,7 +366,7 @@ namespace sirius::simdetail {
             void moveBand(const MoveCtx& c, const Cd* bandRe, const Cd* bandIm,
                           Cd* big) override {
                 const IndexT rows = c.nz * c.ny;
-                #pragma omp parallel for schedule(static)
+#pragma omp parallel for schedule(static)
                 for (IndexT r = 0; r < rows; ++r) {
                     const IndexT zi = r / c.ny;
                     const IndexT yi = r % c.ny;
@@ -375,7 +379,7 @@ namespace sirius::simdetail {
                             double angleX, double angleY,
                             IndexT zdim, IndexT ydim, IndexT xdim) override {
                 const IndexT rows = zdim * ydim;
-                #pragma omp parallel for schedule(static)
+#pragma omp parallel for schedule(static)
                 for (IndexT r = 0; r < rows; ++r) {
                     const IndexT iy = r % ydim;
                     double* dst = out + r * xdim;

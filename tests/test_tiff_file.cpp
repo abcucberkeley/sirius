@@ -27,7 +27,9 @@ namespace {
         ~TempFile() { std::remove(path.c_str()); }
     };
 
-    struct TiffDeleter { void operator()(TIFF* t) const { TIFFClose(t); } };
+    struct TiffDeleter {
+        void operator()(TIFF* t) const { TIFFClose(t); }
+    };
     using TiffPtr = std::unique_ptr<TIFF, TiffDeleter>;
 
     Device gpuOrSkip() {
@@ -60,18 +62,18 @@ namespace {
     };
 
     void setCommonTags(TIFF* tif, const Image<uint16_t>& img, bool tiled, uint16_t compression, bool reduced) {
-        TIFFSetField(tif, TIFFTAG_IMAGEWIDTH,      static_cast<uint32_t>(img.dimension(1)));
-        TIFFSetField(tif, TIFFTAG_IMAGELENGTH,     static_cast<uint32_t>(img.dimension(0)));
-        TIFFSetField(tif, TIFFTAG_BITSPERSAMPLE,   16);
+        TIFFSetField(tif, TIFFTAG_IMAGEWIDTH, static_cast<uint32_t>(img.dimension(1)));
+        TIFFSetField(tif, TIFFTAG_IMAGELENGTH, static_cast<uint32_t>(img.dimension(0)));
+        TIFFSetField(tif, TIFFTAG_BITSPERSAMPLE, 16);
         TIFFSetField(tif, TIFFTAG_SAMPLESPERPIXEL, 1);
-        TIFFSetField(tif, TIFFTAG_SAMPLEFORMAT,    SAMPLEFORMAT_UINT);
-        TIFFSetField(tif, TIFFTAG_PHOTOMETRIC,     PHOTOMETRIC_MINISBLACK);
-        TIFFSetField(tif, TIFFTAG_PLANARCONFIG,    PLANARCONFIG_CONTIG);
-        TIFFSetField(tif, TIFFTAG_COMPRESSION,     compression);
+        TIFFSetField(tif, TIFFTAG_SAMPLEFORMAT, SAMPLEFORMAT_UINT);
+        TIFFSetField(tif, TIFFTAG_PHOTOMETRIC, PHOTOMETRIC_MINISBLACK);
+        TIFFSetField(tif, TIFFTAG_PLANARCONFIG, PLANARCONFIG_CONTIG);
+        TIFFSetField(tif, TIFFTAG_COMPRESSION, compression);
         if (compression != COMPRESSION_NONE) TIFFSetField(tif, TIFFTAG_PREDICTOR, PREDICTOR_HORIZONTAL);
-        TIFFSetField(tif, TIFFTAG_SUBFILETYPE,     reduced ? FILETYPE_REDUCEDIMAGE : 0);
+        TIFFSetField(tif, TIFFTAG_SUBFILETYPE, reduced ? FILETYPE_REDUCEDIMAGE : 0);
         if (tiled) {
-            TIFFSetField(tif, TIFFTAG_TILEWIDTH,  16);
+            TIFFSetField(tif, TIFFTAG_TILEWIDTH, 16);
             TIFFSetField(tif, TIFFTAG_TILELENGTH, 16);
         } else {
             TIFFSetField(tif, TIFFTAG_ROWSPERSTRIP, 8);
@@ -129,7 +131,7 @@ namespace {
             for (Eigen::Index c = 0; c < expected.dimension(1); ++c) {
                 if (t(page, r, c) != static_cast<T>(expected(r, c))) {
                     FAIL("mismatch at page " << page << " (" << r << "," << c << "): got " << +t(page, r, c)
-                         << " expected " << expected(r, c));
+                                             << " expected " << expected(r, c));
                 }
             }
     }

@@ -462,7 +462,7 @@ namespace sirius::app {
         void updateAskToggle() {
             askToggle->setText(QStringLiteral("<a href=\"toggle\" style=\"color:%1; text-decoration:none\">%2</a>")
                                    .arg(theme::hex(theme::kAccent), settings.askBeforeActing ? QStringLiteral("Ask before acting ✓")
-                                                                                              : QStringLiteral("Ask before acting")));
+                                                                                             : QStringLiteral("Ask before acting")));
         }
     };
 

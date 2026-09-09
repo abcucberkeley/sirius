@@ -24,10 +24,8 @@ namespace sirius::app {
                 info_.separableOverT = true;
                 info_.helpPage = "flatfield";
                 info_.params = {
-                    pathParam("flat", "Flat image").withFilter("TIFF (*.tif *.tiff);;All files (*)")
-                        .withHelp("Illumination profile; one page, or one page per channel"),
-                    pathParam("dark", "Dark image").withFilter("TIFF (*.tif *.tiff);;All files (*)")
-                        .withHelp("Camera offset (optional)"),
+                    pathParam("flat", "Flat image").withFilter("TIFF (*.tif *.tiff);;All files (*)").withHelp("Illumination profile; one page, or one page per channel"),
+                    pathParam("dark", "Dark image").withFilter("TIFF (*.tif *.tiff);;All files (*)").withHelp("Camera offset (optional)"),
                 };
             }
 

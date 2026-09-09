@@ -153,7 +153,10 @@ namespace sirius {
 
         Buffer(Buffer&& other) noexcept { swap(other); }
         Buffer& operator=(Buffer&& other) noexcept {
-            if (this != &other) { reset(); swap(other); }
+            if (this != &other) {
+                reset();
+                swap(other);
+            }
             return *this;
         }
         Buffer(const Buffer&) = delete;
@@ -208,12 +211,12 @@ namespace sirius {
     // --- untyped primitives (implemented in buffer.cpp) ---------------------
     namespace detail {
         void* allocateBytes(std::size_t bytes, Device device, HostMemory host, const Stream& stream);
-        void  deallocateBytes(void* p, Device device, HostMemory host) noexcept;
+        void deallocateBytes(void* p, Device device, HostMemory host) noexcept;
         // Any src/dst device combination. Asynchronous on CUDA streams when
         // both sides are device or pinned memory.
-        void  copyBytes(const void* src, Device srcDevice, void* dst, Device dstDevice,
-                        std::size_t bytes, const Stream& stream);
-        void  memsetBytes(void* dst, Device device, int value, std::size_t bytes, const Stream& stream);
+        void copyBytes(const void* src, Device srcDevice, void* dst, Device dstDevice,
+                       std::size_t bytes, const Stream& stream);
+        void memsetBytes(void* dst, Device device, int value, std::size_t bytes, const Stream& stream);
         // Every rank / extent mismatch in the library funnels through here
         // and arrives as a sirius::ShapeError (sirius/errors.hpp).
         [[noreturn]] void throwShapeMismatch(const char* what, const Shape& a, const Shape& b);

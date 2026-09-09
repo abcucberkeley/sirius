@@ -43,7 +43,7 @@ namespace {
             if (a.data()[i] != b.data()[i]) return false;
         return true;
     }
-}
+} // namespace
 
 // -----------------------------------------------------------------------
 // roll - 1D against numpy.roll
@@ -88,8 +88,8 @@ TEST_CASE("roll 2D shifts each axis independently", "[tensor_util][roll]") {
                            {8, 9, 10, 11}});
     const auto out = sirius::roll(in, std::array<int, 2>{1, 2});
     const auto expected = mat2d({{10, 11, 8, 9},
-                                 { 2,  3, 0, 1},
-                                 { 6,  7, 4, 5}});
+                                 {2, 3, 0, 1},
+                                 {6, 7, 4, 5}});
     REQUIRE(exact_equal(out, expected));
 }
 

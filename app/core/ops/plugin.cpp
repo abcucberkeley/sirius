@@ -187,26 +187,18 @@ namespace sirius::app {
                         if (info_.needsLabels && input.labels && !input.labels->empty()) {
                             const Index n = input.labels->volumeSize();
                             labelCopy.assign(input.labels->volume(t), input.labels->volume(t) + n);
-                            refs.push_back({"labels", "uint32", {1, input.labels->z(), input.labels->y(), input.labels->x()},
-                                            labelCopy.data(), labelCopy.size() * sizeof(std::uint32_t)});
+                            refs.push_back({"labels", "uint32", {1, input.labels->z(), input.labels->y(), input.labels->x()}, labelCopy.data(), labelCopy.size() * sizeof(std::uint32_t)});
                         }
                         const double base = static_cast<double>(t) / d.t, span = 1.0 / d.t;
-                        const WorkerResult r = ctx.remote->call("run", request, refs,
-                                                                [&](double f, const std::string& m) { ctx.report(base + span * f, m); },
-                                                                [&] { return ctx.isCancelled(); });
+                        const WorkerResult r = ctx.remote->call("run", request, refs, [&](double f, const std::string& m) { ctx.report(base + span * f, m); }, [&] { return ctx.isCancelled(); });
                         receive(r, t, d.t);
                     }
                 } else {
                     ArrayPtr arr = input.materialize([&](double f, const std::string& m) { ctx.report(0.2 * f, m); });
                     refs.push_back({"input", "float32", {d.c, d.t, d.z, d.y, d.x}, arr->data(), arr->bytes()});
                     if (info_.needsLabels && input.labels && !input.labels->empty())
-                        refs.push_back({"labels", "uint32",
-                                        {input.labels->t(), input.labels->z(), input.labels->y(), input.labels->x()},
-                                        input.labels->volume(0),
-                                        static_cast<std::size_t>(input.labels->t() * input.labels->volumeSize()) * sizeof(std::uint32_t)});
-                    const WorkerResult r = ctx.remote->call("run", request, refs,
-                                                            [&](double f, const std::string& m) { ctx.report(0.2 + 0.8 * f, m); },
-                                                            [&] { return ctx.isCancelled(); });
+                        refs.push_back({"labels", "uint32", {input.labels->t(), input.labels->z(), input.labels->y(), input.labels->x()}, input.labels->volume(0), static_cast<std::size_t>(input.labels->t() * input.labels->volumeSize()) * sizeof(std::uint32_t)});
+                    const WorkerResult r = ctx.remote->call("run", request, refs, [&](double f, const std::string& m) { ctx.report(0.2 + 0.8 * f, m); }, [&] { return ctx.isCancelled(); });
                     receive(r, 0, 1);
                 }
 
@@ -260,7 +252,9 @@ namespace sirius::app {
                             ch.label = c.value("label", "");
                             ch.wavelengthNm = c.value("wavelength_nm", 0.0);
                             if (c.contains("color") && c["color"].is_string()) {
-                                try { ch.color = colorFromHex(c["color"].get<std::string>()); } catch (const std::exception&) {}
+                                try {
+                                    ch.color = colorFromHex(c["color"].get<std::string>());
+                                } catch (const std::exception&) {}
                             }
                         }
                         chans.push_back(ch);

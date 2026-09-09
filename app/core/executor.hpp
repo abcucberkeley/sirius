@@ -31,7 +31,11 @@ namespace sirius::app {
     struct StepReport {
         // Running is only ever seen by the onStep callback, before the step
         // starts; the reports collected by run() hold the other states.
-        enum class State { Running, Ran, Cached, Skipped, Failed };
+        enum class State { Running,
+                           Ran,
+                           Cached,
+                           Skipped,
+                           Failed };
         StepId id = 0;
         int index = -1;
         State state = State::Running;

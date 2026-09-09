@@ -231,9 +231,21 @@ namespace sirius::app {
                 for (const auto& [k, v] : *t) out[std::string(k.str())] = tomlToJson(v);
                 return out;
             }
-            if (const auto* d = n.as_date()) { std::ostringstream ss; ss << *d; return ss.str(); }
-            if (const auto* t = n.as_time()) { std::ostringstream ss; ss << *t; return ss.str(); }
-            if (const auto* dt = n.as_date_time()) { std::ostringstream ss; ss << *dt; return ss.str(); }
+            if (const auto* d = n.as_date()) {
+                std::ostringstream ss;
+                ss << *d;
+                return ss.str();
+            }
+            if (const auto* t = n.as_time()) {
+                std::ostringstream ss;
+                ss << *t;
+                return ss.str();
+            }
+            if (const auto* dt = n.as_date_time()) {
+                std::ostringstream ss;
+                ss << *dt;
+                return ss.str();
+            }
             return json();
         }
     } // namespace
@@ -247,7 +259,8 @@ namespace sirius::app {
         root.insert("steps", steps);
         std::ofstream out(path);
         if (!out) throw std::runtime_error("cannot write pipeline file: " + path);
-        out << "# SIRIUS pipeline\n" << root << "\n";
+        out << "# SIRIUS pipeline\n"
+            << root << "\n";
     }
 
     Pipeline Pipeline::load(const std::string& path) {
@@ -267,11 +280,13 @@ namespace sirius::app {
               "import numpy as np\n"
               "import sirius\n"
               "from sirius.workbench import run_pipeline\n\n"
-              "DATASET = " << json(datasetPath).dump() << "\n"
-              "PIPELINE = json.loads(r'''" << toJson().dump(2) << "''')\n\n"
-              "if __name__ == '__main__':\n"
-              "    result, meta = run_pipeline(DATASET, PIPELINE)\n"
-              "    print('result', result.shape, meta)\n";
+              "DATASET = "
+           << json(datasetPath).dump() << "\n"
+                                          "PIPELINE = json.loads(r'''"
+           << toJson().dump(2) << "''')\n\n"
+                                  "if __name__ == '__main__':\n"
+                                  "    result, meta = run_pipeline(DATASET, PIPELINE)\n"
+                                  "    print('result', result.shape, meta)\n";
         return py.str();
     }
 

@@ -22,9 +22,13 @@ namespace sirius {
 
     std::size_t bytesPerPixel(PixelType t) noexcept {
         switch (t) {
-            case PixelType::UInt8:   case PixelType::Int8:  return 1;
-            case PixelType::UInt16:  case PixelType::Int16: return 2;
-            case PixelType::UInt32:  case PixelType::Int32: case PixelType::Float32: return 4;
+            case PixelType::UInt8:
+            case PixelType::Int8: return 1;
+            case PixelType::UInt16:
+            case PixelType::Int16: return 2;
+            case PixelType::UInt32:
+            case PixelType::Int32:
+            case PixelType::Float32: return 4;
             case PixelType::Float64: return 8;
         }
         return 0;
@@ -32,12 +36,12 @@ namespace sirius {
 
     const char* toString(PixelType t) noexcept {
         switch (t) {
-            case PixelType::UInt8:   return "uint8";
-            case PixelType::Int8:    return "int8";
-            case PixelType::UInt16:  return "uint16";
-            case PixelType::Int16:   return "int16";
-            case PixelType::UInt32:  return "uint32";
-            case PixelType::Int32:   return "int32";
+            case PixelType::UInt8: return "uint8";
+            case PixelType::Int8: return "int8";
+            case PixelType::UInt16: return "uint16";
+            case PixelType::Int16: return "int16";
+            case PixelType::UInt32: return "uint32";
+            case PixelType::Int32: return "int32";
             case PixelType::Float32: return "float32";
             case PixelType::Float64: return "float64";
         }
@@ -84,12 +88,12 @@ namespace sirius {
                     if (bps == 64) return PixelType::Float64;
                     throw IoError("Unsupported float bit depth: " + std::to_string(bps));
                 case SAMPLEFORMAT_INT:
-                    if (bps == 8)  return PixelType::Int8;
+                    if (bps == 8) return PixelType::Int8;
                     if (bps == 16) return PixelType::Int16;
                     if (bps == 32) return PixelType::Int32;
                     throw IoError("Unsupported integer bit depth: " + std::to_string(bps));
                 default: // SAMPLEFORMAT_UINT and the (common) unspecified case
-                    if (bps == 8)  return PixelType::UInt8;
+                    if (bps == 8) return PixelType::UInt8;
                     if (bps == 16) return PixelType::UInt16;
                     if (bps == 32) return PixelType::UInt32;
                     throw IoError("Unsupported integer bit depth: " + std::to_string(bps));
@@ -103,21 +107,21 @@ namespace sirius {
 
             uint16_t bps = 0, fmt = SAMPLEFORMAT_UINT, planar = PLANARCONFIG_CONTIG;
             uint32_t subfileType = 0;
-            if (!TIFFGetField(tif, TIFFTAG_IMAGEWIDTH,    &info.width))
+            if (!TIFFGetField(tif, TIFFTAG_IMAGEWIDTH, &info.width))
                 throw IoError("TIFF missing required tag: IMAGEWIDTH");
-            if (!TIFFGetField(tif, TIFFTAG_IMAGELENGTH,   &info.height))
+            if (!TIFFGetField(tif, TIFFTAG_IMAGELENGTH, &info.height))
                 throw IoError("TIFF missing required tag: IMAGELENGTH");
             if (!TIFFGetField(tif, TIFFTAG_BITSPERSAMPLE, &bps))
                 throw IoError("TIFF missing required tag: BITSPERSAMPLE");
             TIFFGetFieldDefaulted(tif, TIFFTAG_SAMPLESPERPIXEL, &info.samplesPerPixel);
-            TIFFGetFieldDefaulted(tif, TIFFTAG_SAMPLEFORMAT,    &fmt);
-            TIFFGetFieldDefaulted(tif, TIFFTAG_COMPRESSION,     &info.compression);
+            TIFFGetFieldDefaulted(tif, TIFFTAG_SAMPLEFORMAT, &fmt);
+            TIFFGetFieldDefaulted(tif, TIFFTAG_COMPRESSION, &info.compression);
             // The predictor tag only exists for codecs that register it
             // (LZW/Deflate/...); for others libtiff reports nothing.
             if (!TIFFGetField(tif, TIFFTAG_PREDICTOR, &info.predictor) || info.predictor == 0)
                 info.predictor = 1;
-            TIFFGetFieldDefaulted(tif, TIFFTAG_PLANARCONFIG,    &planar);
-            TIFFGetFieldDefaulted(tif, TIFFTAG_SUBFILETYPE,     &subfileType);
+            TIFFGetFieldDefaulted(tif, TIFFTAG_PLANARCONFIG, &planar);
+            TIFFGetFieldDefaulted(tif, TIFFTAG_SUBFILETYPE, &subfileType);
 
             if (info.samplesPerPixel != 1)
                 throw IoError("Only single-channel (grayscale) TIFFs are supported.");
@@ -127,7 +131,7 @@ namespace sirius {
 
             if (TIFFIsTiled(tif)) {
                 info.layout = TiffLayout::Tiles;
-                if (!TIFFGetField(tif, TIFFTAG_TILEWIDTH,  &info.tileWidth)  || info.tileWidth == 0)
+                if (!TIFFGetField(tif, TIFFTAG_TILEWIDTH, &info.tileWidth) || info.tileWidth == 0)
                     throw IoError("TIFF missing or invalid TILEWIDTH");
                 if (!TIFFGetField(tif, TIFFTAG_TILELENGTH, &info.tileHeight) || info.tileHeight == 0)
                     throw IoError("TIFF missing or invalid TILELENGTH");
@@ -162,15 +166,15 @@ namespace sirius {
         template <typename T>
         constexpr uint16_t sampleFormat() {
             if constexpr (std::is_floating_point_v<T>) return SAMPLEFORMAT_IEEEFP;
-            else if constexpr (std::is_unsigned_v<T>)  return SAMPLEFORMAT_UINT;
+            else if constexpr (std::is_unsigned_v<T>) return SAMPLEFORMAT_UINT;
             else return SAMPLEFORMAT_INT;
         }
 
         uint16_t mapCompression(TiffCompression comp) {
-            switch(comp) {
-                case TiffCompression::Lzw:     return COMPRESSION_LZW;
+            switch (comp) {
+                case TiffCompression::Lzw: return COMPRESSION_LZW;
                 case TiffCompression::Deflate: return COMPRESSION_ADOBE_DEFLATE;
-                default:                       return COMPRESSION_NONE;
+                default: return COMPRESSION_NONE;
             }
         }
 
@@ -183,7 +187,7 @@ namespace sirius {
 
         [[noreturn]] void throwReadError(const char* what, uint32_t x, uint32_t y) {
             throw IoError(std::string("Failed to read TIFF ") + what + " at (" +
-                         std::to_string(x) + "," + std::to_string(y) + ")");
+                          std::to_string(x) + "," + std::to_string(y) + ")");
         }
 
         // Strips are full-width, so a strip whose wanted rows begin at its own
@@ -233,7 +237,7 @@ namespace sirius {
         void readTilesRegion(TIFF* tif, const TiffImageInfo& g, const Region& r, uint8_t* dst,
                              std::vector<uint8_t>& scratch) {
             uint32_t tileW = 0, tileH = 0;
-            if (!TIFFGetField(tif, TIFFTAG_TILEWIDTH,  &tileW) || tileW == 0)
+            if (!TIFFGetField(tif, TIFFTAG_TILEWIDTH, &tileW) || tileW == 0)
                 throw IoError("TIFF missing or invalid TILEWIDTH");
             if (!TIFFGetField(tif, TIFFTAG_TILELENGTH, &tileH) || tileH == 0)
                 throw IoError("TIFF missing or invalid TILELENGTH");
@@ -264,7 +268,7 @@ namespace sirius {
         void readRegionRaw(TIFF* tif, const TiffImageInfo& g, const Region& r, uint8_t* dst,
                            std::vector<uint8_t>& scratch) {
             if (TIFFIsTiled(tif)) readTilesRegion(tif, g, r, dst, scratch);
-            else                  readStripsRegion(tif, g, r, dst, scratch);
+            else readStripsRegion(tif, g, r, dst, scratch);
         }
 
         // ------------------------------------------------------------------
@@ -352,7 +356,7 @@ namespace sirius {
                                         src + static_cast<std::size_t>(ty + r) * width + tx, cols * sizeof(T));
                         if (TIFFWriteTile(tif, scratch.data(), tx, ty, 0, 0) < 0)
                             throw IoError("Failed to write TIFF tile at (" + std::to_string(tx) + "," +
-                                         std::to_string(ty) + ")");
+                                          std::to_string(ty) + ")");
                     }
             } else {
                 uint32_t rps = 0;
@@ -422,7 +426,7 @@ namespace sirius {
                     writePixels<T>(tif.get(), srcLevel, lr, lc, scratch);
                     if (!TIFFWriteDirectory(tif.get()))
                         throw IoError("Failed to finalize TIFF pyramid level " + std::to_string(k) +
-                                     " of page " + std::to_string(z));
+                                      " of page " + std::to_string(z));
                 }
                 if (o.progress) o.progress(static_cast<double>(z + 1) / static_cast<double>(pages));
             }
@@ -475,7 +479,7 @@ namespace sirius {
                                     ") lies outside a " + std::to_string(imageWidth) + "x" +
                                     std::to_string(imageHeight) + " image");
         Region r = *this;
-        if (r.width == 0)  r.width  = imageWidth - x;
+        if (r.width == 0) r.width = imageWidth - x;
         if (r.height == 0) r.height = imageHeight - y;
         if (static_cast<std::uint64_t>(x) + r.width > imageWidth ||
             static_cast<std::uint64_t>(y) + r.height > imageHeight)
@@ -534,10 +538,18 @@ namespace sirius {
             bool complete = true;
             for (std::uint64_t pageOff : info.pages) {
                 const auto& p = info.image(pageOff);
-                if (p.subIfds.size() <= k) { complete = false; break; }
+                if (p.subIfds.size() <= k) {
+                    complete = false;
+                    break;
+                }
                 const auto& sub = info.image(p.subIfds[k]);
-                if (level.ifds.empty()) { level.width = sub.width; level.height = sub.height; }
-                else if (sub.width != level.width || sub.height != level.height) { complete = false; break; }
+                if (level.ifds.empty()) {
+                    level.width = sub.width;
+                    level.height = sub.height;
+                } else if (sub.width != level.width || sub.height != level.height) {
+                    complete = false;
+                    break;
+                }
                 level.ifds.push_back(sub.ifdOffset);
             }
             if (!complete || level.ifds.empty()) break;
@@ -578,25 +590,25 @@ namespace sirius {
                 using From = decltype(fromTag);
                 BufferView<const From> s(static_cast<const From*>(src), shape, device);
                 switch (dstType) {
-                    case PixelType::UInt8:   convert<From, std::uint8_t >(s, BufferView<std::uint8_t >(static_cast<std::uint8_t *>(dst), shape, device), stream); break;
-                    case PixelType::Int8:    convert<From, std::int8_t  >(s, BufferView<std::int8_t  >(static_cast<std::int8_t  *>(dst), shape, device), stream); break;
-                    case PixelType::UInt16:  convert<From, std::uint16_t>(s, BufferView<std::uint16_t>(static_cast<std::uint16_t*>(dst), shape, device), stream); break;
-                    case PixelType::Int16:   convert<From, std::int16_t >(s, BufferView<std::int16_t >(static_cast<std::int16_t *>(dst), shape, device), stream); break;
-                    case PixelType::UInt32:  convert<From, std::uint32_t>(s, BufferView<std::uint32_t>(static_cast<std::uint32_t*>(dst), shape, device), stream); break;
-                    case PixelType::Int32:   convert<From, std::int32_t >(s, BufferView<std::int32_t >(static_cast<std::int32_t *>(dst), shape, device), stream); break;
-                    case PixelType::Float32: convert<From, float        >(s, BufferView<float        >(static_cast<float        *>(dst), shape, device), stream); break;
-                    case PixelType::Float64: convert<From, double       >(s, BufferView<double       >(static_cast<double       *>(dst), shape, device), stream); break;
+                    case PixelType::UInt8: convert<From, std::uint8_t>(s, BufferView<std::uint8_t>(static_cast<std::uint8_t*>(dst), shape, device), stream); break;
+                    case PixelType::Int8: convert<From, std::int8_t>(s, BufferView<std::int8_t>(static_cast<std::int8_t*>(dst), shape, device), stream); break;
+                    case PixelType::UInt16: convert<From, std::uint16_t>(s, BufferView<std::uint16_t>(static_cast<std::uint16_t*>(dst), shape, device), stream); break;
+                    case PixelType::Int16: convert<From, std::int16_t>(s, BufferView<std::int16_t>(static_cast<std::int16_t*>(dst), shape, device), stream); break;
+                    case PixelType::UInt32: convert<From, std::uint32_t>(s, BufferView<std::uint32_t>(static_cast<std::uint32_t*>(dst), shape, device), stream); break;
+                    case PixelType::Int32: convert<From, std::int32_t>(s, BufferView<std::int32_t>(static_cast<std::int32_t*>(dst), shape, device), stream); break;
+                    case PixelType::Float32: convert<From, float>(s, BufferView<float>(static_cast<float*>(dst), shape, device), stream); break;
+                    case PixelType::Float64: convert<From, double>(s, BufferView<double>(static_cast<double*>(dst), shape, device), stream); break;
                 }
             };
             switch (srcType) {
-                case PixelType::UInt8:   toAll(std::uint8_t{});  break;
-                case PixelType::Int8:    toAll(std::int8_t{});   break;
-                case PixelType::UInt16:  toAll(std::uint16_t{}); break;
-                case PixelType::Int16:   toAll(std::int16_t{});  break;
-                case PixelType::UInt32:  toAll(std::uint32_t{}); break;
-                case PixelType::Int32:   toAll(std::int32_t{});  break;
-                case PixelType::Float32: toAll(float{});         break;
-                case PixelType::Float64: toAll(double{});        break;
+                case PixelType::UInt8: toAll(std::uint8_t{}); break;
+                case PixelType::Int8: toAll(std::int8_t{}); break;
+                case PixelType::UInt16: toAll(std::uint16_t{}); break;
+                case PixelType::Int16: toAll(std::int16_t{}); break;
+                case PixelType::UInt32: toAll(std::uint32_t{}); break;
+                case PixelType::Int32: toAll(std::int32_t{}); break;
+                case PixelType::Float32: toAll(float{}); break;
+                case PixelType::Float64: toAll(double{}); break;
             }
         }
 
@@ -618,7 +630,7 @@ namespace sirius {
             std::exception_ptr ex;
             std::atomic<bool> failed{false};
 
-            #pragma omp parallel
+#pragma omp parallel
             {
                 TiffPtr localTif;
                 bool openOk = false;
@@ -626,21 +638,23 @@ namespace sirius {
                     localTif = openTiff(path, "r");
                     openOk = true;
                 } catch (...) {
-                    #pragma omp critical
-                    { if (!ex) ex = std::current_exception(); }
+#pragma omp critical
+                    {
+                        if (!ex) ex = std::current_exception();
+                    }
                     failed.store(true, std::memory_order_relaxed);
                 }
 
                 std::vector<std::uint8_t> scratch;      // one strip / tile
                 std::vector<std::uint8_t> nativePage;   // conversion path only
 
-                #pragma omp for schedule(dynamic, 4)
+#pragma omp for schedule(dynamic, 4)
                 for (std::ptrdiff_t z = 0; z < n; ++z) {
                     if (failed.load(std::memory_order_relaxed) || !openOk) continue;
                     try {
                         if (!TIFFSetSubDirectory(localTif.get(), ifds[static_cast<std::size_t>(z)]))
                             throw IoError("Failed to seek to TIFF directory at offset " +
-                                         std::to_string(ifds[static_cast<std::size_t>(z)]));
+                                          std::to_string(ifds[static_cast<std::size_t>(z)]));
                         std::uint8_t* out = dst + static_cast<std::size_t>(z) * dstPageBytes;
                         if (needConvert) {
                             nativePage.resize(nativePageBytes);
@@ -651,8 +665,10 @@ namespace sirius {
                             readRegionRaw(localTif.get(), g, r, out, scratch);
                         }
                     } catch (...) {
-                        #pragma omp critical
-                        { if (!ex) ex = std::current_exception(); }
+#pragma omp critical
+                        {
+                            if (!ex) ex = std::current_exception();
+                        }
                         failed.store(true, std::memory_order_relaxed);
                     }
                 }
@@ -772,10 +788,10 @@ namespace sirius {
             const auto& i = info.image(off);
             if (i.width != g.width || i.height != g.height || i.pixelType != g.pixelType)
                 throw IoError("TIFF image at offset " + std::to_string(off) + " (" +
-                             std::to_string(i.width) + "x" + std::to_string(i.height) + " " +
-                             toString(i.pixelType) + ") does not match the first one (" +
-                             std::to_string(g.width) + "x" + std::to_string(g.height) + " " +
-                             toString(g.pixelType) + ")");
+                              std::to_string(i.width) + "x" + std::to_string(i.height) + " " +
+                              toString(i.pixelType) + ") does not match the first one (" +
+                              std::to_string(g.width) + "x" + std::to_string(g.height) + " " +
+                              toString(g.pixelType) + ")");
         }
         const Region r = region.resolve(g.width, g.height);
         const Shape expected{static_cast<Index>(ifds.size()), static_cast<Index>(r.height), static_cast<Index>(r.width)};
@@ -836,14 +852,14 @@ namespace sirius {
     AnyBuffer readTiffAny(const std::string& path, const TiffReadOptions& opts, const Stream& stream) {
         TiffFile file(path);
         switch (file.info().pixelType()) {
-            case PixelType::UInt8:   return file.readStack<std::uint8_t >(opts, stream);
-            case PixelType::Int8:    return file.readStack<std::int8_t  >(opts, stream);
-            case PixelType::UInt16:  return file.readStack<std::uint16_t>(opts, stream);
-            case PixelType::Int16:   return file.readStack<std::int16_t >(opts, stream);
-            case PixelType::UInt32:  return file.readStack<std::uint32_t>(opts, stream);
-            case PixelType::Int32:   return file.readStack<std::int32_t >(opts, stream);
-            case PixelType::Float32: return file.readStack<float        >(opts, stream);
-            case PixelType::Float64: return file.readStack<double       >(opts, stream);
+            case PixelType::UInt8: return file.readStack<std::uint8_t>(opts, stream);
+            case PixelType::Int8: return file.readStack<std::int8_t>(opts, stream);
+            case PixelType::UInt16: return file.readStack<std::uint16_t>(opts, stream);
+            case PixelType::Int16: return file.readStack<std::int16_t>(opts, stream);
+            case PixelType::UInt32: return file.readStack<std::uint32_t>(opts, stream);
+            case PixelType::Int32: return file.readStack<std::int32_t>(opts, stream);
+            case PixelType::Float32: return file.readStack<float>(opts, stream);
+            case PixelType::Float64: return file.readStack<double>(opts, stream);
         }
         throw IoError("Unsupported TIFF format");
     }
@@ -882,12 +898,12 @@ namespace sirius {
             return stack;
         };
         switch (info.pixelType()) {
-            case PixelType::UInt8:   return read(std::uint8_t{});
-            case PixelType::Int8:    return read(std::int8_t{});
-            case PixelType::UInt16:  return read(std::uint16_t{});
-            case PixelType::Int16:   return read(std::int16_t{});
-            case PixelType::UInt32:  return read(std::uint32_t{});
-            case PixelType::Int32:   return read(std::int32_t{});
+            case PixelType::UInt8: return read(std::uint8_t{});
+            case PixelType::Int8: return read(std::int8_t{});
+            case PixelType::UInt16: return read(std::uint16_t{});
+            case PixelType::Int16: return read(std::int16_t{});
+            case PixelType::UInt32: return read(std::uint32_t{});
+            case PixelType::Int32: return read(std::int32_t{});
             case PixelType::Float32: return read(float{});
             case PixelType::Float64: return read(double{});
         }
@@ -954,19 +970,19 @@ namespace sirius {
     }
 
     // Explicit instantiations for every supported pixel type.
-#define SIRIUS_TIFF_INSTANTIATE(T)                                                                         \
-    template void TiffFile::decode<T>(const std::vector<std::uint64_t>&, Region, BufferView<T>,             \
-                                      const TiffReadOptions&, const Stream&) const;                         \
-    template Buffer<T> TiffFile::readStack<T>(const TiffReadOptions&, const Stream&) const;                 \
+#define SIRIUS_TIFF_INSTANTIATE(T)                                                                                    \
+    template void TiffFile::decode<T>(const std::vector<std::uint64_t>&, Region, BufferView<T>,                       \
+                                      const TiffReadOptions&, const Stream&) const;                                   \
+    template Buffer<T> TiffFile::readStack<T>(const TiffReadOptions&, const Stream&) const;                           \
     template Buffer<T> TiffFile::readPages<T>(std::size_t, std::size_t, const TiffReadOptions&, const Stream&) const; \
-    template Buffer<T> TiffFile::readLevel<T>(std::size_t, const TiffReadOptions&, const Stream&) const;    \
-    template Buffer<T> TiffFile::readRegion<T>(Region, std::size_t, const TiffReadOptions&, const Stream&) const; \
-    template Image<T> readTiff<T>(const std::string&);                                                      \
-    template ImageStack<T> readTiffStack<T>(const std::string&);                                            \
-    template void writeTiff<T>(const std::string&, BufferView<const T>, TiffCompression);                   \
-    template void writeTiff<T>(const std::string&, const Image<T>&, TiffCompression);                       \
-    template void writeTiffStack<T>(const std::string&, BufferView<const T>, TiffCompression);              \
-    template void writeTiffStack<T>(const std::string&, BufferView<const T>, const TiffWriteOptions&);      \
+    template Buffer<T> TiffFile::readLevel<T>(std::size_t, const TiffReadOptions&, const Stream&) const;              \
+    template Buffer<T> TiffFile::readRegion<T>(Region, std::size_t, const TiffReadOptions&, const Stream&) const;     \
+    template Image<T> readTiff<T>(const std::string&);                                                                \
+    template ImageStack<T> readTiffStack<T>(const std::string&);                                                      \
+    template void writeTiff<T>(const std::string&, BufferView<const T>, TiffCompression);                             \
+    template void writeTiff<T>(const std::string&, const Image<T>&, TiffCompression);                                 \
+    template void writeTiffStack<T>(const std::string&, BufferView<const T>, TiffCompression);                        \
+    template void writeTiffStack<T>(const std::string&, BufferView<const T>, const TiffWriteOptions&);                \
     template void writeTiffStack<T>(const std::string&, const ImageStack<T>&, TiffCompression);
 
     SIRIUS_TIFF_INSTANTIATE(std::uint8_t)

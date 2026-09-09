@@ -40,7 +40,7 @@ namespace {
         for (Index i = 0; i < b.size(); ++i) b.data()[i] = static_cast<T>(i);
         return b;
     }
-}
+} // namespace
 
 // -----------------------------------------------------------------------
 // Shape
@@ -187,7 +187,8 @@ TEST_CASE("convert casts between pixel types on the host", "[buffer]") {
 
     SECTION("narrowing conversions follow static_cast") {
         Buffer<double> d(Shape{2});
-        d.data()[0] = 3.9; d.data()[1] = -2.5;
+        d.data()[0] = 3.9;
+        d.data()[1] = -2.5;
         Buffer<std::int8_t> i8(Shape{2});
         convert(d, i8);
         REQUIRE(i8.data()[0] == 3);
@@ -387,7 +388,6 @@ TEST_CASE("Device buffers round-trip through the GPU", "[buffer][cuda]") {
         Buffer<std::uint16_t> dev = toDevice(host, gpu);
         REQUIRE_THROWS_AS((asTensor<std::uint16_t, 3>(dev.view())), std::runtime_error);
     }
-
 }
 
 TEST_CASE("A stream on another device is rejected", "[buffer][cuda][multigpu]") {

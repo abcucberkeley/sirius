@@ -45,10 +45,18 @@ namespace sirius {
 
         // Plane indices, both in the padded real buffer before the forward
         // transform and (for the products) after the inverse transform.
-        enum Fwd { kFixed = 0, kRotMoving = 1, kFixedMask = 2, kRotMovingMask = 3,
-                   kFixedSq = 4, kRotMovingSq = 5 };
-        enum Inv { kOverlap = 0, kMaskCorrFixed = 1, kMaskCorrMoving = 2,
-                   kCorr = 3, kFixedDenom = 4, kMovingDenom = 5 };
+        enum Fwd { kFixed = 0,
+                   kRotMoving = 1,
+                   kFixedMask = 2,
+                   kRotMovingMask = 3,
+                   kFixedSq = 4,
+                   kRotMovingSq = 5 };
+        enum Inv { kOverlap = 0,
+                   kMaskCorrFixed = 1,
+                   kMaskCorrMoving = 2,
+                   kCorr = 3,
+                   kFixedDenom = 4,
+                   kMovingDenom = 5 };
 
         // The two enums index the same storage; comparing them directly is
         // an -Wenum-compare warning, so spell the intent out.
@@ -60,7 +68,7 @@ namespace sirius {
                 case 3: return {s[0], s[1], s[2]};
                 default:
                     throw std::invalid_argument(std::string(what) + ": expected a rank-2 (rows, cols) or "
-                                                "rank-3 (depth, rows, cols) view, got rank " +
+                                                                    "rank-3 (depth, rows, cols) view, got rank " +
                                                 std::to_string(s.rank()));
             }
         }
@@ -68,7 +76,8 @@ namespace sirius {
         void requireHost(Device d, const char* what) {
             if (!d.isCpu())
                 throw std::invalid_argument(std::string(what) + ": masked registration runs on the host, "
-                                            "but the view lives on " + toString(d));
+                                                                "but the view lives on " +
+                                            toString(d));
         }
 
         Index product(const std::array<Index, 3>& e) { return e[0] * e[1] * e[2]; }
@@ -81,7 +90,7 @@ namespace sirius {
         void packPlanes(const T* src, const std::uint8_t* mask, const std::array<Index, 3>& e,
                         const std::array<Index, 3>& pad, double* img, double* msk, double* sq) {
             const Index rows = e[0] * e[1];
-            #pragma omp parallel for schedule(static)
+#pragma omp parallel for schedule(static)
             for (Index r = 0; r < rows; ++r) {
                 const Index z = r / e[1];
                 const Index y = r % e[1];
@@ -128,7 +137,7 @@ namespace sirius {
                               sameSlot(kFixedDenom, kFixedSq) && sameSlot(kMovingDenom, kRotMovingSq),
                           "the in-place product below assumes this slot mapping");
 
-            #pragma omp parallel for schedule(static)
+#pragma omp parallel for schedule(static)
             for (Index i = 0; i < n; ++i) {
                 const Cplx a0 = s0[i], a1 = s1[i], a2 = s2[i], a3 = s3[i], a4 = s4[i], a5 = s5[i];
                 s0[i] = mul(a3, a2);          // kOverlap:        overlapping unmasked voxels
@@ -227,7 +236,7 @@ namespace sirius {
             // Per-row maxima combined serially afterwards. `reduction(max:)`
             // would need OpenMP 3.1, which MSVC does not offer by default, and
             // a per-row array keeps the combination order fixed as well.
-            #pragma omp parallel for schedule(static)
+#pragma omp parallel for schedule(static)
             for (Index r = 0; r < rows; ++r) {
                 const Index z = r / corrExt[1];
                 const Index y = r % corrExt[1];
@@ -260,7 +269,7 @@ namespace sirius {
             // (numerically) nothing, which is what this tolerance guards.
             const double tol = 1000.0 * kEps * maxDen;
             const Index n = product(corrExt);
-            #pragma omp parallel for schedule(static)
+#pragma omp parallel for schedule(static)
             for (Index i = 0; i < n; ++i) {
                 const double d = den[i];
                 const double c = d > tol ? correlation[i] / d : 0.0;
@@ -394,10 +403,13 @@ namespace sirius {
         // the lowest index no matter how the blocks are scheduled.
         constexpr Index kBlock = 4096;
         const Index blocks = (n + kBlock - 1) / kBlock;
-        struct Best { double value; Index index; };
+        struct Best {
+            double value;
+            Index index;
+        };
         std::vector<Best> best(static_cast<std::size_t>(blocks), Best{0.0, -1});
 
-        #pragma omp parallel for schedule(static)
+#pragma omp parallel for schedule(static)
         for (Index b = 0; b < blocks; ++b) {
             Best local{0.0, -1};
             const Index end = std::min((b + 1) * kBlock, n);
@@ -455,16 +467,16 @@ namespace sirius {
     }
 
     // Explicit instantiations: the pixel types tiles actually arrive in.
-#define SIRIUS_INSTANTIATE_REGISTRATION(T)                                                              \
-    template void MaskedCorrelator::correlate<T>(BufferView<const T>, BufferView<const T>,              \
-                                                 BufferView<const std::uint8_t>,                        \
-                                                 BufferView<const std::uint8_t>,                        \
-                                                 BufferView<double>, BufferView<double>);               \
-    template MaskedNccResult maskedNormalizedCrossCorrelation<T>(                                       \
-        BufferView<const T>, BufferView<const T>, BufferView<const std::uint8_t>,                        \
-        BufferView<const std::uint8_t>, const MaskedNccOptions&);                                        \
-    template TranslationResult registerTranslationMasked<T>(                                            \
-        BufferView<const T>, BufferView<const T>, BufferView<const std::uint8_t>,                        \
+#define SIRIUS_INSTANTIATE_REGISTRATION(T)                                                 \
+    template void MaskedCorrelator::correlate<T>(BufferView<const T>, BufferView<const T>, \
+                                                 BufferView<const std::uint8_t>,           \
+                                                 BufferView<const std::uint8_t>,           \
+                                                 BufferView<double>, BufferView<double>);  \
+    template MaskedNccResult maskedNormalizedCrossCorrelation<T>(                          \
+        BufferView<const T>, BufferView<const T>, BufferView<const std::uint8_t>,          \
+        BufferView<const std::uint8_t>, const MaskedNccOptions&);                          \
+    template TranslationResult registerTranslationMasked<T>(                               \
+        BufferView<const T>, BufferView<const T>, BufferView<const std::uint8_t>,          \
         BufferView<const std::uint8_t>, const MaskedNccOptions&);
 
     SIRIUS_INSTANTIATE_REGISTRATION(double)

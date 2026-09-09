@@ -45,7 +45,7 @@ namespace sirius::simdetail {
                 const IndexT ph = (dst / nz) % nphases;
                 const IndexT d = dst / (nz * nphases);
                 const IndexT src = fastSi ? (z * ndirs + d) * nphases + ph
-                                         : (d * nz + z) * nphases + ph;
+                                          : (d * nz + z) * nphases + ph;
                 frames[t] = raw[src * planeElems + pixel];
             }
         }

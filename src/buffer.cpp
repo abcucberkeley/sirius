@@ -256,7 +256,7 @@ namespace sirius {
                 // Large conversions parallelize across cores; the loop
                 // vectorizes on its own for every scalar pair.
                 const auto ni = static_cast<std::ptrdiff_t>(n);
-                #pragma omp parallel for if (ni > (1 << 20)) schedule(static)
+#pragma omp parallel for if (ni > (1 << 20)) schedule(static)
                 for (std::ptrdiff_t i = 0; i < ni; ++i) d[i] = static_cast<To>(s[i]);
             }
             return;
@@ -267,7 +267,8 @@ namespace sirius {
         cuda::DeviceGuard g(src.device().index);
         if constexpr (std::is_same_v<From, To>) {
             cuda::check(cudaMemcpyAsync(dst.data(), src.data(), n * sizeof(To), cudaMemcpyDeviceToDevice,
-                                        cuda::handle(stream)), "cudaMemcpyAsync");
+                                        cuda::handle(stream)),
+                        "cudaMemcpyAsync");
         } else {
             cuda::convertDevice<From, To>(src.data(), dst.data(), n, cuda::handle(stream));
             cuda::check(cudaGetLastError(), "convert kernel launch");
@@ -279,24 +280,26 @@ namespace sirius {
 
     // Explicit instantiations for the supported element types.
 #define SIRIUS_FILL(T) template void fill<T>(BufferView<T>, T, const Stream&);
-    SIRIUS_FILL(std::uint8_t)  SIRIUS_FILL(std::int8_t)
-    SIRIUS_FILL(std::uint16_t) SIRIUS_FILL(std::int16_t)
-    SIRIUS_FILL(std::uint32_t) SIRIUS_FILL(std::int32_t)
-    SIRIUS_FILL(float)         SIRIUS_FILL(double)
-    SIRIUS_FILL(std::complex<float>) SIRIUS_FILL(std::complex<double>)
+    SIRIUS_FILL(std::uint8_t)
+    SIRIUS_FILL(std::int8_t)
+        SIRIUS_FILL(std::uint16_t) SIRIUS_FILL(std::int16_t)
+            SIRIUS_FILL(std::uint32_t) SIRIUS_FILL(std::int32_t)
+                SIRIUS_FILL(float) SIRIUS_FILL(double)
+                    SIRIUS_FILL(std::complex<float>) SIRIUS_FILL(std::complex<double>)
 #undef SIRIUS_FILL
 
 #define SIRIUS_CONVERT_TO(From, To) \
     template void convert<From, To>(BufferView<const From>, BufferView<To>, const Stream&);
-#define SIRIUS_CONVERT_FROM(From) \
-    SIRIUS_CONVERT_TO(From, std::uint8_t)  SIRIUS_CONVERT_TO(From, std::int8_t)  \
-    SIRIUS_CONVERT_TO(From, std::uint16_t) SIRIUS_CONVERT_TO(From, std::int16_t) \
-    SIRIUS_CONVERT_TO(From, std::uint32_t) SIRIUS_CONVERT_TO(From, std::int32_t) \
-    SIRIUS_CONVERT_TO(From, float)         SIRIUS_CONVERT_TO(From, double)
-    SIRIUS_CONVERT_FROM(std::uint8_t)  SIRIUS_CONVERT_FROM(std::int8_t)
-    SIRIUS_CONVERT_FROM(std::uint16_t) SIRIUS_CONVERT_FROM(std::int16_t)
-    SIRIUS_CONVERT_FROM(std::uint32_t) SIRIUS_CONVERT_FROM(std::int32_t)
-    SIRIUS_CONVERT_FROM(float)         SIRIUS_CONVERT_FROM(double)
+#define SIRIUS_CONVERT_FROM(From)                                                        \
+    SIRIUS_CONVERT_TO(From, std::uint8_t)                                                \
+    SIRIUS_CONVERT_TO(From, std::int8_t)                                                 \
+        SIRIUS_CONVERT_TO(From, std::uint16_t) SIRIUS_CONVERT_TO(From, std::int16_t)     \
+            SIRIUS_CONVERT_TO(From, std::uint32_t) SIRIUS_CONVERT_TO(From, std::int32_t) \
+                SIRIUS_CONVERT_TO(From, float) SIRIUS_CONVERT_TO(From, double)
+                        SIRIUS_CONVERT_FROM(std::uint8_t) SIRIUS_CONVERT_FROM(std::int8_t)
+                            SIRIUS_CONVERT_FROM(std::uint16_t) SIRIUS_CONVERT_FROM(std::int16_t)
+                                SIRIUS_CONVERT_FROM(std::uint32_t) SIRIUS_CONVERT_FROM(std::int32_t)
+                                    SIRIUS_CONVERT_FROM(float) SIRIUS_CONVERT_FROM(double)
 #undef SIRIUS_CONVERT_FROM
 #undef SIRIUS_CONVERT_TO
 

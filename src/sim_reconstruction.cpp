@@ -175,7 +175,9 @@ namespace sirius {
             if (nxIn < 4 || nyIn < 4 || nxIn % 2 != 0 || nyIn % 2 != 0)
                 throw std::invalid_argument("SimReconstructor: nx and ny must be even and >= 4, got " +
                                             std::to_string(nxIn) + " x " + std::to_string(nyIn));
-            nx = nxIn; ny = nyIn; nz = nzIn;
+            nx = nxIn;
+            ny = nyIn;
+            nz = nzIn;
             nxh = nx / 2 + 1;
 
             dkx = 1.0 / (static_cast<double>(nx) * p.dx);
@@ -229,8 +231,12 @@ namespace sirius {
 
         simdetail::OverlapCtx overlapCtx(int order1, int order2, double k0x, double k0y) const {
             simdetail::OverlapCtx c{};
-            c.nx = nx; c.ny = ny; c.nz = nz; c.nxh = nxh;
-            c.dkx = dkx; c.dky = dky;
+            c.nx = nx;
+            c.ny = ny;
+            c.nz = nz;
+            c.nxh = nxh;
+            c.dkx = dkx;
+            c.dky = dky;
             c.rdistcutoff = rdistcutoff;
             c.otfcutoff = p.otfcutoff;
             c.order02factor = nz > 1 ? 5.0 : 1.0;
@@ -308,7 +314,10 @@ namespace sirius {
             double bestVal = std::norm(hostPlane[0]);
             for (Index i = 1; i < n; ++i) {
                 const double v = std::norm(hostPlane[static_cast<std::size_t>(i)]);
-                if (v > bestVal) { bestVal = v; best = i; }
+                if (v > bestVal) {
+                    bestVal = v;
+                    best = i;
+                }
             }
             const Index xc = best % nx;
             const Index yc = best / nx;
@@ -357,7 +366,10 @@ namespace sirius {
             double x1 = 0.0;
             if (amp3 > amp2) {
                 while (amp3 > amp2) {
-                    amp1 = amp2; x1 = x2; amp2 = amp3; x2 = x3;
+                    amp1 = amp2;
+                    x1 = x2;
+                    amp2 = amp3;
+                    x2 = x3;
                     angle += deltaangle;
                     x3 = angle;
                     amp3 = getModamp(d, angle, k0mag, fitorder1, fitorder2, false, overlapsValid).amp2;
@@ -367,7 +379,10 @@ namespace sirius {
                 std::swap(amp3, amp2);
                 std::swap(x3, x2);
                 while (amp3 > amp2) {
-                    amp1 = amp2; x1 = x2; amp2 = amp3; x2 = x3;
+                    amp1 = amp2;
+                    x1 = x2;
+                    amp2 = amp3;
+                    x2 = x3;
                     angle -= deltaangle;
                     x3 = angle;
                     amp3 = getModamp(d, angle, k0mag, fitorder1, fitorder2, false, overlapsValid).amp2;
@@ -383,7 +398,10 @@ namespace sirius {
             amp3 = getModamp(d, angle, mag, fitorder1, fitorder2, false, overlapsValid).amp2;
             if (amp3 > amp2) {
                 while (amp3 > amp2) {
-                    amp1 = amp2; x1 = x2; amp2 = amp3; x2 = x3;
+                    amp1 = amp2;
+                    x1 = x2;
+                    amp2 = amp3;
+                    x2 = x3;
                     mag += deltamag;
                     x3 = mag;
                     amp3 = getModamp(d, angle, mag, fitorder1, fitorder2, false, overlapsValid).amp2;
@@ -393,7 +411,10 @@ namespace sirius {
                 std::swap(amp3, amp2);
                 std::swap(x3, x2);
                 while (amp3 > amp2) {
-                    amp1 = amp2; x1 = x2; amp2 = amp3; x2 = x3;
+                    amp1 = amp2;
+                    x1 = x2;
+                    amp2 = amp3;
+                    x2 = x3;
                     mag -= deltamag;
                     x3 = mag;
                     amp3 = getModamp(d, angle, mag, fitorder1, fitorder2, false, overlapsValid).amp2;
@@ -463,9 +484,14 @@ namespace sirius {
             }
 
             simdetail::FilterCtx fc{};
-            fc.nx = nx; fc.ny = ny; fc.nz = nz; fc.nxh = nxh;
-            fc.ndirs = p.ndirs; fc.norders = norders;
-            fc.dkx = dkx; fc.dky = dky;
+            fc.nx = nx;
+            fc.ny = ny;
+            fc.nz = nz;
+            fc.nxh = nxh;
+            fc.ndirs = p.ndirs;
+            fc.norders = norders;
+            fc.dkx = dkx;
+            fc.dky = dky;
             fc.rdistcutoff = rdistcutoff;
             fc.minDkr = std::min(dkx, dky);
             fc.suppRadius = static_cast<double>(p.suppression_radius) * fc.minDkr;
@@ -484,8 +510,13 @@ namespace sirius {
             fc.otf = otfTable;
 
             simdetail::MoveCtx mc{};
-            mc.nx = nx; mc.ny = ny; mc.nz = nz; mc.nxh = nxh;
-            mc.xdim = xdim; mc.ydim = ydim; mc.zdim = zdim;
+            mc.nx = nx;
+            mc.ny = ny;
+            mc.nz = nz;
+            mc.nxh = nxh;
+            mc.xdim = xdim;
+            mc.ydim = ydim;
+            mc.zdim = zdim;
 
             const double fact = p.explodefact / 0.5;
 
@@ -549,8 +580,12 @@ namespace sirius {
                 diag.captured = true;
                 diag.ndirs = p.ndirs;
                 diag.nbands = nbands;
-                diag.nx = nx; diag.ny = ny; diag.nz = nz;
-                diag.dkx = dkx; diag.dky = dky; diag.dkz = dkz;
+                diag.nx = nx;
+                diag.ny = ny;
+                diag.nz = nz;
+                diag.dkx = dkx;
+                diag.dky = dky;
+                diag.dkz = dkz;
                 diag.rdistcutoff = rdistcutoff;
                 diag.zdistcutoff = zdistcutoff;
             }

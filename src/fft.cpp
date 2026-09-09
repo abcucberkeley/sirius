@@ -18,12 +18,14 @@ namespace sirius {
         // RAII for fft plan
         // Note: fftw_plan_s is a struct and fftw_plan is a pointer to that struct
         struct FFTWPlanDeleter {
-            void operator()(fftw_plan plan) const {fftw_destroy_plan(plan);}
+            void operator()(fftw_plan plan) const { fftw_destroy_plan(plan); }
         };
         using PlanPtr = std::unique_ptr<fftw_plan_s, FFTWPlanDeleter>;
 
         // safe fft buffers
-        struct FftwFree { void operator()(void* p) const { fftw_free(p); } };
+        struct FftwFree {
+            void operator()(void* p) const { fftw_free(p); }
+        };
         using FftwBuf = std::unique_ptr<fftw_complex[], FftwFree>;
 
         // FFTW's planner modifies global state — must be serialized across all instances
@@ -53,9 +55,9 @@ namespace sirius {
         // map plan rigor to fftw flags
         unsigned int toFFTWFlag(PlanRigor r) {
             switch (r) {
-                case PlanRigor::Estimate:   return FFTW_ESTIMATE;
-                case PlanRigor::Measure:    return FFTW_MEASURE;
-                case PlanRigor::Patient:    return FFTW_PATIENT;
+                case PlanRigor::Estimate: return FFTW_ESTIMATE;
+                case PlanRigor::Measure: return FFTW_MEASURE;
+                case PlanRigor::Patient: return FFTW_PATIENT;
                 case PlanRigor::Exhaustive: return FFTW_EXHAUSTIVE;
             }
             throw std::invalid_argument("Unknown PlanRigor value");
@@ -131,7 +133,7 @@ namespace sirius {
                 total_ = detail::checkedProduct(dims, "FFT");
                 full_size_ = detail::checkedMultiply(total_, howmany, "FFT");
 
-                FftwBuf buf_in (static_cast<fftw_complex*>(detail::checkedFftwMalloc(sizeof(fftw_complex) * full_size_)));
+                FftwBuf buf_in(static_cast<fftw_complex*>(detail::checkedFftwMalloc(sizeof(fftw_complex) * full_size_)));
                 FftwBuf buf_out(static_cast<fftw_complex*>(detail::checkedFftwMalloc(sizeof(fftw_complex) * full_size_)));
                 alignment_ = fftw_alignment_of(reinterpret_cast<double*>(buf_in.get()));
 
@@ -145,17 +147,17 @@ namespace sirius {
 
             void execute(const std::complex<double>* in, std::complex<double>* out, bool forward,
                          const Stream&) const override {
-                auto* in_ptr  = reinterpret_cast<fftw_complex*>(const_cast<std::complex<double>*>(in));
+                auto* in_ptr = reinterpret_cast<fftw_complex*>(const_cast<std::complex<double>*>(in));
                 auto* out_ptr = reinterpret_cast<fftw_complex*>(out);
                 const fftw_plan outOfPlace = forward ? forward_plan_.get() : inverse_plan_.get();
 
-                const bool aligned = fftw_alignment_of(reinterpret_cast<double*>(in_ptr))  == alignment_ &&
+                const bool aligned = fftw_alignment_of(reinterpret_cast<double*>(in_ptr)) == alignment_ &&
                                      fftw_alignment_of(reinterpret_cast<double*>(out_ptr)) == alignment_;
                 if (!aligned) {
                     // Data that does not match the plan's alignment goes through
                     // FFTW-aligned temporaries. Those are two distinct buffers,
                     // so the out-of-place plan applies whatever the caller passed.
-                    FftwBuf tmp_in (static_cast<fftw_complex*>(detail::checkedFftwMalloc(sizeof(fftw_complex) * full_size_)));
+                    FftwBuf tmp_in(static_cast<fftw_complex*>(detail::checkedFftwMalloc(sizeof(fftw_complex) * full_size_)));
                     FftwBuf tmp_out(static_cast<fftw_complex*>(detail::checkedFftwMalloc(sizeof(fftw_complex) * full_size_)));
                     std::memcpy(tmp_in.get(), in_ptr, sizeof(fftw_complex) * full_size_);
                     fftw_execute_dft(outOfPlace, tmp_in.get(), tmp_out.get());
@@ -233,8 +235,7 @@ namespace sirius {
     };
 
     FFT::FFT(std::vector<int> dims, int howmany, PlanRigor rigor, Device device)
-        : impl_(std::make_unique<Impl>())
-    {
+        : impl_(std::make_unique<Impl>()) {
         if (dims.empty() || dims.size() > 3)
             throw std::invalid_argument("Only ranks 1, 2 and 3 are supported.");
         if (howmany < 1)
@@ -309,12 +310,12 @@ namespace sirius {
     }
 
     // Convenience functions for eigen
-    template<int Rank>
+    template <int Rank>
     void FFT::fft(const TensorXcd<Rank>& in, TensorXcd<Rank>& out) const {
         fft(toConstView(in), toView(out));
     }
 
-    template<int Rank>
+    template <int Rank>
     void FFT::ifft(const TensorXcd<Rank>& in, TensorXcd<Rank>& out, bool normalize) const {
         ifft(toConstView(in), toView(out), normalize);
     }

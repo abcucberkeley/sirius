@@ -67,8 +67,7 @@ namespace {
                             send({{"id", id}, {"type", "error"}, {"message", "bad token"}});
                             continue;
                         }
-                        json caps = {{"version", "test"}, {"methods", {"run:torch_segment", "model_info"}},
-                                     {"cuda", false}, {"device", "cpu"}, {"hostname", "loop"}};
+                        json caps = {{"version", "test"}, {"methods", {"run:torch_segment", "model_info"}}, {"cuda", false}, {"device", "cpu"}, {"hostname", "loop"}};
                         if (protocolVersion >= 0) caps["protocol_version"] = protocolVersion;
                         send({{"id", id}, {"type", "result"}, {"result", caps}});
                     } else if (method == "cancel") {
@@ -364,7 +363,8 @@ TEST_CASE("the segmentation step runs a TorchScript model through the worker", "
         "    def forward(self, x):\n"
         "        fg = torch.sigmoid((x - 0.5) * 20.0)\n"
         "        return torch.cat([fg, torch.zeros_like(x)], 1)\n"
-        "torch.jit.script(M()).save(" + json(model.str).dump() + ")\n";
+        "torch.jit.script(M()).save(" +
+        json(model.str).dump() + ")\n";
     test::TempFile scriptFile("segmodel", ".py");
     {
         std::ofstream out(scriptFile.path);

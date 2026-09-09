@@ -29,14 +29,13 @@ namespace sirius {
     template <typename Scalar, int Rank>
     Eigen::Tensor<Scalar, Rank, Eigen::RowMajor>
     roll(const Eigen::Tensor<Scalar, Rank, Eigen::RowMajor>& in,
-         const std::array<int, static_cast<std::size_t>(Rank)>& shifts)
-    {
+         const std::array<int, static_cast<std::size_t>(Rank)>& shifts) {
         // Comments will cover a simple 2D example
         // but the code is general for any rank tensor.
 
         // eg if in[3,4], dims = [3,4]
         const auto& dims = in.dimensions();
-        
+
         // stride = [4,1] since in[row,col] = in[row*4 + col*1]
         // looping over all ranks is then:
         std::array<Eigen::Index, Rank> stride{};
