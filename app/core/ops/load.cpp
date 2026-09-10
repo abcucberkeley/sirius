@@ -128,8 +128,7 @@ namespace sirius::app {
                         .withHelp("Multi-page TIFF / OME-TIFF, a zarr / N5 store, or a folder with a sirius-dataset.toml manifest."),
                     choiceParam("read_as", "Read as", {kLazy, kFull}, kLazy)
                         .withHelp("Lazy reads planes on demand; full load reads everything once."),
-                    intParam("tile", "Tile", 0).range(0, 1000000)
-                        .withHelp("Multi-file datasets: the tile to view; Stitch fuses all of them"),
+                    intParam("tile", "Tile", 0).range(0, 1000000).withHelp("Multi-file datasets: the tile to view; Stitch fuses all of them"),
                     stringParam("page_order", "Page order", "czt")
                         .withHelp("Axis order of the pages of a plain TIFF, fastest first (ImageJ: czt).")
                         .asAdvanced(),
@@ -144,8 +143,7 @@ namespace sirius::app {
                     boolParam("sim_fast", "Fast SI order", false)
                         .withHelp("Sections ordered z → direction → phase instead of direction → z → phase")
                         .asAdvanced(),
-                    doubleParam("sheet_angle", "Light-sheet angle", 0.0).range(0.0, 90.0, 0.1, 1).withUnit("°")
-                        .withHelp("Angle between the light sheet and the coverslip (0 = not light-sheet)"),
+                    doubleParam("sheet_angle", "Light-sheet angle", 0.0).range(0.0, 90.0, 0.1, 1).withUnit("°").withHelp("Angle between the light sheet and the coverslip (0 = not light-sheet)"),
                 };
             }
 

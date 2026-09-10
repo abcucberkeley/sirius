@@ -155,7 +155,10 @@ namespace sirius::app {
     class VolumeView::Overlays {
     public:
         explicit Overlays(VolumeView* view) : view(view) {
-            static const struct { const char* name; double yaw, pitch; } presets[] = {
+            static const struct {
+                const char* name;
+                double yaw, pitch;
+            } presets[] = {
                 {"Front", 0, 0}, {"Iso", 35, 22}, {"Top", 0, 60}, {"Side", 90, 0}};
             presetHost = new QWidget(view);
             auto* ph = new QHBoxLayout(presetHost);
@@ -242,7 +245,10 @@ namespace sirius::app {
         QSlider* yaw = nullptr;
         QSlider* pitch = nullptr;
         RangeSlider* clip = nullptr;
-        struct Preset { widgets::GlyphButton* button; double yaw, pitch; };
+        struct Preset {
+            widgets::GlyphButton* button;
+            double yaw, pitch;
+        };
         std::vector<Preset> presetButtons;
         bool syncing = false;
     };
@@ -386,7 +392,8 @@ namespace sirius::app {
         const auto fmt = ctx->format();
         if (!ctx->isOpenGLES() && fmt.majorVersion() < 3) {
             glError_ = QStringLiteral("OpenGL 3.0 or newer is required for volume rendering (got %1.%2)")
-                           .arg(fmt.majorVersion()).arg(fmt.minorVersion());
+                           .arg(fmt.majorVersion())
+                           .arg(fmt.minorVersion());
             return;
         }
         gl_->ray = build(kVertex, kFragment, glError_);
@@ -545,14 +552,12 @@ namespace sirius::app {
             // 12 edges; the three from the voxel origin (-x, +y, +z corner) in accent
             const float hx = half.x(), hy = half.y(), hz = half.z();
             const QVector3D o(-hx, hy, hz);
-            struct Edge { QVector3D a, b; bool accent; };
+            struct Edge {
+                QVector3D a, b;
+                bool accent;
+            };
             const Edge edges[] = {
-                {o, {hx, hy, hz}, true}, {o, {-hx, -hy, hz}, true}, {o, {-hx, hy, -hz}, true},
-                {{hx, hy, hz}, {hx, -hy, hz}, false}, {{hx, hy, hz}, {hx, hy, -hz}, false},
-                {{-hx, -hy, hz}, {hx, -hy, hz}, false}, {{-hx, -hy, hz}, {-hx, -hy, -hz}, false},
-                {{-hx, hy, -hz}, {hx, hy, -hz}, false}, {{-hx, hy, -hz}, {-hx, -hy, -hz}, false},
-                {{hx, -hy, -hz}, {hx, hy, -hz}, false}, {{hx, -hy, -hz}, {-hx, -hy, -hz}, false},
-                {{hx, -hy, -hz}, {hx, -hy, hz}, false}};
+                {o, {hx, hy, hz}, true}, {o, {-hx, -hy, hz}, true}, {o, {-hx, hy, -hz}, true}, {{hx, hy, hz}, {hx, -hy, hz}, false}, {{hx, hy, hz}, {hx, hy, -hz}, false}, {{-hx, -hy, hz}, {hx, -hy, hz}, false}, {{-hx, -hy, hz}, {-hx, -hy, -hz}, false}, {{-hx, hy, -hz}, {hx, hy, -hz}, false}, {{-hx, hy, -hz}, {-hx, -hy, -hz}, false}, {{hx, -hy, -hz}, {hx, hy, -hz}, false}, {{hx, -hy, -hz}, {-hx, -hy, -hz}, false}, {{hx, -hy, -hz}, {hx, -hy, hz}, false}};
             gl_->line->bind();
             gl_->line->setUniformValue("uViewProj", viewProj);
             gl_->vao.bind();

@@ -39,8 +39,7 @@ namespace sirius::app {
                     channelParam("fixed_channel", "Fixed channel", 0),
                     channelParam("moving_channel", "Moving channel", 1),
                     intParam("reference_t", "Reference time point", 0).range(0, 1000000),
-                    doubleListParam("max_shift", "Max shift", {4.0, 32.0, 32.0}).withUnit("voxels")
-                        .withHelp("Search bound per axis (z, y, x)"),
+                    doubleListParam("max_shift", "Max shift", {4.0, 32.0, 32.0}).withUnit("voxels").withHelp("Search bound per axis (z, y, x)"),
                     boolParam("mask_background", "Mask background", false),
                     doubleParam("background_level", "Background level", 0.0).range(-1e9, 1e9, 1.0, 2),
                 };
@@ -190,7 +189,10 @@ namespace sirius::app {
                     const float* m = aligned.data() + z * rows * cols;
                     auto norm = [](const float* p, Index n) {
                         float mn = std::numeric_limits<float>::infinity(), mxv = -mn;
-                        for (Index i = 0; i < n; ++i) { mn = std::min(mn, p[i]); mxv = std::max(mxv, p[i]); }
+                        for (Index i = 0; i < n; ++i) {
+                            mn = std::min(mn, p[i]);
+                            mxv = std::max(mxv, p[i]);
+                        }
                         return std::pair<float, float>(mn, mxv > mn ? mxv - mn : 1.0f);
                     };
                     const auto nf = norm(f, rows * cols), nm = norm(m, rows * cols);

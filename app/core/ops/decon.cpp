@@ -30,17 +30,13 @@ namespace sirius::app {
                 info_.params = {
                     choiceParam("algorithm", "Algorithm", {"Richardson–Lucy"}, "Richardson–Lucy"),
                     intParam("iterations", "Iterations", 20).range(1, 500),
-                    pathParam("psf", "PSF").withFilter("PSF (*.tif *.tiff);;All files (*)")
-                        .withHelp("Measured bead PSF (z, y, x) at the data's voxel size; empty = theoretical Gaussian"),
-                    doubleParam("tv_lambda", "TV regularisation", 0.002).range(0.0, 0.1, 0.0005, 4)
-                        .withHelp("Total-variation weight; 0 = plain Richardson–Lucy"),
-                    doubleParam("stop_rel_change", "Stop below Δ", 1e-4).range(0.0, 1.0, 1e-5, 6)
-                        .withHelp("Stop when the relative change per iteration drops below this (0 = never)"),
+                    pathParam("psf", "PSF").withFilter("PSF (*.tif *.tiff);;All files (*)").withHelp("Measured bead PSF (z, y, x) at the data's voxel size; empty = theoretical Gaussian"),
+                    doubleParam("tv_lambda", "TV regularisation", 0.002).range(0.0, 0.1, 0.0005, 4).withHelp("Total-variation weight; 0 = plain Richardson–Lucy"),
+                    doubleParam("stop_rel_change", "Stop below Δ", 1e-4).range(0.0, 1.0, 1e-5, 6).withHelp("Stop when the relative change per iteration drops below this (0 = never)"),
                     doubleParam("na", "NA", 1.4).range(0.1, 2.0, 0.01, 2).withHelp("Theoretical PSF only"),
                     doubleParam("wavelength_nm", "Emission λ", 510.0).range(300.0, 1000.0, 1.0, 0).withUnit("nm"),
                     doubleParam("nimm", "Immersion index", 1.515).range(1.0, 2.0, 0.001, 3),
-                    intParam("psf_size", "Theoretical PSF size", 33).range(5, 257).withUnit("px")
-                        .withHelp("Lateral extent of the theoretical PSF (odd)").asAdvanced(),
+                    intParam("psf_size", "Theoretical PSF size", 33).range(5, 257).withUnit("px").withHelp("Lateral extent of the theoretical PSF (odd)").asAdvanced(),
                 };
             }
 

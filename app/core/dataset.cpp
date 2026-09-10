@@ -30,7 +30,10 @@ namespace sirius::app {
     std::array<float, 3> colorForWavelength(double nm) noexcept {
         // The design's channel palette; anything else is interpolated
         // between its neighbours so unusual lines still get a sensible hue.
-        struct Stop { double nm; std::array<float, 3> c; };
+        struct Stop {
+            double nm;
+            std::array<float, 3> c;
+        };
         static const Stop stops[] = {
             {405.0, {0x7c / 255.f, 0x9c / 255.f, 0xff / 255.f}},
             {488.0, {0x63 / 255.f, 0xe0 / 255.f, 0x8a / 255.f}},

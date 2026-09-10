@@ -29,9 +29,18 @@ namespace sirius::app {
         Index page = 0, stride = 1;
         for (char a : order) {
             switch (a) {
-                case 'c': page += ci * stride; stride *= std::max<Index>(c, 1); break;
-                case 't': page += ti * stride; stride *= std::max<Index>(t, 1); break;
-                case 'z': page += zi * stride; stride *= std::max<Index>(z, 1); break;
+                case 'c':
+                    page += ci * stride;
+                    stride *= std::max<Index>(c, 1);
+                    break;
+                case 't':
+                    page += ti * stride;
+                    stride *= std::max<Index>(t, 1);
+                    break;
+                case 'z':
+                    page += zi * stride;
+                    stride *= std::max<Index>(z, 1);
+                    break;
                 default: break;
             }
         }
@@ -169,7 +178,10 @@ namespace sirius::app {
 
         // Decode the handful of XML entities OME-XML attribute values use.
         std::string xmlUnescape(std::string s) {
-            struct E { const char* from; const char* to; };
+            struct E {
+                const char* from;
+                const char* to;
+            };
             static const E ents[] = {{"&amp;", "&"}, {"&lt;", "<"}, {"&gt;", ">"}, {"&quot;", "\""}, {"&apos;", "'"}};
             for (const E& e : ents) {
                 std::size_t pos = 0;
@@ -187,11 +199,20 @@ namespace sirius::app {
                 unsigned long code = 0;
                 try {
                     code = num.size() > 1 && (num[0] == 'x' || num[0] == 'X') ? std::stoul(num.substr(1), nullptr, 16) : std::stoul(num);
-                } catch (...) { pos = end + 1; continue; }
+                } catch (...) {
+                    pos = end + 1;
+                    continue;
+                }
                 std::string utf8;
                 if (code < 0x80) utf8 += static_cast<char>(code);
-                else if (code < 0x800) { utf8 += static_cast<char>(0xC0 | (code >> 6)); utf8 += static_cast<char>(0x80 | (code & 0x3F)); }
-                else { utf8 += static_cast<char>(0xE0 | (code >> 12)); utf8 += static_cast<char>(0x80 | ((code >> 6) & 0x3F)); utf8 += static_cast<char>(0x80 | (code & 0x3F)); }
+                else if (code < 0x800) {
+                    utf8 += static_cast<char>(0xC0 | (code >> 6));
+                    utf8 += static_cast<char>(0x80 | (code & 0x3F));
+                } else {
+                    utf8 += static_cast<char>(0xE0 | (code >> 12));
+                    utf8 += static_cast<char>(0x80 | ((code >> 6) & 0x3F));
+                    utf8 += static_cast<char>(0x80 | (code & 0x3F));
+                }
                 s.replace(pos, end - pos + 1, utf8);
                 pos += utf8.size();
             }
@@ -213,7 +234,10 @@ namespace sirius::app {
                 while (i < tag.size() && (std::isspace(static_cast<unsigned char>(tag[i])) || tag[i] == '=')) ++i;
                 if (i >= tag.size()) break;
                 const char quote = tag[i];
-                if (quote != '"' && quote != '\'') { ++i; continue; }
+                if (quote != '"' && quote != '\'') {
+                    ++i;
+                    continue;
+                }
                 const std::size_t valueStart = ++i;
                 const std::size_t valueEnd = tag.find(quote, valueStart);
                 if (valueEnd == std::string::npos) break;
@@ -230,7 +254,10 @@ namespace sirius::app {
             std::size_t pos = 0;
             while ((pos = xml.find('<', pos)) != std::string::npos) {
                 std::size_t i = pos + 1;
-                if (i < xml.size() && (xml[i] == '/' || xml[i] == '?' || xml[i] == '!')) { ++pos; continue; }
+                if (i < xml.size() && (xml[i] == '/' || xml[i] == '?' || xml[i] == '!')) {
+                    ++pos;
+                    continue;
+                }
                 std::size_t nameEnd = i;
                 while (nameEnd < xml.size() && !std::isspace(static_cast<unsigned char>(xml[nameEnd])) && xml[nameEnd] != '>' && xml[nameEnd] != '/')
                     ++nameEnd;
@@ -248,7 +275,9 @@ namespace sirius::app {
         double attrDouble(const Attrs& a, const char* key, double def = 0.0) {
             auto it = a.find(key);
             if (it == a.end()) return def;
-            try { return std::stod(it->second); } catch (...) { return def; }
+            try {
+                return std::stod(it->second);
+            } catch (...) { return def; }
         }
         std::string attrString(const Attrs& a, const char* key) {
             auto it = a.find(key);
@@ -260,7 +289,9 @@ namespace sirius::app {
             ok = false;
             if (s.empty()) return {1.f, 1.f, 1.f};
             long long v = 0;
-            try { v = std::stoll(s); } catch (...) { return {1.f, 1.f, 1.f}; }
+            try {
+                v = std::stoll(s);
+            } catch (...) { return {1.f, 1.f, 1.f}; }
             const std::uint32_t u = static_cast<std::uint32_t>(static_cast<std::int32_t>(v));
             ok = true;
             return {static_cast<float>((u >> 24) & 0xFF) / 255.f, static_cast<float>((u >> 16) & 0xFF) / 255.f,
@@ -309,7 +340,9 @@ namespace sirius::app {
             auto num = [&](const char* key, double def) {
                 auto it = kv.find(key);
                 if (it == kv.end()) return def;
-                try { return std::stod(it->second); } catch (...) { return def; }
+                try {
+                    return std::stod(it->second);
+                } catch (...) { return def; }
             };
             m.c = static_cast<Index>(num("channels", 0));
             m.z = static_cast<Index>(num("slices", 0));
@@ -350,7 +383,9 @@ namespace sirius::app {
 
             const DatasetMeta& meta() const noexcept override { return meta_; }
             bool gpuDecodable() const noexcept override {
-                try { return file_.gpuDecodable(); } catch (...) { return false; }
+                try {
+                    return file_.gpuDecodable();
+                } catch (...) { return false; }
             }
 
             void readPlane(Index c, Index t, Index z, float* out) const override {
@@ -484,7 +519,9 @@ namespace sirius::app {
             const ParsedTiffMetadata md = parseTiffDescription(p0.description);
             m.format = md.ome ? "ome-tiff" : "tiff";
             std::ostringstream summary;
-            summary << (md.ome ? "OME-TIFF" : md.imagej ? "ImageJ TIFF" : "TIFF") << " · " << pages << (pages == 1 ? " page" : " pages")
+            summary << (md.ome ? "OME-TIFF" : md.imagej ? "ImageJ TIFF"
+                                                        : "TIFF")
+                    << " · " << pages << (pages == 1 ? " page" : " pages")
                     << " · " << toString(p0.pixelType);
 
             // dimensions: explicit page order > OME / ImageJ metadata > pages as z
@@ -688,7 +725,9 @@ namespace sirius::app {
                     ChannelInfo ch;
                     ch.label = info.channelNames[i];
                     if (i < info.channelColors.size() && info.channelColors[i].size() == 7) {
-                        try { ch.color = colorFromHex(info.channelColors[i]); } catch (...) {}
+                        try {
+                            ch.color = colorFromHex(info.channelColors[i]);
+                        } catch (...) {}
                     }
                     m.channels.push_back(std::move(ch));
                 }
@@ -698,7 +737,9 @@ namespace sirius::app {
             m.acquisition = info.multiscalePaths.size() > 1 ? "OME-Zarr · " + std::to_string(info.multiscalePaths.size()) + " resolution levels"
                                                             : (info.isGroup ? "OME-Zarr" : m.format);
             std::ostringstream s;
-            s << (info.driver == "n5" ? "N5" : info.driver == "zarr3" ? "zarr v3" : "zarr v2") << " · " << toString(info.pixelType)
+            s << (info.driver == "n5" ? "N5" : info.driver == "zarr3" ? "zarr v3"
+                                                                      : "zarr v2")
+              << " · " << toString(info.pixelType)
               << " · chunks";
             for (Index c : info.chunks) s << " " << c;
             s << " · " << info.codec;
