@@ -42,6 +42,11 @@ namespace sirius::app {
         bool busy() const noexcept { return reply_ != nullptr; }
 
         // GET {baseUrl}/models; `done(ids, error)` on the GUI thread.
+        // Ollama only: the models it holds in memory right now (GET /api/ps
+        // on the server behind `baseUrl`), so the panel can say up front
+        // that the first answer will wait for a load. Other servers answer
+        // with an error, which the caller treats as "unknown".
+        void fetchLoadedModels(const QString& baseUrl, std::function<void(QStringList, QString)> done);
         void fetchModels(const QString& baseUrl, const QString& apiKey,
                          std::function<void(QStringList ids, QString error)> done);
 

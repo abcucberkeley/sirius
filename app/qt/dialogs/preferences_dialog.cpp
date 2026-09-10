@@ -1,5 +1,6 @@
 #include "qt/dialogs/preferences_dialog.hpp"
 
+#include <algorithm>
 #include <exception>
 
 #include <QBoxLayout>
@@ -17,6 +18,7 @@
 #include <sirius/device.hpp>
 
 #include "qt/panels/assistant_panel.hpp"
+#include "qt/panels/llm_client.hpp"
 #include "qt/qt_strings.hpp"
 #include "qt/secret_store.hpp"
 #include "qt/theme.hpp"
@@ -53,6 +55,40 @@ namespace sirius::app {
 
     struct PreferencesDialog::Impl {
         WorkbenchBridge& bridge;
+
+        // The server's model list into the dropdown, keeping whatever is
+        // typed; for Ollama the models held in memory are marked, since
+        // the first answer from any other one waits for a load.
+        void refreshModelList() {
+            const QString keep = model->currentText().trimmed();
+            const QString base = baseUrl->text().trimmed(), key = apiKey->text();
+            const bool ollama = provider->currentData().toString() == QLatin1String("ollama");
+            refreshModels->setEnabled(false);
+            modelNote->setText(QStringLiteral("Asking %1 for its models…").arg(base));
+            client.fetchModels(base, key, [this, keep, base, ollama](QStringList ids, QString error) {
+                refreshModels->setEnabled(true);
+                if (ids.isEmpty()) {
+                    modelNote->setText(error.isEmpty() ? QStringLiteral("%1 lists no models.").arg(base)
+                                                       : QStringLiteral("Cannot list the models at %1 (%2); type a name.").arg(base, error));
+                    return;
+                }
+                ids.sort(Qt::CaseInsensitive);
+                model->clear();
+                model->addItems(ids);
+                if (!keep.isEmpty()) model->setCurrentText(keep);
+                else model->setCurrentIndex(0);
+                modelNote->setText(QStringLiteral("%1 model(s) at %2.").arg(ids.size()).arg(base));
+                if (!ollama) return;
+                client.fetchLoadedModels(base, [this, ids](QStringList loaded, QString) {
+                    if (loaded.isEmpty()) {
+                        modelNote->setText(modelNote->text() +
+                                           QStringLiteral(" None is loaded yet: the first answer waits for a load, a minute or two for a large model."));
+                        return;
+                    }
+                    modelNote->setText(modelNote->text() + QStringLiteral(" In memory now: %1.").arg(loaded.join(QStringLiteral(", "))));
+                });
+            });
+        }
         QComboBox* backend = nullptr;
         QComboBox* device = nullptr;
         QLineEdit* host = nullptr;
@@ -62,7 +98,10 @@ namespace sirius::app {
         QLineEdit* hfToken = nullptr;
         QComboBox* provider = nullptr;
         QLineEdit* baseUrl = nullptr;
-        QLineEdit* model = nullptr;
+        QComboBox* model = nullptr;          // editable: the server's list, or any name typed
+        QPushButton* refreshModels = nullptr;
+        QLabel* modelNote = nullptr;
+        LlmClient client;
         QLineEdit* apiKey = nullptr;
         QCheckBox* askFirst = nullptr;
         explicit Impl(WorkbenchBridge& b) : bridge(b) {}
@@ -147,8 +186,19 @@ namespace sirius::app {
         impl_->provider->addItem(QStringLiteral("Custom OpenAI-compatible"), QStringLiteral("custom"));
         impl_->provider->setCurrentIndex(std::max(0, impl_->provider->findData(as.provider)));
         impl_->baseUrl = new QLineEdit(as.baseUrl, assistant);
-        impl_->model = new QLineEdit(as.model, assistant);
-        impl_->model->setPlaceholderText(QStringLiteral("e.g. llama3.1:8b or anthropic/claude-sonnet-4"));
+        impl_->model = new QComboBox(assistant);
+        impl_->model->setEditable(true);
+        impl_->model->setInsertPolicy(QComboBox::NoInsert);
+        impl_->model->lineEdit()->setPlaceholderText(QStringLiteral("e.g. llama3.1:8b or anthropic/claude-sonnet-4"));
+        impl_->model->setToolTip(QStringLiteral("The models the server lists (Refresh asks it again), or any name typed here"));
+        if (!as.model.isEmpty()) {
+            impl_->model->addItem(as.model);
+            impl_->model->setCurrentText(as.model);
+        }
+        impl_->refreshModels = new QPushButton(QStringLiteral("Refresh"), assistant);
+        impl_->refreshModels->setToolTip(QStringLiteral("Ask the server at the base URL which models it offers"));
+        impl_->modelNote = widgets::label(QString(), 11, theme::kNeutral600, -1, assistant);
+        impl_->modelNote->setWordWrap(true);
         impl_->apiKey = new QLineEdit(as.apiKey, assistant);
         impl_->apiKey->setEchoMode(QLineEdit::Password);
         impl_->askFirst = new QCheckBox(QStringLiteral("Ask before acting (the assistant proposes, you confirm)"), assistant);
@@ -156,9 +206,16 @@ namespace sirius::app {
         auto* ag = new QGridLayout();
         ag->setHorizontalSpacing(10);
         ag->addWidget(field(QStringLiteral("Provider"), impl_->provider, assistant), 0, 0);
-        ag->addWidget(field(QStringLiteral("Model"), impl_->model, assistant), 0, 1);
+        auto* modelRow = new QWidget(assistant);
+        auto* mh = new QHBoxLayout(modelRow);
+        mh->setContentsMargins(0, 0, 0, 0);
+        mh->setSpacing(6);
+        mh->addWidget(impl_->model, 1);
+        mh->addWidget(impl_->refreshModels);
+        ag->addWidget(field(QStringLiteral("Model"), modelRow, assistant), 0, 1);
         ag->addWidget(field(QStringLiteral("Base URL"), impl_->baseUrl, assistant), 1, 0, 1, 2);
-        ag->addWidget(field(QStringLiteral("API key"), impl_->apiKey, assistant), 2, 0, 1, 2);
+        ag->addWidget(impl_->modelNote, 2, 0, 1, 2);
+        ag->addWidget(field(QStringLiteral("API key"), impl_->apiKey, assistant), 3, 0, 1, 2);
         al->addLayout(ag);
         al->addWidget(impl_->askFirst);
         auto* note = widgets::label(
@@ -170,14 +227,21 @@ namespace sirius::app {
         al->addStretch(1);
         tabs->addTab(assistant, QStringLiteral("Assistant"));
         root->addWidget(tabs, 1);
+        // the tab last looked at comes back first (the assistant's settings
+        // get revisited far more often than the compute ones)
+        tabs->setCurrentIndex(std::clamp(settings.value(QStringLiteral("prefs/tab"), 0).toInt(), 0, tabs->count() - 1));
+        connect(this, &QDialog::finished, this, [tabs](int) { QSettings().setValue(QStringLiteral("prefs/tab"), tabs->currentIndex()); });
 
         connect(impl_->provider, qOverload<int>(&QComboBox::currentIndexChanged), this, [this](int) {
             const QString p = impl_->provider->currentData().toString();
             if (p == QLatin1String("ollama")) impl_->baseUrl->setText(QStringLiteral("http://localhost:11434/v1"));
             else if (p == QLatin1String("openrouter")) impl_->baseUrl->setText(QStringLiteral("https://openrouter.ai/api/v1"));
             impl_->apiKey->setEnabled(p != QLatin1String("ollama"));
+            impl_->refreshModelList();
         });
         impl_->apiKey->setEnabled(as.provider != QLatin1String("ollama"));
+        connect(impl_->refreshModels, &QPushButton::clicked, this, [this] { impl_->refreshModelList(); });
+        impl_->refreshModelList();   // the list on opening, without blocking the dialog
 
         auto* actions = new QHBoxLayout();
         actions->addStretch(1);
@@ -212,7 +276,7 @@ namespace sirius::app {
         AssistantSettings as;
         as.provider = impl_->provider->currentData().toString();
         as.baseUrl = impl_->baseUrl->text().trimmed();
-        as.model = impl_->model->text().trimmed();
+        as.model = impl_->model->currentText().trimmed();
         as.apiKey = impl_->apiKey->text();
         as.askBeforeActing = impl_->askFirst->isChecked();
         as.save();

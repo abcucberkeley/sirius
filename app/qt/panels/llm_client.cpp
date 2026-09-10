@@ -253,6 +253,37 @@ namespace sirius::app {
         emit finished(acc_.toMessage());
     }
 
+    void LlmClient::fetchLoadedModels(const QString& baseUrl, std::function<void(QStringList, QString)> done) {
+        // the OpenAI-compatible base ends in /v1; Ollama's own API sits beside it
+        QString root = baseUrl.trimmed();
+        while (root.endsWith(QLatin1Char('/'))) root.chop(1);
+        if (root.endsWith(QLatin1String("/v1"))) root.chop(3);
+        QNetworkRequest req(QUrl(root + QStringLiteral("/api/ps")));
+        req.setTransferTimeout(3000);
+        QNetworkReply* reply = nam_.get(req);
+        connect(reply, &QNetworkReply::finished, this, [reply, done = std::move(done)] {
+            reply->deleteLater();
+            if (reply->error() != QNetworkReply::NoError) {
+                done({}, reply->errorString());
+                return;
+            }
+            const QJsonDocument doc = QJsonDocument::fromJson(reply->readAll());
+            if (!doc.isObject() || !doc.object().contains(QStringLiteral("models"))) {
+                done({}, QStringLiteral("not an Ollama server"));
+                return;
+            }
+            QStringList names;
+            for (const QJsonValue& v : doc.object()[QStringLiteral("models")].toArray()) {
+                const QJsonObject m = v.toObject();
+                for (const char* key : {"name", "model"}) {
+                    const QString n = m[QLatin1String(key)].toString();
+                    if (!n.isEmpty() && !names.contains(n)) names << n;
+                }
+            }
+            done(names, {});
+        });
+    }
+
     void LlmClient::fetchModels(const QString& baseUrl, const QString& apiKey,
                                 std::function<void(QStringList, QString)> done) {
         QNetworkRequest req(QUrl(joinUrl(baseUrl, QStringLiteral("/models"))));

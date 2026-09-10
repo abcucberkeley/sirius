@@ -1,5 +1,6 @@
 #include "qt/panels/assistant_panel.hpp"
 
+#include <algorithm>
 #include <deque>
 #include <functional>
 #include <memory>
@@ -308,7 +309,7 @@ namespace sirius::app {
             if (seconds >= 5) text += QStringLiteral(" · %1 s").arg(seconds);
             if (reasoningChars > 0)
                 text += QStringLiteral(" · the model is reasoning before it answers (%1 characters so far)").arg(reasoningChars);
-            else if (waitingForModel && seconds >= 15)
+            else if (waitingForModel && seconds >= 15 && !busyBase.startsWith(QLatin1String("Loading ")))
                 text += QStringLiteral(" · no answer yet from %1 — a large model takes a minute or two to load the first time")
                             .arg(settings.baseUrl);
             busyText->setText(text);
@@ -364,6 +365,23 @@ namespace sirius::app {
             reasoningChars = 0;
             waitingForModel = true;
             setBusy(true);
+            // Ollama loads a model into memory on its first request, which for
+            // a large one is a minute or two of silence: ask what it holds and
+            // say so right away rather than after fifteen mute seconds.
+            if (settings.provider == QLatin1String("ollama")) {
+                const QString model = settings.model;
+                client.fetchLoadedModels(settings.baseUrl, [this, model](QStringList loaded, QString error) {
+                    if (!busy || !waitingForModel || !error.isEmpty()) return;   // no list: nothing to say
+                    const bool held = std::any_of(loaded.begin(), loaded.end(), [&](const QString& n) {
+                        return n == model || n == model + QStringLiteral(":latest") || model == n + QStringLiteral(":latest");
+                    });
+                    if (held) return;
+                    busyBase = QStringLiteral("Loading %1 into memory — the first answer after a start takes a minute or two for a "
+                                              "large model; later ones come in seconds")
+                                   .arg(model);
+                    refreshBusyText();
+                });
+            }
             LlmClient::Request r;
             r.baseUrl = settings.baseUrl;
             r.model = settings.model;
