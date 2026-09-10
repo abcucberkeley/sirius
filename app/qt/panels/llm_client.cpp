@@ -20,6 +20,11 @@ namespace sirius::app {
     void LlmClient::Accumulator::mergeDelta(const QJsonObject& delta) {
         if (delta.contains(QStringLiteral("content")) && delta[QStringLiteral("content")].isString())
             content += delta[QStringLiteral("content")].toString();
+        // OpenAI-style "reasoning" / "reasoning_content": not shown, but
+        // counted, so a long think is not a dead panel
+        for (const char* key : {"reasoning", "reasoning_content"})
+            if (delta.contains(QLatin1String(key)) && delta[QLatin1String(key)].isString())
+                reasoningChars += static_cast<int>(delta[QLatin1String(key)].toString().size());
         const QJsonArray calls = delta[QStringLiteral("tool_calls")].toArray();
         for (int i = 0; i < calls.size(); ++i) {
             const QJsonObject c = calls[i].toObject();
@@ -165,8 +170,10 @@ namespace sirius::app {
         sawData_ = true;
         const QJsonObject delta = choice[QStringLiteral("delta")].toObject();
         const QString before = acc_.content;
+        const int reasoningBefore = acc_.reasoningChars;
         acc_.mergeDelta(delta);
         if (acc_.content.size() > before.size()) emit this->delta(acc_.content.mid(before.size()));
+        if (acc_.reasoningChars > reasoningBefore) emit thinking(acc_.reasoningChars);
         const QJsonValue finish = choice[QStringLiteral("finish_reason")];
         if (finish.isString() && !finish.toString().isEmpty()) acc_.finishReason = finish.toString();
     }

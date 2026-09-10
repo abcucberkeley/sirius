@@ -52,6 +52,7 @@ namespace sirius::app {
         };
         struct Accumulator {
             QString content;
+            int reasoningChars = 0;                      // hidden reasoning seen so far
             std::map<int, ToolCall> toolCalls;   // by index
             QString finishReason;
             void mergeDelta(const QJsonObject& delta);
@@ -64,6 +65,10 @@ namespace sirius::app {
         void delta(const QString& text);              // streamed content fragment
         void finished(const QJsonObject& message);    // complete assistant message
         void failed(const QString& error);
+        // A "thinking" model streams its reasoning before any content (the
+        // `reasoning` field of a delta): how many characters of it so far,
+        // so the panel can show that something is happening.
+        void thinking(int reasoningChars);
 
     private:
         void start(bool stream);

@@ -19,6 +19,7 @@
 #include <QScrollArea>
 #include <QScrollBar>
 #include <QSettings>
+#include <QElapsedTimer>
 #include <QTimer>
 #include <QToolTip>
 #include <QVBoxLayout>
@@ -170,6 +171,14 @@ namespace sirius::app {
         QVBoxLayout* messages = nullptr;
         QWidget* busyRow = nullptr;
         QLabel* busyText = nullptr;
+        // What the busy row says while a reply is pending: the base text,
+        // then the seconds, then why it may be taking long (a 20 GB model
+        // took two minutes to load on first use, with nothing else to show).
+        QString busyBase;
+        QElapsedTimer busySince;
+        QTimer busyTick;
+        int reasoningChars = 0;
+        bool waitingForModel = false;   // between the request and its first byte
         QLineEdit* input = nullptr;
         QPushButton* send = nullptr;
         QLabel* askToggle = nullptr;
@@ -270,10 +279,39 @@ namespace sirius::app {
         void setBusy(bool on, const QString& text = {}) {
             busy = on;
             busyRow->setVisible(on);
-            busyText->setText(text.isEmpty() ? QStringLiteral("Thinking…") : text);
+            busyBase = text.isEmpty() ? QStringLiteral("Thinking…") : text;
+            if (on) {
+                busySince.start();
+                busyTick.start(1000);
+            } else {
+                busyTick.stop();
+                waitingForModel = false;
+                reasoningChars = 0;
+            }
+            refreshBusyText();
             send->setEnabled(!on);
             input->setEnabled(!on);
             if (on) scrollToBottom();
+        }
+
+        // The transcript's labels wrap at a share of the viewport's width.
+        void applyWidths(int w) {
+            for (QLabel* l : transcript->findChildren<QLabel*>()) {
+                if (l->property("class").toString() == QLatin1String("bubble")) l->setMaximumWidth(static_cast<int>(w * 0.88));
+                else if (l->property("assistantText").toBool()) l->setMaximumWidth(static_cast<int>(w * 0.94));
+            }
+        }
+
+        void refreshBusyText() {
+            QString text = busyBase;
+            const qint64 seconds = busySince.isValid() ? busySince.elapsed() / 1000 : 0;
+            if (seconds >= 5) text += QStringLiteral(" · %1 s").arg(seconds);
+            if (reasoningChars > 0)
+                text += QStringLiteral(" · the model is reasoning before it answers (%1 characters so far)").arg(reasoningChars);
+            else if (waitingForModel && seconds >= 15)
+                text += QStringLiteral(" · no answer yet from %1 — a large model takes a minute or two to load the first time")
+                            .arg(settings.baseUrl);
+            busyText->setText(text);
         }
 
         void showError(const QString& error) {
@@ -323,6 +361,8 @@ namespace sirius::app {
         }
 
         void step() {
+            reasoningChars = 0;
+            waitingForModel = true;
             setBusy(true);
             LlmClient::Request r;
             r.baseUrl = settings.baseUrl;
@@ -339,6 +379,7 @@ namespace sirius::app {
         }
 
         void onDelta(const QString& text) {
+            waitingForModel = false;
             if (!streamingLabel) {
                 addAssistantBlock({});
                 streamingSource.clear();
@@ -534,6 +575,10 @@ namespace sirius::app {
         square->setPalette(qp);
         bh->addWidget(square);
         d.busyText = mutedLabel(QStringLiteral("Thinking…"), d.busyRow, 12);
+        // it grows into a sentence while the wait goes on: wrap, and never
+        // let its width push the transcript's
+        d.busyText->setWordWrap(true);
+        d.busyText->setSizePolicy(QSizePolicy::Ignored, QSizePolicy::Preferred);
         bh->addWidget(d.busyText, 1);
         d.busyRow->hide();
         d.messages->addWidget(d.busyRow);
@@ -606,6 +651,12 @@ namespace sirius::app {
 
         // model client
         connect(&d.client, &LlmClient::delta, this, [this](const QString& t) { impl_->onDelta(t); });
+        connect(&d.client, &LlmClient::thinking, this, [this](int chars) {
+            impl_->waitingForModel = false;
+            impl_->reasoningChars = chars;
+            impl_->refreshBusyText();
+        });
+        connect(&impl_->busyTick, &QTimer::timeout, this, [this] { impl_->refreshBusyText(); });
         connect(&d.client, &LlmClient::finished, this, [this](const QJsonObject& m) { impl_->onFinished(m); });
         connect(&d.client, &LlmClient::failed, this, [this](const QString& e) {
             impl_->pending.clear();
@@ -639,6 +690,7 @@ namespace sirius::app {
         connect(&bridge, &WorkbenchBridge::pipelineChanged, this, [this] { impl_->updateContextLine(); });
         d.updateContextLine();
         d.updateAskToggle();
+        d.scroll->viewport()->installEventFilter(this);
         d.addAssistantBlock(QStringLiteral("Ask about a step, or tell me what to do: I can edit parameters, run steps and change the view. "
                                            "Every change lands in the undo stack."));
     }
@@ -659,11 +711,18 @@ namespace sirius::app {
 
     void AssistantPanel::resizeEvent(QResizeEvent* event) {
         QWidget::resizeEvent(event);
-        const int w = impl_->scroll->viewport()->width();
-        for (QLabel* l : impl_->transcript->findChildren<QLabel*>()) {
-            if (l->property("class").toString() == QLatin1String("bubble")) l->setMaximumWidth(static_cast<int>(w * 0.88));
-            else if (l->property("assistantText").toBool()) l->setMaximumWidth(static_cast<int>(w * 0.94));
-        }
+        impl_->applyWidths(impl_->scroll->viewport()->width());
+    }
+
+    bool AssistantPanel::eventFilter(QObject* watched, QEvent* event) {
+        // The transcript's labels take their width from the viewport, which
+        // is laid out after the panel's own resizeEvent has run: sized there
+        // they lag one resize behind (the intro stayed a narrow column until
+        // something else resized the panel). The viewport's own resize is
+        // the moment its width is right.
+        if (watched == impl_->scroll->viewport() && event->type() == QEvent::Resize)
+            impl_->applyWidths(static_cast<QResizeEvent*>(event)->size().width());
+        return QWidget::eventFilter(watched, event);
     }
 
 } // namespace sirius::app
