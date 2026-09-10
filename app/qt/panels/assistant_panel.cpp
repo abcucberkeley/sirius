@@ -13,6 +13,7 @@
 #include <QJsonDocument>
 #include <QJsonObject>
 #include <QIcon>
+#include <QComboBox>
 #include <QLabel>
 #include <QLineEdit>
 #include <QPushButton>
@@ -183,6 +184,8 @@ namespace sirius::app {
         QLineEdit* input = nullptr;
         QPushButton* send = nullptr;
         QLabel* askToggle = nullptr;
+        QComboBox* modelBox = nullptr;   // the model that answers, next to the question
+        bool fillingModels = false;      // programmatic fills of modelBox are not choices
         QLabel* streamingLabel = nullptr;      // the assistant text being streamed
         QString streamingSource;               // its Markdown so far (the label holds HTML)
         static QString renderMarkdown(const QString& markdown) {
@@ -518,6 +521,41 @@ namespace sirius::app {
                 context->setText(QStringLiteral("sees step %1, diagnostics, ops stack").arg(fromStd(Step::number(sel))));
         }
 
+        // A pick or a typed name in the footer is the setting, saved at once.
+        void commitModel(const QString& text) {
+            const QString m = text.trimmed();
+            if (fillingModels || m.isEmpty() || m == settings.model) return;
+            settings.model = m;
+            settings.save();
+            bridge.wb().logLine("Assistant model: " + toStd(m));
+        }
+
+        // The server's model list into the footer's dropdown, the current
+        // choice kept (and listed even when the server does not know it).
+        void refreshModelBox() {
+            const QString keep = settings.model;
+            fillingModels = true;
+            modelBox->clear();
+            if (!keep.isEmpty()) modelBox->addItem(keep);
+            modelBox->setCurrentText(keep);
+            fillingModels = false;
+            client.fetchModels(settings.baseUrl, settings.apiKey, [this, keep](QStringList ids, QString error) {
+                if (ids.isEmpty()) {
+                    modelBox->setToolTip(QStringLiteral("Cannot list the models at %1 (%2): type a name").arg(settings.baseUrl, error));
+                    return;
+                }
+                ids.sort(Qt::CaseInsensitive);
+                if (!keep.isEmpty() && !ids.contains(keep)) ids.prepend(keep);
+                fillingModels = true;
+                modelBox->clear();
+                modelBox->addItems(ids);
+                modelBox->setCurrentText(keep.isEmpty() ? ids.first() : keep);
+                fillingModels = false;
+                modelBox->setToolTip(QStringLiteral("%1 model(s) at %2: pick one, or type a name").arg(ids.size()).arg(settings.baseUrl));
+                if (keep.isEmpty()) commitModel(ids.first());
+            });
+        }
+
         void updateAskToggle() {
             askToggle->setText(QStringLiteral("<a href=\"toggle\" style=\"color:%1; text-decoration:none\">%2</a>")
                                    .arg(theme::hex(theme::kAccent), settings.askBeforeActing ? QStringLiteral("Ask before acting ✓")
@@ -652,9 +690,23 @@ namespace sirius::app {
         connect(d.send, &QPushButton::clicked, this, [this] { impl_->submit(impl_->input->text()); });
         inputRow->addWidget(d.send);
         f->addLayout(inputRow);
-        auto* noteRow = new QHBoxLayout;
-        noteRow->addWidget(mutedLabel(QStringLiteral("Changes are applied as undoable steps"), footer));
-        noteRow->addStretch(1);
+        // the model that answers, where the question is asked
+        auto* modelRow = new QHBoxLayout;
+        modelRow->setSpacing(6);
+        modelRow->addWidget(mutedLabel(QStringLiteral("Model"), footer));
+        d.modelBox = new QComboBox(footer);
+        d.modelBox->setEditable(true);
+        d.modelBox->setInsertPolicy(QComboBox::NoInsert);
+        d.modelBox->setFont(theme::font(theme::kSmallPx));
+        d.modelBox->setSizeAdjustPolicy(QComboBox::AdjustToMinimumContentsLengthWithIcon);
+        d.modelBox->setMinimumContentsLength(12);
+        d.modelBox->setToolTip(QStringLiteral("The model that answers: the server's list, or a name typed here"));
+        d.modelBox->setAccessibleName(QStringLiteral("Model"));
+        d.modelBox->setFocusPolicy(Qt::ClickFocus);   // the question box keeps the keyboard; this takes it on a click
+        connect(d.modelBox, qOverload<int>(&QComboBox::activated), this, [this](int) { impl_->commitModel(impl_->modelBox->currentText()); });
+        connect(d.modelBox->lineEdit(), &QLineEdit::editingFinished, this, [this] { impl_->commitModel(impl_->modelBox->currentText()); });
+        modelRow->addWidget(d.modelBox, 1);
+        modelRow->addSpacing(10);
         d.askToggle = new QLabel(footer);
         d.askToggle->setFont(theme::font(theme::kSmallPx));
         d.askToggle->setCursor(Qt::PointingHandCursor);
@@ -663,7 +715,11 @@ namespace sirius::app {
             impl_->settings.save();
             impl_->updateAskToggle();
         });
-        noteRow->addWidget(d.askToggle);
+        modelRow->addWidget(d.askToggle);
+        f->addLayout(modelRow);
+        auto* noteRow = new QHBoxLayout;
+        noteRow->addWidget(mutedLabel(QStringLiteral("Changes are applied as undoable steps"), footer));
+        noteRow->addStretch(1);
         f->addLayout(noteRow);
         v->addWidget(footer);
 
@@ -708,6 +764,7 @@ namespace sirius::app {
         connect(&bridge, &WorkbenchBridge::pipelineChanged, this, [this] { impl_->updateContextLine(); });
         d.updateContextLine();
         d.updateAskToggle();
+        d.refreshModelBox();
         d.scroll->viewport()->installEventFilter(this);
         d.addAssistantBlock(QStringLiteral("Ask about a step, or tell me what to do: I can edit parameters, run steps and change the view. "
                                            "Every change lands in the undo stack."));
@@ -719,6 +776,7 @@ namespace sirius::app {
         impl_->settings = s;
         impl_->settings.save();
         impl_->updateAskToggle();
+        impl_->refreshModelBox();
     }
 
     AssistantSettings AssistantPanel::settings() const { return impl_->settings; }
