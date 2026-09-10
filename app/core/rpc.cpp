@@ -94,9 +94,10 @@ namespace sirius::app::rpc {
         json list = json::array();
         std::uint64_t offset = 0;
         for (const TensorRef& t : tensors) {
-            Index n = 1;
-            for (Index d : t.shape) n *= d;
-            const std::size_t expected = static_cast<std::size_t>(n) * dtypeSize(t.dtype);
+            // checked like the receiving side: a wrapped product would agree
+            // with nothing and be caught only by the peer
+            const Index n = sirius::detail::checkedProduct(t.shape.begin(), t.shape.end(), "rpc: tensor shape");
+            const std::size_t expected = sirius::detail::checkedBytes(n, dtypeSize(t.dtype), "rpc: tensor size");
             if (expected != t.nbytes)
                 throw std::invalid_argument("rpc: tensor '" + t.name + "' has " + std::to_string(t.nbytes) +
                                             " bytes, shape and dtype imply " + std::to_string(expected));
@@ -143,8 +144,24 @@ namespace sirius::app::rpc {
                 Tensor t;
                 t.name = tj.value("name", "");
                 t.dtype = tj.value("dtype", "float32");
-                if (tj.contains("shape")) t.shape = tj["shape"].get<std::vector<Index>>();
-                const std::uint64_t off = tj.value("offset", 0ull), n = tj.value("nbytes", 0ull);
+                // The descriptor's numbers have to be integers: get<Index>() on
+                // a JSON float (1e309 parses as infinity) is a static_cast and
+                // undefined; a negative extent is wrong on its face.
+                if (tj.contains("shape")) {
+                    if (!tj["shape"].is_array()) throw ProtocolError("rpc: tensor '" + t.name + "': shape is not an array");
+                    for (const json& d : tj["shape"]) {
+                        if (!d.is_number_integer() || d.get<std::int64_t>() < 0)
+                            throw ProtocolError("rpc: tensor '" + t.name + "': shape extent is not a non-negative integer");
+                        t.shape.push_back(d.get<Index>());
+                    }
+                }
+                auto unsignedField = [&](const char* key) -> std::uint64_t {
+                    const auto it = tj.find(key);
+                    if (it == tj.end()) return 0;
+                    if (!it->is_number_unsigned()) throw ProtocolError("rpc: tensor '" + t.name + "': " + key + " is not a non-negative integer");
+                    return it->get<std::uint64_t>();
+                };
+                const std::uint64_t off = unsignedField("offset"), n = unsignedField("nbytes");
                 // Written so neither sum nor product can wrap.
                 if (n > plen || off > plen - n) throw ProtocolError("rpc: tensor '" + t.name + "' exceeds the payload");
                 if (sirius::detail::checkedBytes(t.numel(), dtypeSize(t.dtype), "rpc: tensor size") != n)

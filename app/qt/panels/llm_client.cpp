@@ -27,7 +27,9 @@ namespace sirius::app {
             ToolCall& tc = toolCalls[index];
             if (c.contains(QStringLiteral("id")) && !c[QStringLiteral("id")].toString().isEmpty()) tc.id = c[QStringLiteral("id")].toString();
             const QJsonObject fn = c[QStringLiteral("function")].toObject();
-            if (fn.contains(QStringLiteral("name")) && !fn[QStringLiteral("name")].toString().isEmpty()) tc.name += fn[QStringLiteral("name")].toString();
+            // A name is never streamed in pieces, and some servers repeat it
+            // in every delta: appending made "set_viewset_view".
+            if (fn.contains(QStringLiteral("name")) && !fn[QStringLiteral("name")].toString().isEmpty()) tc.name = fn[QStringLiteral("name")].toString();
             if (fn.contains(QStringLiteral("arguments"))) {
                 const QJsonValue a = fn[QStringLiteral("arguments")];
                 tc.arguments += a.isString() ? a.toString() : QString::fromUtf8(QJsonDocument(a.toObject()).toJson(QJsonDocument::Compact));

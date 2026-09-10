@@ -80,10 +80,14 @@ namespace sirius::app {
     std::vector<std::array<double, 3>> DatasetMeta::tilePositionsPx() const {
         std::vector<std::array<double, 3>> out;
         out.reserve(tiles.size());
+        // a lateral voxel size the file did not give borrows the other one
+        // (pixels are square far more often than they are unknown); without
+        // a z size the tiles stack in one plane
+        const double vx = voxelUm[0] > 0 ? voxelUm[0] : voxelUm[1];
+        const double vy = voxelUm[1] > 0 ? voxelUm[1] : voxelUm[0];
+        const double vz = voxelUm[2];
         for (const TileInfo& t : tiles)
-            out.push_back({voxelUm[2] > 0 ? t.positionUm[0] / voxelUm[2] : 0.0,
-                           voxelUm[1] > 0 ? t.positionUm[1] / voxelUm[1] : 0.0,
-                           voxelUm[0] > 0 ? t.positionUm[2] / voxelUm[0] : 0.0});
+            out.push_back({vz > 0 ? t.positionUm[0] / vz : 0.0, vy > 0 ? t.positionUm[1] / vy : 0.0, vx > 0 ? t.positionUm[2] / vx : 0.0});
         return out;
     }
 

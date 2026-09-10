@@ -57,6 +57,9 @@ namespace sirius::app {
         std::size_t bytes = 0;
         bool arrayOnDisk = false;
         std::weak_ptr<const StepOutput> restored;   // the reloaded copy while someone holds it
+        // The input labels the output's labels were shared from: a re-run
+        // over the same input keeps the user's edits (editedLabelsOf).
+        std::shared_ptr<const LabelVolume> labelsFrom;
     };
 
     Executor::Executor(std::filesystem::path scratchDir) : scratch_(std::move(scratchDir)) {
@@ -120,11 +123,19 @@ namespace sirius::app {
             std::string own = s.kind + "|" + s.params.toJson().dump() + "|" + upstream;
             // every file the step reads, by identity rather than by name
             if (const Operation* op = findOperation(s.kind))
-                for (const ParamSpec& spec : op->info().params)
+                for (const ParamSpec& spec : op->info().params) {
                     if (spec.type == ParamType::Path) {
                         const std::string stamp = fileStamp(s.params.getString(spec.key));
                         if (!stamp.empty()) own += "|" + spec.key + "@" + stamp;
+                    } else if (spec.type == ParamType::StringList) {
+                        // a list of files (the stitch tiles): each one that
+                        // exists is stamped, a string that is no path costs a stat
+                        for (const std::string& v : s.params.getStringList(spec.key)) {
+                            const std::string stamp = fileStamp(v);
+                            if (!stamp.empty()) own += "|" + spec.key + "@" + stamp;
+                        }
                     }
+                }
             upstream = stableHash(own);
         }
         return upstream;
@@ -222,7 +233,18 @@ namespace sirius::app {
                 if (const Step* s = p.find(id)) e->policy = s->cache;
     }
 
-    void Executor::store(const Step& step, const std::string& fp, std::shared_ptr<const StepOutput> out) {
+    std::shared_ptr<LabelVolume> Executor::editedLabelsOf(StepId id, const std::shared_ptr<const LabelVolume>& from) const {
+        if (!from) return nullptr;
+        std::lock_guard<std::mutex> g(mutex_);
+        auto it = entries_.find(id);
+        if (it == entries_.end() || !it->second || !it->second->output) return nullptr;
+        const Entry& e = *it->second;
+        if (!e.output->labels || !e.output->labels->edited() || e.labelsFrom != from) return nullptr;
+        return e.output->labels;
+    }
+
+    void Executor::store(const Step& step, const std::string& fp, std::shared_ptr<const StepOutput> out,
+                         std::shared_ptr<const LabelVolume> labelsFrom) {
         // A disk spill is written before the lock is taken (the file can be
         // gigabytes, and queries must not wait for it); the name is unique
         // per store so it never races an earlier file of the same step.
@@ -256,6 +278,7 @@ namespace sirius::app {
             e.diskPath = std::move(diskPath);
             e.arrayOnDisk = !e.diskPath.empty();
             e.output = std::move(out);
+            e.labelsFrom = std::move(labelsFrom);
             e.restored.reset();
             // "Recompute" keeps nothing beyond the most recent result: drop the
             // arrays of every other recompute entry now that a newer one exists.
@@ -356,12 +379,21 @@ namespace sirius::app {
             // reduces an axis leaves its labels null on purpose, and the
             // input's labels indexed with the new dims would read past their
             // buffer in every consumer (crop, export, cleanup).
-            if (!out->labels && input.labels && labelsFit(*input.labels, out->meta.dims)) out->labels = input.labels->share();
+            std::shared_ptr<const LabelVolume> labelsFrom;
+            if (!out->labels && input.labels && labelsFit(*input.labels, out->meta.dims)) {
+                // The user's corrections on this step survive its re-run (a
+                // parameter change, a Recompute eviction) as long as they were
+                // made over the labels it is about to carry through again; an
+                // upstream that re-segmented supersedes them.
+                labelsFrom = input.labels;
+                std::shared_ptr<LabelVolume> kept = editedLabelsOf(step.id, labelsFrom);
+                out->labels = kept ? kept : input.labels->share();
+            }
             {
                 std::lock_guard<std::mutex> g(mutex_);
                 refreshPolicies(p);
             }
-            store(step, fp, out);
+            store(step, fp, out, labelsFrom);
             current = out;
             report.state = StepReport::State::Ran;
             report.seconds = out->seconds;

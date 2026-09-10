@@ -485,3 +485,12 @@ TEST_CASE("Shape and Buffer refuse element counts that overflow", "[buffer][shap
     CHECK(Shape{3, 0, 5}.empty());
     CHECK(Buffer<std::uint16_t>(Shape{3, 4, 5}).bytes() == 120);
 }
+
+TEST_CASE("BufferView::slice refuses a count that would wrap past the end", "[buffer][view]") {
+    Buffer<float> b(Shape{4, 2});
+    // first + count overflowed to a negative number and passed the old check
+    CHECK_THROWS_AS(b.view().slice(2, std::numeric_limits<Index>::max()), std::out_of_range);
+    CHECK_THROWS_AS(b.view().slice(4, 1), std::out_of_range);
+    CHECK(b.view().slice(4, 0).dim(0) == 0);
+    CHECK(b.view().slice(1, 3).dim(0) == 3);
+}

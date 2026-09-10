@@ -102,6 +102,10 @@ namespace sirius::app {
         if (input.dims.numel() <= 0) v.errors.push_back("No input data.");
         for (const ParamSpec& s : info().params) {
             if (s.type != ParamType::Channel) continue;
+            // a parameter the current settings hide does not apply (the
+            // moving channel of a time alignment): a single-channel movie
+            // could not be time-aligned because "channel 1 does not exist"
+            if (!s.visibleFor(params)) continue;
             const std::int64_t c = params.getInt(s.key, 0);
             if (c < 0 || c >= input.dims.c)
                 v.errors.push_back(s.label + ": channel " + std::to_string(c) + " does not exist (input has " +

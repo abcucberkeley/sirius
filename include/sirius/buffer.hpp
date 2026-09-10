@@ -345,10 +345,9 @@ namespace sirius {
     // ---------------------------------------------------------------------
     template <typename T>
     BufferView<T> BufferView<T>::slice(Index first, Index count) const {
-        if (rank() == 0 || first < 0 || count < 0 || first + count > dim(0))
-            throw std::out_of_range("BufferView::slice: [" + std::to_string(first) + ", " +
-                                    std::to_string(first + count) + ") exceeds dimension 0 of " +
-                                    shape_.toString());
+        if (rank() == 0 || first < 0 || count < 0 || count > dim(0) - first)   // no sum: it could wrap
+            throw std::out_of_range("BufferView::slice: " + std::to_string(count) + " element(s) from " + std::to_string(first) +
+                                    " exceed dimension 0 of " + shape_.toString());
         Shape s = shape_;
         s[0] = count;
         const Index inner = dim(0) == 0 ? 0 : size() / dim(0);

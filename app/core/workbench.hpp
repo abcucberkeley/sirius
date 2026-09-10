@@ -424,6 +424,9 @@ namespace sirius::app {
         // A label edit on step `id`: every step below it consumed (or
         // carried) the labels as they were, so their outputs are stale.
         void staleBelow(StepId id);
+        // The statistics describe one time point: bring them to the one on
+        // screen (a time series after tracking keeps its ids across t).
+        void syncLabelStats();
         // Undo / redo of a label edit: applies `diff` to the labels of step
         // `id` if they are still the volume the edit was made on, else a
         // logged no-op (the step was re-run or removed since).

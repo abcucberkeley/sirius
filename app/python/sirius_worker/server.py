@@ -297,6 +297,13 @@ class WorkerServer:
             except OSError as e:
                 log.info("connection error: %s", e)
                 break
+            except Exception as e:  # noqa: BLE001 - a decoder bug ends the connection, not the worker
+                log.exception("unexpected error reading a frame from %s", peer)
+                try:
+                    error(None, f"internal error: {_message(e)}")
+                except OSError:
+                    pass
+                break
             rid = header.get("id")
             method = str(header.get("method", ""))
             params = header.get("params")

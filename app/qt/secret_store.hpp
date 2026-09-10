@@ -32,8 +32,10 @@ namespace sirius::app::secrets {
     QString read(const QString& key);
 
     // Stores `value`, or removes the secret when `value` is empty. Also
-    // clears any plaintext leftover under the same QSettings key.
-    void write(const QString& key, const QString& value);
+    // clears any plaintext leftover under the same QSettings key. False when
+    // the backend refused (DPAPI, or the store file could not be written):
+    // the caller then knows the value is gone at the next launch.
+    bool write(const QString& key, const QString& value);
 
     void remove(const QString& key);
 

@@ -288,9 +288,12 @@ namespace sirius::app {
                                "Stored in the application settings and passed to the local worker as HF_TOKEN."),
                 QLineEdit::Password, hubToken(), &ok);
             if (!ok) return;
-            secrets::write(QStringLiteral("hub/token"), token.trimmed());
-            tokenButton->setText(token.trimmed().isEmpty() ? QStringLiteral("Token…") : QStringLiteral("Token ✓"));
-            setStatus(token.trimmed().isEmpty() ? QStringLiteral("Token cleared.") : QStringLiteral("Token stored."), false);
+            const bool stored = secrets::write(QStringLiteral("hub/token"), token.trimmed());
+            tokenButton->setText(token.trimmed().isEmpty() || !stored ? QStringLiteral("Token…") : QStringLiteral("Token ✓"));
+            setStatus(!stored                     ? QStringLiteral("The token could not be stored (secret store refused); it is not kept.")
+                      : token.trimmed().isEmpty() ? QStringLiteral("Token cleared.")
+                                                  : QStringLiteral("Token stored."),
+                      !stored);
         }
 
         void fileSelected() {

@@ -150,18 +150,49 @@ def _numel(shape: Tuple[int, ...], name: str) -> int:
     return n
 
 
+def _reject_constant(name: str):
+    # json.loads would happily make NaN and Infinity out of the wire; a
+    # descriptor with an infinite extent then ended the process in int()
+    raise ProtocolError(f"header contains the non-number {name}")
+
+
+def _load_header(data: bytes) -> Dict[str, Any]:
+    try:
+        header = json.loads(data.decode("utf-8"), parse_constant=_reject_constant)
+    except (UnicodeDecodeError, json.JSONDecodeError) as e:
+        raise ProtocolError(f"header is not JSON: {e}") from e
+    if not isinstance(header, dict):
+        raise ProtocolError("header is not a JSON object")
+    return header
+
+
+def _count(value: Any, what: str) -> int:
+    """A descriptor number: a non-negative JSON integer, nothing else (a
+    float such as 1e309 is not truncated, rounded or overflowed into one)."""
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise ProtocolError(f"{what} is not an integer: {value!r}")
+    if value < 0:
+        raise ProtocolError(f"{what} is negative: {value}")
+    return value
+
+
 def _decode_tensors(header: Dict[str, Any], payload: memoryview) -> Dict[str, np.ndarray]:
     descriptors = header.get("tensors") or []
     if not isinstance(descriptors, list):
         raise ProtocolError("header 'tensors' is not an array")
     out: Dict[str, np.ndarray] = {}
     for d in descriptors:
+        if not isinstance(d, dict):
+            raise ProtocolError(f"malformed tensor descriptor {d!r}")
         try:
             name = str(d["name"])
             dtype = DTYPES[str(d["dtype"])]
-            shape = tuple(int(s) for s in d["shape"])
-            offset = int(d["offset"])
-            nbytes = int(d["nbytes"])
+            raw_shape = d["shape"]
+            if not isinstance(raw_shape, list):
+                raise ProtocolError(f"tensor '{name}': shape is not an array")
+            shape = tuple(_count(s, f"tensor '{name}': shape extent") for s in raw_shape)
+            offset = _count(d["offset"], f"tensor '{name}': offset")
+            nbytes = _count(d["nbytes"], f"tensor '{name}': nbytes")
         except (KeyError, TypeError, ValueError) as e:
             raise ProtocolError(f"malformed tensor descriptor {d!r}: {e}") from e
         expected = _numel(shape, name) * dtype.itemsize if shape else dtype.itemsize
@@ -195,10 +226,7 @@ def decode_frame(buffer: bytearray, max_header: int = MAX_HEADER,
     end = pos + PAYLOAD_LEN.size + plen
     if len(buffer) < end:
         return None
-    try:
-        header = json.loads(bytes(buffer[HEADER_LEN.size:pos]).decode("utf-8"))
-    except (UnicodeDecodeError, json.JSONDecodeError) as e:
-        raise ProtocolError(f"header is not JSON: {e}") from e
+    header = _load_header(bytes(buffer[HEADER_LEN.size:pos]))
     if not isinstance(header, dict):
         raise ProtocolError("header is not a JSON object")
     payload = memoryview(buffer)[pos + PAYLOAD_LEN.size:end]
@@ -259,12 +287,7 @@ def read_frame(sock: socket.socket, max_header: int = MAX_HEADER,
     if plen > max_payload:
         raise ProtocolError(f"payload length {plen} exceeds {max_payload}")
     payload = recv_exactly(sock, plen) if plen else b""
-    try:
-        header = json.loads(hb.decode("utf-8"))
-    except (UnicodeDecodeError, json.JSONDecodeError) as e:
-        raise ProtocolError(f"header is not JSON: {e}") from e
-    if not isinstance(header, dict):
-        raise ProtocolError("header is not a JSON object")
+    header = _load_header(hb)
     return header, _decode_tensors(header, memoryview(payload))
 
 

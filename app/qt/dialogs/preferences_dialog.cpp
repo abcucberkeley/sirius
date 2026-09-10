@@ -8,6 +8,7 @@
 #include <QGridLayout>
 #include <QLabel>
 #include <QLineEdit>
+#include <QMessageBox>
 #include <QPushButton>
 #include <QSettings>
 #include <QSpinBox>
@@ -204,9 +205,10 @@ namespace sirius::app {
         settings.setValue(QStringLiteral("compute/cudaDevice"), impl_->device->currentData().toInt());
         settings.setValue(QStringLiteral("hpc/host"), impl_->host->text().trimmed());
         settings.setValue(QStringLiteral("hpc/port"), impl_->port->value());
-        secrets::write(QStringLiteral("hpc/token"), impl_->token->text());
+        QStringList notStored;
+        if (!secrets::write(QStringLiteral("hpc/token"), impl_->token->text())) notStored << QStringLiteral("the HPC token");
         settings.setValue(QStringLiteral("worker/python"), impl_->python->text().trimmed());
-        secrets::write(QStringLiteral("hub/token"), impl_->hfToken->text().trimmed());
+        if (!secrets::write(QStringLiteral("hub/token"), impl_->hfToken->text().trimmed())) notStored << QStringLiteral("the Hugging Face token");
         AssistantSettings as;
         as.provider = impl_->provider->currentData().toString();
         as.baseUrl = impl_->baseUrl->text().trimmed();
@@ -222,6 +224,10 @@ namespace sirius::app {
         rc.token = toStd(impl_->token->text());
         wb.setRemoteConfig(rc);
         emit assistantSettingsChanged();
+        if (!notStored.isEmpty())
+            QMessageBox::warning(this, QStringLiteral("Preferences"),
+                                 QStringLiteral("Could not store %1 in the secret store: it will not be there at the next launch.")
+                                     .arg(notStored.join(QStringLiteral(" and "))));
     }
 
     void PreferencesDialog::applyStored(Workbench& wb) {

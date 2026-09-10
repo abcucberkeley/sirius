@@ -527,13 +527,19 @@ namespace sirius::app {
             // dimensions: explicit page order > OME / ImageJ metadata > pages as z
             Index c = 1, t = 1, z = pages;
             std::string order = "czt";
+            const bool described = (md.ome || md.imagej) && (md.c > 0 || md.t > 0 || md.z > 0);
             if (options && options->pageOrder) {
+                // An axis left at 0 is not "1": it is whatever the file says
+                // (a 2-channel OME stack with only z given stays 2 channels),
+                // and the page order likewise unless one was given.
                 const PageOrder& po = *options->pageOrder;
-                c = std::max<Index>(po.c, 1);
-                t = std::max<Index>(po.t, 1);
-                z = po.z > 0 ? po.z : std::max<Index>(pages / (c * t), 1);
-                order = normalizeOrder(po.order);
-            } else if ((md.ome || md.imagej) && (md.c > 0 || md.t > 0 || md.z > 0)) {
+                c = po.c > 0 ? po.c : (described && md.c > 0 ? md.c : 1);
+                t = po.t > 0 ? po.t : (described && md.t > 0 ? md.t : 1);
+                z = po.z > 0 ? po.z : std::max<Index>(pages / std::max<Index>(c * t, 1), 1);
+                order = described && po.order == "czt" && !md.dimensionOrder.empty() ? pageOrderFromOme(md.dimensionOrder)
+                                                                                     : normalizeOrder(po.order);
+                r.dimsFromMetadata = described && po.c <= 0 && po.t <= 0 && po.z <= 0;
+            } else if (described) {
                 c = std::max<Index>(md.c, 1);
                 t = std::max<Index>(md.t, 1);
                 z = md.z > 0 ? md.z : std::max<Index>(pages / (c * t), 1);
@@ -564,7 +570,9 @@ namespace sirius::app {
                 if (xy[1] > 0.0) voxel[1] = xy[1];
             }
             if (voxel[2] <= 0.0 && md.imagej) voxel[2] = md.voxelUm[2];
-            if (options && options->voxelUm) voxel = *options->voxelUm;
+            if (options && options->voxelUm)
+                for (int k = 0; k < 3; ++k)
+                    if ((*options->voxelUm)[k] > 0.0) voxel[k] = (*options->voxelUm)[k];   // 0 = the file's
             const bool knownXy = voxel[0] > 0.0 && voxel[1] > 0.0;
             if (!knownXy) voxel[0] = voxel[1] = 0.1;
             if (voxel[2] <= 0.0) voxel[2] = knownXy ? voxel[0] * 2.0 : 0.2;

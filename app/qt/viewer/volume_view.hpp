@@ -47,7 +47,11 @@ namespace sirius::app {
 
         // Instance labels of the same (z, y, x) grid, composited over the
         // volume in their palette colours; `key` changes with every edit.
-        void setLabels(quint64 key, const std::uint32_t* labels, Index z, Index y, Index x, float opacity, std::uint32_t only = 0);
+        // `owner` keeps the voxels `labels` points into alive until the next
+        // setLabels / clearLabels: a paint stroke (copy-on-write) or a re-run
+        // may otherwise free them between the call and the next paintGL.
+        void setLabels(quint64 key, std::shared_ptr<const void> owner, const std::uint32_t* labels, Index z, Index y, Index x,
+                       float opacity, std::uint32_t only = 0);
         void clearLabels();
         bool hasLabels() const noexcept { return labels_ != nullptr; }
 
@@ -93,6 +97,7 @@ namespace sirius::app {
         QString preparing_;
         quint64 key_ = 0, uploadedKey_ = 0;
         const std::uint32_t* labels_ = nullptr;
+        std::shared_ptr<const void> labelsOwner_;   // what labels_ points into
         Index lz_ = 0, ly_ = 0, lx_ = 0;
         quint64 labelsKey_ = 0, uploadedLabelsKey_ = 0;
         float labelOpacity_ = 0.45f;

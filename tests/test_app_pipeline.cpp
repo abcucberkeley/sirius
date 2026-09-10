@@ -15,6 +15,8 @@
 
 #include <nlohmann/json.hpp>
 
+#include <sirius/tiff_io.hpp>
+
 #include "core/array_source.hpp"
 #include "core/cancel.hpp"
 #include "core/executor.hpp"
@@ -1790,4 +1792,126 @@ TEST_CASE("A run job cancelled before it starts does not start a worker", "[app]
     CHECK_FALSE(job->succeeded());
     wb.finishRun(job);
     CHECK_FALSE(wb.running());
+}
+
+TEST_CASE("Label edits on a step survive its re-run over the same input labels", "[app][workbench][labels][executor]") {
+    registerTestOps();
+    Scratch scratch;
+    Workbench wb(scratch.dir);
+    wb.setDataset(syntheticSource(1, 1, 4, 16, 16));
+    wb.setBackend(Backend::Cpu);
+    while (wb.pipeline().size() > 1) wb.removeStep(1);
+    wb.addStep("test_labels");   // 1: the labels
+    wb.addStep("test_scale");    // 2: carries them; Recompute keeps one array at a time
+    wb.addStep("test_scale");    // 3
+    wb.setStepCache(2, CachePolicy::Recompute);
+    wb.setStepCache(3, CachePolicy::Recompute);
+    REQUIRE(runSync(wb, 2)->succeeded());
+
+    wb.view(2);
+    paintOne(wb, 1, 2, 2, 9);
+    std::shared_ptr<LabelVolume> edited = wb.output(2)->labels;
+    REQUIRE(edited);
+    CHECK(edited->edited());
+    CHECK(edited->at(0, 1, 2, 2) == 9);
+
+    REQUIRE(runSync(wb, 3)->succeeded());   // step 3's store evicts step 2's array
+    CHECK_FALSE(wb.outputFresh(2));
+    REQUIRE(runSync(wb, 2)->succeeded());   // step 2 runs again, over the same input labels
+    REQUIRE(wb.output(2)->labels);
+    CHECK(wb.output(2)->labels == edited);   // the volume with the correction, not a fresh share
+    CHECK(wb.output(2)->labels->at(0, 1, 2, 2) == 9);
+
+    SECTION("an upstream that re-segmented supersedes them") {
+        wb.setStepParam(1, "label", std::int64_t{2});   // new labels upstream, step 2 stale
+        REQUIRE(runSync(wb, 2)->succeeded());
+        REQUIRE(wb.output(2)->labels);
+        CHECK(wb.output(2)->labels != edited);
+        CHECK(wb.output(2)->labels->at(0, 1, 2, 2) == 0);
+    }
+}
+
+TEST_CASE("Files named in a list parameter are part of the fingerprint", "[app][executor]") {
+    registerTestOps();
+    Scratch scratch;
+    Executor ex(scratch.dir / "cache");
+    const std::filesystem::path tile = scratch.dir / "tile.tif";
+    {
+        std::ofstream f(tile, std::ios::binary);
+        f << "one";
+    }
+    Pipeline p;
+    p.add("stitch");   // its `tiles` is a list of files, not a Path parameter
+    ParamSet q = p.at(1).params;
+    q.set("tiles", std::vector<std::string>{tile.string()});
+    p.setParams(1, q);
+    const std::string before = ex.fingerprint(p, 1);
+    {
+        std::ofstream f(tile, std::ios::binary);
+        f << "another size";   // rewritten under the same name
+    }
+    CHECK(ex.fingerprint(p, 1) != before);
+}
+
+TEST_CASE("Label statistics follow the viewed time point", "[app][workbench][labels]") {
+    registerTestOps();
+    Scratch scratch;
+    Workbench wb(scratch.dir);
+    wb.setDataset(syntheticSource(1, 3, 4, 16, 16));
+    wb.setBackend(Backend::Cpu);
+    while (wb.pipeline().size() > 1) wb.removeStep(1);
+    wb.addStep("test_labels");
+    REQUIRE(runSync(wb)->succeeded());
+    wb.view(1);
+    std::shared_ptr<LabelVolume> labels = wb.viewedLabels();
+    REQUIRE(labels);
+    REQUIRE(labels->t() == 3);
+    wb.setT(2);
+    CHECK(labels->statsT() == 2);
+    wb.setT(1);
+    CHECK(labels->statsT() == 1);
+    ViewState s = wb.viewState();
+    s.t = 0;
+    wb.setViewState(s);
+    CHECK(labels->statsT() == 0);
+}
+
+TEST_CASE("Load parameters left at zero keep the file's own axes and voxel sizes", "[app][workbench][load]") {
+    registerTestOps();
+    const Operation* load = findOperation("load");
+    REQUIRE(load);
+    ParamSet p = load->defaults();
+    p.set("z", std::int64_t{3});
+    p.set("voxel_z", 0.5);
+    const OpenOptions o = Workbench::openOptionsFromLoadParams(p);
+    REQUIRE(o.pageOrder);
+    CHECK(o.pageOrder->c == 0);   // 0: whatever the file says, not 1
+    CHECK(o.pageOrder->t == 0);
+    CHECK(o.pageOrder->z == 3);
+    REQUIRE(o.voxelUm);
+    CHECK((*o.voxelUm)[0] == 0.0);
+    CHECK((*o.voxelUm)[2] == 0.5);
+
+    // an ImageJ hyperstack of 2 channels x 3 planes: giving only z keeps the channels
+    Scratch scratch;
+    const std::filesystem::path path = scratch.dir / "hyper.tif";
+    Buffer<std::uint16_t> pages(Shape{6, 8, 8});
+    for (Index i = 0; i < pages.size(); ++i) pages.data()[i] = static_cast<std::uint16_t>(i);
+    TiffWriteOptions w;
+    w.description = "ImageJ=1.53t\nimages=6\nchannels=2\nslices=3\nhyperstack=true\n";
+    writeTiffStack<std::uint16_t>(path.string(), pages.view(), w);
+    const OpenResult plain = sirius::app::openDataset(path.string(), {});
+    CHECK(plain.meta.dims.c == 2);
+    CHECK(plain.meta.dims.z == 3);
+    OpenOptions onlyZ;
+    onlyZ.pageOrder = PageOrder{"czt", 0, 0, 3};
+    const OpenResult partial = sirius::app::openDataset(path.string(), onlyZ);
+    CHECK(partial.meta.dims.c == 2);   // was 1: the unset axis used to be forced to 1
+    CHECK(partial.meta.dims.t == 1);
+    CHECK(partial.meta.dims.z == 3);
+    OpenOptions oneVoxel;
+    oneVoxel.voxelUm = std::array<double, 3>{0.0, 0.0, 0.7};
+    const OpenResult voxel = sirius::app::openDataset(path.string(), oneVoxel);
+    CHECK(voxel.meta.voxelUm[2] == 0.7);
+    CHECK(voxel.meta.voxelUm[0] == plain.meta.voxelUm[0]);   // the file's, not 0
 }

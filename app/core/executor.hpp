@@ -106,7 +106,13 @@ namespace sirius::app {
         };
         std::shared_ptr<const StepOutput> load(Entry& e, PendingRestore& pending) const;   // caller holds mutex_
         std::shared_ptr<const StepOutput> restore(const PendingRestore& pending) const;    // no lock held
-        void store(const Step& step, const std::string& fp, std::shared_ptr<const StepOutput> out);
+        // `labelsFrom`: the input labels the output's labels were carried
+        // through from (null when the step made its own).
+        void store(const Step& step, const std::string& fp, std::shared_ptr<const StepOutput> out,
+                   std::shared_ptr<const LabelVolume> labelsFrom = nullptr);
+        // The step's previous labels when they carry user edits made over
+        // exactly these input labels; null otherwise.
+        std::shared_ptr<LabelVolume> editedLabelsOf(StepId id, const std::shared_ptr<const LabelVolume>& from) const;
         void refreshPolicies(const Pipeline& p);   // caller holds mutex_
         void evictRecomputeExcept(StepId keep);    // caller holds mutex_
 

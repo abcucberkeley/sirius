@@ -76,10 +76,10 @@ namespace sirius::app {
             if (c > 0 || t > 0 || z > 0) {
                 // the page count is fixed: derive the axis that was left at 0
                 const Index pages = meta.dims.planes();
-                Dims5 d = meta.dims;
-                d.c = c > 0 ? c : 1;
-                d.t = t > 0 ? t : 1;
-                d.z = z > 0 ? z : std::max<Index>(1, pages / (d.c * d.t));
+                Dims5 d = meta.dims;   // the axes left at 0 keep what the file says
+                d.c = c > 0 ? c : meta.dims.c;
+                d.t = t > 0 ? t : meta.dims.t;
+                d.z = z > 0 ? z : std::max<Index>(1, pages / std::max<Index>(d.c * d.t, 1));
                 if (d.planes() == pages) meta.dims = d;
             }
             const Index nd = p.getInt("sim_ndirs"), np = p.getInt("sim_nphases");
@@ -206,8 +206,8 @@ namespace sirius::app {
                 if (c > 0 || t > 0 || z > 0 || order != "czt") {
                     PageOrder po;
                     po.order = order.empty() ? "czt" : order;
-                    po.c = std::max<Index>(1, c);
-                    po.t = std::max<Index>(1, t);
+                    po.c = std::max<Index>(0, c);   // 0: the file's own (probeTiff)
+                    po.t = std::max<Index>(0, t);
                     po.z = std::max<Index>(0, z);
                     options.pageOrder = po;
                 }

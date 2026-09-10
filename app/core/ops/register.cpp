@@ -37,8 +37,8 @@ namespace sirius::app {
                 info_.params = {
                     choiceParam("mode", "Mode", {kChannels, kTime}, kChannels),
                     channelParam("fixed_channel", "Fixed channel", 0),
-                    channelParam("moving_channel", "Moving channel", 1),
-                    intParam("reference_t", "Reference time point", 0).range(0, 1000000),
+                    channelParam("moving_channel", "Moving channel", 1).visibleWhen("mode", {kChannels}),
+                    intParam("reference_t", "Reference time point", 0).range(0, 1000000).visibleWhen("mode", {kTime}),
                     doubleListParam("max_shift", "Max shift", {4.0, 32.0, 32.0}).withUnit("voxels").withHelp("Search bound per axis (z, y, x)"),
                     boolParam("mask_background", "Mask background", false),
                     doubleParam("background_level", "Background level", 0.0).range(-1e9, 1e9, 1.0, 2),
@@ -103,6 +103,26 @@ namespace sirius::app {
                     // voxel q of the aligned image = moving[q - shift]
                     cropPad(src, d.z, d.y, d.x, -shift[0], -shift[1], -shift[2], dst, d.z, d.y, d.x, 0.0f);
                 };
+                // Labels are one volume per time point, so a time alignment
+                // moves them with the images; a channel alignment leaves them
+                // where they are (they belong to whichever channel was
+                // segmented, usually the fixed one).
+                std::shared_ptr<LabelVolume> labels = input.labels ? input.labels->clone() : nullptr;
+                auto shiftLabels = [&](Index t, const std::array<Index, 3>& shift) {
+                    if (!labels || t >= labels->t()) return;
+                    const Index lz = labels->z(), ly = labels->y(), lx = labels->x();
+                    std::vector<std::uint32_t> src(labels->volume(t), labels->volume(t) + lz * ly * lx);
+                    std::uint32_t* dst = labels->volume(t);
+                    for (Index z = 0; z < lz; ++z)
+                        for (Index y = 0; y < ly; ++y)
+                            for (Index x = 0; x < lx; ++x) {
+                                // voxel q of the aligned image = moving[q - shift]
+                                const Index sz = z - shift[0], sy = y - shift[1], sx = x - shift[2];
+                                dst[(z * ly + y) * lx + x] = (sz >= 0 && sz < lz && sy >= 0 && sy < ly && sx >= 0 && sx < lx)
+                                                                 ? src[static_cast<std::size_t>((sz * ly + sy) * lx + sx)]
+                                                                 : 0u;
+                            }
+                };
                 Index jobs = alignTime ? d.t : d.t;
                 Index done = 0;
                 for (Index t = 0; t < d.t; ++t) {
@@ -123,6 +143,7 @@ namespace sirius::app {
                             Buffer<float> vol = input.readVolume(c, t);
                             shiftInto(vol.data(), result->volume(c, t).data(), r.integerShift);
                         }
+                        shiftLabels(t, r.integerShift);
                     } else {
                         shiftInto(moving.data(), result->volume(movingC, t).data(), r.integerShift);
                     }
@@ -134,7 +155,8 @@ namespace sirius::app {
                     }
                 }
                 out.array = result;
-                out.labels = input.labels ? input.labels->clone() : nullptr;
+                if (labels && alignTime && labels->statsT() >= 0) labels->recomputeStats(labels->statsT());   // the boxes moved
+                out.labels = labels;
                 out.ranOn = Backend::Cpu;
                 out.diagnostics = diagnostics(p, meta, results, pairNames, refVol, firstAligned);
                 int valid = 0;

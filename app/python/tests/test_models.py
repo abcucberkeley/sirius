@@ -480,3 +480,30 @@ class TestHubMethods(ServerTestCase, _CacheCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestCachePathJail(unittest.TestCase):
+    """A repository file name must not name a file outside the repository's
+    cache directory (".." or an absolute path on Windows)."""
+
+    def test_cached_path_stays_inside_the_cache(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            old = os.environ.get("SIRIUS_MODEL_CACHE")
+            os.environ["SIRIUS_MODEL_CACHE"] = tmp
+            try:
+                repo = models.repo_dir("owner/repo")
+                repo.mkdir(parents=True)
+                (repo / "model.pt").write_bytes(b"x")
+                outside = os.path.join(tmp, "secret.pt")
+                with open(outside, "wb") as f:
+                    f.write(b"y")
+                self.assertEqual(models.cached_path("owner/repo", "model.pt"), str((repo / "model.pt").resolve()))
+                self.assertIsNone(models.cached_path("owner/repo", "../secret.pt"))
+                self.assertIsNone(models.cached_path("owner/repo", "../../secret.pt"))
+                self.assertIsNone(models.cached_path("owner/repo", outside))
+                self.assertIsNone(models.cached_path("owner/repo", "missing.pt"))
+            finally:
+                if old is None:
+                    os.environ.pop("SIRIUS_MODEL_CACHE", None)
+                else:
+                    os.environ["SIRIUS_MODEL_CACHE"] = old

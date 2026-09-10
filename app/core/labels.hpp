@@ -76,6 +76,10 @@ namespace sirius::app {
         bool empty() const noexcept { return data_->empty(); }
         // True while another volume shares these voxels (share()).
         bool sharesVoxels() const noexcept { return data_.use_count() > 1; }
+        // True once a user edit (paint, fill, merge, split, delete, or an
+        // undo / redo of one) has touched this volume: what the executor
+        // keeps when the step that carries it is run again.
+        bool edited() const noexcept { return edited_; }
 
         // The mutable accessors detach a shared copy first (see the header note).
         std::uint32_t* volume(Index t);                          // (z, y, x)
@@ -149,6 +153,7 @@ namespace sirius::app {
         Index statsT_ = -1;
         std::optional<LabelFlagRules> flagRules_;       // the last applyFlags()
         std::uint32_t maxLabel_ = 0;
+        bool edited_ = false;
     };
 
     using LabelsPtr = std::shared_ptr<const LabelVolume>;

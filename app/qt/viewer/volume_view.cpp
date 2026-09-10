@@ -308,8 +308,10 @@ namespace sirius::app {
         update();
     }
 
-    void VolumeView::setLabels(quint64 key, const std::uint32_t* labels, Index z, Index y, Index x, float opacity, std::uint32_t only) {
+    void VolumeView::setLabels(quint64 key, std::shared_ptr<const void> owner, const std::uint32_t* labels, Index z, Index y, Index x,
+                               float opacity, std::uint32_t only) {
         labels_ = labels;
+        labelsOwner_ = std::move(owner);
         labelOnly_ = only;
         lz_ = z;
         ly_ = y;
@@ -322,6 +324,7 @@ namespace sirius::app {
     void VolumeView::clearLabels() {
         if (!labels_ && labelsKey_ == 0) return;
         labels_ = nullptr;
+        labelsOwner_.reset();
         labelsKey_ = 0;
         update();
     }

@@ -153,7 +153,12 @@ def cached_path(repo: str, filename: str) -> Optional[str]:
     """Local path of an already-downloaded repository file, else None."""
     if not filename:
         return None
-    p = repo_dir(repo) / filename
+    root = repo_dir(repo).resolve()
+    p = (repo_dir(repo) / filename).resolve()
+    # a file name with ".." or a drive in it must not name a file outside
+    # the repository's cache directory
+    if p != root and root not in p.parents:
+        return None
     return str(p) if p.is_file() else None
 
 

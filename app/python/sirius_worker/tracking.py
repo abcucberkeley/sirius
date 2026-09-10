@@ -105,20 +105,35 @@ def run_btrack(labels: np.ndarray, voxel_um: Tuple[float, float, float], params:
     t_, z_, y_, x_ = labels.shape
     if progress:
         progress(0.05, "objects")
-    objects = btrack.utils.segmentation_to_objects(labels)
+    # Objects in micrometres, so the search radius means the same thing on
+    # every axis (in voxels, a light-sheet stack's z gate was dx / dz times
+    # too generous); the built-in tracker gates in micrometres too. An older
+    # btrack without the `scale` argument tracks in voxels, gated by dx.
+    dx = float(voxel_um[0]) if voxel_um and voxel_um[0] > 0 else 1.0
+    dy = float(voxel_um[1]) if voxel_um and len(voxel_um) > 1 and voxel_um[1] > 0 else dx
+    dz = float(voxel_um[2]) if voxel_um and len(voxel_um) > 2 and voxel_um[2] > 0 else dx
+    scale = (dz, dy, dx) if z_ > 1 else (dy, dx)
+    try:
+        objects = btrack.utils.segmentation_to_objects(labels, scale=scale)
+        physical = True
+    except TypeError:
+        objects = btrack.utils.segmentation_to_objects(labels)
+        physical = False
     if not objects:
         return np.zeros_like(labels), {"tracks": 0, "objects": 0}
 
-    dx = float(voxel_um[0]) if voxel_um and voxel_um[0] > 0 else 1.0
-    search_px = max(1.0, float(params.get("max_distance", 10.0)) / dx)
+    max_distance = float(params.get("max_distance", 10.0))
     config = _config(str(params.get("config", "") or ""))
     if progress:
         progress(0.2, "btrack")
     with btrack.BayesianTracker() as tracker:
         tracker.configure(config)
-        tracker.max_search_radius = search_px
-        tracker.append(objects)
-        tracker.volume = ((0, x_), (0, y_), (0, z_)) if z_ > 1 else ((0, x_), (0, y_))
+        if physical:
+            tracker.max_search_radius = max(1e-6, max_distance)
+            tracker.volume = ((0, x_ * dx), (0, y_ * dy), (0, z_ * dz)) if z_ > 1 else ((0, x_ * dx), (0, y_ * dy))
+        else:
+            tracker.max_search_radius = max(1.0, max_distance / dx)
+            tracker.volume = ((0, x_), (0, y_), (0, z_)) if z_ > 1 else ((0, x_), (0, y_))
         tracker.track(step_size=100)
         if bool(params.get("optimise", True)):
             # the hypothesis optimisation is what reconstructs lineages
@@ -151,6 +166,8 @@ def run_btrack(labels: np.ndarray, voxel_um: Tuple[float, float, float], params:
         for t, zc, yc, xc in zip(frames, track.z, track.y, track.x):
             if not (0 <= t < t_):
                 continue
+            if physical:   # back to voxels, where the centroids live
+                zc, yc, xc = zc / dz, yc / dy, xc / dx
             ids_t, centres_t = centroids[t]
             src = 0
             if ids_t.size:

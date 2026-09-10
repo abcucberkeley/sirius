@@ -25,7 +25,9 @@ namespace sirius::app {
                 info_.diagnostics = DiagnosticsKind::Deconvolve;
                 info_.defaultCache = CachePolicy::Disk;
                 info_.separableOverT = true;
-                info_.hasGpuPath = true;
+                // The library serves a CUDA device from the host (src/deconvolution.cpp):
+                // advertising a GPU path would only show "GPU" in the UI for a CPU run.
+                info_.hasGpuPath = false;
                 info_.helpPage = "decon";
                 info_.params = {
                     choiceParam("algorithm", "Algorithm", {"Richardson–Lucy"}, "Richardson–Lucy"),

@@ -343,6 +343,7 @@ namespace sirius::app {
         LabelDiff diff;
         diff.t = t;
         if (t < 0 || t >= t_) throw std::out_of_range("LabelVolume::paint: t out of range");
+        edited_ = true;
         std::uint32_t* v = volume(t);
         const double r = std::max(radius, 0.0);
         const Index ri = static_cast<Index>(std::ceil(r));
@@ -377,6 +378,7 @@ namespace sirius::app {
         if (t < 0 || t >= t_) throw std::out_of_range("LabelVolume::fill: t out of range");
         if (z < 0 || z >= z_ || y < 0 || y >= y_ || x < 0 || x >= x_)
             throw std::out_of_range("LabelVolume::fill: seed outside the volume");
+        edited_ = true;
         std::uint32_t* v = volume(t);
         const Index seed = (z * y_ + y) * x_ + x;
         const std::uint32_t from = v[seed];
@@ -417,6 +419,7 @@ namespace sirius::app {
         std::sort(sources.begin(), sources.end());
         sources.erase(std::unique(sources.begin(), sources.end()), sources.end());
         const std::uint32_t target = sources.front();
+        edited_ = true;
         std::uint32_t* v = volume(t);
         const Index n = volumeSize();
         for (Index i = 0; i < n; ++i) {
@@ -436,6 +439,7 @@ namespace sirius::app {
         diff.t = t;
         if (t < 0 || t >= t_) throw std::out_of_range("LabelVolume::remove: t out of range");
         if (!id) return diff;
+        edited_ = true;
         std::uint32_t* v = volume(t);
         const Index n = volumeSize();
         for (Index i = 0; i < n; ++i) {
@@ -453,6 +457,7 @@ namespace sirius::app {
         diff.t = t;
         if (t < 0 || t >= t_) throw std::out_of_range("LabelVolume::split: t out of range");
         if (!id) throw std::invalid_argument("LabelVolume::split: cannot split the background");
+        edited_ = true;
         std::uint32_t* v = volume(t);
         auto inside = [&](const std::array<Index, 3>& s) {
             return s[0] >= 0 && s[0] < z_ && s[1] >= 0 && s[1] < y_ && s[2] >= 0 && s[2] < x_ &&
@@ -518,6 +523,7 @@ namespace sirius::app {
         if (diff.t < 0 || diff.t >= t_) throw std::out_of_range("LabelVolume::apply: t out of range");
         if (diff.before.size() != diff.indices.size() || diff.after.size() != diff.indices.size())
             throw std::invalid_argument("LabelVolume::apply: malformed diff");
+        edited_ = true;
         std::uint32_t* v = volume(diff.t);
         const std::vector<std::uint32_t>& values = forward ? diff.after : diff.before;
         const Index n = volumeSize();

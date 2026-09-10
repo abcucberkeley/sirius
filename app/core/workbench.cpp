@@ -411,13 +411,14 @@ namespace sirius::app {
         if (c > 0 || t > 0 || z > 0 || (!order.empty() && order != "czt")) {
             PageOrder po;
             po.order = order.empty() ? "czt" : order;
-            po.c = std::max<Index>(c, 1);
-            po.t = std::max<Index>(t, 1);
-            po.z = z;
+            po.c = std::max<Index>(c, 0);   // 0: the file's own (probeTiff)
+            po.t = std::max<Index>(t, 0);
+            po.z = std::max<Index>(z, 0);
             o.pageOrder = po;
         }
+        // any one of them overrides that axis; 0 keeps the file's (as the Load step's run does)
         const double vx = p.getDouble("voxel_x", 0.0), vy = p.getDouble("voxel_y", 0.0), vz = p.getDouble("voxel_z", 0.0);
-        if (vx > 0.0 && vy > 0.0 && vz > 0.0) o.voxelUm = std::array<double, 3>{vx, vy, vz};
+        if (vx > 0.0 || vy > 0.0 || vz > 0.0) o.voxelUm = std::array<double, 3>{std::max(vx, 0.0), std::max(vy, 0.0), std::max(vz, 0.0)};
         const int ndirs = static_cast<int>(p.getInt("sim_ndirs", 0)), nphases = static_cast<int>(p.getInt("sim_nphases", 0));
         if (ndirs > 0 && nphases > 0) {
             SimLayout sim;
@@ -735,7 +736,11 @@ namespace sirius::app {
                 if (v.empty() || std::filesystem::path(v).is_absolute()) continue;
                 std::error_code ec;
                 const std::filesystem::path beside = base / v;
-                if (std::filesystem::exists(beside, ec)) s.params.set(spec.key, beside.lexically_normal().string());
+                // beside the pipeline file, unless it only exists relative to
+                // the working directory; a missing file is named where the
+                // pipeline expects it, so validation can say so
+                if (std::filesystem::exists(beside, ec) || !std::filesystem::exists(std::filesystem::path(v), ec))
+                    s.params.set(spec.key, beside.lexically_normal().string());
             }
         }
         const ParamSet loadBefore = pipeline_.at(0).params;
@@ -902,12 +907,27 @@ namespace sirius::app {
         viewed_ = index;
         const DatasetMeta meta = outputMetaOf(index);
         view_.channelVisible.resize(static_cast<std::size_t>(std::max<Index>(meta.dims.c, 1)), true);
+        syncLabelStats();
         notify(&Observer::viewedStepChanged);
+    }
+
+    void Workbench::syncLabelStats() {
+        if (running()) return;   // the worker may be reading the statistics
+        auto labels = viewedLabels();
+        if (!labels || labels->empty() || labels->t() <= 1) return;
+        if (view_.t < 0 || view_.t >= labels->t() || labels->statsT() == view_.t) return;
+        endPaintStroke();
+        labels->recomputeStats(view_.t);
+        int actual = -1;
+        displayOutput(&actual);
+        notifyLabels(actual >= 0 ? pipeline_.at(actual).id : 0);
     }
 
     void Workbench::setViewState(const ViewState& s) {
         const bool jump = s.soloLabel && s.selectedLabel != 0 && s.selectedLabel != view_.selectedLabel;
+        const bool tChanged = s.t != view_.t;
         view_ = s;
+        if (tChanged) syncLabelStats();
         // inspecting one label at a time: a new selection brings it into view
         if (jump) centreOnLabel(s.selectedLabel);
         notify(&Observer::viewStateChanged);
@@ -973,6 +993,7 @@ namespace sirius::app {
         t = std::clamp<Index>(t, 0, std::max<Index>(meta.dims.t - 1, 0));
         if (view_.t == t) return;
         view_.t = t;
+        syncLabelStats();
         notify(&Observer::viewStateChanged);
     }
 
@@ -1264,6 +1285,7 @@ namespace sirius::app {
         view_.channelVisible.resize(static_cast<std::size_t>(std::max<Index>(meta.dims.c, 1)), true);
         view_.z = std::clamp<Index>(view_.z, 0, std::max<Index>(meta.dims.z - 1, 0));
         view_.t = std::clamp<Index>(view_.t, 0, std::max<Index>(meta.dims.t - 1, 0));
+        syncLabelStats();   // a tracking step leaves the last frame's table
         notify(&Observer::outputsChanged);
         notify(&Observer::viewStateChanged);
         notify(&Observer::runStateChanged);
@@ -1473,6 +1495,7 @@ namespace sirius::app {
 
     std::uint32_t Workbench::nextFlaggedLabel(bool forward) {
         endPaintStroke();
+        syncLabelStats();
         auto labels = viewedLabels();
         if (!labels) return 0;
         const auto& stats = labels->stats();

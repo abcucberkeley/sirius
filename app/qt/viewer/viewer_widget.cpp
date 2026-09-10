@@ -1577,7 +1577,11 @@ namespace sirius::app {
             const quint64 lkey = (static_cast<quint64>(reinterpret_cast<std::uintptr_t>(L)) ^ (static_cast<quint64>(t + 1) << 40) ^
                                   (labelsVersion << 8) ^ (static_cast<quint64>(only) << 20)) |
                                  1;
-            volume->setLabels(lkey, L->volume(t), L->z(), L->y(), L->x(), static_cast<float>(s.labelOpacity), only);
+            // the view keeps the volume (and so its voxels) alive between the
+            // call and its upload; a stroke's copy-on-write must not free them
+            const std::shared_ptr<const StepOutput> owner = model.output();
+            volume->setLabels(lkey, std::shared_ptr<const void>(owner, owner ? owner->labels.get() : nullptr), L->volume(t), L->z(),
+                              L->y(), L->x(), static_cast<float>(s.labelOpacity), only);
         } else {
             volume->clearLabels();
         }

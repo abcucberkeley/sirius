@@ -77,11 +77,12 @@ namespace sirius::app::secrets {
             return QString::fromUtf8(unprotect(blob, key));
         }
 
-        void writeBackend(const QString& key, const QString& value) {
+        bool writeBackend(const QString& key, const QString& value) {
             QSettings s;
             const QByteArray blob = protect(value.toUtf8(), key);
-            if (blob.isEmpty()) return;   // DPAPI refused; better no value than a plaintext one
+            if (blob.isEmpty()) return false;   // DPAPI refused; better no value than a plaintext one
             s.setValue(settingsKey(key), QString::fromLatin1(blob.toBase64()));
+            return true;
         }
 
         void removeBackend(const QString& key) { QSettings().remove(settingsKey(key)); }
@@ -107,18 +108,20 @@ namespace sirius::app::secrets {
             return doc.isObject() ? doc.object() : QJsonObject();
         }
 
-        void saveStore(const QJsonObject& obj) {
+        bool saveStore(const QJsonObject& obj) {
             const QString path = storePath();
             QDir().mkpath(QFileInfo(path).absolutePath());
             QFile::setPermissions(QFileInfo(path).absolutePath(),
                                   QFileDevice::ReadOwner | QFileDevice::WriteOwner | QFileDevice::ExeOwner);
             QFile f(path);
-            if (!f.open(QIODevice::WriteOnly | QIODevice::Truncate)) return;
+            if (!f.open(QIODevice::WriteOnly | QIODevice::Truncate)) return false;
             // Tighten the mode on the (still empty) file before anything is
             // written into it, so the secret is never briefly world-readable.
             f.setPermissions(QFileDevice::ReadOwner | QFileDevice::WriteOwner);
-            f.write(QJsonDocument(obj).toJson(QJsonDocument::Indented));
+            const QByteArray text = QJsonDocument(obj).toJson(QJsonDocument::Indented);
+            const bool written = f.write(text) == text.size();
             f.close();
+            return written && f.error() == QFileDevice::NoError;
         }
 
         QString readBackend(const QString& key) {
@@ -127,10 +130,10 @@ namespace sirius::app::secrets {
             return QString::fromUtf8(mask(QByteArray::fromBase64(v.toString().toLatin1()), key));
         }
 
-        void writeBackend(const QString& key, const QString& value) {
+        bool writeBackend(const QString& key, const QString& value) {
             QJsonObject obj = loadStore();
             obj.insert(key, QString::fromLatin1(mask(value.toUtf8(), key).toBase64()));
-            saveStore(obj);
+            return saveStore(obj);
         }
 
         void removeBackend(const QString& key) {
@@ -158,12 +161,15 @@ namespace sirius::app::secrets {
         return legacy;
     }
 
-    void write(const QString& key, const QString& value) {
+    bool write(const QString& key, const QString& value) {
+        bool ok = true;
         if (value.isEmpty())
             removeBackend(key);
         else
-            writeBackend(key, value);
+            ok = writeBackend(key, value);
         QSettings().remove(key);   // never leave the old plaintext behind
+        if (!ok) qWarning("secret store: could not store '%s'", qPrintable(key));
+        return ok;
     }
 
     void remove(const QString& key) {

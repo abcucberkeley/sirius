@@ -994,3 +994,24 @@ TEST_CASE("The 256-bin histogram puts a bin's centre where valueOf says", "[app]
     CHECK(t > 0.3f);
     CHECK(t < 0.7f);
 }
+
+TEST_CASE("A LabelVolume remembers that it was edited", "[app][labels]") {
+    LabelVolume v(1, 2, 8, 8);
+    CHECK_FALSE(v.edited());
+    v.paint(0, 0, 4, 4, 1.0, 0, 3);
+    CHECK(v.edited());
+    CHECK_FALSE(v.share()->edited());   // a share over the same voxels has not been edited on its own
+    CHECK_FALSE(v.clone()->edited());
+    LabelVolume w(1, 2, 8, 8);
+    LabelDiff d;
+    d.t = 0;
+    d.indices = {0};
+    d.before = {0};
+    d.after = {5};
+    w.apply(d, true);   // an undo / redo counts as an edit too
+    CHECK(w.edited());
+    LabelVolume untouched(1, 2, 8, 8);
+    untouched.recomputeStats(0);
+    (void)untouched.volume(0);   // a mutable accessor alone is not an edit
+    CHECK_FALSE(untouched.edited());
+}

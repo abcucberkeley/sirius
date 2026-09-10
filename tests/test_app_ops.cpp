@@ -1680,3 +1680,44 @@ TEST_CASE("Contrast's summary does not promise a per-channel window", "[app][ops
     ParamSet p = op.defaults();
     CHECK(op.summary(p, meta).find("per channel") == std::string::npos);
 }
+
+TEST_CASE("Register moves the labels with the time points it aligns", "[app][ops][register][labels]") {
+    const Dims5 dims{1, 2, 1, 48, 48};
+    const DatasetMeta meta = metaFor(dims);
+    auto data = std::make_shared<Array5>(Array5::zeros(dims));
+    // the blobs of t = 0 sit at (y + 3, x - 4) in t = 1
+    const int pts[][2] = {{10, 12}, {30, 20}, {22, 36}, {38, 40}, {14, 30}};
+    for (const auto& pt : pts)
+        for (Index y = 0; y < 48; ++y)
+            for (Index x = 0; x < 48; ++x) {
+                const double d0 = std::hypot(y - pt[0], x - pt[1]);
+                data->at(0, 0, 0, y, x) += static_cast<float>(100.0 * std::exp(-d0 * d0 / 8.0));
+                const double d1 = std::hypot(y - (pt[0] + 3), x - (pt[1] - 4));
+                data->at(0, 1, 0, y, x) += static_cast<float>(100.0 * std::exp(-d1 * d1 / 8.0));
+            }
+    // a label on the first blob in both frames, where the blob is in each
+    auto labels = std::make_shared<LabelVolume>(2, 1, 48, 48);
+    for (Index y = 9; y <= 11; ++y)
+        for (Index x = 11; x <= 13; ++x) {
+            labels->volume(0)[y * 48 + x] = 7;
+            labels->volume(1)[(y + 3) * 48 + (x - 4)] = 7;
+        }
+    const Operation& op = requireOperation("register");
+    ParamSet p = op.defaults();
+    p.set("mode", std::string("Align time points to reference"));
+    p.set("reference_t", std::int64_t{0});
+    p.set("max_shift", std::vector<double>{0.0, 8.0, 8.0});
+    REQUIRE(op.validate(p, meta).ok());
+    Progress prog;
+    StepInput in = inputOf(data, meta);
+    in.labels = labels;
+    const StepOutput r = op.run(in, p, prog.ctx);
+    REQUIRE(r.array);
+    CHECK(r.array->at(0, 1, 0, 10, 12) > 80.0f);   // the frame moved onto the reference
+    REQUIRE(r.labels);
+    CHECK(r.labels != labels);                      // a copy: the input's labels are untouched
+    CHECK(labels->at(1, 0, 13, 8) == 7);
+    CHECK(r.labels->at(1, 0, 10, 12) == 7);         // and so did its label
+    CHECK(r.labels->at(1, 0, 13, 8) == 0);
+    CHECK(r.labels->at(0, 0, 10, 12) == 7);         // the reference frame stays
+}

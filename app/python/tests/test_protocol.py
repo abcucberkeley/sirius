@@ -587,3 +587,51 @@ class TestJsonScrubbing(unittest.TestCase):
         out = _jsonable(table)
         self.assertEqual(out, {"rows": [[None, 1.5], [None, 2]], "n": 3})
         json.dumps(out, allow_nan=False)   # what encode_frame does
+
+
+class TestDescriptorNumbers(unittest.TestCase):
+    """Every number in a tensor descriptor must be a non-negative JSON
+    integer. json.loads makes 1e309 an infinite float and accepts Infinity
+    and NaN; int() of the first raised OverflowError, which nothing caught,
+    and the worker process ended on an unauthenticated frame."""
+
+    @staticmethod
+    def _frame(tensors_json: str, payload: bytes = b"\0" * 4) -> bytes:
+        header = ('{"id":1,"type":"request","method":"run","tensors":' + tensors_json + '}').encode("utf-8")
+        return protocol.HEADER_LEN.pack(len(header)) + header + protocol.PAYLOAD_LEN.pack(len(payload)) + payload
+
+    def test_non_integer_descriptor_numbers_are_protocol_errors(self):
+        cases = ['"shape":[1e309],"offset":0,"nbytes":4', '"shape":[Infinity],"offset":0,"nbytes":4',
+                 '"shape":[1.5],"offset":0,"nbytes":4', '"shape":[-1],"offset":0,"nbytes":4',
+                 '"shape":["2"],"offset":0,"nbytes":4', '"shape":[true],"offset":0,"nbytes":4',
+                 '"shape":1,"offset":0,"nbytes":4', '"shape":[1],"offset":1e309,"nbytes":4',
+                 '"shape":[1],"offset":0.5,"nbytes":4', '"shape":[1],"offset":0,"nbytes":NaN',
+                 '"shape":[1],"offset":0,"nbytes":4.0']
+        for fields in cases:
+            with self.subTest(fields=fields):
+                reader = protocol.FrameReader()
+                with self.assertRaises(protocol.ProtocolError):
+                    reader.feed(self._frame('[{"name":"a","dtype":"float32",' + fields + '}]'))
+        reader = protocol.FrameReader()
+        frames = reader.feed(self._frame('[{"name":"a","dtype":"float32","shape":[1],"offset":0,"nbytes":4}]'))
+        self.assertEqual(len(frames), 1)
+        self.assertEqual(frames[0][1]["a"].shape, (1,))
+
+    def test_a_hostile_descriptor_does_not_end_the_worker(self):
+        server = WorkerServer("127.0.0.1", 0, "t", "cpu")
+        port = server.bind()
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        try:
+            hostile = socket.create_connection(("127.0.0.1", port), timeout=10)
+            hostile.sendall(self._frame('[{"name":"a","dtype":"float32","shape":[1e309],"offset":0,"nbytes":4}]'))
+            header, _ = protocol.read_frame(hostile)
+            self.assertEqual(header["type"], "error")
+            hostile.close()
+            self.assertTrue(thread.is_alive())
+            client = _Client(port, "t")   # the next client is served as before
+            self.assertEqual(client.hello()["type"], "result")
+            client.close()
+        finally:
+            server.stop()
+            thread.join(timeout=5)

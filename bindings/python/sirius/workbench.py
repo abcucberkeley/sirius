@@ -454,7 +454,10 @@ def _load_zarr(path: str) -> Tuple[np.ndarray, Dict[str, Any]]:
     if axes_names is None or len(axes_names) != data.ndim:
         if data.ndim > 5:
             raise ValueError(f"{path}: cannot map {data.ndim} axes onto (c, t, z, y, x)")
-        axes_names = list(AXES[5 - data.ndim:])
+        # unnamed axes are read from the fast end as x, y, z, c, t (the
+        # OME-NGFF default order, and what array_source.cpp does): a 5D store
+        # is (t, c, z, y, x), a 4D one (c, z, y, x)
+        axes_names = list("tczyx"[5 - data.ndim:])
     a = _as5(_reorder_to_ctzyx(data, "".join(ax[0] for ax in axes_names)))
     meta = _default_meta(a, path, "n5" if path.lower().rstrip("/\\").endswith(".n5") else "zarr")
     if scale is not None and len(scale) == len(axes_names):

@@ -14,6 +14,7 @@
 #include <catch2/matchers/catch_matchers_string.hpp>
 
 #include <atomic>
+#include <limits>
 #include <thread>
 
 #include "core/cancel.hpp"
@@ -548,3 +549,51 @@ TEST_CASE("plugins from the worker become operations and run", "[app][rpc][worke
     std::filesystem::remove_all(pdir);
 }
 #endif
+
+TEST_CASE("rpc tensor descriptors must hold non-negative integers", "[app][rpc]") {
+    // 1e309 parses as an infinite double; get<Index>() of that is undefined
+    // (the Python worker died of int(inf)). Every such descriptor is a
+    // protocol error, whatever the JSON parser made of the number.
+    auto put32 = [](std::vector<std::byte>& out, std::uint32_t v) {   // little-endian, as the wire is
+        for (int i = 0; i < 4; ++i) out.push_back(static_cast<std::byte>((v >> (8 * i)) & 0xff));
+    };
+    auto put64 = [](std::vector<std::byte>& out, std::uint64_t v) {
+        for (int i = 0; i < 8; ++i) out.push_back(static_cast<std::byte>((v >> (8 * i)) & 0xff));
+    };
+    auto frame = [&](const std::string& header, std::uint64_t payloadLen) {
+        std::vector<std::byte> out;
+        put32(out, static_cast<std::uint32_t>(header.size()));
+        for (char c : header) out.push_back(static_cast<std::byte>(c));
+        put64(out, payloadLen);
+        out.resize(out.size() + payloadLen, std::byte{0});
+        return out;
+    };
+    auto descriptor = [](const std::string& shape, const std::string& offset, const std::string& nbytes) {
+        return "{\"id\":1,\"type\":\"result\",\"tensors\":[{\"name\":\"a\",\"dtype\":\"float32\",\"shape\":" + shape +
+               ",\"offset\":" + offset + ",\"nbytes\":" + nbytes + "}]}";
+    };
+    for (const char* shape : {"[1e309]", "[1.5]", "[-1]", "[\"2\"]", "[true]", "2"}) {
+        INFO("shape " << shape);
+        std::vector<std::byte> bytes = frame(descriptor(shape, "0", "4"), 4);
+        CHECK_THROWS_AS(rpc::decodeFrame(bytes), ProtocolError);
+    }
+    for (const char* offset : {"1e309", "0.5", "-1", "\"0\""}) {
+        INFO("offset " << offset);
+        std::vector<std::byte> bytes = frame(descriptor("[1]", offset, "4"), 4);
+        CHECK_THROWS_AS(rpc::decodeFrame(bytes), ProtocolError);
+    }
+    for (const char* nbytes : {"1e309", "4.0", "-4"}) {
+        INFO("nbytes " << nbytes);
+        std::vector<std::byte> bytes = frame(descriptor("[1]", "0", nbytes), 4);
+        CHECK_THROWS_AS(rpc::decodeFrame(bytes), ProtocolError);
+    }
+    std::vector<std::byte> good = frame(descriptor("[1]", "0", "4"), 4);
+    const auto m = rpc::decodeFrame(good);
+    REQUIRE(m);
+    REQUIRE(m->tensors.size() == 1);
+    CHECK(m->tensors[0].numel() == 1);
+    // and the sender checks its own arithmetic the same way
+    std::vector<float> one{1.f};
+    std::vector<rpc::TensorRef> wrapped{{"a", "float32", {std::numeric_limits<Index>::max(), 4}, one.data(), 4}};
+    CHECK_THROWS(rpc::encodeFrame({{"id", 1}}, wrapped));
+}
