@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <exception>
 #include <fstream>
+#include <functional>
 #include <vector>
 
 #include <QAbstractSlider>
@@ -15,6 +16,7 @@
 #include <QMimeData>
 #include <QDragEnterEvent>
 #include <QDockWidget>
+#include <QEvent>
 #include <QPushButton>
 #include <QWindow>
 #include <QMouseEvent>
@@ -234,6 +236,28 @@ namespace sirius::app {
 
     } // namespace
 
+    namespace {
+        // A menu action whose unmodified shortcut (Space, L, the arrows ...)
+        // stands back when the focused widget uses that key itself. Only the
+        // shortcut is guarded: a click on the menu, or a scripted trigger(),
+        // means the action and must never be swallowed -- with a spin box
+        // focused, View > Labels overlay from the menu used to do nothing.
+        class GuardedAction final : public QAction {
+        public:
+            using QAction::QAction;
+            std::function<bool()> shortcutBlocked;   // true: this shortcut press is the widget's
+
+        protected:
+            bool event(QEvent* e) override {
+                if (e->type() == QEvent::Shortcut && shortcutBlocked && shortcutBlocked()) {
+                    e->accept();
+                    return true;
+                }
+                return QAction::event(e);
+            }
+        };
+    } // namespace
+
     struct MainWindow::Impl {
         MainWindow* self;
         WorkbenchBridge& bridge;
@@ -401,17 +425,13 @@ namespace sirius::app {
 
         QAction* action(QMenu* menu, const QString& text, const QKeySequence& key, std::function<void()> fn,
                         const QString& tip = {}) {
-            auto* a = menu->addAction(text);
+            auto* a = new GuardedAction(text, menu);
+            menu->addAction(a);
             if (!key.isEmpty()) a->setShortcut(key);
             a->setShortcutContext(Qt::WindowShortcut);
             if (!tip.isEmpty()) a->setStatusTip(tip);
-            if (fn) {
-                const bool guard = unmodified(key);
-                QObject::connect(a, &QAction::triggered, self, [fn, guard, key] {
-                    if (guard && focusClaims(key)) return;
-                    fn();
-                });
-            }
+            if (unmodified(key)) a->shortcutBlocked = [key] { return focusClaims(key); };
+            if (fn) QObject::connect(a, &QAction::triggered, self, [fn] { fn(); });
             return a;
         }
 
