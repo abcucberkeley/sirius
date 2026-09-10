@@ -78,12 +78,14 @@ def _frame_centroids(frame: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
     idx = np.flatnonzero(flat)
     if idx.size == 0:
         return np.zeros(0, dtype=np.uint32), np.zeros((0, 3), dtype=np.float64)
-    ids = flat[idx].astype(np.int64)
+    # counted by the rank of the id, so the arrays are sized by the ids
+    # present and not by the largest one (a stray id near 2^32 is a 32 GB
+    # bincount otherwise)
+    ids, inverse = np.unique(flat[idx], return_inverse=True)
     coords = np.stack(np.unravel_index(idx, frame.shape), axis=1).astype(np.float64)
-    counts = np.bincount(ids)
-    sums = np.stack([np.bincount(ids, weights=coords[:, k]) for k in range(3)], axis=1)
-    present = np.flatnonzero(counts)
-    return present.astype(np.uint32), sums[present] / counts[present][:, None]
+    counts = np.bincount(inverse, minlength=ids.size)
+    sums = np.stack([np.bincount(inverse, weights=coords[:, k], minlength=ids.size) for k in range(3)], axis=1)
+    return ids.astype(np.uint32), sums / counts[:, None]
 
 
 def run_btrack(labels: np.ndarray, voxel_um: Tuple[float, float, float], params: Dict[str, Any],

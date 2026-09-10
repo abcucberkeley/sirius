@@ -381,6 +381,8 @@ class WorkerServer:
                     self._cancel(target)
                     reply(rid, {"cancelled": target})
                 elif method == "run":
+                    # a step fetching a gated model sends the token with the request
+                    model_hub.set_hub_token(str(params.get("token", "") or ""))
                     self._start_run(rid, params, tensors, send)
                 else:
                     error(rid, f"unknown method '{method}'")
@@ -434,8 +436,11 @@ class WorkerServer:
             except OSError:
                 pass
 
+        token = model_hub.current_request_token()   # the request's, read on the connection thread
+
         def run() -> None:
             t0 = time.time()
+            model_hub.set_hub_token(token or "")   # this thread's copy: the connection may move on
             try:
                 result, out = work(progress, cancel)
                 if cancel.is_set():
@@ -496,6 +501,11 @@ class WorkerServer:
     # --- plugins ---------------------------------------------------------------------
 
     def plugin_list(self, reload: bool = False, extra=None) -> Dict[str, Any]:
+        if reload:
+            job = self._current_job()
+            if job is not None and job["thread"].is_alive():
+                # re-importing a plugin file while a job may be executing it
+                raise RuntimeError(f"busy: request {job['id']} is still running; reload the plugins afterwards")
         with self._job_lock:
             cached = getattr(self, "_plugins", None)
         if cached is None or reload:

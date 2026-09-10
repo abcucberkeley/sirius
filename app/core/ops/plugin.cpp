@@ -222,7 +222,10 @@ namespace sirius::app {
                     for (Index t = 0; t < outLabels->t(); ++t) outLabels->recomputeStats(t);
                     outLabels->applyFlags(LabelFlagRules{});
                     out.labels = outLabels;
-                } else if (input.labels) {
+                } else if (input.labels && outArray && input.labels->t() == outArray->dims().t && input.labels->z() == outArray->dims().z &&
+                           input.labels->y() == outArray->dims().y && input.labels->x() == outArray->dims().x) {
+                    // the input's labels follow only onto the same grid (a
+                    // plugin that resamples or crops leaves them behind)
                     out.labels = input.labels->clone();
                 }
                 out.diagnostics = toDiagnostics(diagnostics, images, out);

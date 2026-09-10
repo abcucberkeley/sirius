@@ -971,29 +971,73 @@ namespace sirius::app {
         return static_cast<std::uint32_t>(accepted.size());
     }
 
+    namespace {
+        // Voxel counts per id. Dense ids get a table indexed by id; ids far
+        // beyond the voxel count (a plugin's, a corrupt file's) get a map,
+        // so a single id near 2^32 does not size a 16 GB table.
+        struct IdCounts {
+            std::vector<Index> table;
+            std::unordered_map<std::uint32_t, Index> sparse;
+            bool dense = true;
+            Index of(std::uint32_t id) const {
+                if (dense) return id < table.size() ? table[id] : 0;
+                const auto it = sparse.find(id);
+                return it == sparse.end() ? 0 : it->second;
+            }
+            template <typename F>
+            void forEachId(F&& f) const {   // ascending id order, ids present only
+                if (dense) {
+                    for (std::uint32_t id = 1; id < table.size(); ++id)
+                        if (table[id] > 0) f(id, table[id]);
+                } else {
+                    std::vector<std::uint32_t> ids;
+                    ids.reserve(sparse.size());
+                    for (const auto& [id, c] : sparse)
+                        if (id) ids.push_back(id);
+                    std::sort(ids.begin(), ids.end());
+                    for (std::uint32_t id : ids) f(id, sparse.at(id));
+                }
+            }
+        };
+
+        IdCounts countIds(const std::uint32_t* labels, Index n) {
+            IdCounts c;
+            std::uint32_t maxId = 0;
+            for (Index i = 0; i < n; ++i) maxId = std::max(maxId, labels[i]);
+            c.dense = static_cast<Index>(maxId) <= 4 * n + 1024;
+            if (c.dense) {
+                c.table.assign(static_cast<std::size_t>(maxId) + 1, 0);
+                for (Index i = 0; i < n; ++i) ++c.table[labels[i]];
+            } else {
+                for (Index i = 0; i < n; ++i) ++c.sparse[labels[i]];
+            }
+            return c;
+        }
+    } // namespace
+
     std::uint32_t removeSmall(std::uint32_t* labels, Index n, Index minVoxels) {
-        std::uint32_t maxId = 0;
-        for (Index i = 0; i < n; ++i) maxId = std::max(maxId, labels[i]);
-        std::vector<Index> counts(static_cast<std::size_t>(maxId) + 1, 0);
-        for (Index i = 0; i < n; ++i) ++counts[labels[i]];
-        std::vector<std::uint32_t> remap(counts.size(), 0);
+        const IdCounts counts = countIds(labels, n);
+        std::unordered_map<std::uint32_t, std::uint32_t> remap;
         std::uint32_t next = 0;
-        for (std::uint32_t id = 1; id <= maxId; ++id)
-            if (counts[id] > 0 && counts[id] >= minVoxels) remap[id] = ++next;
-        for (Index i = 0; i < n; ++i) labels[i] = remap[labels[i]];
+        counts.forEachId([&](std::uint32_t id, Index c) {
+            if (c >= minVoxels) remap[id] = ++next;
+        });
+        for (Index i = 0; i < n; ++i) {
+            if (!labels[i]) continue;
+            const auto it = remap.find(labels[i]);
+            labels[i] = it == remap.end() ? 0u : it->second;
+        }
         return next;
     }
 
     std::uint32_t dropSmall(std::uint32_t* labels, Index n, Index minVoxels) {
-        std::uint32_t maxId = 0;
-        for (Index i = 0; i < n; ++i) maxId = std::max(maxId, labels[i]);
-        std::vector<Index> counts(static_cast<std::size_t>(maxId) + 1, 0);
-        for (Index i = 0; i < n; ++i) ++counts[labels[i]];
+        const IdCounts counts = countIds(labels, n);
         std::uint32_t kept = 0;
-        for (std::uint32_t id = 1; id <= maxId; ++id)
-            if (counts[id] > 0 && counts[id] >= minVoxels) ++kept;
+        counts.forEachId([&](std::uint32_t, Index c) {
+            if (c >= minVoxels) ++kept;
+        });
         for (Index i = 0; i < n; ++i)
-            if (labels[i] && counts[labels[i]] < minVoxels) labels[i] = 0;
+            if (labels[i] && counts.of(labels[i]) < minVoxels) labels[i] = 0;
         return kept;
     }
 

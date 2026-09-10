@@ -100,27 +100,22 @@ namespace sirius::app {
                 info_.producesLabels = true;
                 info_.helpPage = "seg";
                 info_.params = {
-                    pathParam("model", "Model").withFilter("Models (*.pt *.pts *.pth *.onnx);;All files (*)")
-                        .withHelp("A TorchScript / ONNX file taking (1, 1, Z, Y, X) float32, or a spec the worker resolves: "
-                                  "hf:<repo>[:<file>] (Hugging Face, cached in $SIRIUS_MODEL_CACHE or ~/.sirius/models), "
-                                  "cellpose:<model> (default = the installed Cellpose's built-in model, one of its model names, "
-                                  "or a custom model file) or "
-                                  "microsam:<model_type> (vit_b_lm, vit_l_lm, vit_t_lm, vit_b_em_organelles, ...). "
-                                  "Cellpose and micro-SAM return instance labels directly; threshold and post-processing "
-                                  "then do not apply"),
+                    pathParam("model", "Model").withFilter("Models (*.pt *.pts *.pth *.onnx);;All files (*)").withHelp("A TorchScript / ONNX file taking (1, 1, Z, Y, X) float32, or a spec the worker resolves: "
+                                                                                                                       "hf:<repo>[:<file>] (Hugging Face, cached in $SIRIUS_MODEL_CACHE or ~/.sirius/models), "
+                                                                                                                       "cellpose:<model> (default = the installed Cellpose's built-in model, one of its model names, "
+                                                                                                                       "or a custom model file) or "
+                                                                                                                       "microsam:<model_type> (vit_b_lm, vit_l_lm, vit_t_lm, vit_b_em_organelles, ...). "
+                                                                                                                       "Cellpose and micro-SAM return instance labels directly; threshold and post-processing "
+                                                                                                                       "then do not apply"),
                     channelParam("input_channel", "Input channel", 0),
-                    doubleListParam("tile", "Tile", {32.0, 256.0, 256.0}).withUnit("px")
-                        .withHelp("Tile extent (z, y, x); must fit GPU memory"),
-                    intParam("overlap", "Overlap", 32).range(0, 512).withUnit("px")
-                        .withHelp("Tile halo; should exceed the model's receptive-field radius"),
-                    doubleParam("threshold", "Threshold", 0.5).range(0.0, 1.0, 0.01, 2)
-                        .withHelp("Foreground probability cut"),
+                    doubleListParam("tile", "Tile", {32.0, 256.0, 256.0}).withUnit("px").withHelp("Tile extent (z, y, x); must fit GPU memory"),
+                    intParam("overlap", "Overlap", 32).range(0, 512).withUnit("px").withHelp("Tile halo; should exceed the model's receptive-field radius"),
+                    doubleParam("threshold", "Threshold", 0.5).range(0.0, 1.0, 0.01, 2).withHelp("Foreground probability cut"),
                     choiceParam("post", "Post-processing", {kWatershed, kComponents, kNone}, kWatershed),
                     intParam("min_voxels", "Min. voxels", 0).range(0, 1000000000).withHelp("Drop smaller objects (0 = keep all)"),
                     doubleParam("label_opacity", "Label opacity", 0.45).range(0.0, 1.0, 0.05, 2),
                     stringParam("class_name", "Class", "nucleus").asAdvanced(),
-                    doubleParam("seed_distance", "Seed distance", 5.0).range(1.0, 200.0, 0.5, 1).withUnit("px")
-                        .withHelp("Minimum distance between watershed seeds").asAdvanced(),
+                    doubleParam("seed_distance", "Seed distance", 5.0).range(1.0, 200.0, 0.5, 1).withUnit("px").withHelp("Minimum distance between watershed seeds").asAdvanced(),
                 };
             }
 
@@ -129,7 +124,8 @@ namespace sirius::app {
             std::string summary(const ParamSet& p, const DatasetMeta&) const override {
                 const std::string model = p.getString("model");
                 std::string post = p.getString("post", kWatershed);
-                post = post.rfind("Watershed", 0) == 0 ? "watershed" : post == kComponents ? "components" : "probabilities";
+                post = post.rfind("Watershed", 0) == 0 ? "watershed" : post == kComponents ? "components"
+                                                                                           : "probabilities";
                 if (isFamilySpec(model)) post = "model labels";
                 return joinSummary({modelLabel(model), post});
             }
@@ -185,6 +181,7 @@ namespace sirius::app {
                     {"overlap", p.getInt("overlap", 32)},
                     {"device", ctx.backend == Backend::Cpu ? "cpu" : "auto"},
                 };
+                if (!ctx.hubToken.empty()) params["token"] = ctx.hubToken;   // a gated hf: model
                 double seconds = 0.0;
                 std::uint32_t total = 0;
                 std::string classes;

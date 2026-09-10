@@ -119,6 +119,10 @@ namespace sirius::app {
         Backend backend = Backend::Cpu;
         Device device = Device::cpu();             // the CUDA device for Backend::Cuda
         RemoteWorker* remote = nullptr;            // Backend::Hpc
+        // Hugging Face access token for a step that fetches a gated model
+        // through the worker: sent with that request, never put in the
+        // worker's environment (where pip and conda would inherit it).
+        std::string hubToken;
         std::function<void(double fraction, const std::string& message)> progress;
         std::function<bool()> cancelled;
         std::filesystem::path scratchDir;          // per-session scratch (disk cache, worker files)

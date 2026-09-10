@@ -81,3 +81,31 @@ class TestFrangi(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestSparseIds(unittest.TestCase):
+    def test_remove_small_copes_with_an_id_near_2_32(self):
+        labels = np.zeros((1, 1, 4, 8), dtype=np.uint32)
+        labels[0, 0, 0, 0:3] = 4_000_000_000   # a bincount by id would be 16 GB
+        labels[0, 0, 1, 0:2] = 7
+        labels[0, 0, 2, 0] = 3
+        dense = wb._remove_small(labels, 2, True)
+        self.assertEqual(sorted(int(v) for v in np.unique(dense)), [0, 1, 2])
+        self.assertEqual(int(dense[0, 0, 1, 0]), 1)   # numbered in id order: 7 first, then the huge one
+        self.assertEqual(int(dense[0, 0, 0, 0]), 2)
+        kept = wb._remove_small(labels, 2, False)
+        self.assertEqual(int(kept[0, 0, 0, 0]), 4_000_000_000)
+        self.assertEqual(int(kept[0, 0, 1, 0]), 7)
+        self.assertEqual(int(kept[0, 0, 2, 0]), 0)
+        flags = wb._label_flags(labels[0], 0.6, 4.0)
+        self.assertIn(4_000_000_000, flags["touching border"])
+
+
+class TestResampleLegacyKeys(unittest.TestCase):
+    def test_voxel_um_is_xyz_like_the_metadata(self):
+        a = np.zeros((1, 1, 4, 16, 16), dtype=np.float32)
+        meta = {"dims": [1, 1, 4, 16, 16], "voxel_um": [0.1, 0.1, 0.4]}
+        # the metadata's key, in the metadata's order: x, y, z
+        out = wb.run_step("resample", {"voxel_um": [0.2, 0.2, 0.8], "interpolation": "nearest"}, a, meta)
+        self.assertEqual([round(v, 6) for v in out.meta["voxel_um"]], [0.2, 0.2, 0.8])
+        self.assertEqual(tuple(out.array.shape), (1, 1, 2, 8, 8))

@@ -345,6 +345,10 @@ namespace sirius::app {
         // job calls it on its own thread; loadPlugins calls it here.
         using WorkerLauncher = LocalWorkerLauncher;
         void setLocalWorkerLauncher(WorkerLauncher launcher) { launcher_ = std::move(launcher); }
+        // The Hugging Face token a run hands the steps that download models
+        // (StepContext::hubToken); the Qt layer reads it from the secret
+        // store when a run is created.
+        void setHubTokenProvider(std::function<std::string()> provider) { hubToken_ = std::move(provider); }
         // Starts the local worker (through the launcher, synchronously: this
         // blocks until the worker answers), registers the user operations it
         // finds (app/python/sirius_worker/plugins.py) and logs the outcome;
@@ -455,6 +459,7 @@ namespace sirius::app {
         std::optional<std::pair<std::string, ParamSet>> clipboard_;
         std::shared_ptr<const StepOutput> loadOutput_;   // the Load step's lazy output
         WorkerLauncher launcher_;
+        std::function<std::string()> hubToken_;
         std::vector<PluginInfo> plugins_;
         std::vector<std::string> pluginDirs_;
         // The first "before" of the merge group the top history entry belongs

@@ -1915,3 +1915,65 @@ TEST_CASE("Load parameters left at zero keep the file's own axes and voxel sizes
     CHECK(voxel.meta.voxelUm[2] == 0.7);
     CHECK(voxel.meta.voxelUm[0] == plain.meta.voxelUm[0]);   // the file's, not 0
 }
+
+TEST_CASE("A recorded session marks the strokes and the review decisions", "[app][workbench][session]") {
+    registerTestOps();
+    Scratch scratch;
+    Workbench wb(scratch.dir);
+    wb.setDataset(syntheticSource(1, 1, 4, 16, 16));
+    wb.setBackend(Backend::Cpu);
+    while (wb.pipeline().size() > 1) wb.removeStep(1);
+    wb.addStep("test_labels");
+    REQUIRE(runSync(wb)->succeeded());
+    wb.view(1);
+    const std::filesystem::path log = scratch.dir / "session.jsonl";
+    wb.startRecording(log.string());
+    paintOne(wb, 1, 2, 2, 9);
+    wb.setLabelReviewed(9, true);
+    wb.acceptAllReviewed();
+    wb.stopRecording();
+
+    std::ifstream in(log);
+    std::vector<std::string> events;
+    std::vector<nlohmann::json> records;
+    for (std::string line; std::getline(in, line);)
+        if (!line.empty()) {
+            records.push_back(nlohmann::json::parse(line));
+            events.push_back(records.back().value("event", std::string()));
+        }
+    auto indexOf = [&](const std::string& name) {
+        return static_cast<int>(std::find(events.begin(), events.end(), name) - events.begin());
+    };
+    // a stroke is bracketed, so a replay can group the paint events it holds
+    REQUIRE(indexOf("stroke_begin") < static_cast<int>(events.size()));
+    REQUIRE(indexOf("stroke_end") < static_cast<int>(events.size()));
+    REQUIRE(indexOf("paint") < static_cast<int>(events.size()));
+    CHECK(indexOf("stroke_begin") < indexOf("paint"));
+    CHECK(indexOf("paint") < indexOf("stroke_end"));
+    CHECK(records[static_cast<std::size_t>(indexOf("stroke_end"))].value("voxels", 0) > 0);
+    CHECK(records[static_cast<std::size_t>(indexOf("stroke_begin"))].value("label", 0u) == 9u);
+    // and the review decisions, which used to leave no trace
+    REQUIRE(indexOf("review") < static_cast<int>(events.size()));
+    CHECK(records[static_cast<std::size_t>(indexOf("review"))].value("label", 0u) == 9u);
+    CHECK(records[static_cast<std::size_t>(indexOf("review"))].value("reviewed", false));
+    CHECK(indexOf("review_all") < static_cast<int>(events.size()));
+}
+
+TEST_CASE("The tool API takes an integral float as a step number", "[app][tools]") {
+    registerTestOps();
+    Scratch scratch;
+    Workbench wb(scratch.dir);
+    wb.setDataset(syntheticSource());
+    while (wb.pipeline().size() > 1) wb.removeStep(1);
+    wb.addStep("test_scale");
+    wb.addStep("test_maxz");
+    ToolApi api(wb);
+    api.call("view_step", {{"step", 2.0}});   // a model writes 2 as 2.0 now and then
+    CHECK(wb.viewedIndex() == 1);
+    api.call("view_step", {{"step", 3}});
+    CHECK(wb.viewedIndex() == 2);
+    // call() turns a throw into {"error": ...}: a fraction is not a step
+    const json half = api.call("view_step", {{"step", 2.5}});
+    CHECK(half.contains("error"));
+    CHECK(wb.viewedIndex() == 2);
+}

@@ -38,9 +38,10 @@ namespace sirius::app {
             process_->setProcessChannelMode(QProcess::SeparateChannels);
             // the Hugging Face token from Preferences (kept in the secret store,
             // not in QSettings) reaches huggingface_hub as HF_TOKEN
+            // The Hugging Face token is not put in the environment: every
+            // request that needs it carries it (SECURITY.md), so pip and
+            // conda started by the worker never see it.
             QProcessEnvironment env = QProcessEnvironment::systemEnvironment();
-            const QString hfToken = secrets::read(QStringLiteral("hub/token")).trimmed();
-            if (!hfToken.isEmpty() && !env.contains(QStringLiteral("HF_TOKEN"))) env.insert(QStringLiteral("HF_TOKEN"), hfToken);
             // The shared secret goes through the environment: a command line
             // is readable by every user of the machine (ps, /proc), the
             // environment of a process only by its owner.

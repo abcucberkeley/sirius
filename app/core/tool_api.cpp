@@ -3,6 +3,7 @@
 #include "core/training_export.hpp"
 
 #include <algorithm>
+#include <cmath>
 #include <cctype>
 #include <stdexcept>
 
@@ -504,8 +505,9 @@ namespace sirius::app {
         if (!args.contains(key)) throw std::invalid_argument(std::string("missing '") + key + "'");
         const json& v = args[key];
         const Pipeline& p = wb_.pipeline();
-        if (v.is_number_integer()) {
-            const int i = v.get<int>() - 1;
+        // a model writes 2 as 2.0 now and then: an integral number is a number
+        if (v.is_number() && (v.is_number_integer() || v.get<double>() == std::floor(v.get<double>()))) {
+            const int i = static_cast<int>(v.get<double>()) - 1;
             if (i < 0 || i >= p.size()) throw std::invalid_argument("no step " + std::to_string(i + 1) + " (there are " + std::to_string(p.size()) + ")");
             return i;
         }

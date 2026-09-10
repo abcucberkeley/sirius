@@ -1216,6 +1216,7 @@ namespace sirius::app {
         job->ctx_.backend = backend_;
         job->ctx_.device = (backend_ == Backend::Cuda && cudaAvailable()) ? Device::cuda(cudaDevice_) : Device::cpu();
         job->ctx_.scratchDir = executor_.scratchDir();
+        job->ctx_.hubToken = hubToken_ ? hubToken_() : std::string();
         // The worker itself is obtained by execute(), on the run's thread.
         job->backend_ = backend_;
         job->needsWorker_ = needsWorker;
@@ -1378,6 +1379,10 @@ namespace sirius::app {
         strokeOpen_ = static_cast<bool>(strokeLabels_);
         if (view_.selectedLabel == 0 && strokeLabels_ && view_.paintTool == PaintTool::Brush)
             view_.selectedLabel = strokeLabels_->maxLabel() + 1;
+        // the stroke's bounds: what a replay needs to group the paint events
+        // between them (each move records one), and what undo works on
+        if (strokeOpen_ && session_.recording())
+            session_.record("stroke_begin", {{"stroke", strokeCounter_}, {"step", pipeline_.indexOf(strokeStep_)}, {"t", view_.t}, {"label", view_.selectedLabel}, {"tool", toString(view_.paintTool)}, {"brush_px", view_.brushPx}, {"paint_3d", view_.paint3d}});
     }
 
     void Workbench::paintLabels(Index z, Index y, Index x, bool erase) {
@@ -1425,6 +1430,8 @@ namespace sirius::app {
         strokeOpen_ = false;
         std::shared_ptr<LabelVolume> labels = std::move(strokeLabels_);
         strokeLabels_.reset();
+        if (session_.recording())
+            session_.record("stroke_end", {{"stroke", strokeCounter_}, {"voxels", strokeDiff_.indices.size()}});
         if (!labels || strokeDiff_.empty()) return;
         labels->updateStats(strokeDiff_);
         strokeDiff_ = LabelDiff{};
@@ -1479,6 +1486,7 @@ namespace sirius::app {
         if (!labels) return;
         for (LabelStats& s : labels->stats())
             if (s.id == label) s.reviewed = reviewed;
+        session_.record("review", {{"step", pipeline_.indexOf(id)}, {"label", label}, {"reviewed", reviewed}});
         notifyLabels(id);
     }
 
@@ -1489,6 +1497,7 @@ namespace sirius::app {
         auto labels = editableLabels(&id);
         if (!labels) return;
         for (LabelStats& s : labels->stats()) s.reviewed = true;
+        session_.record("review_all", {{"step", pipeline_.indexOf(id)}, {"labels", labels->stats().size()}});
         logLine("Accepted all reviewed labels");
         notifyLabels(id);
     }

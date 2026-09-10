@@ -130,7 +130,7 @@ namespace sirius::app {
         impl_->hfToken = new QLineEdit(secrets::read(QStringLiteral("hub/token")), compute);
         impl_->hfToken->setEchoMode(QLineEdit::Password);
         impl_->hfToken->setToolTip(QStringLiteral("Access token for gated or private Hugging Face repositories (huggingface.co ▸ Settings ▸ "
-                                                  "Access Tokens); passed to the local worker as HF_TOKEN"));
+                                                  "Access Tokens); sent with each request that downloads a model"));
         cl->addWidget(field(QStringLiteral("Hugging Face access token (optional)"), impl_->hfToken, compute));
         cl->addStretch(1);
         tabs->addTab(compute, QStringLiteral("Compute"));

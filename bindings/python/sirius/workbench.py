@@ -934,10 +934,16 @@ def step_croppad(a: np.ndarray, params: Dict[str, Any], meta: Dict[str, Any],
 
 
 def _resample_legacy(p: Dict[str, Any], meta: Optional[Dict[str, Any]]) -> None:
-    # older exports: voxel [z, y, x] (or one isotropic size) or factor [z, y, x]
-    voxel = _pop_first(p, ("voxel", "voxel_um", "target", "isotropic"))
+    # older exports: voxel [z, y, x] (or one isotropic size) or factor [z, y, x];
+    # voxel_um is the metadata's key and, like it, [x, y, z]
+    xyz = _pop_first(p, ("voxel_um",))
+    voxel = _pop_first(p, ("voxel", "target", "isotropic"))
     factor = _pop_first(p, ("factor", "factors", "zoom"))
-    if voxel is not None:
+    if xyz is not None:
+        target = [float(xyz)] * 3 if isinstance(xyz, (int, float)) else _as_list(xyz, 3, [0, 0, 0])
+        for k, v in zip(("voxel_x", "voxel_y", "voxel_z"), target):
+            p.setdefault(k, v)
+    elif voxel is not None:
         target = [float(voxel)] * 3 if isinstance(voxel, (int, float)) else _as_list(voxel, 3, [0, 0, 0])
         for k, v in zip(("voxel_z", "voxel_y", "voxel_x"), target):
             p.setdefault(k, v)
@@ -1159,18 +1165,35 @@ def _watershed(landscape: np.ndarray, mask: np.ndarray, seeds: np.ndarray) -> np
     return watershed(landscape, markers=seeds, mask=mask, connectivity=1).astype(np.uint32)
 
 
+def _compact_ids(labels: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
+    """(ids, index volume): the volume renumbered by the rank of its ids, so
+    that counting by id costs the number of ids present, not the largest id
+    (a single id near 2^32 sized a 16 GB bincount). Cheap dense volumes keep
+    their ids: `ids` is then arange and the index volume the input."""
+    flat = labels.reshape(-1)
+    top = int(flat.max()) if flat.size else 0
+    if top <= 4 * flat.size + 1024:
+        return np.arange(top + 1, dtype=np.uint32), flat
+    ids, inverse = np.unique(flat, return_inverse=True)
+    if ids.size == 0 or ids[0] != 0:
+        ids = np.concatenate([[0], ids]).astype(np.uint32)
+        inverse = inverse + 1
+    return ids.astype(np.uint32), inverse.reshape(-1)
+
+
 def _remove_small(labels: np.ndarray, min_voxels: int, relabel: bool = True) -> np.ndarray:
     """``removeSmall`` / ``dropSmall``: drop labels with fewer than `min_voxels`
     voxels and, with `relabel`, number the rest 1..n densely in id order."""
-    counts = np.bincount(labels.reshape(-1))
+    ids, index = _compact_ids(labels)
+    counts = np.bincount(index, minlength=ids.size)
     keep = (counts >= max(int(min_voxels), 0)) & (counts > 0)
     keep[0] = False
     remap = np.zeros(counts.size, dtype=np.uint32)
     if relabel:
         remap[keep] = np.arange(1, int(keep.sum()) + 1, dtype=np.uint32)
     else:
-        remap[keep] = np.nonzero(keep)[0].astype(np.uint32)
-    return remap[labels]
+        remap[keep] = ids[keep]
+    return remap[index].reshape(labels.shape)
 
 
 def _labels_from_probabilities(fg: np.ndarray, boundary: Optional[np.ndarray], threshold: float, post: str,
@@ -1215,12 +1238,14 @@ def _label_flags(vol: np.ndarray, low_conf: float, size_outlier_factor: float,
                  confidence: Optional[Dict[int, float]] = None) -> Dict[str, List[int]]:
     """``LabelVolume::applyFlags`` on one volume: small (< median / 8),
     touching border, merged? (> factor x median), low conf (when known)."""
-    counts = np.bincount(vol.reshape(-1))
-    ids = np.flatnonzero(counts[1:] > 0) + 1
+    id_of, index = _compact_ids(vol)          # counts by rank of id, not by id
+    counts = np.bincount(index, minlength=id_of.size)
+    present = np.flatnonzero(counts[1:] > 0) + 1
+    ids = id_of[present]
     flags: Dict[str, List[int]] = {"low conf": [], "small": [], "touching border": [], "merged?": []}
     if ids.size == 0:
         return flags
-    sizes = counts[ids]
+    sizes = counts[present]
     median = int(np.sort(sizes)[sizes.size // 2])
     min_voxels = max(1, median // 8)
     border = set(int(i) for i in _border_labels(vol))

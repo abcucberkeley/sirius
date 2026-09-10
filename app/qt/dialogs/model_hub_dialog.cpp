@@ -285,7 +285,7 @@ namespace sirius::app {
             const QString token = QInputDialog::getText(
                 dialog, QStringLiteral("Hugging Face access token"),
                 QStringLiteral("Token for gated or private repositories (huggingface.co ▸ Settings ▸ Access Tokens).\n"
-                               "Stored in the application settings and passed to the local worker as HF_TOKEN."),
+                               "Kept in the secret store and sent with each request that downloads a model."),
                 QLineEdit::Password, hubToken(), &ok);
             if (!ok) return;
             const bool stored = secrets::write(QStringLiteral("hub/token"), token.trimmed());

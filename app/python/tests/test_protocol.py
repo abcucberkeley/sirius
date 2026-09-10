@@ -635,3 +635,30 @@ class TestDescriptorNumbers(unittest.TestCase):
         finally:
             server.stop()
             thread.join(timeout=5)
+
+
+class TestReloadWhileBusy(unittest.TestCase):
+    def test_reloading_plugins_is_refused_while_a_job_runs(self):
+        server = WorkerServer("127.0.0.1", 0, "t", "cpu")
+        release = threading.Event()
+
+        def send(header, tensors=None):
+            pass
+
+        def slow(progress, cancel):
+            release.wait(30)
+            return {}, None
+
+        server._start_job(1, "slow", send, slow)
+        try:
+            # re-importing a plugin file under a step that may be executing it
+            with self.assertRaises(RuntimeError) as caught:
+                server.plugin_list(reload=True)
+            self.assertIn("busy", str(caught.exception))
+            server.plugin_list(reload=False)   # listing is fine
+        finally:
+            release.set()
+        job = server._current_job()
+        if job is not None:
+            job["thread"].join(timeout=30)
+        server.plugin_list(reload=True)   # and afterwards a reload is

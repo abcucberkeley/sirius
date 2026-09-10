@@ -24,6 +24,7 @@ import os
 import shutil
 import subprocess
 import sys
+import threading
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
@@ -240,13 +241,21 @@ def delete_cached_model(path: str) -> Dict[str, Any]:
 # environment: HF_TOKEN would outlive the request and reach every subprocess
 # the worker starts (pip, conda). None lets huggingface_hub fall back to its
 # own sources (HF_TOKEN in the worker's environment, `huggingface-cli login`).
-_request_token: Optional[str] = None
+# Per thread: the connection thread serves the synchronous methods while a
+# job thread may be inside a download, and the two must not swap each
+# other's token (the server sets the job thread's copy when the job starts).
+_request = threading.local()
 
 
 def _token_arg(token: Optional[str]) -> Optional[str]:
     """`token` when given, else the request's token; "" means "none given"."""
-    token = (token if token is not None else _request_token) or ""
+    token = (token if token is not None else current_request_token()) or ""
     return token.strip() or None
+
+
+def current_request_token() -> Optional[str]:
+    """The token set_hub_token gave this thread, or None."""
+    return getattr(_request, "token", None)
 
 
 def _hf_api(token: Optional[str] = None):
@@ -397,8 +406,7 @@ def set_hub_token(token: str) -> None:
     """The access token for gated / private repositories that the hub calls of
     the current request use (the server calls this before each of them; an
     empty token means "the client sent none"). Kept out of os.environ."""
-    global _request_token
-    _request_token = (token or "").strip() or None
+    _request.token = (token or "").strip() or None
 
 
 def resolve(spec: str, progress: ProgressFn = None) -> Tuple[ModelSpec, str]:

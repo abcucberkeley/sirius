@@ -10,6 +10,7 @@
 // this suits mosaics whose one-channel volume fits in RAM.
 #include "core/ops/builtin.hpp"
 
+#include <limits>
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
@@ -52,10 +53,19 @@ namespace sirius::app {
         // manifest's grid indices, names row-major over that grid. Tiles that
         // do not form a grid (no indices, or two tiles on one cell) go in a row.
         void tileGrid(const std::vector<TileInfo>& tiles, AlignmentInfo& a) {
+            // rows / columns from the indices' own origin: a folder numbered
+            // from 1 is not a grid with an empty first row and column
+            Index row0 = std::numeric_limits<Index>::max(), col0 = row0;
+            for (const TileInfo& t : tiles)
+                if (t.gridIndex[1] >= 0 && t.gridIndex[2] >= 0) {
+                    row0 = std::min(row0, t.gridIndex[1]);
+                    col0 = std::min(col0, t.gridIndex[2]);
+                }
+            if (row0 == std::numeric_limits<Index>::max()) row0 = col0 = 0;
             Index rows = 0, cols = 0;
             for (const TileInfo& t : tiles) {
-                rows = std::max(rows, t.gridIndex[1] + 1);
-                cols = std::max(cols, t.gridIndex[2] + 1);
+                rows = std::max(rows, t.gridIndex[1] - row0 + 1);
+                cols = std::max(cols, t.gridIndex[2] - col0 + 1);
             }
             const std::size_t n = tiles.size();
             bool grid = rows > 0 && cols > 0 && static_cast<std::size_t>(rows * cols) >= n && static_cast<std::size_t>(rows * cols) <= 4 * n + 4;
@@ -63,9 +73,15 @@ namespace sirius::app {
             if (grid) {
                 names.assign(static_cast<std::size_t>(rows * cols), std::string());
                 for (const TileInfo& t : tiles) {
-                    if (t.gridIndex[1] < 0 || t.gridIndex[2] < 0) { grid = false; break; }
-                    std::string& cell = names[static_cast<std::size_t>(t.gridIndex[1] * cols + t.gridIndex[2])];
-                    if (!cell.empty()) { grid = false; break; }   // two tiles on one cell (a z stack of tiles)
+                    if (t.gridIndex[1] < 0 || t.gridIndex[2] < 0) {
+                        grid = false;
+                        break;
+                    }
+                    std::string& cell = names[static_cast<std::size_t>((t.gridIndex[1] - row0) * cols + (t.gridIndex[2] - col0))];
+                    if (!cell.empty()) {
+                        grid = false;
+                        break;
+                    }   // two tiles on one cell (a z stack of tiles)
                     cell = t.name;
                 }
             }
@@ -136,16 +152,13 @@ namespace sirius::app {
                     tiles,
                     channelParam("channel", "Registration channel", 0)
                         .withHelp("Dataset tiles: the channel the tiles are registered on; the layout applies to every channel"),
-                    intParam("reference_t", "Registration t", 0).range(0, 1000000)
-                        .withHelp("Dataset tiles: the time point the tiles are registered at"),
+                    intParam("reference_t", "Registration t", 0).range(0, 1000000).withHelp("Dataset tiles: the time point the tiles are registered at"),
                     doubleListParam("positions", "Positions", {})
                         .withUnit("voxels")
                         .withHelp("Tile files: nominal origins, z y x per tile (flattened); empty = a grid from the overlap"),
                     intParam("grid_cols", "Grid columns", 0).range(0, 1000).withHelp("Tile files: 0 = square grid (positions empty)"),
-                    doubleParam("overlap_fraction", "Overlap", 0.10).range(0.0, 0.9, 0.01, 2)
-                        .withHelp("Tile files: nominal overlap between neighbours (positions empty)"),
-                    doubleListParam("search_radius", "Search radius", {4.0, 32.0, 32.0}).withUnit("voxels")
-                        .withHelp("How far a tile may move from its nominal origin (z, y, x)"),
+                    doubleParam("overlap_fraction", "Overlap", 0.10).range(0.0, 0.9, 0.01, 2).withHelp("Tile files: nominal overlap between neighbours (positions empty)"),
+                    doubleListParam("search_radius", "Search radius", {4.0, 32.0, 32.0}).withUnit("voxels").withHelp("How far a tile may move from its nominal origin (z, y, x)"),
                     doubleParam("min_correlation", "Min. correlation", 0.3).range(0.0, 1.0, 0.05, 2),
                     choiceParam("blend", "Blend", {"Feather", "Average", "Maximum", "Overwrite"}, "Feather"),
                     boolParam("mask_background", "Mask background", true)

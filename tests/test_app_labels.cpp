@@ -1015,3 +1015,18 @@ TEST_CASE("A LabelVolume remembers that it was edited", "[app][labels]") {
     (void)untouched.volume(0);   // a mutable accessor alone is not an edit
     CHECK_FALSE(untouched.edited());
 }
+
+TEST_CASE("removeSmall and dropSmall cope with an id near 2^32", "[app][labels]") {
+    // counting by a table indexed by id would allocate 16 GB for this one
+    const std::uint32_t huge = 4000000000u;
+    std::vector<std::uint32_t> v{0, huge, huge, 7, 0, huge, 3};
+    std::vector<std::uint32_t> w = v;
+    CHECK(removeSmall(v.data(), static_cast<Index>(v.size()), 2) == 1);
+    CHECK(v == std::vector<std::uint32_t>{0, 1, 1, 0, 0, 1, 0});
+    CHECK(dropSmall(w.data(), static_cast<Index>(w.size()), 2) == 1);
+    CHECK(w == std::vector<std::uint32_t>{0, huge, huge, 0, 0, huge, 0});
+    // dense ids keep the fast path and the same answers
+    std::vector<std::uint32_t> d{0, 5, 5, 5, 9, 9, 0, 7, 0, 5};
+    CHECK(removeSmall(d.data(), static_cast<Index>(d.size()), 2) == 2);
+    CHECK(d == std::vector<std::uint32_t>{0, 1, 1, 1, 2, 2, 0, 0, 0, 1});
+}

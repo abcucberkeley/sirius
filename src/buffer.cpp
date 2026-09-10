@@ -42,8 +42,7 @@ namespace sirius {
             case 2: return Shape{1, dims_[0], dims_[1]};
             case 3: return *this;
             default: {
-                Index lead = 1;
-                for (int i = 0; i < rank_ - 2; ++i) lead *= dims_[static_cast<std::size_t>(i)];
+                const Index lead = detail::checkedProduct(dims_.data(), dims_.data() + (rank_ - 2), "Shape::asStack");
                 return Shape{lead, dims_[static_cast<std::size_t>(rank_ - 2)],
                              dims_[static_cast<std::size_t>(rank_ - 1)]};
             }

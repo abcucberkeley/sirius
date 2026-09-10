@@ -162,11 +162,13 @@ It is opt-in:
 
 ## Tokens the worker is given
 
-The Hugging Face access token a client sends with `hub_*` and `model_prepare`
-is passed to `huggingface_hub` as a call argument for that request only. It is
+The Hugging Face access token a client sends with `hub_*`, `model_prepare`
+and a `run` that fetches a gated model is passed to `huggingface_hub` as a
+call argument for that request only (held per thread, so a job in flight and
+the connection serving the next request cannot swap each other's). It is
 deliberately **not** written to `os.environ`: `HF_TOKEN` there would outlive
 the request and be inherited by every subprocess the worker starts, `pip` and
-`conda` included.
+`conda` included -- and the desktop launcher does not put it there either.
 
 On the application side, the worker token, the Hugging Face token and the
 assistant's API key are stored through `app/qt/secret_store.hpp` (DPAPI on

@@ -32,6 +32,7 @@
 #include "qt/viewer/viewer_widget.hpp"
 #include "qt/worker_launcher.hpp"
 #include "qt/qt_strings.hpp"
+#include "qt/secret_store.hpp"
 #include "qt/theme.hpp"
 #include "qt/workbench_bridge.hpp"
 
@@ -96,6 +97,8 @@ int main(int argc, char** argv) {
     QObject::connect(&launcher, &sirius::app::WorkerLauncher::logged, &bridge,
                      [&workbench](const QString& line) { workbench.logLine("worker: " + sirius::app::toStd(line)); });
     workbench.setLocalWorkerLauncher([&launcher] { return launcher.connect(); });
+    // a gated model's token goes with the request that downloads it
+    workbench.setHubTokenProvider([] { return sirius::app::toStd(sirius::app::secrets::read(QStringLiteral("hub/token")).trimmed()); });
     sirius::app::MainWindow window(bridge);
     // User operations come from the Python worker. A pipeline given on the
     // command line may use them, so load them first in that case; otherwise

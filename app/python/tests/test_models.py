@@ -507,3 +507,25 @@ class TestCachePathJail(unittest.TestCase):
                     os.environ.pop("SIRIUS_MODEL_CACHE", None)
                 else:
                     os.environ["SIRIUS_MODEL_CACHE"] = old
+
+
+class TestRequestTokenIsPerThread(unittest.TestCase):
+    def test_a_token_set_on_one_thread_is_not_seen_by_another(self):
+        import threading
+
+        models.set_hub_token("connection-token")
+        seen = {}
+
+        def job():
+            seen["before"] = models.current_request_token()
+            models.set_hub_token("job-token")
+            seen["after"] = models.current_request_token()
+
+        t = threading.Thread(target=job)
+        t.start()
+        t.join()
+        self.assertIsNone(seen["before"])
+        self.assertEqual(seen["after"], "job-token")
+        self.assertEqual(models.current_request_token(), "connection-token")
+        models.set_hub_token("")
+        self.assertIsNone(models.current_request_token())

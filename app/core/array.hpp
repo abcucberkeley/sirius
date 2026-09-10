@@ -21,7 +21,11 @@
 
 namespace sirius::app {
 
-    enum class Axis : int { C = 0, T = 1, Z = 2, Y = 3, X = 4 };
+    enum class Axis : int { C = 0,
+                            T = 1,
+                            Z = 2,
+                            Y = 3,
+                            X = 4 };
     constexpr int kAxisCount = 5;
     constexpr std::array<Axis, kAxisCount> kAxes{Axis::C, Axis::T, Axis::Z, Axis::Y, Axis::X};
 
@@ -40,7 +44,10 @@ namespace sirius::app {
             const std::array<Index, kAxisCount> e{c, t, z, y, x};
             return sirius::detail::checkedProduct(e.begin(), e.end(), "Dims5::numel");
         }
-        Index planes() const noexcept { return c * t * z; }
+        Index planes() const {   // checked like numel(): the extents come from files
+            const std::array<Index, 3> e{c, t, z};
+            return sirius::detail::checkedProduct(e.begin(), e.end(), "Dims5::planes");
+        }
         Index planeIndex(Index ci, Index ti, Index zi) const noexcept { return (ci * t + ti) * z + zi; }
         Index planeSize() const noexcept { return y * x; }
         std::size_t bytes() const { return sirius::detail::checkedBytes(numel(), sizeof(float), "Dims5::bytes"); }
