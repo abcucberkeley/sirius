@@ -83,14 +83,16 @@ def _clean(labels: np.ndarray, min_voxels: int) -> np.ndarray:
     """Drop anything too small and renumber 1..n densely."""
     out = np.asarray(labels, dtype=np.int64)
     out[out < 0] = 0
-    counts = np.bincount(out.ravel())
-    keep = np.zeros(counts.size, dtype=np.uint32)
+    # counted by rank of id, so a stray id near 2^32 does not size the table
+    ids, index = np.unique(out.ravel(), return_inverse=True)
+    counts = np.bincount(index, minlength=ids.size)
+    keep = np.zeros(ids.size, dtype=np.uint32)
     nxt = 0
-    for i in range(1, counts.size):
-        if counts[i] and counts[i] >= max(1, int(min_voxels)):
+    for i in range(ids.size):
+        if ids[i] and counts[i] >= max(1, int(min_voxels)):
             nxt += 1
             keep[i] = nxt
-    return keep[out].astype(np.uint32)
+    return keep[index].reshape(out.shape).astype(np.uint32)
 
 
 def _normalized(volume: np.ndarray) -> np.ndarray:

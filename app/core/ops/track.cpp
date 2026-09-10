@@ -144,6 +144,7 @@ namespace sirius::app {
                 for (Index t = 0; t < frames; ++t) labels->recomputeStats(t);
                 for (LabelStats& s : labels->stats()) s.cls = "track";
 
+                labels->setTracked(true);   // one id, one object, every frame
                 out.labels = labels;
                 out.ranOn = Backend::Cpu;
                 out.diagnostics = trackDiagnostics(linked, byFrame, meta, summary(p, meta));
@@ -202,6 +203,7 @@ namespace sirius::app {
                     labels->recomputeStats(t);
                 }
                 for (LabelStats& s : labels->stats()) s.cls = "track";
+                labels->setTracked(true);   // one id, one object, every frame
                 out.labels = labels;
                 out.ranOn = ctx.backend;
                 out.seconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();

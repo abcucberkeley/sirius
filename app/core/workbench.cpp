@@ -1359,6 +1359,31 @@ namespace sirius::app {
         pushCommand(std::move(c));
     }
 
+    void Workbench::recordLabelDiffs(const std::string& label, StepId id, const std::shared_ptr<LabelVolume>& labels,
+                                     std::vector<LabelDiff> diffs) {
+        diffs.erase(std::remove_if(diffs.begin(), diffs.end(), [](const LabelDiff& d) { return d.empty(); }), diffs.end());
+        if (diffs.empty() || !labels) return;
+        std::size_t voxels = 0;
+        for (const LabelDiff& d : diffs) voxels += d.indices.size();
+        session_.record("label_edit", {{"what", label}, {"voxels", voxels}, {"frames", diffs.size()}});
+        for (const LabelDiff& d : diffs) labels->updateStats(d);
+        auto shared = std::make_shared<std::vector<LabelDiff>>(std::move(diffs));
+        std::weak_ptr<LabelVolume> target = labels;
+        Command c;
+        c.label = label;
+        c.undo = [this, id, target, shared] {
+            for (auto it = shared->rbegin(); it != shared->rend(); ++it) applyLabelDiff(id, target, *it, false);
+        };
+        c.redo = [this, id, target, shared] {
+            for (const LabelDiff& d : *shared) applyLabelDiff(id, target, d, true);
+        };
+        pushCommand(std::move(c));
+        staleBelow(id);
+        syncLabelStats();   // the statistics ended on the last frame touched
+        notifyLabels(id);
+        notify(&Observer::outputsChanged);
+    }
+
     void Workbench::recordLabelDiff(const std::string& label, StepId id, const std::shared_ptr<LabelVolume>& labels,
                                     LabelDiff diff) {
         if (diff.empty() || !labels) return;
@@ -1430,8 +1455,23 @@ namespace sirius::app {
         strokeOpen_ = false;
         std::shared_ptr<LabelVolume> labels = std::move(strokeLabels_);
         strokeLabels_.reset();
-        if (session_.recording())
-            session_.record("stroke_end", {{"stroke", strokeCounter_}, {"voxels", strokeDiff_.indices.size()}});
+        if (session_.recording()) {
+            nlohmann::json end{{"stroke", strokeCounter_}, {"t", strokeDiff_.t}, {"voxels", strokeDiff_.indices.size()}};
+            if (labels && !strokeDiff_.empty()) {
+                // the box the stroke touched (half open), so a replay or a
+                // training crop knows where to look without the moves
+                const Index ly = labels->y(), lx = labels->x();
+                Index z0 = labels->z(), z1 = 0, y0 = ly, y1 = 0, x0 = lx, x1 = 0;
+                for (Index i : strokeDiff_.indices) {
+                    const Index z = i / (ly * lx), y = (i / lx) % ly, x = i % lx;
+                    z0 = std::min(z0, z), z1 = std::max(z1, z + 1);
+                    y0 = std::min(y0, y), y1 = std::max(y1, y + 1);
+                    x0 = std::min(x0, x), x1 = std::max(x1, x + 1);
+                }
+                end["bbox"] = {z0, z1, y0, y1, x0, x1};
+            }
+            session_.record("stroke_end", end);
+        }
         if (!labels || strokeDiff_.empty()) return;
         labels->updateStats(strokeDiff_);
         strokeDiff_ = LabelDiff{};
@@ -1455,6 +1495,12 @@ namespace sirius::app {
         StepId id = 0;
         auto labels = editableLabels(&id);
         if (!labels) return;
+        if (labels->tracked() && labels->t() > 1) {
+            std::vector<LabelDiff> diffs;
+            for (Index t = 0; t < labels->t(); ++t) diffs.push_back(labels->merge(t, ids));
+            recordLabelDiffs("Merge tracks", id, labels, std::move(diffs));
+            return;
+        }
         recordLabelDiff("Merge labels", id, labels, labels->merge(view_.t, ids));
     }
 
@@ -1473,8 +1519,14 @@ namespace sirius::app {
         StepId id = 0;
         auto labels = editableLabels(&id);
         if (!labels) return;
-        LabelDiff diff = labels->remove(view_.t, label);
         if (view_.selectedLabel == label) view_.selectedLabel = 0;
+        if (labels->tracked() && labels->t() > 1) {
+            std::vector<LabelDiff> diffs;
+            for (Index t = 0; t < labels->t(); ++t) diffs.push_back(labels->remove(t, label));
+            recordLabelDiffs("Delete track " + std::to_string(label), id, labels, std::move(diffs));
+            return;
+        }
+        LabelDiff diff = labels->remove(view_.t, label);
         recordLabelDiff("Delete label " + std::to_string(label), id, labels, std::move(diff));
     }
 

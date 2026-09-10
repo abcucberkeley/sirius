@@ -142,3 +142,17 @@ class TestGuards(unittest.TestCase):
         self.assertEqual(ok, why == "")
         if not ok:
             self.assertIn("scikit-image", why)
+
+
+class TestCleanSparseIds(unittest.TestCase):
+    def test_clean_copes_with_an_id_near_2_32(self):
+        from sirius_worker import skimage_seg
+
+        labels = np.zeros((4, 8, 8), dtype=np.int64)
+        labels[:, 1:4, 1:4] = 4_000_000_000
+        labels[:, 5:7, 5:7] = 7
+        labels[0, 0, 7] = 3
+        out = skimage_seg._clean(labels, 2)
+        self.assertEqual(sorted(int(v) for v in np.unique(out)), [0, 1, 2])
+        self.assertEqual(int(out[0, 5, 5]), 1)   # in id order: 7 before the huge one
+        self.assertEqual(int(out[0, 1, 1]), 2)

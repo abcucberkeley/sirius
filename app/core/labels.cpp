@@ -557,6 +557,7 @@ namespace sirius::app {
         c->statsT_ = statsT_;
         c->flagRules_ = flagRules_;
         c->maxLabel_ = maxLabel_;
+        c->tracked_ = tracked_;
         return c;
     }
 

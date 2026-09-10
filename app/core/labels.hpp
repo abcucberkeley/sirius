@@ -80,6 +80,11 @@ namespace sirius::app {
         // undo / redo of one) has touched this volume: what the executor
         // keeps when the step that carries it is run again.
         bool edited() const noexcept { return edited_; }
+        // True when one id names the same object at every time point (the
+        // tracking step's output): a merge or a delete then applies to the
+        // whole track, not to the frame on screen.
+        bool tracked() const noexcept { return tracked_; }
+        void setTracked(bool on) noexcept { tracked_ = on; }
 
         // The mutable accessors detach a shared copy first (see the header note).
         std::uint32_t* volume(Index t);                          // (z, y, x)
@@ -154,6 +159,7 @@ namespace sirius::app {
         std::optional<LabelFlagRules> flagRules_;       // the last applyFlags()
         std::uint32_t maxLabel_ = 0;
         bool edited_ = false;
+        bool tracked_ = false;
     };
 
     using LabelsPtr = std::shared_ptr<const LabelVolume>;

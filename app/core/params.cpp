@@ -331,20 +331,13 @@ namespace sirius::app {
                 // case-insensitive match
                 std::string ls = s;
                 std::transform(ls.begin(), ls.end(), ls.begin(), [](unsigned char ch) { return static_cast<char>(std::tolower(ch)); });
-                const std::string* prefixMatch = nullptr;
-                bool ambiguous = false;
+                // Case is forgiven; nothing else is. A prefix ("c" for
+                // "cubic") used to be, which made a typo a valid setting.
                 for (const std::string& c : spec.choices) {
                     std::string lc = c;
                     std::transform(lc.begin(), lc.end(), lc.begin(), [](unsigned char ch) { return static_cast<char>(std::tolower(ch)); });
                     if (lc == ls) return c;
-                    // a prefix stands for a choice only when it names one choice
-                    // (an empty string is a prefix of all of them)
-                    if (!ls.empty() && lc.rfind(ls, 0) == 0) {
-                        if (prefixMatch) ambiguous = true;
-                        prefixMatch = &c;
-                    }
                 }
-                if (prefixMatch && !ambiguous) return *prefixMatch;
                 std::string opts;
                 for (const std::string& c : spec.choices) opts += (opts.empty() ? "" : ", ") + c;
                 throw std::invalid_argument("parameter '" + spec.key + "': '" + s + "' is not one of " + opts);

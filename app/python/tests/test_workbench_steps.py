@@ -109,3 +109,25 @@ class TestResampleLegacyKeys(unittest.TestCase):
         out = wb.run_step("resample", {"voxel_um": [0.2, 0.2, 0.8], "interpolation": "nearest"}, a, meta)
         self.assertEqual([round(v, 6) for v in out.meta["voxel_um"]], [0.2, 0.2, 0.8])
         self.assertEqual(tuple(out.array.shape), (1, 1, 2, 8, 8))
+
+
+class TestSparseIdsElsewhere(unittest.TestCase):
+    def test_shape_filter_and_cleanup_cope_with_an_id_near_2_32(self):
+        labels = np.zeros((1, 2, 8, 8), dtype=np.uint32)
+        labels[0, :, 1:4, 1:4] = 4_000_000_000
+        labels[0, :, 5:7, 5:7] = 7
+        labels[0, 0, 0, 7] = 3
+        a = np.zeros((1, 1, 2, 8, 8), dtype=np.float32)
+        result = wb.run_step("cleanup", {"min_voxels": 2, "relabel": True}, a, _meta(z=2), labels=labels)
+        self.assertEqual(result.info["labels"], 2)
+        filtered = wb._filter_labels_by_shape(labels[0], 0, 0.0, 0.0, False)
+        self.assertEqual(sorted(int(v) for v in np.unique(filtered)), [0, 1, 2, 3])
+
+    def test_cleanup_flags_cover_every_time_point(self):
+        labels = np.zeros((2, 1, 16, 16), dtype=np.uint32)
+        labels[0, 0, 4:8, 4:8] = 1       # an interior object in frame 0 ...
+        labels[1, 0, 0:4, 0:4] = 1       # ... touching the border in frame 1
+        labels[:, 0, 12:14, 12:14] = 2
+        a = np.zeros((1, 2, 1, 16, 16), dtype=np.float32)
+        result = wb.run_step("cleanup", {"min_voxels": 1, "relabel": False}, a, _meta(t=2, y=16, x=16), labels=labels)
+        self.assertIn(1, result.info["flags"]["touching border"])   # frame 1's verdict is not lost to frame 0's

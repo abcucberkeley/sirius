@@ -159,14 +159,21 @@ namespace {
             info_.kindLabel = "SEGMENT";
             info_.producesLabels = true;
             info_.defaultCache = CachePolicy::Memory;
-            info_.params = {intParam("label", "Label", 1)};
+            info_.params = {intParam("label", "Label", 1), boolParam("tracked", "Tracked", false)};
         }
         const OpInfo& info() const noexcept override { return info_; }
         StepOutput run(const StepInput& in, const ParamSet& p, const StepContext&) const override {
             ++runs;
             const Dims5 d = in.meta.dims;
             auto labels = std::make_shared<LabelVolume>(d.t, d.z, d.y, d.x);
-            labels->paint(0, d.z / 2, d.y / 2, d.x / 2, 1.5, 0, static_cast<std::uint32_t>(p.getInt("label")));
+            // tracked: the same object, under the same id, in every frame (and
+            // a second one in the corner), as the tracking step leaves them
+            const bool tracked = p.getBool("tracked");
+            for (Index t = 0; t < (tracked ? d.t : 1); ++t) {
+                labels->paint(t, d.z / 2, d.y / 2, d.x / 2, 1.5, 0, static_cast<std::uint32_t>(p.getInt("label")));
+                if (tracked) labels->paint(t, d.z / 2, 2, 2, 1.0, 0, static_cast<std::uint32_t>(p.getInt("label")) + 1);
+            }
+            labels->setTracked(tracked);
             labels->recomputeStats(0);
             StepOutput o;
             o.meta = in.meta;
@@ -1976,4 +1983,68 @@ TEST_CASE("The tool API takes an integral float as a step number", "[app][tools]
     const json half = api.call("view_step", {{"step", 2.5}});
     CHECK(half.contains("error"));
     CHECK(wb.viewedIndex() == 2);
+}
+
+TEST_CASE("On tracked labels a delete and a merge apply to every time point", "[app][workbench][labels][track]") {
+    registerTestOps();
+    Scratch scratch;
+    Workbench wb(scratch.dir);
+    wb.setDataset(syntheticSource(1, 3, 4, 16, 16));
+    wb.setBackend(Backend::Cpu);
+    while (wb.pipeline().size() > 1) wb.removeStep(1);
+    wb.addStep("test_labels");
+    wb.setStepParam(1, "tracked", true);
+    REQUIRE(runSync(wb)->succeeded());
+    wb.view(1);
+    std::shared_ptr<LabelVolume> labels = wb.viewedLabels();
+    REQUIRE(labels);
+    REQUIRE(labels->tracked());
+    const Index cz = 2, cy = 8, cx = 8;
+    for (Index t = 0; t < 3; ++t) {
+        REQUIRE(labels->at(t, cz, cy, cx) == 1);
+        REQUIRE(labels->at(t, cz, 2, 2) == 2);
+    }
+
+    SECTION("delete removes the track, undo brings it back everywhere") {
+        wb.setT(1);
+        wb.deleteLabel(1);   // the id is the object's whole life, not this frame's
+        for (Index t = 0; t < 3; ++t) {
+            CHECK(labels->at(t, cz, cy, cx) == 0);
+            CHECK(labels->at(t, cz, 2, 2) == 2);
+        }
+        CHECK(wb.history().undoLabel() == "Delete track 1");
+        wb.undo();
+        for (Index t = 0; t < 3; ++t) CHECK(labels->at(t, cz, cy, cx) == 1);
+        wb.redo();
+        for (Index t = 0; t < 3; ++t) CHECK(labels->at(t, cz, cy, cx) == 0);
+    }
+    SECTION("merge joins the two tracks in every frame") {
+        wb.mergeLabels({1, 2});
+        for (Index t = 0; t < 3; ++t) {
+            CHECK(labels->at(t, cz, cy, cx) == 1);
+            CHECK(labels->at(t, cz, 2, 2) == 1);   // into the smaller id
+        }
+        wb.undo();
+        for (Index t = 0; t < 3; ++t) CHECK(labels->at(t, cz, 2, 2) == 2);
+    }
+    SECTION("untracked labels are still edited one frame at a time") {
+        wb.setStepParam(1, "tracked", false);
+        REQUIRE(runSync(wb)->succeeded());
+        labels = wb.viewedLabels();
+        REQUIRE(labels);
+        CHECK_FALSE(labels->tracked());
+    }
+}
+
+TEST_CASE("A choice has to be named in full", "[app][pipeline][params]") {
+    registerBuiltinOperations();
+    Pipeline p;
+    p.add("resample");
+    ParamSet q = p.at(1).params;
+    q.set("interpolation", std::string("Cubic"));   // case is forgiven
+    p.setParams(1, q);
+    CHECK(p.at(1).params.getString("interpolation") == "cubic");
+    q.set("interpolation", std::string("c"));       // a prefix is a typo: the default it is
+    p.setParams(1, q);
+    CHECK(p.at(1).params.getString("interpolation") != "cubic");
 }

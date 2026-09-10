@@ -385,6 +385,8 @@ namespace sirius::app {
         void paintLabels(Index z, Index y, Index x, bool erase);          // uses brush size / label
         void endPaintStroke();
         void fillLabel(Index z, Index y, Index x);
+        // On tracked labels (LabelVolume::tracked) a merge or a delete
+        // applies to every time point: the id is the object's whole life.
         void mergeLabels(const std::vector<std::uint32_t>& ids);
         void splitLabel(std::uint32_t id, std::array<Index, 3> a, std::array<Index, 3> b);
         void deleteLabel(std::uint32_t id);
@@ -439,6 +441,10 @@ namespace sirius::app {
                               const std::shared_ptr<LabelVolume>& labels, std::shared_ptr<LabelDiff> diff);
         void recordLabelDiff(const std::string& label, StepId id, const std::shared_ptr<LabelVolume>& labels,
                              LabelDiff diff);
+        // One undo entry for an edit that touched several time points (a
+        // merge or a delete on tracked labels).
+        void recordLabelDiffs(const std::string& label, StepId id, const std::shared_ptr<LabelVolume>& labels,
+                              std::vector<LabelDiff> diffs);
 
         std::vector<Observer*> observers_;
         std::shared_ptr<ArraySource> source_;

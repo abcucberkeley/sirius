@@ -2136,6 +2136,11 @@ def _morphological_chan_vese_plane(image: np.ndarray, mask: np.ndarray, iteratio
 def _filter_labels_by_shape(labels: np.ndarray, max_voxels: int, min_fill: float, max_elongation: float,
                             drop_border: bool) -> np.ndarray:
     """``filterLabelsByShape``: bounding-box measures, then a dense relabel."""
+    # by rank of id: find_objects and bincount are sized by the largest id,
+    # and the dense relabel below keeps the ids' order either way
+    ids, index = _compact_ids(labels)
+    if ids.size != int(labels.max()) + 1:
+        labels = index.reshape(labels.shape).astype(np.uint32)
     max_id = int(labels.max())
     if max_id == 0:
         return labels
@@ -2552,6 +2557,9 @@ def step_cleanup(a: np.ndarray, params: Dict[str, Any], meta: Dict[str, Any],
     low_conf = _float(params, "low_conf", 0.6)
     outlier = _float(params, "size_outlier_factor", 4.0)
     out = np.array(labels, dtype=np.uint32, copy=True)
+    # the flags of every time point, as one list of ids per flag (an id that
+    # is flagged in any frame is listed once); the last frame's alone used
+    # to be reported
     flags: Dict[str, List[int]] = {}
     for t in range(out.shape[0]):
         vol = out[t]
@@ -2562,8 +2570,10 @@ def step_cleanup(a: np.ndarray, params: Dict[str, Any], meta: Dict[str, Any],
         if min_voxels > 0 or relabel:
             vol = _remove_small(vol, min_voxels, relabel)
         out[t] = vol
-        flags = _label_flags(vol, low_conf, outlier)
-    kept = int(np.count_nonzero(np.bincount(out.reshape(-1))[1:]))
+        for key, ids in _label_flags(vol, low_conf, outlier).items():
+            have = flags.setdefault(key, [])
+            have.extend(i for i in ids if i not in have)
+    kept = int(np.count_nonzero(np.unique(out)))
     return StepResult(a, dict(meta), labels=out, info={"labels": kept, "flags": flags})
 
 

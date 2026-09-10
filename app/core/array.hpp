@@ -49,7 +49,10 @@ namespace sirius::app {
             return sirius::detail::checkedProduct(e.begin(), e.end(), "Dims5::planes");
         }
         Index planeIndex(Index ci, Index ti, Index zi) const noexcept { return (ci * t + ti) * z + zi; }
-        Index planeSize() const noexcept { return y * x; }
+        Index planeSize() const {
+            const std::array<Index, 2> e{y, x};
+            return sirius::detail::checkedProduct(e.begin(), e.end(), "Dims5::planeSize");
+        }
         std::size_t bytes() const { return sirius::detail::checkedBytes(numel(), sizeof(float), "Dims5::bytes"); }
         // "c2 t40 z48 y2048 x2048"
         std::string toString() const;
