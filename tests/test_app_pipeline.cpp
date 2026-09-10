@@ -171,7 +171,12 @@ namespace {
             const bool tracked = p.getBool("tracked");
             for (Index t = 0; t < (tracked ? d.t : 1); ++t) {
                 labels->paint(t, d.z / 2, d.y / 2, d.x / 2, 1.5, 0, static_cast<std::uint32_t>(p.getInt("label")));
-                if (tracked) labels->paint(t, d.z / 2, 2, 2, 1.0, 0, static_cast<std::uint32_t>(p.getInt("label")) + 1);
+                if (tracked) {
+                    // a second lobe of the same object, joined to the first (something to split)
+                    labels->paint(t, d.z / 2, d.y / 2, d.x / 2 + 2, 1.5, 0, static_cast<std::uint32_t>(p.getInt("label")));
+                    labels->paint(t, d.z / 2, d.y / 2, d.x / 2 + 4, 1.5, 0, static_cast<std::uint32_t>(p.getInt("label")));
+                    labels->paint(t, d.z / 2, 2, 2, 1.0, 0, static_cast<std::uint32_t>(p.getInt("label")) + 1);
+                }
             }
             labels->setTracked(tracked);
             labels->recomputeStats(0);
@@ -2047,4 +2052,40 @@ TEST_CASE("A choice has to be named in full", "[app][pipeline][params]") {
     q.set("interpolation", std::string("c"));       // a prefix is a typo: the default it is
     p.setParams(1, q);
     CHECK(p.at(1).params.getString("interpolation") != "cubic");
+}
+
+TEST_CASE("On tracked labels a split travels along the track", "[app][workbench][labels][track]") {
+    registerTestOps();
+    Scratch scratch;
+    Workbench wb(scratch.dir);
+    wb.setDataset(syntheticSource(1, 3, 4, 16, 16));
+    wb.setBackend(Backend::Cpu);
+    while (wb.pipeline().size() > 1) wb.removeStep(1);
+    wb.addStep("test_labels");
+    wb.setStepParam(1, "tracked", true);
+    REQUIRE(runSync(wb)->succeeded());
+    wb.view(1);
+    std::shared_ptr<LabelVolume> labels = wb.viewedLabels();
+    REQUIRE(labels);
+    const Index cz = 2, cy = 8, cx = 8;   // the object spans x = 8 .. 12 in every frame
+    for (Index t = 0; t < 3; ++t) {
+        REQUIRE(labels->at(t, cz, cy, cx) == 1);
+        REQUIRE(labels->at(t, cz, cy, cx + 4) == 1);
+    }
+    wb.setT(1);
+    wb.splitLabel(1, {cz, cy, cx}, {cz, cy, cx + 4});
+    CHECK(wb.history().undoLabel() == "Split track 1");
+    const std::uint32_t part = labels->at(1, cz, cy, cx + 4);
+    REQUIRE(part != 0);
+    REQUIRE(part != 1);
+    for (Index t = 0; t < 3; ++t) {
+        INFO("frame " << t);
+        CHECK(labels->at(t, cz, cy, cx) == 1);        // the seed's lobe keeps the id ...
+        CHECK(labels->at(t, cz, cy, cx + 4) == part);   // ... the other lobe has the same new id in every frame
+        CHECK(labels->at(t, cz, 2, 2) == 2);            // the neighbour is untouched
+    }
+    wb.undo();
+    for (Index t = 0; t < 3; ++t) CHECK(labels->at(t, cz, cy, cx + 4) == 1);
+    wb.redo();
+    for (Index t = 0; t < 3; ++t) CHECK(labels->at(t, cz, cy, cx + 4) == part);
 }

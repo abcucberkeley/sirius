@@ -137,8 +137,10 @@ namespace sirius::app {
         LabelDiff merge(Index t, const std::vector<std::uint32_t>& ids);   // all into the smallest id
         LabelDiff remove(Index t, std::uint32_t id);
         // Split `id` into two by a watershed from the two seeds (distance transform);
-        // the new part gets maxLabel() + 1.
-        LabelDiff split(Index t, std::uint32_t id, std::array<Index, 3> seedA, std::array<Index, 3> seedB);
+        // the new part gets maxLabel() + 1, or `newId` when given (the same
+        // part in another frame of a track).
+        LabelDiff split(Index t, std::uint32_t id, std::array<Index, 3> seedA, std::array<Index, 3> seedB,
+                        std::uint32_t newId = 0);
         // Re-apply / revert a diff.
         void apply(const LabelDiff& diff, bool forward);
 

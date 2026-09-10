@@ -13,6 +13,7 @@
 #include <cstdint>
 #include <memory>
 #include <optional>
+#include <stdexcept>
 #include <string>
 #include <vector>
 
@@ -48,7 +49,14 @@ namespace sirius::app {
             const std::array<Index, 3> e{c, t, z};
             return sirius::detail::checkedProduct(e.begin(), e.end(), "Dims5::planes");
         }
-        Index planeIndex(Index ci, Index ti, Index zi) const noexcept { return (ci * t + ti) * z + zi; }
+        // The plane of (c, t, z): the indices are checked against the extents,
+        // and planes() is checked, so the arithmetic below cannot wrap.
+        Index planeIndex(Index ci, Index ti, Index zi) const {
+            if (ci < 0 || ci >= c || ti < 0 || ti >= t || zi < 0 || zi >= z)
+                throw std::out_of_range("Dims5::planeIndex: (" + std::to_string(ci) + ", " + std::to_string(ti) + ", " +
+                                        std::to_string(zi) + ") outside " + toString());
+            return (ci * t + ti) * z + zi;
+        }
         Index planeSize() const {
             const std::array<Index, 2> e{y, x};
             return sirius::detail::checkedProduct(e.begin(), e.end(), "Dims5::planeSize");

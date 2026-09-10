@@ -17,6 +17,7 @@
 #include <vector>
 
 #include "core/display_mapping.hpp"
+#include "core/array.hpp"
 #include "core/session.hpp"
 #include "core/volume_ops.hpp"
 
@@ -289,7 +290,7 @@ namespace {
                     v.data()[(z * ny + y) * nx + x] = static_cast<double>(z * 10000 + y * 100 + x);
         return v;
     }
-}
+} // namespace
 
 TEST_CASE("cropVolume copies the box and rejects bad boxes", "[app][volume]") {
     const Buffer<double> v = rampVolume(3, 5, 7);
@@ -467,4 +468,14 @@ TEST_CASE("ReconSession falls back to the ideal OTF and captures diagnostics", "
     CHECK_FALSE(m.idealOtf);
     CHECK_FALSE(m.diagnostics.captured);
     CHECK_FALSE(m.plansReused);
+}
+
+TEST_CASE("Dims5::planeIndex refuses a plane outside the extents", "[app][array]") {
+    using namespace sirius::app;
+    const Dims5 d{2, 3, 4, 5, 6};
+    CHECK(d.planeIndex(1, 2, 3) == d.planes() - 1);
+    CHECK(d.planeIndex(0, 0, 0) == 0);
+    CHECK_THROWS_AS(d.planeIndex(2, 0, 0), std::out_of_range);
+    CHECK_THROWS_AS(d.planeIndex(0, 3, 0), std::out_of_range);
+    CHECK_THROWS_AS(d.planeIndex(0, 0, -1), std::out_of_range);
 }

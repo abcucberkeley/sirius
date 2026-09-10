@@ -5,6 +5,7 @@
 #include <algorithm>
 #include <chrono>
 #include <cmath>
+#include <limits>
 #include <ctime>
 #include <filesystem>
 #include <stdexcept>
@@ -1504,12 +1505,84 @@ namespace sirius::app {
         recordLabelDiff("Merge labels", id, labels, labels->merge(view_.t, ids));
     }
 
+    namespace {
+        // The rounded centroid of `id` in frame t, or {-1, -1, -1} when absent.
+        std::array<Index, 3> centroidOf(const LabelVolume& labels, Index t, std::uint32_t id) {
+            const std::uint32_t* v = labels.volume(t);
+            double sz = 0, sy = 0, sx = 0;
+            Index n = 0;
+            for (Index z = 0; z < labels.z(); ++z)
+                for (Index y = 0; y < labels.y(); ++y) {
+                    const std::uint32_t* row = v + (z * labels.y() + y) * labels.x();
+                    for (Index x = 0; x < labels.x(); ++x)
+                        if (row[x] == id) {
+                            sz += static_cast<double>(z);
+                            sy += static_cast<double>(y);
+                            sx += static_cast<double>(x);
+                            ++n;
+                        }
+                }
+            if (!n) return {-1, -1, -1};
+            return {static_cast<Index>(std::lround(sz / n)), static_cast<Index>(std::lround(sy / n)), static_cast<Index>(std::lround(sx / n))};
+        }
+
+        // Moves `seed` onto the voxel of `id` nearest to it in frame t (the
+        // centroid of a bent object lies outside it); false when `id` is absent.
+        bool snapToLabel(const LabelVolume& labels, Index t, std::uint32_t id, std::array<Index, 3>& seed) {
+            const std::uint32_t* v = labels.volume(t);
+            double best = std::numeric_limits<double>::infinity();
+            std::array<Index, 3> nearest{-1, -1, -1};
+            for (Index z = 0; z < labels.z(); ++z)
+                for (Index y = 0; y < labels.y(); ++y) {
+                    const std::uint32_t* row = v + (z * labels.y() + y) * labels.x();
+                    for (Index x = 0; x < labels.x(); ++x) {
+                        if (row[x] != id) continue;
+                        const double dz = static_cast<double>(z - seed[0]), dy = static_cast<double>(y - seed[1]),
+                                     dx = static_cast<double>(x - seed[2]);
+                        const double d = dz * dz + dy * dy + dx * dx;
+                        if (d < best) {
+                            best = d;
+                            nearest = {z, y, x};
+                            if (d == 0.0) break;
+                        }
+                    }
+                }
+            if (nearest[0] < 0) return false;
+            seed = nearest;
+            return true;
+        }
+    } // namespace
+
     void Workbench::splitLabel(std::uint32_t label, std::array<Index, 3> a, std::array<Index, 3> b) {
         endPaintStroke();
         if (label == 0 || refuseIfRunning("split a label")) return;
         StepId id = 0;
         auto labels = editableLabels(&id);
         if (!labels) return;
+        if (labels->tracked() && labels->t() > 1) {
+            // The split travels along the track: the two parts' centroids in
+            // one frame seed the same watershed of the same id in the next,
+            // forward and backward, so the new part keeps one id throughout.
+            std::vector<LabelDiff> diffs;
+            LabelDiff first = labels->split(view_.t, label, a, b);
+            if (first.empty()) return;
+            const std::uint32_t part = labels->maxLabel();
+            diffs.push_back(std::move(first));
+            for (const Index dir : {Index{1}, Index{-1}}) {
+                std::array<Index, 3> seedA = centroidOf(*labels, view_.t, label), seedB = centroidOf(*labels, view_.t, part);
+                for (Index f = view_.t + dir; f >= 0 && f < labels->t(); f += dir) {
+                    if (!snapToLabel(*labels, f, label, seedA)) continue;   // the object is absent here
+                    if (!snapToLabel(*labels, f, label, seedB) || seedA == seedB) continue;
+                    LabelDiff d = labels->split(f, label, seedA, seedB, part);
+                    if (d.empty()) continue;
+                    diffs.push_back(std::move(d));
+                    seedA = centroidOf(*labels, f, label);
+                    seedB = centroidOf(*labels, f, part);
+                }
+            }
+            recordLabelDiffs("Split track " + std::to_string(label), id, labels, std::move(diffs));
+            return;
+        }
         recordLabelDiff("Split label " + std::to_string(label), id, labels, labels->split(view_.t, label, a, b));
     }
 

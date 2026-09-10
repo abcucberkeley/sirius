@@ -452,7 +452,8 @@ namespace sirius::app {
         return diff;
     }
 
-    LabelDiff LabelVolume::split(Index t, std::uint32_t id, std::array<Index, 3> seedA, std::array<Index, 3> seedB) {
+    LabelDiff LabelVolume::split(Index t, std::uint32_t id, std::array<Index, 3> seedA, std::array<Index, 3> seedB,
+                                 std::uint32_t newId) {
         LabelDiff diff;
         diff.t = t;
         if (t < 0 || t >= t_) throw std::out_of_range("LabelVolume::split: t out of range");
@@ -498,7 +499,8 @@ namespace sirius::app {
         // ridges of the watershed are the thin necks: flood from deep inside
         for (float& d : dist) d = -d;
 
-        const std::uint32_t newId = maxLabel_ + 1;
+        if (newId == 0) newId = maxLabel_ + 1;
+        if (newId == id) throw std::invalid_argument("LabelVolume::split: the new part needs an id of its own");
         std::vector<std::uint32_t> labels(static_cast<std::size_t>(bn), 0);
         labels[static_cast<std::size_t>(((seedA[0] - oz) * by + (seedA[1] - oy)) * bx + (seedA[2] - ox))] = id;
         labels[static_cast<std::size_t>(((seedB[0] - oz) * by + (seedB[1] - oy)) * bx + (seedB[2] - ox))] = newId;
@@ -515,7 +517,7 @@ namespace sirius::app {
                     diff.after.push_back(newId);
                     v[i] = newId;
                 }
-        if (!diff.empty()) maxLabel_ = newId;
+        if (!diff.empty()) maxLabel_ = std::max(maxLabel_, newId);
         return diff;
     }
 
