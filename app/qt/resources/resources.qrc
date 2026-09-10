@@ -6,4 +6,7 @@
     <file>fonts/Archivo-ExtraBold.ttf</file>
     <file>fonts/OFL.txt</file>
 </qresource>
+<qresource prefix="/icons">
+    <file alias="chevron-down.svg">icons/chevron-down.svg</file>
+</qresource>
 </RCC>

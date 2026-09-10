@@ -253,6 +253,20 @@ namespace sirius::app {
         emit finished(acc_.toMessage());
     }
 
+    QString LlmClient::resolveModel(const QString& typed, const QStringList& listed) {
+        const QString t = typed.trimmed();
+        if (t.isEmpty() || listed.contains(t)) return t;
+        for (const QString& name : listed)
+            if (name.compare(t, Qt::CaseInsensitive) == 0) return name;
+        QString unique;
+        for (const QString& name : listed) {
+            if (!name.startsWith(t, Qt::CaseInsensitive)) continue;
+            if (!unique.isEmpty()) return t;   // several: the user has to say which
+            unique = name;
+        }
+        return unique.isEmpty() ? t : unique;
+    }
+
     void LlmClient::fetchLoadedModels(const QString& baseUrl, std::function<void(QStringList, QString)> done) {
         // the OpenAI-compatible base ends in /v1; Ollama's own API sits beside it
         QString root = baseUrl.trimmed();

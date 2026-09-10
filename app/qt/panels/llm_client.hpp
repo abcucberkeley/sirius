@@ -50,6 +50,13 @@ namespace sirius::app {
         void fetchModels(const QString& baseUrl, const QString& apiKey,
                          std::function<void(QStringList ids, QString error)> done);
 
+        // A model name as typed into an editable dropdown, against the names
+        // the server lists: the listed name it matches ignoring case, or the
+        // one it is a prefix of when that is unique ("gemma" -> "gemma4:31b"),
+        // else the text as typed -- a name the server does not list yet may
+        // still be right, and the answer will say if it is not.
+        static QString resolveModel(const QString& typed, const QStringList& listed);
+
         // Parses one SSE "data:" payload (or a whole non-streaming body) into
         // the accumulator; exposed for tests.
         struct ToolCall {

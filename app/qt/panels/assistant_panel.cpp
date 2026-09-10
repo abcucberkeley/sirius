@@ -21,6 +21,7 @@
 #include <QScrollArea>
 #include <QScrollBar>
 #include <QSettings>
+#include <QStyle>
 #include <QElapsedTimer>
 #include <QTimer>
 #include <QToolTip>
@@ -186,6 +187,7 @@ namespace sirius::app {
         QLabel* askToggle = nullptr;
         QComboBox* modelBox = nullptr;   // the model that answers, next to the question
         bool fillingModels = false;      // programmatic fills of modelBox are not choices
+        QStringList listedModels;        // what the server said it has, empty until it answers
         QLabel* streamingLabel = nullptr;      // the assistant text being streamed
         QString streamingSource;               // its Markdown so far (the label holds HTML)
         static QString renderMarkdown(const QString& markdown) {
@@ -521,19 +523,44 @@ namespace sirius::app {
                 context->setText(QStringLiteral("sees step %1, diagnostics, ops stack").arg(fromStd(Step::number(sel))));
         }
 
+        // The footer's dropdown outlined in the accent while its name is one
+        // the server does not list (a typed name, or a server that changed).
+        void markUnlisted() {
+            const bool unlisted = !listedModels.isEmpty() && !listedModels.contains(settings.model);
+            if (modelBox->property("unlisted").toBool() == unlisted) return;
+            modelBox->setProperty("unlisted", unlisted);
+            modelBox->style()->unpolish(modelBox);
+            modelBox->style()->polish(modelBox);
+            if (unlisted)
+                modelBox->setToolTip(QStringLiteral("%1 is not a model %2 lists: pick one from the list, or the answer will say if it is unknown")
+                                         .arg(settings.model, settings.baseUrl));
+        }
+
         // A pick or a typed name in the footer is the setting, saved at once.
         void commitModel(const QString& text) {
-            const QString m = text.trimmed();
-            if (fillingModels || m.isEmpty() || m == settings.model) return;
+            if (fillingModels) return;
+            const QString m = LlmClient::resolveModel(text, listedModels);
+            if (m.isEmpty()) return;
+            if (m != text.trimmed()) {
+                fillingModels = true;
+                modelBox->setCurrentText(m);
+                fillingModels = false;
+            }
+            if (m == settings.model) return;
             settings.model = m;
             settings.save();
-            bridge.wb().logLine("Assistant model: " + toStd(m));
+            std::string line = "Assistant model: " + toStd(m);
+            if (!listedModels.isEmpty() && !listedModels.contains(m))
+                line += " (not among the " + std::to_string(listedModels.size()) + " the server lists; the answer will say if it is unknown)";
+            bridge.wb().logLine(line);
+            markUnlisted();
         }
 
         // The server's model list into the footer's dropdown, the current
         // choice kept (and listed even when the server does not know it).
         void refreshModelBox() {
             const QString keep = settings.model;
+            listedModels.clear();
             fillingModels = true;
             modelBox->clear();
             if (!keep.isEmpty()) modelBox->addItem(keep);
@@ -545,14 +572,19 @@ namespace sirius::app {
                     return;
                 }
                 ids.sort(Qt::CaseInsensitive);
-                if (!keep.isEmpty() && !ids.contains(keep)) ids.prepend(keep);
+                listedModels = ids;
+                // a saved name that is only a prefix of one the server has
+                // (typed and left, say) becomes that one
+                const QString chosen = keep.isEmpty() ? ids.first() : LlmClient::resolveModel(keep, ids);
+                if (!ids.contains(chosen)) ids.prepend(chosen);
                 fillingModels = true;
                 modelBox->clear();
                 modelBox->addItems(ids);
-                modelBox->setCurrentText(keep.isEmpty() ? ids.first() : keep);
+                modelBox->setCurrentText(chosen);
                 fillingModels = false;
                 modelBox->setToolTip(QStringLiteral("%1 model(s) at %2: pick one, or type a name").arg(ids.size()).arg(settings.baseUrl));
-                if (keep.isEmpty()) commitModel(ids.first());
+                if (chosen != keep) commitModel(chosen);
+                markUnlisted();
             });
         }
 

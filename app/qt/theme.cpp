@@ -206,11 +206,16 @@ namespace sirius::app::theme {
                    .arg(n700, accent, n400);
 
         // inputs
+        // QComboBox::down-arrow needs an image: without one the styled drop-down
+        // draws nothing, and an editable combo box (the assistant's model)
+        // reads as a plain text field.
         qss += QStringLiteral(
                    "QLineEdit, QSpinBox, QDoubleSpinBox, QComboBox, QPlainTextEdit, QTextEdit {"
                    "  background: %1; border: 1.5px solid %2; border-radius: 0; padding: 0 8px; min-height: 29px;"
                    "  selection-background-color: %3; selection-color: %1; }\n"
                    "QPlainTextEdit, QTextEdit { padding: 6px 8px; }\n"
+                   // a model name the server does not list (the assistant's footer)
+                   "QComboBox[unlisted=\"true\"] { border-color: %3; }\n"
                    "QLineEdit[focusVisible=\"true\"], QSpinBox[focusVisible=\"true\"], QDoubleSpinBox[focusVisible=\"true\"],"
                    " QComboBox[focusVisible=\"true\"], QPlainTextEdit[focusVisible=\"true\"], QTextEdit[focusVisible=\"true\"]"
                    " { border: 2px solid %3; }\n"
@@ -219,7 +224,8 @@ namespace sirius::app::theme {
                    "QSpinBox::up-button, QDoubleSpinBox::up-button, QSpinBox::down-button, QDoubleSpinBox::down-button {"
                    "  width: 16px; border: none; background: transparent; }\n"
                    "QSpinBox::up-arrow, QDoubleSpinBox::up-arrow { width: 7px; height: 7px; }\n"
-                   "QComboBox::drop-down { border: none; width: 22px; }\n"
+                   "QComboBox::drop-down { border: none; width: 22px; subcontrol-origin: padding; subcontrol-position: center right; }\n"
+                   "QComboBox::down-arrow { image: url(:/icons/chevron-down.svg); width: 12px; height: 12px; }\n"
                    "QComboBox QAbstractItemView { background: %1; border: 2px solid %7; selection-background-color: %8;"
                    "  selection-color: %3; outline: none; padding: 2px 0; }\n"
                    "QComboBox QAbstractItemView::item { min-height: 24px; padding: 2px 8px; }\n")

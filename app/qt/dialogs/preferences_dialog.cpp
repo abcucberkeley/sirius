@@ -63,6 +63,7 @@ namespace sirius::app {
             const QString keep = model->currentText().trimmed();
             const QString base = baseUrl->text().trimmed(), key = apiKey->text();
             const bool ollama = provider->currentData().toString() == QLatin1String("ollama");
+            listedModels.clear();
             refreshModels->setEnabled(false);
             modelNote->setText(QStringLiteral("Asking %1 for its models…").arg(base));
             client.fetchModels(base, key, [this, keep, base, ollama](QStringList ids, QString error) {
@@ -73,6 +74,7 @@ namespace sirius::app {
                     return;
                 }
                 ids.sort(Qt::CaseInsensitive);
+                listedModels = ids;
                 model->clear();
                 model->addItems(ids);
                 if (!keep.isEmpty()) model->setCurrentText(keep);
@@ -101,6 +103,7 @@ namespace sirius::app {
         QComboBox* model = nullptr;          // editable: the server's list, or any name typed
         QPushButton* refreshModels = nullptr;
         QLabel* modelNote = nullptr;
+        QStringList listedModels;   // what the server said it has, empty until it answers
         LlmClient client;
         QLineEdit* apiKey = nullptr;
         QCheckBox* askFirst = nullptr;
@@ -276,7 +279,7 @@ namespace sirius::app {
         AssistantSettings as;
         as.provider = impl_->provider->currentData().toString();
         as.baseUrl = impl_->baseUrl->text().trimmed();
-        as.model = impl_->model->currentText().trimmed();
+        as.model = LlmClient::resolveModel(impl_->model->currentText(), impl_->listedModels);
         as.apiKey = impl_->apiKey->text();
         as.askBeforeActing = impl_->askFirst->isChecked();
         as.save();
