@@ -34,7 +34,9 @@ from __future__ import annotations
 import json
 import math
 import os
+import threading
 import warnings
+from collections import OrderedDict
 from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
@@ -2801,7 +2803,15 @@ def resolve_device(device: str = "auto") -> str:
     return device
 
 
-_model_cache: Dict[Tuple[str, str], Any] = {}
+# Loaded models by (file, device), each with the file's (mtime, size) when it
+# was read: a model re-exported under the same name is another model. The
+# application re-runs the step because the file changed, and a long-lived
+# worker must not answer with the old weights. Least recently used models go
+# first once there are more than _MODEL_CACHE_SIZE (GPU memory is not free).
+_MODEL_CACHE_SIZE = 4
+_model_cache: OrderedDict[Tuple[str, str], Tuple[Optional[Tuple[int, int]], Any]] = OrderedDict()
+_model_lock = threading.Lock()
+_hf_spec_files: Dict[str, str] = {}   # hf: spec -> the cached file it resolved to (no network to find it again)
 
 # Model specs beyond a file path (the worker's ``sirius_worker.models`` has
 # the full hub / family machinery; the layout of the download cache is shared):
@@ -2905,17 +2915,21 @@ def load_model(path: str, device: str = "auto", progress: ProgressFn = None):
         raise NotAvailable(f"'{path}' is a {family} model family spec: it returns labels through the worker "
                            "(sirius_worker.models.run_family), not a loadable tensor model")
     device = resolve_device(device)
-    key = (path.strip(), device)
-    m = _model_cache.get(key)
-    if m is not None:
-        return m
-    path = resolve_model_spec(path, progress)
-    key = (os.path.abspath(path), device)
-    m = _model_cache.get(key)
+    spec = path.strip()
+    known = _hf_spec_files.get(spec)
+    if known is not None:
+        m = _cached_model(known, device)
+        if m is not None:
+            return m
+    path = os.path.abspath(resolve_model_spec(spec, progress))
+    if _is_hf_spec(spec):
+        _hf_spec_files[spec] = path
+    m = _cached_model(path, device)
     if m is not None:
         return m
     if not os.path.exists(path):
         raise FileNotFoundError(path)
+    stamp = _file_stamp(path)   # taken before reading: a rewrite during the load shows next time
     if path.lower().endswith(".onnx"):
         try:
             import onnxruntime as ort  # type: ignore
@@ -2931,8 +2945,38 @@ def load_model(path: str, device: str = "auto", progress: ProgressFn = None):
         except Exception as e:  # noqa: BLE001 - say what the file is instead of PytorchStreamReader details
             raise ValueError(_not_torchscript_message(path, e)) from e
         m.eval()
-    _model_cache[key] = m
+    with _model_lock:
+        for other in [k for k, (st, _) in _model_cache.items() if k[0] == path and st != stamp]:
+            del _model_cache[other]   # the same file on another device, read before it changed
+        _model_cache[(path, device)] = (stamp, m)
+        _model_cache.move_to_end((path, device))
+        while len(_model_cache) > _MODEL_CACHE_SIZE:
+            _model_cache.popitem(last=False)
     return m
+
+
+def _file_stamp(path: str) -> Optional[Tuple[int, int]]:
+    """(modification time in ns, size) of a model file; None when it is gone."""
+    try:
+        st = os.stat(path)
+    except OSError:
+        return None
+    return int(st.st_mtime_ns), int(st.st_size)
+
+
+def _cached_model(path: str, device: str):
+    """The cached model of `path` on `device` while the file is unchanged since
+    it was read; a stale entry is dropped."""
+    stamp = _file_stamp(path)
+    with _model_lock:
+        entry = _model_cache.get((path, device))
+        if entry is None:
+            return None
+        if stamp is None or entry[0] != stamp:
+            del _model_cache[(path, device)]
+            return None
+        _model_cache.move_to_end((path, device))
+        return entry[1]
 
 
 def _not_torchscript_message(path: str, error: BaseException) -> str:

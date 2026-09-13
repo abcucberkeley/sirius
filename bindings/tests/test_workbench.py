@@ -194,6 +194,58 @@ def _sirius_extension():
         return None
 
 
+try:
+    import torch  # type: ignore
+except ImportError:  # pragma: no cover - environment dependent
+    torch = None
+
+
+@unittest.skipIf(torch is None, "torch not installed")
+class TestModelCache(unittest.TestCase):
+    """load_model serves a model from memory only while its file is the one
+    it read: a re-export under the same name is another model."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.path = os.path.join(self.tmp.name, "model.pt")
+
+    def _export(self, path, k, mtime_ns):
+        class Scale(torch.nn.Module):
+            def __init__(self, k):
+                super().__init__()
+                self.k = k
+
+            def forward(self, x):
+                return x * self.k
+
+        torch.jit.script(Scale(k)).save(path)
+        os.utime(path, ns=(mtime_ns, mtime_ns))   # distinct stamps however coarse the file system clock
+
+    def _value(self, model):
+        with torch.no_grad():
+            return float(model(torch.ones(1))[0])
+
+    def test_a_model_rewritten_in_place_is_read_again(self):
+        self._export(self.path, 1.0, 1_000_000_000)
+        first = wb.load_model(self.path, "cpu")
+        self.assertEqual(self._value(first), 1.0)
+        self.assertIs(wb.load_model(self.path, "cpu"), first)   # unchanged: served from memory
+        self._export(self.path, 2.0, 2_000_000_000)
+        second = wb.load_model(self.path, "cpu")
+        self.assertEqual(self._value(second), 2.0)
+        self.assertIsNot(second, first)
+
+    def test_the_cache_is_bounded(self):
+        paths = [os.path.join(self.tmp.name, f"m{i}.pt") for i in range(wb._MODEL_CACHE_SIZE + 2)]
+        for i, p in enumerate(paths):
+            self._export(p, float(i), 1_000_000_000 + i)
+            wb.load_model(p, "cpu")
+        self.assertLessEqual(len(wb._model_cache), wb._MODEL_CACHE_SIZE)
+        self.assertNotIn((os.path.abspath(paths[0]), "cpu"), wb._model_cache)   # the least recently used went
+        self.assertIn((os.path.abspath(paths[-1]), "cpu"), wb._model_cache)
+
+
 @unittest.skipIf(_sirius_extension() is None, "sirius extension not importable")
 class TestSimStep(unittest.TestCase):
     DATA = Path(__file__).resolve().parents[2] / "tests" / "data"
