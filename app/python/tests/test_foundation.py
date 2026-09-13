@@ -34,11 +34,18 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from sirius_worker import foundation, protocol  # noqa: E402
 
+_path = list(sys.path)
 try:
     foundation._import_latents()
     HAVE, WHY = True, ""
 except Exception as exc:                                   # noqa: BLE001
     HAVE, WHY = False, str(exc)
+finally:
+    # _import_latents puts SIRIUS_LATENTS_PATH first on sys.path, and a latents
+    # checkout has a top-level `tests` package of its own: left there while the
+    # suite is being discovered, it hides this directory's from test_models.
+    # The package stays importable from sys.modules; runs put the path back.
+    sys.path[:] = _path
 
 try:
     from scipy import ndimage as ndi
