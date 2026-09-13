@@ -2620,6 +2620,21 @@ def _sirius_ext():
     return sirius
 
 
+def _sim_parameter_format(path: str) -> str:
+    """"toml" or "legacy", decided as session.cpp's detectParameterFormat does:
+    a .toml extension, else the first line that is neither blank nor a comment
+    opening a [table]."""
+    if path.lower().endswith(".toml"):
+        return "toml"
+    with open(path, encoding="utf-8", errors="replace") as f:
+        for line in f:
+            s = line.lstrip(" \t\r\n")
+            if not s or s[0] in "#;":
+                continue
+            return "toml" if s[0] == "[" else "legacy"
+    return "legacy"   # an empty file: the legacy loader yields defaults
+
+
 def _sim_parameters(params: Dict[str, Any], meta: Dict[str, Any]):
     """SIMParameters as sim.cpp's buildParameters assembles them."""
     sirius = _sirius_ext()
@@ -2630,9 +2645,12 @@ def _sim_parameters(params: Dict[str, Any], meta: Dict[str, Any]):
         cfg = _str(params, "params_file")
         if not cfg:
             raise ValueError("SIM: From file mode needs a parameter file ('params_file')")
-        try:
-            p = sirius.load_parameters(cfg) if cfg.lower().endswith(".toml") else sirius.load_legacy_parameters(cfg)
-        except Exception:  # noqa: BLE001 - try the other format
+        # one format, chosen as the application chooses it: retrying a TOML
+        # file that failed (a parse or validation error) as a legacy config
+        # reported "Unknown legacy config key" instead of what was wrong
+        if _sim_parameter_format(cfg) == "toml":
+            p = sirius.load_parameters(cfg)
+        else:
             p = sirius.load_legacy_parameters(cfg)
     else:
         p = sirius.SIMParameters()

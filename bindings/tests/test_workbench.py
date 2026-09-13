@@ -188,6 +188,27 @@ class TestSimStep(unittest.TestCase):
         r2 = wb.run_step("sim", params, raw, {"voxel_um": [0.08, 0.08, 0.125]}, device="cpu")
         np.testing.assert_array_equal(r2.array, r.array)
 
+    def test_sim_from_file_reports_the_toml_error(self):
+        # a TOML file that fails to load was retried as a legacy config, which
+        # hid the real error behind "Unknown legacy config key"
+        meta = {"voxel_um": [0.08, 0.08, 0.125]}
+        with tempfile.TemporaryDirectory() as d:
+            bad = Path(d) / "bad.toml"
+            bad.write_text("[optics]\nndirs = 0\n")
+            with self.assertRaises(Exception) as cm:
+                wb._sim_parameters({"mode": "From file", "params_file": str(bad)}, meta)
+            self.assertIn("ndirs", str(cm.exception))
+            self.assertNotIn("legacy", str(cm.exception))
+            # a TOML file without the extension is read as TOML, as the application does
+            plain = Path(d) / "sim2d.cfg"
+            plain.write_text("# 2D SIM\n[optics]\nndirs = 3\nnphases = 3\n")
+            p = wb._sim_parameters({"mode": "From file", "params_file": str(plain)}, meta)
+            self.assertEqual(p.nphases, 3)
+            self.assertEqual(p.norders, 0)   # derived: 2 orders for 3 phases
+        # and a legacy config still loads as one
+        p = wb._sim_parameters({"mode": "From file", "params_file": str(self.DATA / "config.txt")}, meta)
+        self.assertEqual(p.nphases, 5)
+
     def test_sim_step_needs_an_otf_file(self):
         raw = np.zeros((15, 8, 8), np.float32)
         with self.assertRaises(wb.NotAvailable):
