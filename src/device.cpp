@@ -131,9 +131,17 @@ namespace sirius {
 #endif
     }
 
+    // Like every other CUDA call in the library, stream and event teardown and
+    // synchronization run with the owning device current: on a multi-GPU host
+    // the call would otherwise go to (and create a context on) whichever
+    // device the caller happens to have selected.
+
     Stream::~Stream() {
 #ifdef SIRIUS_HAS_CUDA
-        if (handle_) (void)cudaStreamDestroy(static_cast<cudaStream_t>(handle_));
+        if (handle_) {
+            cuda::DeviceGuardNoThrow g(device_.index);
+            (void)cudaStreamDestroy(static_cast<cudaStream_t>(handle_));
+        }
 #endif
     }
 
@@ -143,7 +151,10 @@ namespace sirius {
     Stream& Stream::operator=(Stream&& other) noexcept {
         if (this != &other) {
 #ifdef SIRIUS_HAS_CUDA
-            if (handle_) (void)cudaStreamDestroy(static_cast<cudaStream_t>(handle_));
+            if (handle_) {
+                cuda::DeviceGuardNoThrow g(device_.index);
+                (void)cudaStreamDestroy(static_cast<cudaStream_t>(handle_));
+            }
 #endif
             device_ = other.device_;
             handle_ = std::exchange(other.handle_, nullptr);
@@ -154,6 +165,7 @@ namespace sirius {
     void Stream::synchronize() const {
 #ifdef SIRIUS_HAS_CUDA
         if (handle_) {
+            cuda::DeviceGuard g(device_.index);
             cuda::check(cudaStreamSynchronize(static_cast<cudaStream_t>(handle_)), "cudaStreamSynchronize");
         } else if (device_.isCuda()) {
             cuda::DeviceGuard g(device_.index);
@@ -182,7 +194,10 @@ namespace sirius {
 
     Event::~Event() {
 #ifdef SIRIUS_HAS_CUDA
-        if (handle_) (void)cudaEventDestroy(static_cast<cudaEvent_t>(handle_));
+        if (handle_) {
+            cuda::DeviceGuardNoThrow g(deviceIndex_);
+            (void)cudaEventDestroy(static_cast<cudaEvent_t>(handle_));
+        }
 #endif
     }
 
@@ -192,7 +207,10 @@ namespace sirius {
     Event& Event::operator=(Event&& other) noexcept {
         if (this != &other) {
 #ifdef SIRIUS_HAS_CUDA
-            if (handle_) (void)cudaEventDestroy(static_cast<cudaEvent_t>(handle_));
+            if (handle_) {
+                cuda::DeviceGuardNoThrow g(deviceIndex_);
+                (void)cudaEventDestroy(static_cast<cudaEvent_t>(handle_));
+            }
 #endif
             handle_ = std::exchange(other.handle_, nullptr);
             deviceIndex_ = other.deviceIndex_;
@@ -226,6 +244,7 @@ namespace sirius {
     void Event::synchronize() const {
         if (!handle_) return;
 #ifdef SIRIUS_HAS_CUDA
+        cuda::DeviceGuard g(deviceIndex_);
         cuda::check(cudaEventSynchronize(static_cast<cudaEvent_t>(handle_)), "cudaEventSynchronize");
 #endif
     }
@@ -233,6 +252,7 @@ namespace sirius {
     bool Event::ready() const {
         if (!handle_) return true;
 #ifdef SIRIUS_HAS_CUDA
+        cuda::DeviceGuard g(deviceIndex_);
         const cudaError_t e = cudaEventQuery(static_cast<cudaEvent_t>(handle_));
         if (e == cudaSuccess) return true;
         if (e == cudaErrorNotReady) return false;
