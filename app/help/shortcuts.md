@@ -3,7 +3,7 @@ title: Keyboard shortcuts
 figure: Modifier keys: ⌘ is Ctrl on Linux and Windows
 ---
 
-Shortcuts follow the menus; ⌘ stands for Ctrl on Linux and Windows. Single-letter keys act while the viewer has focus.
+Shortcuts follow the menus; ⌘ stands for Ctrl on Linux and Windows. Keys without a modifier act anywhere in the window, except on a control that uses the key itself.
 
 $$
 \text{⌘} = \text{Ctrl},\qquad \text{⌥} = \text{Alt},\qquad \text{⇧} = \text{Shift}
@@ -55,7 +55,7 @@ $$
 
 | Parameter | Explanation |
 |---|---|
-| **Viewer focus** <br> click a pane | Single-key shortcuts (1, 2, 3, H, L, V, P, M, R, B, E, +, −, 0) act on the viewer only while one of its panes has keyboard focus. |
+| **Focused controls** <br> click or Tab to one | A key without a modifier (Space, the arrows, the letters and digits) goes to the focused control when that control uses it: typing in a field, Space on a button, a list or the log, the arrows on a slider, a list or a slice pane (which moves the crosshair). Everywhere else it is the shortcut. |
 
 ## Note
 

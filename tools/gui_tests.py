@@ -5,9 +5,10 @@ The core is covered by tests/test_app_*.cpp, which run without a display. The
 widgets were covered by one screenshot that only proved the window came up.
 This drives the real application through the hooks it already has for
 scripting -- ``--tool`` for the assistant API, ``--action`` for a menu item,
-``--stroke`` and ``--wheel`` for mouse input on the XY pane, ``--drop`` for a
-drag and drop, ``--record`` for a machine-readable log of what happened -- and
-asserts on what comes back rather than on the process surviving.
+``--key`` for a key press on a named widget, ``--stroke`` and ``--wheel`` for
+mouse input on the XY pane, ``--drop`` for a drag and drop, ``--record`` for a
+machine-readable log of what happened -- and asserts on what comes back rather
+than on the process surviving.
 
     python3 tools/gui_tests.py --app build/linux-gcc-app-dev/app/sirius-app
 
@@ -462,6 +463,82 @@ def test_a_token_the_secret_store_refuses_stays_in_the_settings(app: Path, tmp: 
     check("tok_LEGACY" in conf.read_text(), "the plaintext token went although the store could not take it")
 
 
+def focused(out: str, spec: str) -> None:
+    """The --key press `spec` ("Z plane=Right") reached the widget it named."""
+    target, key = spec.split("=", 1)
+    check(f"key {key} to {target}: focus yes" in out, f"--key {spec} did not get the focus onto {target}")
+
+
+def test_arrow_keys_reach_the_focused_control(app: Path, tmp: Path) -> None:
+    # Left / Right are also Segment > Previous / Next flagged label. The
+    # shortcut stood back for a focused slider or slice pane only after Qt had
+    # already given it the key press, so the arrows moved nothing at all.
+    env = isolated_settings(tmp, "arrows")
+    out = run(
+        app,
+        [
+            "--dataset",
+            str(RAW),
+            "--tool",
+            '{"name":"get_state","args":{}}',
+            "--key",
+            "Z plane=Right",
+            "--key",
+            "xyPane=Right",
+            "--tool",
+            '{"name":"get_state","args":{}}',
+            "--settle",
+            "600",
+            "--quit-after",
+            "6000",
+        ],
+        env=env,
+    )
+    focused(out, "Z plane=Right")
+    focused(out, "xyPane=Right")
+    before, after = tool_results(out)["get_state"][-2:]
+    z0, z1 = before["view"]["z"], after["view"]["z"]
+    check(z1 == z0 + 1, f"Right on the Z slider: z {z0} -> {z1}")
+    x0, x1 = before["view"]["crosshair_x"], after["view"]["crosshair_x"]
+    check(x1 == x0 + 1, f"Right on the XY pane: crosshair x {x0} -> {x1}")
+
+
+def test_space_in_a_read_only_view_leaves_the_step_alone(app: Path, tmp: Path) -> None:
+    # Space is Edit > Enable / skip step. Pressed in the (read-only) session
+    # log, which pages with it, it silently skipped the selected step. With the
+    # focus on a widget that has no use for Space it still does.
+    env = isolated_settings(tmp, "space")
+    out = run(
+        app,
+        [
+            "--dataset",
+            str(RAW),
+            "--tool",
+            '{"name":"add_step","args":{"kind":"classic"}}',
+            "--tool",
+            '{"name":"select_step","args":{"step":3}}',
+            "--key",
+            "Session log=Space",
+            "--tool",
+            '{"name":"get_step","args":{"step":3}}',
+            "--key",
+            "xyPane=Space",
+            "--tool",
+            '{"name":"get_step","args":{"step":3}}',
+            "--settle",
+            "600",
+            "--quit-after",
+            "6000",
+        ],
+        env=env,
+    )
+    focused(out, "Session log=Space")
+    focused(out, "xyPane=Space")
+    in_log, on_pane = tool_results(out)["get_step"][-2:]
+    check(in_log["enabled"] is True, "Space in the session log skipped the selected step")
+    check(on_pane["enabled"] is False, "Space on the XY pane no longer skips the selected step (the shortcut is gone)")
+
+
 def test_ollama_never_gets_the_api_key(app: Path, tmp: Path) -> None:
     # One stored key serves OpenRouter and custom servers. With the provider
     # switched to Ollama (whose key field is disabled) every request still
@@ -514,6 +591,8 @@ SCENARIOS = [
     test_menu_actions_reach_the_view,
     test_a_preset_fills_the_fields,
     test_a_token_the_secret_store_refuses_stays_in_the_settings,
+    test_arrow_keys_reach_the_focused_control,
+    test_space_in_a_read_only_view_leaves_the_step_alone,
     test_ollama_never_gets_the_api_key,
     test_an_api_key_from_the_environment_is_not_stored,
 ]

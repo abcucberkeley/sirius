@@ -6,17 +6,20 @@
 #include <functional>
 #include <vector>
 
+#include <QAbstractItemView>
 #include <QAbstractSlider>
 #include <QAction>
 #include <QActionGroup>
 #include <QApplication>
 #include <QBoxLayout>
 #include <QCloseEvent>
+#include <QComboBox>
 #include <QDesktopServices>
 #include <QMimeData>
 #include <QDragEnterEvent>
 #include <QDockWidget>
 #include <QEvent>
+#include <QKeyEvent>
 #include <QPushButton>
 #include <QWindow>
 #include <QMouseEvent>
@@ -37,8 +40,10 @@
 #include <QPainter>
 #include <QProgressBar>
 #include <QScreen>
+#include <QSet>
 #include <QSettings>
 #include <QStatusBar>
+#include <QTabBar>
 #include <QUrl>
 
 #include <sirius/device.hpp>
@@ -64,6 +69,7 @@
 #include "qt/theme.hpp"
 #include "qt/trace.hpp"
 #include "qt/viewer/viewer_widget.hpp"
+#include "qt/viewer/viewer_widgets.hpp"
 #include "qt/widgets/controls.hpp"
 
 namespace sirius::app {
@@ -237,24 +243,73 @@ namespace sirius::app {
     } // namespace
 
     namespace {
-        // A menu action whose unmodified shortcut (Space, L, the arrows ...)
-        // stands back when the focused widget uses that key itself. Only the
-        // shortcut is guarded: a click on the menu, or a scripted trigger(),
-        // means the action and must never be swallowed -- with a spin box
-        // focused, View > Labels overlay from the menu used to do nothing.
-        class GuardedAction final : public QAction {
+        // Space, H, L, B, E, the digits, Left / Right and Backspace are
+        // window-wide shortcuts with no modifier, and they stand back when
+        // the focused widget uses the key itself: a button is pressed with
+        // Space, a slider or a slice pane moves with the arrows, a read-only
+        // text view pages with Space.
+        //
+        // That has to be decided at QEvent::ShortcutOverride, the question Qt
+        // asks the focus widget before it looks at the shortcut map: accepted
+        // there, the key press goes to the widget. Refusing the shortcut once
+        // it fired (the QEvent::Shortcut the action receives) is too late --
+        // Qt has already taken the key press for the shortcut, so the arrows
+        // did nothing on a focused slider or pane, and Space on a button did
+        // not press it. Stock text entries claim the keys they type
+        // themselves; the widgets below do not, which is what this adds.
+        // Menu clicks and scripted trigger()s never pass through here.
+        class ShortcutGuard final : public QObject {
         public:
-            using QAction::QAction;
-            std::function<bool()> shortcutBlocked;   // true: this shortcut press is the widget's
+            explicit ShortcutGuard(QObject* parent) : QObject(parent) {}
+            void guard(const QKeySequence& key) {
+                if (key.count() == 1 && (key[0].keyboardModifiers() & ~Qt::KeypadModifier) == Qt::NoModifier) keys_.insert(key[0].key());
+            }
 
         protected:
-            bool event(QEvent* e) override {
-                if (e->type() == QEvent::Shortcut && shortcutBlocked && shortcutBlocked()) {
-                    e->accept();
-                    return true;
-                }
-                return QAction::event(e);
+            bool eventFilter(QObject* watched, QEvent* e) override {
+                if (e->type() != QEvent::ShortcutOverride || watched != QApplication::focusWidget()) return false;
+                const auto* ke = static_cast<QKeyEvent*>(e);
+                if ((ke->modifiers() & ~Qt::KeypadModifier) != Qt::NoModifier || !keys_.contains(ke->key())) return false;
+                if (!focusClaims(ke->key())) return false;
+                e->accept();
+                return true;
             }
+
+        private:
+            static bool typingSomewhere(QWidget* w) {
+                if (auto* line = qobject_cast<QLineEdit*>(w)) return !line->isReadOnly();
+                if (auto* plain = qobject_cast<QPlainTextEdit*>(w)) return !plain->isReadOnly();
+                if (auto* rich = qobject_cast<QTextEdit*>(w)) return !rich->isReadOnly();
+                return w->inherits("QAbstractSpinBox");
+            }
+
+            // The focused widget uses `key` itself.
+            static bool focusClaims(int key) {
+                QWidget* w = QApplication::focusWidget();
+                if (!w || !w->isEnabled()) return false;
+                if (typingSomewhere(w)) return true;
+                const bool space = key == Qt::Key_Space;
+                const bool activate = space || key == Qt::Key_Return || key == Qt::Key_Enter;
+                const bool arrows = key == Qt::Key_Left || key == Qt::Key_Right || key == Qt::Key_Up || key == Qt::Key_Down;
+                const bool paging = key == Qt::Key_PageUp || key == Qt::Key_PageDown || key == Qt::Key_Home || key == Qt::Key_End;
+                // pressed with Space / Enter
+                if (activate && (qobject_cast<QAbstractButton*>(w) || qobject_cast<widgets::ClickRow*>(w))) return true;
+                // moved with the arrows and the page keys
+                if ((arrows || paging) && (qobject_cast<QAbstractSlider*>(w) || qobject_cast<SlicePane*>(w) ||
+                                           qobject_cast<widgets::SegmentedControl*>(w) || qobject_cast<RangeSlider*>(w) ||
+                                           qobject_cast<QTabBar*>(w)))
+                    return true;
+                if (space && qobject_cast<RangeSlider*>(w)) return true;
+                // item views: the arrows move the current row, Space selects it
+                if ((arrows || paging || space) && qobject_cast<QAbstractItemView*>(w)) return true;
+                // a closed dropdown: Space opens it, Up / Down pick
+                if ((space || key == Qt::Key_Up || key == Qt::Key_Down || paging) && qobject_cast<QComboBox*>(w)) return true;
+                // read-only text (the log, a help page): Space pages, the rest scroll or move the caret
+                const bool readOnlyText = qobject_cast<QPlainTextEdit*>(w) || qobject_cast<QTextEdit*>(w);
+                return (arrows || paging || space) && readOnlyText;
+            }
+
+            QSet<int> keys_;
         };
     } // namespace
 
@@ -389,48 +444,15 @@ namespace sirius::app {
         Workbench& wb() { return bridge.wb(); }
 
         // --- building -----------------------------------------------------------
-        // Space, H, L, B, E, the digits, Left / Right and Backspace are
-        // window-wide shortcuts with no modifier. Qt asks the focus widget
-        // first (ShortcutOverride) and every stock text entry claims the keys
-        // it types, but a painted widget of ours might not, so the unmodified
-        // ones check for themselves that no text field is being typed into.
-        static bool typingSomewhere() {
-            QWidget* w = QApplication::focusWidget();
-            if (!w || !w->isEnabled()) return false;
-            if (auto* line = qobject_cast<QLineEdit*>(w)) return !line->isReadOnly();
-            if (auto* plain = qobject_cast<QPlainTextEdit*>(w)) return !plain->isReadOnly();
-            if (auto* rich = qobject_cast<QTextEdit*>(w)) return !rich->isReadOnly();
-            return w->inherits("QAbstractSpinBox");
-        }
-
-        // The focused widget uses the key itself (a button is pressed with
-        // Space, a slider and a slice pane move with the arrows and the page
-        // keys), so the window-wide shortcut on it stands back.
-        static bool focusClaims(const QKeySequence& key) {
-            if (typingSomewhere()) return true;
-            if (key.count() != 1) return false;
-            QWidget* w = QApplication::focusWidget();
-            if (!w || !w->isEnabled()) return false;
-            const int k = key[0].key();
-            if (k == Qt::Key_Space || k == Qt::Key_Return || k == Qt::Key_Enter) return qobject_cast<QAbstractButton*>(w) != nullptr;
-            const bool navigation = k == Qt::Key_Left || k == Qt::Key_Right || k == Qt::Key_Up || k == Qt::Key_Down ||
-                                    k == Qt::Key_PageUp || k == Qt::Key_PageDown;
-            return navigation && (qobject_cast<QAbstractSlider*>(w) != nullptr || qobject_cast<SlicePane*>(w) != nullptr);
-        }
-
-        static bool unmodified(const QKeySequence& key) {
-            if (key.count() != 1) return false;
-            return (key[0].keyboardModifiers() & ~Qt::KeypadModifier) == Qt::NoModifier;
-        }
+        ShortcutGuard* shortcutGuard = nullptr;   // on qApp: see ShortcutGuard
 
         QAction* action(QMenu* menu, const QString& text, const QKeySequence& key, std::function<void()> fn,
                         const QString& tip = {}) {
-            auto* a = new GuardedAction(text, menu);
-            menu->addAction(a);
+            QAction* a = menu->addAction(text);
             if (!key.isEmpty()) a->setShortcut(key);
             a->setShortcutContext(Qt::WindowShortcut);
             if (!tip.isEmpty()) a->setStatusTip(tip);
-            if (unmodified(key)) a->shortcutBlocked = [key] { return focusClaims(key); };
+            shortcutGuard->guard(key);
             if (fn) QObject::connect(a, &QAction::triggered, self, [fn] { fn(); });
             return a;
         }
@@ -1290,6 +1312,10 @@ namespace sirius::app {
         setCorner(Qt::BottomLeftCorner, Qt::LeftDockWidgetArea);
         setCorner(Qt::BottomRightCorner, Qt::RightDockWidgetArea);
 
+        // Application-wide: the focus may be in a floating dock or in the
+        // help window, whose Tool window keeps these shortcuts live.
+        d.shortcutGuard = new ShortcutGuard(this);
+        QApplication::instance()->installEventFilter(d.shortcutGuard);
         d.buildMenus();
         d.buildStatusBar();
         d.defaultState = saveState();
