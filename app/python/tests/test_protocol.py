@@ -610,6 +610,77 @@ class TestConnectionLifecycle(unittest.TestCase):
             server.stop()
             thread.join(timeout=5)
 
+    def test_a_partial_frame_before_hello_does_not_lock_the_next_client_out(self):
+        # one byte of a header length, then silence: the frame read used to
+        # block with no deadline, so nobody else was ever served
+        server = WorkerServer("127.0.0.1", 0, "t", "cpu")
+        server.HELLO_TIMEOUT = 1.0
+        port = server.bind()
+        thread = self._serve(server)
+        try:
+            stalled = socket.create_connection(("127.0.0.1", port), timeout=10)
+            stalled.sendall(b"\x05")
+            time.sleep(0.3)
+            client = _Client(port, "t")
+            client.sock.settimeout(10)
+            t0 = time.monotonic()
+            self.assertEqual(client.hello()["type"], "result")
+            self.assertLess(time.monotonic() - t0, 5.0)
+            self.assertEqual(stalled.recv(1), b"")   # the stalled peer was dropped
+            stalled.close()
+            client.close()
+        finally:
+            server.stop()
+            thread.join(timeout=5)
+        self.assertFalse(thread.is_alive())
+
+    def test_a_hello_dripped_a_byte_at_a_time_is_cut_off_at_the_deadline(self):
+        # every byte arrives well within the poll interval, so only a
+        # deadline on the whole frame stops it; a served hello is the failure
+        server = WorkerServer("127.0.0.1", 0, "t", "cpu")
+        server.HELLO_TIMEOUT = 0.5
+        port = server.bind()
+        thread = self._serve(server)
+        try:
+            frame = protocol.encode_frame({"id": 1, "type": "request", "method": "hello",
+                                           "params": {"token": "t", "protocol_version": protocol.PROTOCOL_VERSION}})
+            self.assertGreater(len(frame) * 0.03, 2 * server.HELLO_TIMEOUT)
+            drip = socket.create_connection(("127.0.0.1", port), timeout=10)
+            closed = False
+            for byte in frame:
+                try:
+                    drip.sendall(bytes([byte]))
+                except OSError:
+                    closed = True
+                    break
+                time.sleep(0.03)
+            if not closed:
+                drip.settimeout(10)
+                try:
+                    header, _ = protocol.read_frame(drip)
+                    closed = header.get("type") != "result"
+                except (ConnectionError, OSError):
+                    closed = True
+            self.assertTrue(closed, "a hello that took longer than HELLO_TIMEOUT was served")
+            drip.close()
+        finally:
+            server.stop()
+            thread.join(timeout=5)
+
+    def test_stop_takes_effect_while_an_authenticated_frame_is_half_sent(self):
+        server = WorkerServer("127.0.0.1", 0, "t", "cpu")
+        port = server.bind()
+        thread = self._serve(server)
+        client = _Client(port, "t")
+        self.assertEqual(client.hello()["type"], "result")
+        frame = protocol.encode_frame({"id": 2, "type": "request", "method": "ping", "params": {}})
+        client.sock.sendall(frame[:6])   # the length and two bytes of the header, then nothing
+        time.sleep(0.3)
+        server.stop()
+        thread.join(timeout=5)
+        self.assertFalse(thread.is_alive(), "stop() did not reach a reader waiting inside a frame")
+        client.close()
+
     def test_hello_params_of_the_wrong_type_are_an_error_not_a_crash(self):
         server = WorkerServer("127.0.0.1", 0, "t", "cpu")
         port = server.bind()

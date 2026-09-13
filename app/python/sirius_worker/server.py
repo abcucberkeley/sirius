@@ -265,6 +265,13 @@ class WorkerServer:
         # to MAX_PREAUTH_FRAME.
         authenticated = False
 
+        def keep_reading() -> bool:
+            # A frame in flight is read to its end only while the worker is
+            # not stopping and, before `hello`, only until the hello deadline:
+            # one byte of a header used to block the reader for good, locking
+            # everyone else out and SIGTERM with them.
+            return not self._stop.is_set() and (authenticated or time.monotonic() <= hello_deadline)
+
         def send(header: Dict[str, Any], tensors=None) -> None:
             data = encode_frame(header, tensors)
             with send_lock:
@@ -280,7 +287,7 @@ class WorkerServer:
             # Wait for the next frame without blocking in recv: a blocked recv
             # ignores stop() (SIGTERM, the launcher) for as long as the client
             # stays silent, and a silent pre-hello peer would hold the worker
-            # forever. Once bytes are on the wire the frame is read in full.
+            # forever. The frame itself is then read under keep_reading.
             try:
                 readable, _, _ = select.select([conn], [], [], self.IDLE_POLL)
             except (OSError, ValueError):
@@ -292,10 +299,17 @@ class WorkerServer:
                 continue
             try:
                 if authenticated:
-                    header, tensors = read_frame(conn)
+                    header, tensors = read_frame(conn, keep_waiting=keep_reading)
                 else:
-                    header, tensors = read_frame(conn, MAX_PREAUTH_FRAME, MAX_PREAUTH_FRAME)
+                    header, tensors = read_frame(conn, MAX_PREAUTH_FRAME, MAX_PREAUTH_FRAME, keep_waiting=keep_reading)
             except ConnectionError:
+                break
+            except TimeoutError as e:
+                if self._stop.is_set():
+                    log.info("stopping with a frame from %s half read", peer)
+                else:
+                    log.warning("client %s sent no complete hello within %.0f s (%s); dropped", peer,
+                                self.HELLO_TIMEOUT, e)
                 break
             except ProtocolError as e:
                 log.warning("protocol error from %s: %s", peer, e)
