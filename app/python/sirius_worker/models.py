@@ -19,12 +19,17 @@ packages are imported lazily so the worker starts without them and reports a
 
 from __future__ import annotations
 
+import http.client
 import importlib
 import os
 import shutil
 import subprocess
 import sys
 import threading
+import time
+import urllib.error
+import urllib.parse
+import urllib.request
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
@@ -344,31 +349,101 @@ def pick_model_file(repo: str, token: Optional[str] = None) -> str:
                      f"; choose one as hf:{repo}:<filename>")
 
 
-def _progress_tqdm(progress: ProgressFn):
-    """A tqdm subclass whose updates call `progress(fraction, message)`; None
-    when tqdm is not importable (then only start/end are reported)."""
-    if progress is None:
-        return None
+# A download whose connection delivers nothing for this long is given up.
+# Kept below the application's wait for a cancelled request to answer: a
+# cancel is noticed between chunks, so a silent connection delays it by at
+# most this much.
+DOWNLOAD_STALL_S = 10.0
+
+
+def _hub_file_source(repo: str, filename: str, token: Optional[str]) -> Tuple[str, Dict[str, str], Optional[int]]:
+    """(URL to fetch, request headers, size in bytes or None) of one repository
+    file. One HEAD request through huggingface_hub, which also turns a gated,
+    private or missing file into its own error; the URL is the storage
+    location the Hub redirects to when it does (as hf_hub_download fetches
+    it), and the access token is only sent to the Hub's own host (a signed
+    storage URL needs none; a redirect elsewhere drops it too)."""
+    from huggingface_hub import get_hf_file_metadata, hf_hub_url  # type: ignore
+    from huggingface_hub.utils import build_hf_headers  # type: ignore
+
+    url = hf_hub_url(repo_id=repo, filename=filename)
+    meta = get_hf_file_metadata(url, token=token)
+    headers = dict(build_hf_headers(token=token))
+    headers["Accept-Encoding"] = "identity"   # the size is the size on the wire
+    # a Xet-stored file is fetched from the resolve URL, whose redirect leads
+    # to its bridge (hf_hub_download's plain-HTTP fallback does the same)
+    location = url if getattr(meta, "xet_file_data", None) is not None else (getattr(meta, "location", None) or url)
+    if urllib.parse.urlsplit(location).netloc != urllib.parse.urlsplit(url).netloc:
+        headers = {k: v for k, v in headers.items() if k.lower() != "authorization"}
+    size = getattr(meta, "size", None)
+    return location, headers, int(size) if size is not None else None
+
+
+class _NoTokenAcrossHosts(urllib.request.HTTPRedirectHandler):
+    """Follows redirects, but drops the Authorization header on one that leads
+    to another host."""
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        new = super().redirect_request(req, fp, code, msg, headers, newurl)
+        if new is not None and urllib.parse.urlsplit(newurl).netloc != urllib.parse.urlsplit(req.full_url).netloc:
+            for key in [k for k in new.headers if k.lower() == "authorization"]:
+                del new.headers[key]
+        return new
+
+
+def _stream_download(url: str, headers: Dict[str, str], size: Optional[int], dest: Path, progress: ProgressFn,
+                     cancelled: CancelFn, label: str) -> None:
+    """GET `url` into `dest` chunk by chunk: progress as it arrives, the cancel
+    flag between chunks. The bytes go to a hidden partial file beside `dest`
+    that is renamed into place only once complete, and removed otherwise."""
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    partial = dest.with_name(f".{dest.name}.part")
+    opener = urllib.request.build_opener(_NoTokenAcrossHosts())
+    done = 0
     try:
-        from tqdm.auto import tqdm  # type: ignore
-    except ImportError:
-        return None
+        with opener.open(urllib.request.Request(url, headers=headers), timeout=DOWNLOAD_STALL_S) as response, \
+                open(partial, "wb") as out:
+            total = size if size else int(response.headers.get("Content-Length") or 0)
+            reported = 0.0
+            read = getattr(response, "read1", response.read)
+            while True:
+                _check(cancelled)
+                chunk = read(1 << 20)
+                if not chunk:
+                    break
+                out.write(chunk)
+                done += len(chunk)
+                now = time.monotonic()
+                if progress and now - reported >= 0.2:
+                    reported = now
+                    fraction = min(0.99, done / total) if total > 0 else 0.0
+                    what = f"{done / 2**20:.0f} / {total / 2**20:.0f} MB" if total > 0 else f"{done / 2**20:.0f} MB"
+                    progress(fraction, f"{label}: {what}")
+        _check(cancelled)
+        if total > 0 and done != total:
+            raise ModelError(f"{label}: the download ended after {done} of {total} bytes; try again")
+        os.replace(partial, dest)
+    except BaseException:
+        try:
+            partial.unlink()
+        except OSError:
+            pass
+        raise
 
-    class _Tqdm(tqdm):  # type: ignore[misc]
-        def update(self, n=1):
-            super().update(n)
-            total = self.total or 0
-            if total > 0:
-                progress(min(1.0, self.n / total), f"{self.n / 2**20:.0f} / {total / 2**20:.0f} MB")
 
-    return _Tqdm
-
-
-def hub_download(repo: str, filename: str = "", progress: ProgressFn = None, token: Optional[str] = None) -> str:
+def hub_download(repo: str, filename: str = "", progress: ProgressFn = None, token: Optional[str] = None,
+                 cancelled: CancelFn = None) -> str:
     """Download one repository file into the cache; returns the local path.
-    Files already present are not fetched again."""
+    Files already present are not fetched again.
+
+    The file is streamed here rather than through hf_hub_download: that
+    reports progress only through a tqdm class not every huggingface_hub
+    version accepts, and can be interrupted only from inside that progress
+    hook, so a cancel waited for the whole file. Now progress is reported as
+    the bytes arrive and `cancelled` (or an exception from `progress`) stops
+    the download within a chunk."""
     try:
-        from huggingface_hub import hf_hub_download  # type: ignore
+        import huggingface_hub  # type: ignore  # noqa: F401
     except ImportError as e:
         raise NotAvailable(f"Hugging Face downloads need 'huggingface_hub' ({INSTALL_HINTS['hf']})") from e
     if not filename:
@@ -378,28 +453,29 @@ def hub_download(repo: str, filename: str = "", progress: ProgressFn = None, tok
         if progress:
             progress(1.0, "cached")
         return have
-    target = repo_dir(repo)
-    target.mkdir(parents=True, exist_ok=True)
+    root = repo_dir(repo)
+    dest = root / filename
+    # the name comes from the client: it must not reach outside the repository's directory
+    if root.resolve() not in dest.resolve().parents:
+        raise ModelError(f"{repo}: '{filename}' is not a file name inside the repository")
     if progress:
         progress(0.0, f"downloading {filename}")
-    kwargs: Dict[str, Any] = {"repo_id": repo, "filename": filename, "local_dir": str(target),
-                              "token": _token_arg(token)}
-    tqdm_class = _progress_tqdm(progress)
-    if tqdm_class is not None:
-        kwargs["tqdm_class"] = tqdm_class
     try:
-        try:
-            path = hf_hub_download(**kwargs)
-        except TypeError:   # older huggingface_hub without tqdm_class
-            kwargs.pop("tqdm_class", None)
-            path = hf_hub_download(**kwargs)
+        url, headers, size = _hub_file_source(repo, filename, _token_arg(token))
     except (ModelError, RuntimeError):
         raise
     except Exception as e:  # noqa: BLE001
         raise _hub_error(e, repo) from e
+    try:
+        _stream_download(url, headers, size, dest, progress, cancelled, filename)
+    except urllib.error.HTTPError as e:
+        raise ModelError(f"{repo}: downloading {filename} failed: HTTP {e.code} {e.reason}") from e
+    except (urllib.error.URLError, http.client.HTTPException, TimeoutError, ConnectionError) as e:
+        raise ModelError(f"{repo}: downloading {filename} failed ({e}); Hugging Face or its storage is "
+                         "unreachable from the worker, or the connection stalled") from e
     if progress:
         progress(1.0, filename)
-    return str(Path(path).resolve())
+    return str(dest.resolve())
 
 
 def set_hub_token(token: str) -> None:
@@ -409,7 +485,7 @@ def set_hub_token(token: str) -> None:
     _request.token = (token or "").strip() or None
 
 
-def resolve(spec: str, progress: ProgressFn = None) -> Tuple[ModelSpec, str]:
+def resolve(spec: str, progress: ProgressFn = None, cancelled: CancelFn = None) -> Tuple[ModelSpec, str]:
     """Spec -> (parsed spec, local file path) for file and hf models; family
     specs resolve to (spec, model name)."""
     ms = parse_spec(spec)
@@ -418,7 +494,7 @@ def resolve(spec: str, progress: ProgressFn = None) -> Tuple[ModelSpec, str]:
             raise FileNotFoundError(ms.name)
         return ms, ms.name
     if ms.family == "hf":
-        return ms, hub_download(ms.name, ms.filename, progress)
+        return ms, hub_download(ms.name, ms.filename, progress, cancelled=cancelled)
     return ms, ms.name
 
 
@@ -634,7 +710,7 @@ def prepare(spec: str, progress: ProgressFn = None, cancelled: CancelFn = None) 
     if progress:
         progress(0.02, f"fetching {ms.text()}")
     if ms.family == "hf":
-        path = hub_download(ms.name, ms.filename, progress)
+        path = hub_download(ms.name, ms.filename, progress, cancelled=cancelled)
         return {"spec": ms.text(), "path": path, "cached": True}
     if ms.family == "cellpose":
         try:

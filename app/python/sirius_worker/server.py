@@ -518,7 +518,7 @@ class WorkerServer:
                 raise _Cancelled()
             progress(fraction, message)
 
-        path = model_hub.hub_download(repo, filename, report)
+        path = model_hub.hub_download(repo, filename, report, cancelled=cancel.is_set)
         return {"path": path, "bytes": os.path.getsize(path), "repo": repo, "file": filename or os.path.basename(path),
                 "spec": f"hf:{repo}:{filename or os.path.basename(path)}"}, None
 
@@ -610,7 +610,7 @@ class WorkerServer:
                     out_t["prob"] = np.ascontiguousarray(prob, dtype=np.float32)
                 return {"labels": int(labels.max()) if labels.size else 0, "model": spec,
                         "format": model_hub.parse_spec(spec).family, "device": device}, out_t
-            _, path = model_hub.resolve(spec, progress)   # hf: specs download on first use
+            _, path = model_hub.resolve(spec, progress, cancelled)   # hf: specs download on first use
             model = wb.load_model(path, device)
             tile = _triple(p.get("tile"), (32, 256, 256))
             ov = p.get("overlap", 32)
