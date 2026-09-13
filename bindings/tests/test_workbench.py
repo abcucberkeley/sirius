@@ -500,6 +500,38 @@ class TestSteps(unittest.TestCase):
         with self.assertRaises(ValueError):
             wb.run_step("merge", {}, r.array, r.meta)
 
+    def test_merge_gives_uncoloured_channels_the_palette(self):
+        # the application colours a multi-channel dataset without colours
+        # 488 / 561 nm (green, magenta); the mirror used white for both, so an
+        # exported Merge came out grey
+        a = np.zeros((2, 1, 1, 4, 4), np.float32)
+        a[0] = 0.5
+        a[1] = 0.25
+        r = wb.run_step("merge", {}, a)
+        f32 = np.float32
+        green = [f32(v) / f32(255) for v in (0x63, 0xE0, 0x8A)]
+        magenta = [f32(v) / f32(255) for v in (0xE8, 0x71, 0xD9)]
+        expected = [min(f32(1), green[k] * f32(0.5) + magenta[k] * f32(0.25)) for k in range(3)]
+        self.assertEqual(r.array[:, 0, 0, 0, 0].tolist(), [float(v) for v in expected])
+        # a single channel stays white, as there
+        r = wb.run_step("merge", {}, a[:1])
+        self.assertEqual(r.array[:, 0, 0, 0, 0].tolist(), [0.5, 0.5, 0.5])
+
+    def test_merge_treats_nan_as_the_application_does(self):
+        a = np.full((2, 1, 1, 1, 3), 0.5, np.float32)
+        a[0, 0, 0, 0, 1] = np.nan
+        meta = {"channels": [{"color": "#ff0000"}, {"color": "#00ff00"}]}
+        # additive: std::min(1, r + NaN) is 1 -- the voxel turns white
+        r = wb.run_step("merge", {"blend": "Additive"}, a, meta)
+        self.assertEqual(r.array[:, 0, 0, 0, 1].tolist(), [1.0, 1.0, 1.0])
+        self.assertEqual(r.array[:, 0, 0, 0, 0].tolist(), [0.5, 0.5, 0.0])
+        # max: std::max(r, NaN) keeps r
+        r = wb.run_step("merge", {"blend": "Max"}, a, meta)
+        self.assertEqual(r.array[:, 0, 0, 0, 1].tolist(), [0.0, 0.5, 0.0])
+        # screen passes the NaN on
+        r = wb.run_step("merge", {"blend": "Screen"}, a, meta)
+        self.assertTrue(np.isnan(r.array[:, 0, 0, 0, 1]).all())
+
     @unittest.skipUnless(_HAVE_SCIPY, "connected components need scipy")
     def test_threshold_methods_and_min_voxels(self):
         a = np.zeros((1, 1, 4, 10, 10), np.float32)

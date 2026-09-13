@@ -1325,6 +1325,13 @@ def _hex_to_rgb(s: str) -> Tuple[float, float, float]:
         return 1.0, 1.0, 1.0
 
 
+def _hex_to_rgb8(s: str) -> Tuple[float, float, float]:
+    """``colorFromHex``: "#rrggbb" as byte / 255 in float32 (white when unreadable)."""
+    f32 = np.float32
+    rgb = _hex_to_rgb(s)
+    return tuple(float(f32(round(v * 255.0)) / f32(255.0)) for v in rgb)  # type: ignore[return-value]
+
+
 _MERGE = StepSpec("merge", {"blend": "Additive", "colors": [], "weights": [], "normalize_percentile": 99.9},
                   choices={"blend": ("Additive", "Screen", "Max")}, aliases={"colours": "colors"})
 
@@ -1343,10 +1350,13 @@ def step_merge(a: np.ndarray, params: Dict[str, Any], meta: Dict[str, Any]) -> S
     if isinstance(colors, str):
         colors = [x.strip() for x in colors.split(",") if x.strip()]
     colors = list(colors or [])
-    channel_colors = [ch.get("color", "#ffffff") for ch in meta.get("channels", [])]
-    colors = [colors[i] if i < len(colors) else (channel_colors[i] if i < len(channel_colors) else "#ffffff")
-              for i in range(c)]
-    rgbs = [_hex_to_rgb(col) for col in colors]
+    # the channels' own colours as the application holds them: normalised,
+    # so a multi-channel file without colours merges in the palette's
+    # green / magenta / blue / orange rather than in white (grey)
+    channel_colors = [ch["color"] for ch in _normalize_channels(meta.get("channels") or [], c)]
+    colors = [colors[i] if i < len(colors) else channel_colors[i] for i in range(c)]
+    f32 = np.float32
+    rgbs = [tuple(f32(v) for v in _hex_to_rgb8(col)) for col in colors]
     weights = _floats(params.get("weights"))
     pct = _float(params, "normalize_percentile", 99.9)
     scales = []
@@ -1355,24 +1365,27 @@ def step_merge(a: np.ndarray, params: Dict[str, Any], meta: Dict[str, Any]) -> S
         finite = ch[~np.isnan(ch)]
         mn, mx = (float(finite.min()), float(finite.max())) if finite.size else (0.0, 1.0)
         if mn >= 0.0 and mx <= 1.0:
-            scales.append(1.0)
+            scales.append(f32(1.0))
             continue
-        hi = _percentiles(ch, 0.0, pct)[1]
-        scales.append(1.0 / hi if hi > 0.0 else 1.0)
+        hi = f32(_percentiles(ch, 0.0, pct)[1])
+        scales.append(f32(1.0) / hi if hi > 0.0 else f32(1.0))
     out = np.zeros((3,) + a.shape[1:], dtype=np.float32)
     for i in range(c):
-        w = float(weights[i]) if i < len(weights) else 1.0
-        v0 = np.clip(a[i] * np.float32(scales[i] * w), 0.0, 1.0)
+        w = f32(weights[i]) if i < len(weights) else f32(1.0)
+        # merge.cpp in float32, with std::clamp / std::min / std::max as they
+        # treat NaN: clamp keeps it, min(1, r + NaN) is 1 (an additive NaN
+        # voxel turns white), max(r, NaN) is r, and screen passes it on
+        v0 = a[i] * (scales[i] * w)
+        v0 = np.where(v0 < 0.0, f32(0.0), np.where(v0 > 1.0, f32(1.0), v0))
         for k in range(3):
-            if rgbs[i][k] == 0.0:
-                continue
-            contribution = v0 * np.float32(rgbs[i][k])
+            contribution = rgbs[i][k] * v0
             if blend == "Screen":
                 out[k] = 1.0 - (1.0 - out[k]) * (1.0 - contribution)
             elif blend == "Max":
-                np.maximum(out[k], contribution, out=out[k])
+                out[k] = np.where(out[k] < contribution, contribution, out[k])
             else:
-                out[k] = np.minimum(1.0, out[k] + contribution)
+                total = out[k] + contribution
+                out[k] = np.where(total < 1.0, total, f32(1.0))
     m = dict(meta, dims=_dims(out), rgb=True,
              channels=[{"label": n, "wavelength_nm": 0.0, "color": col}
                        for n, col in (("R", "#ff0000"), ("G", "#00ff00"), ("B", "#0000ff"))],

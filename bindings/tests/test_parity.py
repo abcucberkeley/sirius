@@ -130,6 +130,8 @@ TOLERANCES = {
     # would mean giving the mirror the C++ loop order, five times slower in
     # numpy for no numerical gain.
     "resample": (2.0 * ULP, 1e-6),
+    # The RGB blend is float32 on both sides in the same order: exact.
+    "merge": (0.0, 0.0),
 }
 
 

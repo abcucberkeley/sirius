@@ -116,9 +116,10 @@ namespace {
     };
 
     // One case per behaviour the two implementations are meant to share.
-    // Steps left out on purpose: merge (its output is a display RGB blend
-    // whose channel colours come from the metadata, not from the array),
-    // flatfield and load (both read files), and every worker-backed kind.
+    // Steps left out on purpose: flatfield and load (both read files; the
+    // loader has its own fixture below), and every worker-backed kind.
+    // Merge takes its colours from the metadata: the fixture's channels have
+    // none, so both sides give them the palette (normalizeChannels).
     const std::vector<Case> kCases = {
         {"einsum_mean_t", "einsum", {{"keep", "czyx"}, {"reduction", "mean"}}},
         {"einsum_sum_zyx", "einsum", {{"keep", "ct"}, {"reduction", "sum"}}},
@@ -131,6 +132,9 @@ namespace {
         {"contrast_percentiles", "contrast", {{"min", 0.0}, {"max", 0.0}, {"lo_percentile", 5.0}, {"hi_percentile", 95.0}}},
         {"contrast_manual", "contrast", {{"min", 0.25}, {"max", 0.8}, {"gamma", 1.0}}},
         {"contrast_gamma", "contrast", {{"min", 0.1}, {"max", 0.9}, {"gamma", 0.45}}},
+        {"merge_additive", "merge", json::object()},
+        {"merge_screen_weights", "merge", {{"blend", "Screen"}, {"weights", json::array({0.5, 2.0})}, {"normalize_percentile", 90.0}}},
+        {"merge_max_colors", "merge", {{"blend", "Max"}, {"colors", json::array({"#ff8000", "#0080ff"})}}},
         {"croppad_crop", "croppad", {{"z0", 1}, {"y0", 2}, {"x0", 3}, {"z", 2}, {"y", 4}, {"x", 5}}},
         {"croppad_pad", "croppad", {{"z0", -1}, {"y0", -2}, {"x0", -2}, {"z", 6}, {"y", 12}, {"x", 14}, {"fill", 0.25}}},
         {"croppad_to_edge", "croppad", {{"z0", 1}, {"y0", 1}, {"x0", 1}}},
@@ -261,6 +265,8 @@ namespace {
             if (it->is_boolean()) p.set(it.key(), it->get<bool>());
             else if (it->is_number_integer()) p.set(it.key(), it->get<std::int64_t>());
             else if (it->is_number_float()) p.set(it.key(), it->get<double>());
+            else if (it->is_array() && !it->empty() && it->front().is_string()) p.set(it.key(), it->get<std::vector<std::string>>());
+            else if (it->is_array()) p.set(it.key(), it->get<std::vector<double>>());
             else p.set(it.key(), it->get<std::string>());
         }
         return p;
