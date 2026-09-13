@@ -87,6 +87,18 @@ namespace sirius::app::widgets {
         tips_[index] = tip;
     }
 
+    // Elide rather than clip. A tile can end up narrower than its text -- a
+    // dock dragged in, or a layout restored from before the bundled font
+    // loaded -- and "Recomput" with the R cut off reads as a rendering fault,
+    // where "Recom..." reads as a tile too small to say it, which the tooltip
+    // then says in full.
+    QString SegmentedControl::textFor(int index) const {
+        const QFontMetrics fm(font());
+        const int room = rectOf(index).width() - 4;
+        if (fm.horizontalAdvance(options_[index]) <= room) return options_[index];
+        return fm.elidedText(options_[index], Qt::ElideRight, room);
+    }
+
     int SegmentedControl::optionWidth(int index) const {
         if (tiles_) {
             const int n = std::max(1, static_cast<int>(options_.size()));
@@ -117,7 +129,15 @@ namespace sirius::app::widgets {
         // Segmented mode never shrinks below its text: the design's
         // "Ortho | 3D | Compare" must not read "Orth" when the toolbar is
         // tight -- whatever sits beside it gives way instead.
-        return tiles_ ? QSize(static_cast<int>(options_.size()) * 40, 36) : sizeHint();
+        if (!tiles_) return sizeHint();
+        // Tiles divide the width equally, so the widest option decides: 3 x 40
+        // ignored the text and let "Memory | Disk | Recompute" lose glyphs off
+        // both ends of the last tile in a narrowed dock. Padding is tighter
+        // than the 60 px of sizeHint(): this is the floor, not the preference.
+        const QFontMetrics fm(font());
+        int widest = 0;
+        for (const QString& option : options_) widest = std::max(widest, fm.horizontalAdvance(option));
+        return {static_cast<int>(options_.size()) * std::max(40, widest + 12), 36};
     }
 
     // The bundled face arrives after the widget is built: re-measure.
@@ -192,7 +212,7 @@ namespace sirius::app::widgets {
             painter.setBrush(sel ? QBrush(selFill) : Qt::NoBrush);
             painter.drawRect(crispRect(QRectF(r), 1.5, dpr));
             painter.setPen(sel ? theme::kBg : theme::kText);
-            painter.drawText(r, Qt::AlignCenter, options_[i]);
+            painter.drawText(r, Qt::AlignCenter, textFor(i));
             if (focused && sel) {
                 painter.setPen(QPen(theme::kAccent, crispPen(2.0, dpr)));
                 painter.setBrush(Qt::NoBrush);
@@ -229,7 +249,12 @@ namespace sirius::app::widgets {
         if (e->type() == QEvent::ToolTip) {
             auto* he = static_cast<QHelpEvent*>(e);
             const int i = indexAt(he->pos());
-            if (i >= 0 && !tips_[i].isEmpty()) QToolTip::showText(he->globalPos(), tips_[i], this);
+            QString tip = i >= 0 ? tips_[i] : QString();
+            // an elided tile says what it could not draw, whether or not the
+            // option was given a tooltip of its own
+            if (i >= 0 && textFor(i) != options_[i])
+                tip = tip.isEmpty() ? options_[i] : options_[i] + QStringLiteral(" · ") + tip;
+            if (!tip.isEmpty()) QToolTip::showText(he->globalPos(), tip, this);
             else QToolTip::hideText();
             return true;
         }

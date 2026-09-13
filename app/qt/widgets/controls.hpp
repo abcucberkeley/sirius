@@ -71,6 +71,7 @@ namespace sirius::app::widgets {
         int indexAt(const QPoint& p) const;
         QRect rectOf(int index) const;
         int optionWidth(int index) const;
+        QString textFor(int index) const;      // the option, elided if its tile is too narrow
 
         QStringList options_;
         QList<bool> enabled_;
