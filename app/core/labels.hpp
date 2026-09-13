@@ -21,6 +21,7 @@
 #include <array>
 #include <cstdint>
 #include <functional>
+#include <map>
 #include <memory>
 #include <optional>
 #include <string>
@@ -31,6 +32,11 @@
 #include "core/array.hpp"
 
 namespace sirius::app {
+
+    class TrackIndex;   // core/tracks.hpp
+
+    // {child track id: parent track id}; divisions only.
+    using Lineage = std::map<std::uint32_t, std::uint32_t>;
 
     struct LabelStats {
         std::uint32_t id = 0;
@@ -85,6 +91,20 @@ namespace sirius::app {
         // whole track, not to the frame on screen.
         bool tracked() const noexcept { return tracked_; }
         void setTracked(bool on) noexcept { tracked_ = on; }
+
+        // --- tracks (tracked volumes) --------------------------------------
+        // Which track divided from which, as the tracker reported it. Kept
+        // beside the voxels rather than in them: an edit leaves it as it was,
+        // and core/tracks.hpp ignores entries whose ids are gone.
+        const Lineage& lineage() const noexcept { return lineage_; }
+        void setLineage(Lineage lineage) { lineage_ = std::move(lineage); }
+        // Where every id is in every frame (core/tracks.hpp). Null until
+        // indexTracks() builds it -- one pass over the voxels, what a tracking
+        // step does once its labels are written -- and from then on kept
+        // current by every edit and apply(), at the cost of the voxels they
+        // change. Writes through volume() / plane() bypass it: rebuild after.
+        void indexTracks();
+        std::shared_ptr<const TrackIndex> tracks() const noexcept { return tracks_; }
 
         // The mutable accessors detach a shared copy first (see the header note).
         std::uint32_t* volume(Index t);                          // (z, y, x)
@@ -152,6 +172,7 @@ namespace sirius::app {
 
     private:
         void detach();                       // own the voxels before writing
+        LabelDiff indexed(LabelDiff diff);   // an edit's diff, after bringing the track index up to date
         LabelStats* mutableStatsOf(std::uint32_t id) noexcept;
 
         Index t_ = 0, z_ = 0, y_ = 0, x_ = 0;
@@ -162,6 +183,8 @@ namespace sirius::app {
         std::uint32_t maxLabel_ = 0;
         bool edited_ = false;
         bool tracked_ = false;
+        Lineage lineage_;
+        std::shared_ptr<TrackIndex> tracks_;            // shared by share() until an edit
     };
 
     using LabelsPtr = std::shared_ptr<const LabelVolume>;

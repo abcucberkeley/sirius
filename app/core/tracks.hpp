@@ -11,7 +11,7 @@
 // index and a lineage map into one row per track; it touches only the index,
 // so it is cheap enough to redo after every edit.
 //
-// Lineage is kept beside the labels as {child id: parent id}, the form the
+// Lineage (core/labels.hpp) is kept beside the labels as {child id: parent id}, the form the
 // model and btrack return it in. Nothing here assumes it is complete or even
 // consistent: ids that no longer exist in the labels (deleted, merged away)
 // are ignored rather than reported, and a cycle cannot hang anything because
@@ -27,6 +27,8 @@
 #include <unordered_map>
 #include <vector>
 
+#include <nlohmann/json_fwd.hpp>
+
 #include "core/labels.hpp"
 
 namespace sirius::app {
@@ -37,9 +39,6 @@ namespace sirius::app {
         std::array<double, 3> centroid{0.0, 0.0, 0.0};
         Index voxels = 0;
     };
-
-    // {child track id: parent track id}; divisions only.
-    using Lineage = std::map<std::uint32_t, std::uint32_t>;
 
     class TrackIndex {
     public:
@@ -105,6 +104,12 @@ namespace sirius::app {
     // the axes of anisotropic data.
     std::vector<TrackSummary> summarizeTracks(const TrackIndex& index, const Lineage& lineage,
                                               const std::array<double, 3>& voxelUm);
+
+    // The lineage a worker reports, {"child id": parent id} with the keys as
+    // strings (JSON object keys are). Entries that are not two positive ids
+    // are skipped rather than failing the step: the labels are the result,
+    // the lineage an annotation of them.
+    Lineage lineageFromJson(const nlohmann::json& j);
 
     // Parents with two or more children present: the divisions the lineage
     // still describes after any edits.

@@ -1,5 +1,7 @@
 #include "core/labels.hpp"
 
+#include "core/tracks.hpp"
+
 #include <algorithm>
 #include <array>
 #include <deque>
@@ -369,7 +371,7 @@ namespace sirius::app {
                 }
         }
         maxLabel_ = std::max(maxLabel_, label);
-        return diff;
+        return indexed(std::move(diff));
     }
 
     LabelDiff LabelVolume::fill(Index t, Index z, Index y, Index x, std::uint32_t label) {
@@ -382,7 +384,7 @@ namespace sirius::app {
         std::uint32_t* v = volume(t);
         const Index seed = (z * y_ + y) * x_ + x;
         const std::uint32_t from = v[seed];
-        if (from == label) return diff;
+        if (from == label) return indexed(std::move(diff));
         // the changed value doubles as the visited mark
         std::vector<Index> stack{seed};
         v[seed] = label;
@@ -405,7 +407,7 @@ namespace sirius::app {
         diff.before.assign(diff.indices.size(), from);
         diff.after.assign(diff.indices.size(), label);
         maxLabel_ = std::max(maxLabel_, label);
-        return diff;
+        return indexed(std::move(diff));
     }
 
     LabelDiff LabelVolume::merge(Index t, const std::vector<std::uint32_t>& ids) {
@@ -415,7 +417,7 @@ namespace sirius::app {
         std::vector<std::uint32_t> sources;
         for (std::uint32_t id : ids)
             if (id) sources.push_back(id);
-        if (sources.size() < 2) return diff;
+        if (sources.size() < 2) return indexed(std::move(diff));
         std::sort(sources.begin(), sources.end());
         sources.erase(std::unique(sources.begin(), sources.end()), sources.end());
         const std::uint32_t target = sources.front();
@@ -431,14 +433,14 @@ namespace sirius::app {
             diff.after.push_back(target);
             v[i] = target;
         }
-        return diff;
+        return indexed(std::move(diff));
     }
 
     LabelDiff LabelVolume::remove(Index t, std::uint32_t id) {
         LabelDiff diff;
         diff.t = t;
         if (t < 0 || t >= t_) throw std::out_of_range("LabelVolume::remove: t out of range");
-        if (!id) return diff;
+        if (!id) return indexed(std::move(diff));
         edited_ = true;
         std::uint32_t* v = volume(t);
         const Index n = volumeSize();
@@ -449,7 +451,7 @@ namespace sirius::app {
             diff.after.push_back(0);
             v[i] = 0;
         }
-        return diff;
+        return indexed(std::move(diff));
     }
 
     LabelDiff LabelVolume::split(Index t, std::uint32_t id, std::array<Index, 3> seedA, std::array<Index, 3> seedB,
@@ -483,7 +485,7 @@ namespace sirius::app {
                         x1 = std::max(x1, x);
                     }
             }
-        if (z1 < 0) return diff;
+        if (z1 < 0) return indexed(std::move(diff));
         const Index bz = z1 - z0 + 3, by = y1 - y0 + 3, bx = x1 - x0 + 3;   // one voxel of padding each side
         const Index oz = z0 - 1, oy = y0 - 1, ox = x0 - 1;
         const Index bn = bz * by * bx;
@@ -518,7 +520,7 @@ namespace sirius::app {
                     v[i] = newId;
                 }
         if (!diff.empty()) maxLabel_ = std::max(maxLabel_, newId);
-        return diff;
+        return indexed(std::move(diff));
     }
 
     void LabelVolume::apply(const LabelDiff& diff, bool forward) {
@@ -540,7 +542,21 @@ namespace sirius::app {
             v[i] = values[k];
             maxLabel_ = std::max(maxLabel_, values[k]);
         }
+        if (tracks_) {
+            if (tracks_.use_count() > 1) tracks_ = std::make_shared<TrackIndex>(*tracks_);
+            tracks_->apply(diff, forward);
+        }
     }
+
+    LabelDiff LabelVolume::indexed(LabelDiff diff) {
+        if (tracks_ && !diff.empty()) {
+            if (tracks_.use_count() > 1) tracks_ = std::make_shared<TrackIndex>(*tracks_);
+            tracks_->apply(diff);
+        }
+        return diff;
+    }
+
+    void LabelVolume::indexTracks() { tracks_ = std::make_shared<TrackIndex>(*this); }
 
     std::shared_ptr<LabelVolume> LabelVolume::clone() const {
         auto c = share();
@@ -560,6 +576,8 @@ namespace sirius::app {
         c->flagRules_ = flagRules_;
         c->maxLabel_ = maxLabel_;
         c->tracked_ = tracked_;
+        c->lineage_ = lineage_;
+        c->tracks_ = tracks_;
         return c;
     }
 

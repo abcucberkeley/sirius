@@ -12,11 +12,19 @@
 #include <array>
 #include <cmath>
 #include <cstdint>
+#include <filesystem>
+#include <memory>
+#include <random>
+#include <string>
 #include <utility>
 #include <vector>
 
+#include <nlohmann/json.hpp>
+
+#include "core/array_source.hpp"
 #include "core/labels.hpp"
 #include "core/tracks.hpp"
+#include "core/workbench.hpp"
 
 using namespace sirius;
 using namespace sirius::app;
@@ -48,6 +56,67 @@ namespace {
     }
 
     const std::array<double, 3> kIsotropic{1.0, 1.0, 1.0};
+
+    // A tracking step's output without the tracking: track 1 moves two voxels
+    // along x per frame; track 2 lives in frames 0-1 and divides into 3 and 4,
+    // which appear in frames 2-3.
+    struct MovingTracksOp final : Operation {
+        OpInfo info_;
+        MovingTracksOp() {
+            info_.kind = "test_moving_tracks";
+            info_.name = "Moving tracks";
+            info_.group = "Segment";
+            info_.kindLabel = "SEGMENT";
+            info_.producesLabels = true;
+            info_.defaultCache = CachePolicy::Memory;
+        }
+        const OpInfo& info() const noexcept override { return info_; }
+        StepOutput run(const StepInput& in, const ParamSet&, const StepContext&) const override {
+            const Dims5 d = in.meta.dims;
+            auto labels = std::make_shared<LabelVolume>(d.t, d.z, d.y, d.x);
+            for (Index t = 0; t < d.t; ++t) {
+                cube(*labels, t, 1, 1, 1, 1 + 2 * t, 2);
+                if (t < 2) cube(*labels, t, 2, 1, 10, 8, 2);
+                else {
+                    cube(*labels, t, 3, 1, 8, 8, 2);
+                    cube(*labels, t, 4, 1, 12, 8, 2);
+                }
+            }
+            labels->setTracked(true);
+            labels->setLineage({{3, 2}, {4, 2}});
+            labels->indexTracks();
+            labels->recomputeStats(0);
+            StepOutput o;
+            o.meta = in.meta;
+            o.array = in.materialize();
+            o.labels = labels;
+            return o;
+        }
+    };
+
+    struct Scratch {
+        std::filesystem::path dir;
+        Scratch() {
+            dir = std::filesystem::temp_directory_path() / ("sirius-tracks-test-" + std::to_string(std::random_device{}()));
+            std::filesystem::create_directories(dir);
+        }
+        ~Scratch() {
+            std::error_code ec;
+            std::filesystem::remove_all(dir, ec);
+        }
+    };
+
+    std::shared_ptr<MemorySource> clip(Index t, Index z, Index y, Index x) {
+        auto a = std::make_shared<Array5>(Dims5{1, t, z, y, x});
+        DatasetMeta m;
+        m.name = "clip";
+        m.sourcePath = "memory://clip";
+        m.format = "memory";
+        m.dims = a->dims();
+        m.voxelUm = {0.1, 0.1, 0.3};   // x, y, z
+        m.normalizeChannels();
+        return std::make_shared<MemorySource>(a, m);
+    }
 
 } // namespace
 
@@ -267,4 +336,113 @@ TEST_CASE("summarizeTracks attaches lineage only between tracks that exist", "[a
         CHECK(rows[0].children == std::vector<std::uint32_t>{2});
         CHECK(countDivisions(rows) == 0);
     }
+}
+
+TEST_CASE("The workbench reviews tracks: summaries, focus, follow, and edits kept in step", "[app][tracks][workbench]") {
+    registerOperation(std::make_unique<MovingTracksOp>());
+    Scratch scratch;
+    Workbench wb(scratch.dir);
+    wb.setDataset(clip(4, 4, 16, 16));
+    wb.setBackend(Backend::Cpu);
+    while (wb.pipeline().size() > 1) wb.removeStep(1);
+    wb.addStep("test_moving_tracks");
+    auto job = wb.createRun(-1);
+    REQUIRE(job);
+    job->execute();
+    wb.finishRun(job);
+    REQUIRE(job->succeeded());
+    wb.view(1);
+    REQUIRE(wb.viewedLabels());
+    REQUIRE(wb.viewedLabels()->tracks());
+
+    std::vector<TrackSummary> rows = wb.viewedTrackSummaries();
+    REQUIRE(rows.size() == 4);
+    CHECK(rows[0].frames == 4);
+    CHECK_THAT(rows[0].umPerFrame, WithinAbs(2 * 0.1, 1e-9));   // x steps, at the x voxel size
+    CHECK(rows[1].children == std::vector<std::uint32_t>{3, 4});
+    CHECK(rows[2].parent == 2);
+    CHECK(countDivisions(rows) == 1);
+
+    SECTION("focusTrack goes to the nearest frame the track is in and onto its centroid") {
+        REQUIRE(wb.viewState().t == 0);
+        REQUIRE(wb.focusTrack(3));
+        CHECK(wb.viewState().t == 2);
+        CHECK(wb.viewState().selectedLabel == 3);
+        CHECK(wb.viewState().labels);
+        CHECK(wb.viewState().cx == 8);   // centroid 8.5, floored
+        CHECK(wb.viewState().cy == 8);
+        CHECK(wb.viewState().z == 1);
+        CHECK_FALSE(wb.focusTrack(99));
+        CHECK(wb.viewState().selectedLabel == 3);
+    }
+
+    SECTION("follow keeps the crosshair on the selected track, and stays put where it is missing") {
+        wb.focusTrack(1);
+        wb.setFollowTrack(true);
+        for (Index t = 1; t < 4; ++t) {
+            wb.setT(t);
+            CHECK(wb.viewState().cx == 1 + 2 * t);
+        }
+        wb.focusTrack(2);
+        REQUIRE(wb.viewState().t == 1);
+        const Index cx = wb.viewState().cx, cy = wb.viewState().cy;
+        wb.setT(3);   // track 2 has divided: nothing to follow
+        CHECK(wb.viewState().cx == cx);
+        CHECK(wb.viewState().cy == cy);
+        wb.setFollowTrack(false);
+        wb.focusTrack(1);
+        const Index before = wb.viewState().cx;
+        wb.setT(0);
+        CHECK(wb.viewState().cx == before);
+    }
+
+    SECTION("a delete of a daughter track is reflected in the lineage, and undone") {
+        wb.setT(2);
+        wb.deleteLabel(3);   // tracked: every frame
+        rows = wb.viewedTrackSummaries();
+        REQUIRE(rows.size() == 3);
+        CHECK(rows[1].children == std::vector<std::uint32_t>{4});
+        CHECK(countDivisions(rows) == 0);
+        wb.undo();
+        rows = wb.viewedTrackSummaries();
+        REQUIRE(rows.size() == 4);
+        CHECK(countDivisions(rows) == 1);
+    }
+
+    SECTION("painting a track into another frame extends it") {
+        wb.focusTrack(3);
+        ViewState s = wb.viewState();
+        s.tool = ViewerTool::Paint;
+        s.paintTool = PaintTool::Brush;
+        s.brushPx = 2;
+        s.paint3d = false;
+        wb.setViewState(s);
+        wb.setT(1);
+        wb.beginPaintStroke();
+        wb.paintLabels(1, 4, 4, false);
+        wb.paintLabels(1, 4, 5, false);
+        wb.endPaintStroke();
+        const TrackIndex& index = *wb.viewedLabels()->tracks();
+        CHECK(index.pointAt(3, 1).has_value());
+        requireSame(index, TrackIndex(*wb.viewedLabels()));
+    }
+
+    SECTION("the view state keeps the track settings") {
+        ViewState s = wb.viewState();
+        s.trajectories = false;
+        s.followTrack = true;
+        const ViewState back = ViewState::fromJson(s.toJson());
+        CHECK_FALSE(back.trajectories);
+        CHECK(back.followTrack);
+        CHECK(ViewState::fromJson(nlohmann::json::object()).trajectories);
+    }
+}
+
+TEST_CASE("lineageFromJson keeps the entries that name two ids", "[app][tracks]") {
+    const nlohmann::json j = nlohmann::json::parse(
+        R"({"3": 1, "4": "1", "5": 0, "6": -2, "x": 1, "7": 7, "8": 4294967296, "9": [1], "10": 2})");
+    const Lineage got = lineageFromJson(j);
+    CHECK(got == Lineage{{3, 1}, {4, 1}, {10, 2}});
+    CHECK(lineageFromJson(nlohmann::json::array()).empty());
+    CHECK(lineageFromJson(nlohmann::json()).empty());
 }

@@ -6,6 +6,8 @@
 #include <stdexcept>
 #include <string>
 
+#include <nlohmann/json.hpp>
+
 namespace sirius::app {
 
     // --- TrackIndex -----------------------------------------------------------------
@@ -193,6 +195,33 @@ namespace sirius::app {
         std::vector<TrackSummary> out;
         out.reserve(rows.size());
         for (auto& [id, row] : rows) out.push_back(std::move(row));
+        return out;
+    }
+
+    Lineage lineageFromJson(const nlohmann::json& j) {
+        Lineage out;
+        if (!j.is_object()) return out;
+        const auto id = [](const std::string& text, std::uint32_t& value) {
+            if (text.empty() || text.size() > 10 || !std::all_of(text.begin(), text.end(), [](char c) { return c >= '0' && c <= '9'; }))
+                return false;
+            const unsigned long long v = std::stoull(text);
+            if (v == 0 || v > std::numeric_limits<std::uint32_t>::max()) return false;
+            value = static_cast<std::uint32_t>(v);
+            return true;
+        };
+        for (auto it = j.begin(); it != j.end(); ++it) {
+            std::uint32_t child = 0, parent = 0;
+            if (!id(it.key(), child)) continue;
+            const nlohmann::json& v = it.value();
+            if (v.is_number_unsigned() || (v.is_number_integer() && v.get<long long>() > 0)) {
+                const unsigned long long p = v.get<unsigned long long>();
+                if (p == 0 || p > std::numeric_limits<std::uint32_t>::max()) continue;
+                parent = static_cast<std::uint32_t>(p);
+            } else if (!(v.is_string() && id(v.get<std::string>(), parent))) {
+                continue;
+            }
+            if (child != parent) out[child] = parent;
+        }
         return out;
     }
 
