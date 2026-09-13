@@ -16,6 +16,7 @@
 #include "sirius/tiff_io.hpp"
 
 #include "temp_path.hpp"
+#include "tiff_internal.hpp"   // detail::libtiffReadOpens
 
 using namespace sirius;
 
@@ -288,6 +289,35 @@ TEST_CASE("TiffFile reads stacks page ranges and regions on the CPU", "[tifffile
             REQUIRE(stack.pinned());
             requireEqual(stack, p1, 1);
         }
+    }
+}
+
+TEST_CASE("A CPU read opens the file only on the threads that decode a page", "[tifffile][cpu]") {
+    // Every thread of the OpenMP team used to open the file, and parse its
+    // first directory, before the page loop: 32 opens for a one-page read on
+    // 32 cores. Counting opens keeps this free of wall-clock thresholds.
+    const auto opensDuring = [](const auto& read) {
+        const std::size_t before = detail::libtiffReadOpens();
+        read();
+        return detail::libtiffReadOpens() - before;
+    };
+    SECTION("a few small pages decode on one thread: one open") {
+        const auto a = pattern(40, 50, 0), b = pattern(40, 50, 1), c = pattern(40, 50, 2);
+        TempFile f(".tif");
+        writeTiffPages(f.path, {{&a, false, 0}, {&b, false, 0}, {&c, false, 0}}, false);
+        TiffFile file(f.path);
+        CHECK(opensDuring([&] { requireEqual(file.readPages<uint16_t>(1, 1), b); }) == 1);
+        CHECK(opensDuring([&] { requireEqual(file.readStack<uint16_t>(), c, 2); }) == 1);
+        CHECK(opensDuring([&] { requireEqual(file.readRegion<float>(Region{5, 7, 20, 11}), crop(a, Region{5, 7, 20, 11})); }) == 1);
+    }
+    SECTION("larger pages: at most one open per page") {
+        const auto a = pattern(1024, 1024, 0), b = pattern(1024, 1024, 1), c = pattern(1024, 1024, 2);
+        TempFile f(".tif");
+        writeTiffPages(f.path, {{&a, false, 0}, {&b, false, 0}, {&c, false, 0}}, false);
+        TiffFile file(f.path);
+        const std::size_t opens = opensDuring([&] { requireEqual(file.readStack<uint16_t>(), b, 1); });
+        CHECK(opens >= 1);
+        CHECK(opens <= 3);
     }
 }
 

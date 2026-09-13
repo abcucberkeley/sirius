@@ -41,6 +41,11 @@ namespace sirius {
         // of dstType, converting pixels when the on-disk type differs.
         void decodeWithLibtiff(const std::string& path, const DecodeJob& job, void* dstHost);
 
+        // libtiff handles opened for reading so far in this process (inspection
+        // and decoding). For tests: a read opens the file once per thread that
+        // decodes a page, not once per thread of the OpenMP team.
+        std::size_t libtiffReadOpens() noexcept;
+
         // nvTIFF (only linked with SIRIUS_HAS_NVTIFF): decode into device memory
         // of the same layout. Returns false with `reason` set, and dst untouched,
         // when nvTIFF cannot decode this file; throws on hard errors.
