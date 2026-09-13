@@ -106,11 +106,19 @@ def _float(params, keys, default: float) -> float:
         return float(default)
 
 
+def _llround(x: float) -> int:
+    """``std::llround``: halves away from zero (Python's round() goes to even)."""
+    a = abs(x)
+    f = math.floor(a)
+    n = int(f) + (1 if a - f >= 0.5 else 0)
+    return -n if x < 0 else n
+
+
 def _int(params, keys, default: int) -> int:
     v = _get(params, keys, default)
     try:
-        return int(round(float(v)))
-    except (TypeError, ValueError):
+        return _llround(float(v))
+    except (TypeError, ValueError, OverflowError):
         return int(default)
 
 
@@ -238,7 +246,48 @@ def _prepare_params(spec: StepSpec, params: Optional[Dict[str, Any]],
     for k, d in spec.defaults.items():
         if p.get(k) is None:
             p[k] = list(d) if isinstance(d, list) else d
+    _clamp_to_ranges(spec.kind, p)
     return p
+
+
+_schema_ranges: Optional[Dict[str, Dict[str, Tuple[str, float, float]]]] = None
+
+
+def _ranges_of(kind: str) -> Dict[str, Tuple[str, float, float]]:
+    """(type, min, max) of the int / double parameters of a kind, from the
+    snapshot of the C++ parameter tables beside this file (op_schema.json);
+    empty when the snapshot is not there (a copy of workbench.py alone)."""
+    global _schema_ranges
+    if _schema_ranges is None:
+        table: Dict[str, Dict[str, Tuple[str, float, float]]] = {}
+        try:
+            with open(os.path.join(os.path.dirname(os.path.abspath(__file__)), "op_schema.json"), encoding="utf-8") as f:
+                for op in json.load(f).get("operations", []):
+                    table[op.get("kind", "")] = {
+                        q["key"]: (q["type"], float(q["min"]), float(q["max"])) for q in op.get("params", [])
+                        if q.get("type") in ("int", "double") and "min" in q and "max" in q}
+        except (OSError, ValueError, KeyError, TypeError):
+            table = {}
+        _schema_ranges = table
+    return _schema_ranges.get(kind, {})
+
+
+def _clamp_to_ranges(kind: str, p: Dict[str, Any]) -> None:
+    """What loading a pipeline does to a number in the application
+    (coerceToSpec): clamped to the parameter's range, and an integer rounded
+    half away from zero. A value that is not a number is left to the step."""
+    for key, (kind_of, lo, hi) in _ranges_of(kind).items():
+        v = p.get(key)
+        if isinstance(v, bool) or v is None:
+            continue
+        try:
+            d = float(v)
+        except (TypeError, ValueError):
+            continue
+        if not math.isfinite(d):
+            continue
+        d = min(max(d, lo), hi)
+        p[key] = _llround(d) if kind_of == "int" else d
 
 
 def _progress(progress: ProgressFn, fraction: float, message: str = "") -> None:

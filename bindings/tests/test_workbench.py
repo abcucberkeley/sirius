@@ -417,6 +417,17 @@ class TestParameters(unittest.TestCase):
         self.assertEqual(p["min_voxels"], 20)
         self.assertEqual(p["post"], "Connected components")
 
+    def test_numbers_are_parsed_as_the_application_loads_them(self):
+        # coerceToSpec: integers round half away from zero (llround, where
+        # Python's round() goes to even) and every number is clamped to the
+        # parameter's range
+        self.assertEqual([wb._int({"v": v}, "v", 0) for v in (2.5, 3.5, -2.5, "0.5", 1.49)], [3, 4, -3, 1, 1])
+        p = wb._prepare_params(wb.step_spec("classic"),
+                               {"window": 1, "min_voxels": -4, "sigma": 75.0, "opening": 2.5}, None)
+        self.assertEqual((p["window"], p["min_voxels"], p["sigma"], p["opening"]), (3, 0, 50.0, 3))
+        p = wb._prepare_params(wb.step_spec("croppad"), {"z0": -1e9, "x": "12.5"}, None)
+        self.assertEqual((p["z0"], p["x"]), (-100000, 13))
+
     def test_kind_aliases_resolve_to_implemented_kinds(self):
         for alias, kind in wb._KIND_ALIASES.items():
             self.assertIn(kind, wb.step_kinds(), alias)
