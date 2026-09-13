@@ -519,7 +519,8 @@ namespace sirius {
 
         for (std::size_t i = 0; i < chainCount; ++i)
             if (!info.images[i].reducedResolution) info.pages.push_back(info.images[i].ifdOffset);
-        if (info.pages.empty())   // every IFD flagged reduced: treat the chain as pages anyway
+        const bool chainIsPages = info.pages.empty();
+        if (chainIsPages)   // every IFD flagged reduced: treat the chain as pages anyway
             for (std::size_t i = 0; i < chainCount; ++i) info.pages.push_back(info.images[i].ifdOffset);
 
         // Level 0: the full-resolution pages.
@@ -557,23 +558,29 @@ namespace sirius {
         }
 
         // Levels from reduced-resolution IFDs on the main chain (GDAL/Aperio
-        // style): consecutive reduced IFDs of one size form a level.
-        for (std::size_t i = 0; i < chainCount; ++i) {
+        // style): the reduced IFDs of one size form a level, in chain order,
+        // one per page -- whether each page is followed by its own reductions
+        // (page 0, its 1/2, its 1/4, page 1, its 1/2, ...) or the reductions
+        // come level by level after the pages. Grouping only consecutive IFDs
+        // split the first layout into a level per IFD. A chain that is all
+        // reduced IFDs already serves as the pages and forms no levels.
+        const std::size_t firstChainLevel = info.levels.size();
+        for (std::size_t i = 0; i < chainCount && !chainIsPages; ++i) {
             const auto& img = info.images[i];
             if (!img.reducedResolution) continue;
-            TiffLevel* last = info.levels.size() > 1 ? &info.levels.back() : nullptr;
-            const bool sameAsLast = last && last->width == img.width && last->height == img.height &&
-                                    info.image(last->ifds.back()).reducedResolution &&
-                                    info.image(last->ifds.back()).subIfds.empty() &&
-                                    std::find(info.pages.begin(), info.pages.end(), last->ifds.back()) == info.pages.end();
-            if (sameAsLast && last->ifds.size() < info.pages.size()) {
-                last->ifds.push_back(img.ifdOffset);
+            const auto level = std::find_if(info.levels.begin() + static_cast<std::ptrdiff_t>(firstChainLevel),
+                                            info.levels.end(), [&](const TiffLevel& l) {
+                                                return l.width == img.width && l.height == img.height &&
+                                                       l.ifds.size() < info.pages.size();
+                                            });
+            if (level != info.levels.end()) {
+                level->ifds.push_back(img.ifdOffset);
             } else {
-                TiffLevel level;
-                level.width = img.width;
-                level.height = img.height;
-                level.ifds.push_back(img.ifdOffset);
-                info.levels.push_back(std::move(level));
+                TiffLevel added;
+                added.width = img.width;
+                added.height = img.height;
+                added.ifds.push_back(img.ifdOffset);
+                info.levels.push_back(std::move(added));
             }
         }
         return info;

@@ -392,6 +392,55 @@ TEST_CASE("Flat pyramids (reduced IFDs on the main chain) expose levels", "[tiff
     REQUIRE(eigenStack.dimension(0) == 1);
 }
 
+TEST_CASE("Flat pyramids of several pages put the same reduction of every page in one level", "[tifffile][pyramid]") {
+    // Reduced IFDs of one size form a level whether they follow their page
+    // (page 0, its 1/2, its 1/4, page 1, ...) or come level by level after
+    // the pages. Only consecutive ones used to be grouped, so the interleaved
+    // chain gave 5 levels and level 1 read page 0 alone.
+    const auto a0 = pattern(64, 96, 0), b0 = pattern(64, 96, 1);
+    const auto a1 = downsample2(a0), b1 = downsample2(b0);
+    const auto a2 = downsample2(a1), b2 = downsample2(b1);
+    const bool interleaved = GENERATE(true, false);
+    INFO("interleaved=" << interleaved);
+    TempFile f(".tif");
+    if (interleaved)
+        writeTiffPages(f.path, {{&a0, false, 0}, {&a1, true, 0}, {&a2, true, 0}, {&b0, false, 0}, {&b1, true, 0}, {&b2, true, 0}}, true);
+    else
+        writeTiffPages(f.path, {{&a0, false, 0}, {&b0, false, 0}, {&a1, true, 0}, {&b1, true, 0}, {&a2, true, 0}, {&b2, true, 0}}, true);
+
+    TiffFile file(f.path);
+    const TiffInfo& info = file.info();
+    REQUIRE(info.pageCount() == 2);
+    REQUIRE(info.levelCount() == 3);
+    CHECK(info.levels[1].width == 48);
+    CHECK(info.levels[2].width == 24);
+    CHECK(info.levels[1].ifds.size() == 2);
+    CHECK(info.levels[2].ifds.size() == 2);
+    auto half = file.readLevel<uint16_t>(1);
+    REQUIRE(half.shape() == Shape{2, 32, 48});
+    requireEqual(half, a1, 0);
+    requireEqual(half, b1, 1);
+    auto quarter = file.readLevel<uint16_t>(2);
+    REQUIRE(quarter.shape() == Shape{2, 16, 24});
+    requireEqual(quarter, a2, 0);
+    requireEqual(quarter, b2, 1);
+    requireEqual(file.readStack<uint16_t>(), b0, 1);
+}
+
+TEST_CASE("A chain of only reduced IFDs is read as pages, not also as levels", "[tifffile][pyramid]") {
+    // Every IFD flagged reduced: the chain serves as the pages, and used to be
+    // listed a second time, one level per IFD.
+    const auto a = pattern(16, 20, 0), b = pattern(16, 20, 1);
+    TempFile f(".tif");
+    writeTiffPages(f.path, {{&a, true, 0}, {&b, true, 0}}, false);
+    TiffFile file(f.path);
+    REQUIRE(file.info().pageCount() == 2);
+    CHECK(file.info().levelCount() == 1);
+    auto stack = file.readStack<uint16_t>();
+    requireEqual(stack, a, 0);
+    requireEqual(stack, b, 1);
+}
+
 // -----------------------------------------------------------------------
 // GPU (nvTIFF) reads
 // -----------------------------------------------------------------------
