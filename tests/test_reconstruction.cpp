@@ -13,6 +13,7 @@
 
 #include "sirius/buffer.hpp"
 #include "sirius/errors.hpp"
+#include "sirius/fft.hpp"
 #include "sirius/legacy_config.hpp"
 #include "sirius/otf.hpp"
 #include "sirius/sim_reconstruction.hpp"
@@ -598,5 +599,90 @@ TEST_CASE("CPU and GPU agree on 2D and thin stacks", "[reconstruction][cuda][2d]
         TestData t = loadTestData();
         const Eigen::Tensor<double, 3, Eigen::RowMajor> raw = thinStack(t, 3);
         compare(t.params, t.otf, BufferView<const double>(raw.data(), Shape(raw), Device::cpu()));
+    }
+}
+
+// --- output grids -----------------------------------------------------------------
+
+namespace {
+
+    // Fourier coefficients |kx|, |ky| <= k of plane z, relative to its DC: the
+    // part of the spectrum every output grid of the same field represents.
+    std::vector<std::complex<double>> lowBand(const Buffer<double>& v, Index z, int k) {
+        using Cplx = std::complex<double>;
+        const Index ny = v.dim(1), nx = v.dim(2);
+        Buffer<Cplx> in(Shape{ny, nx}), out(Shape{ny, nx});
+        for (Index i = 0; i < ny * nx; ++i) in.data()[i] = v.data()[z * ny * nx + i];
+        FFT fft({static_cast<int>(ny), static_cast<int>(nx)}, 1, PlanRigor::Estimate);
+        fft.fft(in.data(), out.data());
+        const Cplx dc = out.data()[0];
+        std::vector<Cplx> band;
+        for (int ky = -k; ky <= k; ++ky)
+            for (int kx = -k; kx <= k; ++kx)
+                band.push_back(out.data()[((ky + ny) % ny) * nx + (kx + nx) % nx] / dc);
+        return band;
+    }
+
+} // namespace
+
+TEST_CASE("Odd and non-integral output grids carry the side bands at the right phase", "[reconstruction][zoom]") {
+    // The carrier was referenced to output pixel xdim / 2 in integer division
+    // and stepped by dx / zoomfact. On an odd grid (zoom 1.5 of 62 px = 93) the
+    // first put every side band half an output pixel off; when zoomfact * nx is
+    // not whole (1.3 x 64 = 83.2 -> 83) the second is not the grid's pixel.
+    // Either left 7-14 % error in the low frequencies against an even,
+    // integral grid of the same field; a correct carrier leaves a few 0.1 %.
+    TestData t = loadTestData();
+    SIMParameters p = t.params;
+    p.apodize_output = ApodizationType::None;   // the window differs between grids
+
+    struct Case {
+        int crop;
+        double zoom, reference;
+    };
+    const Case c = GENERATE(Case{62, 1.5, 3.0}, Case{64, 1.3, 2.0});
+    INFO("crop " << c.crop << ", zoom " << c.zoom << " against " << c.reference);
+    Eigen::Tensor<double, 3, Eigen::RowMajor> raw(135, c.crop, c.crop);
+    for (Eigen::Index s = 0; s < 135; ++s)
+        for (int y = 0; y < c.crop; ++y)
+            for (int x = 0; x < c.crop; ++x) raw(s, y, x) = t.raw(s, y, x);
+
+    auto reconstruct = [&](double zoom, Device device) {
+        SIMParameters q = p;
+        q.zoomfact = zoom;
+        SimReconstructor recon(q, t.otf, device, PlanRigor::Estimate);
+        Buffer<double> input = toDevice(raw, device);
+        synchronizeDevice(device);
+        Buffer<double> out = recon.reconstruct(input.view()).to(Device::cpu());
+        synchronizeDevice(device);
+        return out;
+    };
+    const Buffer<double> reference = reconstruct(c.reference, Device::cpu());
+    const Buffer<double> test = reconstruct(c.zoom, Device::cpu());
+    REQUIRE(test.dim(2) == std::lround(c.zoom * c.crop));
+
+    double err = 0.0;
+    for (Index z = 3; z < 6; ++z) {
+        const auto a = lowBand(test, z, 12), b = lowBand(reference, z, 12);
+        double num = 0.0, den = 0.0;
+        for (std::size_t i = 0; i < a.size(); ++i) {
+            num += std::norm(a[i] - b[i]);
+            den += std::norm(b[i]);
+        }
+        err += std::sqrt(num / den) / 3.0;
+    }
+    INFO("relative low-frequency error " << err);
+    CHECK(err < 0.01);
+
+    if (cudaAvailable()) {
+        // the CUDA kernel computes its carrier per voxel: same centre, same pixel
+        const Buffer<double> gpu = reconstruct(c.zoom, Device::cuda(0));
+        double peak = 0.0, diff = 0.0;
+        for (Index i = 0; i < test.size(); ++i) {
+            peak = std::max(peak, std::abs(test.data()[i]));
+            diff = std::max(diff, std::abs(test.data()[i] - gpu.data()[i]));
+        }
+        INFO("max |cpu-gpu| / max |cpu| = " << diff / peak);
+        CHECK(diff / peak < 1e-6);
     }
 }

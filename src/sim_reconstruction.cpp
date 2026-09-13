@@ -628,12 +628,16 @@ namespace sirius {
                                       asCd(bigF.data()));
                     bigFft->ifft(bigF.data(), big.data(), stream);   // unnormalized
 
+                    // Carrier phase per output pixel. The output grid spans
+                    // the input's field with xdim = round(zoomfact * nx)
+                    // samples, so its pixel is nx * dx / xdim -- dx / zoomfact
+                    // only when zoomfact * nx is a whole number.
                     double angleX = 0, angleY = 0;
                     if (order != 0) {
                         angleX = fact * kPi * fit.k0[static_cast<std::size_t>(d)][0] * order *
-                                 (p.dx / p.zoomfact);
+                                 (p.dx * static_cast<double>(nx) / static_cast<double>(xdim));
                         angleY = fact * kPi * fit.k0[static_cast<std::size_t>(d)][1] * order *
-                                 (p.dy / p.zoomfact);
+                                 (p.dy * static_cast<double>(ny) / static_cast<double>(ydim));
                     }
                     backend->accumulate(out.data(), asCd(big.data()), order, angleX, angleY,
                                         zdim, ydim, xdim);
