@@ -61,8 +61,9 @@ namespace sirius::app {
         // the first answer from any other one waits for a load.
         void refreshModelList() {
             const QString keep = model->currentText().trimmed();
-            const QString base = baseUrl->text().trimmed(), key = apiKey->text();
+            const QString base = baseUrl->text().trimmed();
             const bool ollama = provider->currentData().toString() == QLatin1String("ollama");
+            const QString key = ollama ? QString() : typedOrEnvironmentKey();   // Ollama takes no key
             listedModels.clear();
             refreshModels->setEnabled(false);
             modelNote->setText(QStringLiteral("Asking %1 for its models…").arg(base));
@@ -107,6 +108,30 @@ namespace sirius::app {
         LlmClient client;
         QLineEdit* apiKey = nullptr;
         QCheckBox* askFirst = nullptr;
+        // The secrets as the dialog opened with them. Save writes only the
+        // ones the user changed: rewriting an untouched token into a store
+        // that refuses it is how a token that still worked got lost, and
+        // a key that came from the environment is not the user's to store.
+        QString openedToken, openedHfToken, openedApiKey;
+
+        // The key field holds a stored or typed key; a key from the
+        // environment is shown as a placeholder naming its variable.
+        QString typedOrEnvironmentKey() const {
+            if (!apiKey->text().isEmpty()) return apiKey->text();
+            return AssistantSettings::environmentKey(provider->currentData().toString());
+        }
+        void refreshKeyField() {
+            const QString p = provider->currentData().toString();
+            const bool ollama = p == QLatin1String("ollama");
+            QString variable;
+            AssistantSettings::environmentKey(p, &variable);
+            apiKey->setEnabled(!ollama);
+            apiKey->setPlaceholderText(ollama               ? QStringLiteral("Ollama takes no key")
+                                       : variable.isEmpty() ? QString()
+                                                            : QStringLiteral("from $%1 (not stored)").arg(variable));
+            apiKey->setToolTip(ollama ? QStringLiteral("Never sent to Ollama; a stored key stays for OpenRouter and custom servers")
+                                      : QString());
+        }
         explicit Impl(WorkbenchBridge& b) : bridge(b) {}
     };
 
@@ -155,6 +180,7 @@ namespace sirius::app {
         impl_->port->setValue(wb.remoteConfig().port);
         impl_->token = new QLineEdit(fromStd(wb.remoteConfig().token), compute);
         impl_->token->setEchoMode(QLineEdit::Password);
+        impl_->openedToken = impl_->token->text();
         hg->addWidget(field(QStringLiteral("Host"), impl_->host, compute), 0, 0);
         hg->addWidget(field(QStringLiteral("Port"), impl_->port, compute), 0, 1);
         hg->addWidget(field(QStringLiteral("Token"), impl_->token, compute), 1, 0, 1, 2);
@@ -166,11 +192,21 @@ namespace sirius::app {
         hpcNote->setWordWrap(true);
         cl->addWidget(hpcNote);
         cl->addWidget(new Rule(2, Qt::Horizontal, compute));
-        impl_->python = new QLineEdit(settings.value(QStringLiteral("worker/python"), QStringLiteral("python3")).toString(), compute);
-        impl_->python->setToolTip(QStringLiteral("Interpreter with numpy (and torch for segmentation); SIRIUS_PYTHON overrides"));
+        // Empty unless the user chose one: a default written back by Save
+        // is a choice nobody made (see WorkerLauncher::python).
+        impl_->python = new QLineEdit(settings.value(QStringLiteral("worker/python")).toString(), compute);
+        const QString envPython = qEnvironmentVariable("SIRIUS_PYTHON");
+        impl_->python->setPlaceholderText(envPython.isEmpty() ? QStringLiteral("python3")
+                                                              : QStringLiteral("%1 (from $SIRIUS_PYTHON)").arg(envPython));
+        impl_->python->setToolTip(envPython.isEmpty()
+                                      ? QStringLiteral("Interpreter with numpy (and torch for segmentation); empty = python3. "
+                                                       "$SIRIUS_PYTHON, when set, overrides this field")
+                                      : QStringLiteral("Interpreter with numpy (and torch for segmentation). $SIRIUS_PYTHON is set "
+                                                       "and overrides this field"));
         cl->addWidget(field(QStringLiteral("Python for the local worker"), impl_->python, compute));
         impl_->hfToken = new QLineEdit(secrets::read(QStringLiteral("hub/token")), compute);
         impl_->hfToken->setEchoMode(QLineEdit::Password);
+        impl_->openedHfToken = impl_->hfToken->text();
         impl_->hfToken->setToolTip(QStringLiteral("Access token for gated or private Hugging Face repositories (huggingface.co ▸ Settings ▸ "
                                                   "Access Tokens); sent with each request that downloads a model"));
         cl->addWidget(field(QStringLiteral("Hugging Face access token (optional)"), impl_->hfToken, compute));
@@ -202,8 +238,10 @@ namespace sirius::app {
         impl_->refreshModels->setToolTip(QStringLiteral("Ask the server at the base URL which models it offers"));
         impl_->modelNote = widgets::label(QString(), 11, theme::kNeutral600, -1, assistant);
         impl_->modelNote->setWordWrap(true);
-        impl_->apiKey = new QLineEdit(as.apiKey, assistant);
+        // a key from the environment stays out of the field (and out of the store)
+        impl_->apiKey = new QLineEdit(as.apiKeyVariable.isEmpty() ? as.apiKey : QString(), assistant);
         impl_->apiKey->setEchoMode(QLineEdit::Password);
+        impl_->openedApiKey = impl_->apiKey->text();
         impl_->askFirst = new QCheckBox(QStringLiteral("Ask before acting (the assistant proposes, you confirm)"), assistant);
         impl_->askFirst->setChecked(as.askBeforeActing);
         auto* ag = new QGridLayout();
@@ -223,7 +261,7 @@ namespace sirius::app {
         al->addWidget(impl_->askFirst);
         auto* note = widgets::label(
             QStringLiteral("Ollama needs a model with tool calling (ollama pull llama3.1). OpenRouter keys start with sk-or-; "
-                           "the key is stored in the application settings."),
+                           "the key is kept in the secret store and never sent to Ollama."),
             11, theme::kNeutral600, -1, assistant);
         note->setWordWrap(true);
         al->addWidget(note);
@@ -239,10 +277,10 @@ namespace sirius::app {
             const QString p = impl_->provider->currentData().toString();
             if (p == QLatin1String("ollama")) impl_->baseUrl->setText(QStringLiteral("http://localhost:11434/v1"));
             else if (p == QLatin1String("openrouter")) impl_->baseUrl->setText(QStringLiteral("https://openrouter.ai/api/v1"));
-            impl_->apiKey->setEnabled(p != QLatin1String("ollama"));
+            impl_->refreshKeyField();
             impl_->refreshModelList();
         });
-        impl_->apiKey->setEnabled(as.provider != QLatin1String("ollama"));
+        impl_->refreshKeyField();
         connect(impl_->refreshModels, &QPushButton::clicked, this, [this] { impl_->refreshModelList(); });
         impl_->refreshModelList();   // the list on opening, without blocking the dialog
 
@@ -273,16 +311,20 @@ namespace sirius::app {
         settings.setValue(QStringLiteral("hpc/host"), impl_->host->text().trimmed());
         settings.setValue(QStringLiteral("hpc/port"), impl_->port->value());
         QStringList notStored;
-        if (!secrets::write(QStringLiteral("hpc/token"), impl_->token->text())) notStored << QStringLiteral("the HPC token");
-        settings.setValue(QStringLiteral("worker/python"), impl_->python->text().trimmed());
-        if (!secrets::write(QStringLiteral("hub/token"), impl_->hfToken->text().trimmed())) notStored << QStringLiteral("the Hugging Face token");
+        if (impl_->token->text() != impl_->openedToken && !secrets::write(QStringLiteral("hpc/token"), impl_->token->text()))
+            notStored << QStringLiteral("the HPC token");
+        if (const QString python = impl_->python->text().trimmed(); python.isEmpty()) settings.remove(QStringLiteral("worker/python"));
+        else settings.setValue(QStringLiteral("worker/python"), python);
+        if (impl_->hfToken->text() != impl_->openedHfToken && !secrets::write(QStringLiteral("hub/token"), impl_->hfToken->text().trimmed()))
+            notStored << QStringLiteral("the Hugging Face token");
         AssistantSettings as;
         as.provider = impl_->provider->currentData().toString();
         as.baseUrl = impl_->baseUrl->text().trimmed();
         as.model = LlmClient::resolveModel(impl_->model->currentText(), impl_->listedModels);
-        as.apiKey = impl_->apiKey->text();
         as.askBeforeActing = impl_->askFirst->isChecked();
         as.save();
+        if (impl_->apiKey->text() != impl_->openedApiKey && !AssistantSettings::storeApiKey(impl_->apiKey->text()))
+            notStored << QStringLiteral("the assistant's API key");
         wb.setBackend(static_cast<Backend>(impl_->backend->currentIndex()));
         wb.setCudaDevice(impl_->device->currentData().toInt());
         RemoteConfig rc;

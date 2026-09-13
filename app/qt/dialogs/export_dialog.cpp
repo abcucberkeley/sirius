@@ -101,7 +101,12 @@ namespace sirius::app {
         QCheckBox* sidecarLabels = nullptr;
         QLabel* problem = nullptr;
         QPushButton* exportBtn = nullptr;
+        QLabel* stale = nullptr;
         Dims5 dims;
+        // Whether the user set the t / z range. Until then it follows the
+        // chosen step's extents; it used to keep the first step's, so a
+        // switch from a 14-plane step to a 135-plane one exported 0..14.
+        bool tEdited = false, zEdited = false;
 
         explicit Impl(WorkbenchBridge& b) : bridge(b) {}
     };
@@ -171,10 +176,15 @@ namespace sirius::app {
         for (int s = 0; s < p.size(); ++s) {
             QString label = fromStd(Step::number(s) + " " + p.at(s).name);
             if (!wb.output(s)) label += QStringLiteral("  (not computed)");
+            else if (!wb.outputFresh(s)) label += QStringLiteral("  (out of date)");
             impl_->step->addItem(label);
         }
         impl_->step->setCurrentIndex(std::max(0, wb.viewedIndex()));
         rl->addWidget(field(QStringLiteral("From step"), impl_->step, right));
+        impl_->stale = widgets::label(QString(), 11, theme::kAccentText, -1, right);
+        impl_->stale->setWordWrap(true);
+        impl_->stale->hide();
+        rl->addWidget(impl_->stale);
 
         auto* rangeGrid = new QGridLayout();
         rangeGrid->setHorizontalSpacing(6);
@@ -379,7 +389,11 @@ namespace sirius::app {
         connect(impl_->zarrVersion, qOverload<int>(&QComboBox::currentIndexChanged), this, [this](int) { refresh(); });
         connect(impl_->destination, &QLineEdit::textChanged, this, [this](const QString&) { refresh(); });
         for (QSpinBox* s : {impl_->t0, impl_->t1, impl_->z0, impl_->z1})
-            connect(s, qOverload<int>(&QSpinBox::valueChanged), this, [this](int) { refresh(); });
+            connect(s, qOverload<int>(&QSpinBox::valueChanged), this, [this, s](int) {
+                // refresh() moves them under a signal blocker: this is the user
+                (s == impl_->t0 || s == impl_->t1 ? impl_->tEdited : impl_->zEdited) = true;
+                refresh();
+            });
 
         // defaults from the dataset
         const DatasetMeta& ds = wb.dataset();
@@ -420,12 +434,29 @@ namespace sirius::app {
         DatasetMeta meta = step >= 0 ? wb.outputMetaOf(step) : wb.dataset();
         if (auto out = wb.output(step)) meta = out->meta;
         impl_->dims = meta.dims;
-        impl_->t1->setMaximum(static_cast<int>(meta.dims.t));
-        impl_->t0->setMaximum(static_cast<int>(std::max<Index>(meta.dims.t - 1, 0)));
-        impl_->z1->setMaximum(static_cast<int>(meta.dims.z));
-        impl_->z0->setMaximum(static_cast<int>(std::max<Index>(meta.dims.z - 1, 0)));
-        if (impl_->t1->value() == 0) impl_->t1->setValue(static_cast<int>(meta.dims.t));
-        if (impl_->z1->value() == 0) impl_->z1->setValue(static_cast<int>(meta.dims.z));
+        {
+            const QSignalBlocker b0(impl_->t0), b1(impl_->t1), b2(impl_->z0), b3(impl_->z1);
+            impl_->t1->setMaximum(static_cast<int>(meta.dims.t));
+            impl_->t0->setMaximum(static_cast<int>(std::max<Index>(meta.dims.t - 1, 0)));
+            impl_->z1->setMaximum(static_cast<int>(meta.dims.z));
+            impl_->z0->setMaximum(static_cast<int>(std::max<Index>(meta.dims.z - 1, 0)));
+            // the whole of the chosen step until the user narrows it; a range
+            // the user set is kept (clamped to the new step) when the step changes
+            if (!impl_->tEdited) impl_->t0->setValue(0);
+            if (!impl_->tEdited || impl_->t1->value() == 0) impl_->t1->setValue(static_cast<int>(meta.dims.t));
+            if (!impl_->zEdited) impl_->z0->setValue(0);
+            if (!impl_->zEdited || impl_->z1->value() == 0) impl_->z1->setValue(static_cast<int>(meta.dims.z));
+        }
+        // The file gets the step's last output, while the sidecar records the
+        // pipeline as it is now: after a parameter edit or an undo the two do
+        // not belong together, and nothing said so.
+        const bool stale = wb.output(step) && !wb.outputFresh(step);
+        impl_->stale->setText(stale ? QStringLiteral("The parameters changed since step %1 was computed: the export writes that earlier "
+                                                     "result, and a pipeline sidecar would record the current parameters, which did not "
+                                                     "produce it. Run the step again for a matching pair.")
+                                          .arg(fromStd(Step::number(step)))
+                                    : QString());
+        impl_->stale->setVisible(stale);
 
         for (int i = 0; i < impl_->rows.size(); ++i) {
             impl_->rows[i]->setSelected(i == impl_->format);

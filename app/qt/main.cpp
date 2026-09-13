@@ -21,6 +21,8 @@
 #include <QDockWidget>
 #include <QJsonDocument>
 #include <QJsonObject>
+#include <QKeyEvent>
+#include <QKeySequence>
 #include <QStandardPaths>
 #include <QTimer>
 
@@ -70,14 +72,16 @@ int main(int argc, char** argv) {
                                      QStringLiteral("path"));
     const QCommandLineOption strokeOpt(QStringLiteral("stroke"), QStringLiteral("Drag on the XY pane: x0,y0,x1,y1,moves in voxels (repeatable, after the tools)"),
                                        QStringLiteral("spec"));
-    const QCommandLineOption wheelOpt(QStringLiteral("wheel"), QStringLiteral("Wheel on the XY pane: x,y,steps in voxels (repeatable, before the strokes)"),
+    const QCommandLineOption wheelOpt(QStringLiteral("wheel"), QStringLiteral("Wheel on the XY pane (the step pane in Compare): x,y,steps in voxels (repeatable, before the strokes)"),
                                       QStringLiteral("spec"));
     const QCommandLineOption actionOpt(QStringLiteral("action"), QStringLiteral("Trigger a menu action by its text (repeatable)"),
                                        QStringLiteral("text"));
+    const QCommandLineOption keyOpt(QStringLiteral("key"), QStringLiteral("Focus a widget by its accessible or object name and press a key: \"Z plane=Right\" (repeatable)"),
+                                    QStringLiteral("name=key"));
     const QCommandLineOption askOpt(QStringLiteral("ask"), QStringLiteral("Send a message to the assistant"), QStringLiteral("text"));
     const QCommandLineOption settleOpt(QStringLiteral("settle"), QStringLiteral("Milliseconds to wait before the screenshot (default 600)"),
                                        QStringLiteral("ms"));
-    parser.addOptions({datasetOpt, pipelineOpt, runOpt, screenshotOpt, quitAfterOpt, toolOpt, actionOpt, askOpt, settleOpt, strokeOpt, wheelOpt, dropOpt, recordOpt});
+    parser.addOptions({datasetOpt, pipelineOpt, runOpt, screenshotOpt, quitAfterOpt, toolOpt, actionOpt, keyOpt, askOpt, settleOpt, strokeOpt, wheelOpt, dropOpt, recordOpt});
     parser.process(app);
 
     sirius::app::registerBuiltinOperations();
@@ -168,6 +172,46 @@ int main(int argc, char** argv) {
         workbench.logLine("no action named " + sirius::app::toStd(text));
         qWarning("no action named %s", qPrintable(text));
     };
+    // A key press as a user makes it: to the focused widget, through the
+    // application -- so a shortcut the key matches is asked about first --
+    // with the dock the widget sits in raised so that it can take the focus.
+    auto pressKey = [&](const QString& spec) {
+        const int eq = spec.indexOf(QLatin1Char('='));
+        const QString target = spec.left(eq);
+        const QKeySequence key(eq < 0 ? QString() : spec.mid(eq + 1));
+        QWidget* widget = nullptr;
+        for (QWidget* top : QApplication::topLevelWidgets()) {
+            for (QWidget* w : top->findChildren<QWidget*>())
+                if (!widget && (w->accessibleName() == target || w->objectName() == target)) widget = w;
+        }
+        if (!widget || key.isEmpty()) {
+            qWarning("--key %s: no widget of that name, or no key", qPrintable(spec));
+            return;
+        }
+        for (QWidget* w = widget; w; w = w->parentWidget())
+            if (auto* dock = qobject_cast<QDockWidget*>(w)) {
+                dock->show();
+                dock->raise();
+            }
+        widget->window()->activateWindow();
+        letTheWindowCatchUp();
+        widget->setFocus(Qt::OtherFocusReason);
+        letTheWindowCatchUp();
+        const QKeyCombination combo = key[0];
+        const Qt::KeyboardModifiers mods = combo.keyboardModifiers();
+        QString text;
+        if (combo.key() >= Qt::Key_Space && combo.key() <= Qt::Key_AsciiTilde && !(mods & (Qt::ControlModifier | Qt::AltModifier | Qt::MetaModifier))) {
+            text = QChar(static_cast<char16_t>(combo.key()));
+            if (!(mods & Qt::ShiftModifier)) text = text.toLower();
+        }
+        QWidget* receiver = QApplication::focusWidget() ? QApplication::focusWidget() : widget;
+        qInfo("key %s to %s: focus %s", qPrintable(key.toString()), qPrintable(target), receiver == widget ? "yes" : "no");
+        QKeyEvent press(QEvent::KeyPress, combo.key(), mods, text);
+        QCoreApplication::sendEvent(receiver, &press);
+        QKeyEvent release(QEvent::KeyRelease, combo.key(), mods, text);
+        QCoreApplication::sendEvent(receiver, &release);
+        letTheWindowCatchUp();
+    };
     auto script = [&] {
         const QStringList argv = QCoreApplication::arguments();
         for (int i = 1; i < argv.size(); ++i) {
@@ -184,6 +228,7 @@ int main(int argc, char** argv) {
             }
             if (name == QLatin1String("tool")) runTool(value);
             else if (name == QLatin1String("action")) runAction(value);
+            else if (name == QLatin1String("key")) pressKey(value);
             else if (name == QLatin1String("drop")) {
                 window.dropPaths({value});
                 letTheWindowCatchUp();
@@ -202,7 +247,7 @@ int main(int argc, char** argv) {
             }
         }
     };
-    const bool scripted = !toolCalls.isEmpty() || !actions.isEmpty() || parser.isSet(askOpt) || parser.isSet(strokeOpt) || parser.isSet(wheelOpt) || parser.isSet(dropOpt);
+    const bool scripted = !toolCalls.isEmpty() || !actions.isEmpty() || parser.isSet(keyOpt) || parser.isSet(askOpt) || parser.isSet(strokeOpt) || parser.isSet(wheelOpt) || parser.isSet(dropOpt);
     const bool headless = scripted || parser.isSet(screenshotOpt);
     // An interactive --run just starts; a headless one (below) also decides
     // the exit code and when the window is grabbed.

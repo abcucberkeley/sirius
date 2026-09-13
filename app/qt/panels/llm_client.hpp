@@ -86,7 +86,10 @@ namespace sirius::app {
         void start(bool stream);
         void onReadyRead();
         void onReplyFinished();
-        void consumeSseLine(const QByteArray& line);
+        // False once the line was an error event and failed() has been
+        // emitted: the reply is over, and nothing may follow it -- above all
+        // not finished(), which cleared the error and added an empty turn.
+        bool consumeSseLine(const QByteArray& line);
 
         QNetworkAccessManager nam_;
         QNetworkReply* reply_ = nullptr;

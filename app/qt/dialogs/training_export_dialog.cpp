@@ -54,6 +54,7 @@ namespace sirius::app {
         QComboBox* scaling = nullptr;
         QLabel* summary = nullptr;
         QLabel* problem = nullptr;
+        QLabel* stale = nullptr;
         QPushButton* exportBtn = nullptr;
 
         // boundingBoxes() walks every voxel of every time point. refresh()
@@ -88,10 +89,15 @@ namespace sirius::app {
             const auto out = wb.output(s);
             if (!out) label += QStringLiteral("  (not computed)");
             else if (!out->labels || out->labels->empty()) label += QStringLiteral("  (no labels)");
+            else if (!wb.outputFresh(s)) label += QStringLiteral("  (out of date)");
             impl_->step->addItem(label);
         }
         impl_->step->setCurrentIndex(std::max(0, wb.viewedIndex()));
         root->addWidget(field(QStringLiteral("Labels from step"), impl_->step, this));
+        impl_->stale = widgets::label(QString(), 11, theme::kAccentText, -1, this);
+        impl_->stale->setWordWrap(true);
+        impl_->stale->hide();
+        root->addWidget(impl_->stale);
 
         auto* destRow = new QHBoxLayout();
         impl_->directory = new QLineEdit(this);
@@ -213,6 +219,16 @@ namespace sirius::app {
                 summary += QStringLiteral(" The slice output writes %1 plane files.").arg(labels->t() * labels->z() * 2);
         }
         impl_->summary->setText(summary);
+        // The sample keeps the pipeline as it is now as its provenance, and
+        // after a parameter edit or an undo that is not the one that made
+        // these labels.
+        const bool stale = labels != nullptr && !labels->empty() && !wb.outputFresh(step);
+        impl_->stale->setText(stale ? QStringLiteral("The parameters changed since step %1 was computed: these labels come from the "
+                                                     "earlier parameters, and the sample's provenance records the current pipeline, "
+                                                     "which did not make them. Run the step again for a matching record.")
+                                          .arg(fromStd(Step::number(step)))
+                                    : QString());
+        impl_->stale->setVisible(stale);
 
         std::string problem;
         if (!out) problem = "step " + Step::number(step) + " has not been computed yet; run it first";

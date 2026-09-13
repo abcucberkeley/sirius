@@ -1,12 +1,17 @@
 #include "qt/secret_store.hpp"
 
+#include <mutex>
+
 #include <QByteArray>
 #include <QDir>
 #include <QFile>
 #include <QFileInfo>
 #include <QJsonDocument>
 #include <QJsonObject>
+#include <QJsonParseError>
 #include <QJsonValue>
+#include <QSaveFile>
+#include <QSet>
 #include <QSettings>
 
 #ifdef Q_OS_WIN
@@ -85,7 +90,10 @@ namespace sirius::app::secrets {
             return true;
         }
 
-        void removeBackend(const QString& key) { QSettings().remove(settingsKey(key)); }
+        bool removeBackend(const QString& key) {
+            QSettings().remove(settingsKey(key));
+            return true;
+        }
 
 #else
 
@@ -101,11 +109,22 @@ namespace sirius::app::secrets {
 
         QString storePath() { return QDir::homePath() + QStringLiteral("/.sirius/secrets.json"); }
 
-        QJsonObject loadStore() {
+        // The store as it is on disk: an empty object when there is no file
+        // (or an empty one). False when the file is there but cannot be read
+        // or parsed -- a write would then replace every secret in it with
+        // the one being written, so the callers refuse instead.
+        bool loadStore(QJsonObject& obj) {
+            obj = QJsonObject();
             QFile f(storePath());
-            if (!f.open(QIODevice::ReadOnly)) return QJsonObject();
-            const QJsonDocument doc = QJsonDocument::fromJson(f.readAll());
-            return doc.isObject() ? doc.object() : QJsonObject();
+            if (!f.exists()) return true;
+            if (!f.open(QIODevice::ReadOnly)) return false;
+            const QByteArray text = f.readAll();
+            if (text.trimmed().isEmpty()) return true;
+            QJsonParseError error;
+            const QJsonDocument doc = QJsonDocument::fromJson(text, &error);
+            if (error.error != QJsonParseError::NoError || !doc.isObject()) return false;
+            obj = doc.object();
+            return true;
         }
 
         bool saveStore(const QJsonObject& obj) {
@@ -113,68 +132,102 @@ namespace sirius::app::secrets {
             QDir().mkpath(QFileInfo(path).absolutePath());
             QFile::setPermissions(QFileInfo(path).absolutePath(),
                                   QFileDevice::ReadOwner | QFileDevice::WriteOwner | QFileDevice::ExeOwner);
-            QFile f(path);
-            if (!f.open(QIODevice::WriteOnly | QIODevice::Truncate)) return false;
+            // Written to a file beside the store and renamed over it by
+            // commit(): a short write or a crash leaves the previous store
+            // whole, where truncating it in place left an empty file and
+            // every secret gone.
+            QSaveFile f(path);
+            if (!f.open(QIODevice::WriteOnly)) return false;
             // Tighten the mode on the (still empty) file before anything is
             // written into it, so the secret is never briefly world-readable.
             f.setPermissions(QFileDevice::ReadOwner | QFileDevice::WriteOwner);
             const QByteArray text = QJsonDocument(obj).toJson(QJsonDocument::Indented);
-            const bool written = f.write(text) == text.size();
-            f.close();
-            return written && f.error() == QFileDevice::NoError;
+            if (f.write(text) != text.size()) {
+                f.cancelWriting();
+                return false;
+            }
+            return f.commit();
         }
 
         QString readBackend(const QString& key) {
-            const QJsonValue v = loadStore().value(key);
+            QJsonObject obj;
+            loadStore(obj);   // an unreadable store holds nothing this can use
+            const QJsonValue v = obj.value(key);
             if (!v.isString()) return QString();
             return QString::fromUtf8(mask(QByteArray::fromBase64(v.toString().toLatin1()), key));
         }
 
         bool writeBackend(const QString& key, const QString& value) {
-            QJsonObject obj = loadStore();
+            QJsonObject obj;
+            if (!loadStore(obj)) return false;
             obj.insert(key, QString::fromLatin1(mask(value.toUtf8(), key).toBase64()));
             return saveStore(obj);
         }
 
-        void removeBackend(const QString& key) {
-            QJsonObject obj = loadStore();
-            if (obj.contains(key)) {
-                obj.remove(key);
-                saveStore(obj);
-            }
+        bool removeBackend(const QString& key) {
+            QJsonObject obj;
+            if (!loadStore(obj)) return false;
+            if (!obj.contains(key)) return true;
+            obj.remove(key);
+            return saveStore(obj);
         }
 
 #endif
 
+        // One store for the process: the hub token is read on a run's thread
+        // while the GUI may be writing, and the file backend's
+        // read-modify-write must not interleave.
+        std::mutex& storeMutex() {
+            static std::mutex m;
+            return m;
+        }
+
+        // A plaintext value the store would not take is left where it is and
+        // said once per key, not on every read (the hub token is read for
+        // each request).
+        void warnKeptPlaintext(const QString& key) {
+            static QSet<QString> warned;
+            if (warned.contains(key)) return;
+            warned.insert(key);
+            qWarning("secret store: could not move '%s' into the store; it stays in the settings as plain text until it can be",
+                     qPrintable(key));
+        }
+
     } // namespace
 
     QString read(const QString& key) {
+        const std::lock_guard<std::mutex> lock(storeMutex());
         const QString stored = readBackend(key);
         if (!stored.isEmpty()) return stored;
 
         // Migration from the plaintext QSettings entry this store replaced.
+        // The entry goes only once the store holds the value: deleting it
+        // after a refused write (DPAPI, a read-only or unparsable store)
+        // worked for this session and lost the token at the next launch.
         QSettings s;
         const QString legacy = s.value(key).toString();
         if (legacy.isEmpty()) return QString();
-        writeBackend(key, legacy);
-        s.remove(key);
+        if (writeBackend(key, legacy)) s.remove(key);
+        else warnKeptPlaintext(key);
         return legacy;
     }
 
     bool write(const QString& key, const QString& value) {
-        bool ok = true;
-        if (value.isEmpty())
-            removeBackend(key);
-        else
-            ok = writeBackend(key, value);
-        QSettings().remove(key);   // never leave the old plaintext behind
+        const std::lock_guard<std::mutex> lock(storeMutex());
+        const bool ok = value.isEmpty() ? removeBackend(key) : writeBackend(key, value);
+        // Never leave an old plaintext value behind -- unless the store
+        // refused this very value and the plaintext is its only copy.
+        QSettings s;
+        if (ok || s.value(key).toString() != value) s.remove(key);
         if (!ok) qWarning("secret store: could not store '%s'", qPrintable(key));
         return ok;
     }
 
-    void remove(const QString& key) {
-        removeBackend(key);
+    bool remove(const QString& key) {
+        const std::lock_guard<std::mutex> lock(storeMutex());
+        const bool ok = removeBackend(key);
         QSettings().remove(key);
+        return ok;
     }
 
 } // namespace sirius::app::secrets

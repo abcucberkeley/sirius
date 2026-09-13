@@ -10,7 +10,8 @@
 // configuration. The store keeps the same key names ("hpc/token",
 // "hub/token", "assistant/apiKey") so a call site only changes which function
 // it calls, and read() migrates a plaintext value it still finds there:
-// it moves the value into the store and deletes the old entry.
+// it moves the value into the store and deletes the old entry -- only once
+// the store has taken it.
 //
 // Windows: DPAPI (CryptProtectData) with the key name as entropy, base64 in
 // QSettings under secrets/<key>. Only this user on this machine can read it
@@ -20,6 +21,8 @@
 // file are obfuscated, NOT encrypted -- the obfuscation only keeps the token
 // out of a `grep -r` and out of a backup that someone skims. The file mode is
 // the actual protection; anyone who can read the file can recover the value.
+// The file is replaced atomically (QSaveFile), and one that exists but does
+// not parse is never written over: that would drop every other secret in it.
 // A keyring (libsecret / Keychain) would be the real fix and needs a
 // dependency the project does not have yet.
 
@@ -33,11 +36,14 @@ namespace sirius::app::secrets {
 
     // Stores `value`, or removes the secret when `value` is empty. Also
     // clears any plaintext leftover under the same QSettings key. False when
-    // the backend refused (DPAPI, or the store file could not be written):
-    // the caller then knows the value is gone at the next launch.
+    // the backend refused (DPAPI, or the store file could not be read back
+    // or written): the caller then knows the value is gone at the next
+    // launch. (A plaintext entry holding this same value is then kept: it
+    // is the only copy.)
     bool write(const QString& key, const QString& value);
 
-    void remove(const QString& key);
+    // False when the store could not be rewritten without the secret.
+    bool remove(const QString& key);
 
 } // namespace sirius::app::secrets
 
