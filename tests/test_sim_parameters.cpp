@@ -5,6 +5,7 @@
 #include <cstdio>
 #include <filesystem>
 #include <fstream>
+#include <limits>
 #include <string>
 
 #include "sirius/sim_parameters.hpp"
@@ -65,32 +66,119 @@ TEST_CASE("default SIMParameters validate cleanly", "[params]") {
 
 TEST_CASE("validate rejects out-of-range fields", "[params]") {
     SECTION("ndirs < 1") {
-        SIMParameters p; p.ndirs = 0;
+        SIMParameters p;
+        p.ndirs = 0;
         REQUIRE_THROWS_AS(p.validate(), std::runtime_error);
     }
     SECTION("nphases < 1") {
-        SIMParameters p; p.nphases = 0;
+        SIMParameters p;
+        p.nphases = 0;
         REQUIRE_THROWS_AS(p.validate(), std::runtime_error);
     }
     SECTION("linespacing_um <= 0") {
-        SIMParameters p; p.linespacing_um = 0.0;
+        SIMParameters p;
+        p.linespacing_um = 0.0;
         REQUIRE_THROWS_AS(p.validate(), std::runtime_error);
     }
     SECTION("na <= 0") {
-        SIMParameters p; p.na = 0.0;
+        SIMParameters p;
+        p.na = 0.0;
         REQUIRE_THROWS_AS(p.validate(), std::runtime_error);
     }
     SECTION("non-positive pixel sizes") {
-        SIMParameters p; p.dz = -0.1;
+        SIMParameters p;
+        p.dz = -0.1;
         REQUIRE_THROWS_AS(p.validate(), std::runtime_error);
     }
     SECTION("negative wiener") {
-        SIMParameters p; p.wiener = -1.0;
+        SIMParameters p;
+        p.wiener = -1.0;
         REQUIRE_THROWS_AS(p.validate(), std::runtime_error);
     }
     SECTION("z_zoom < 1") {
-        SIMParameters p; p.z_zoom = 0;
+        SIMParameters p;
+        p.z_zoom = 0;
         REQUIRE_THROWS_AS(p.validate(), std::runtime_error);
+    }
+}
+
+TEST_CASE("validate resolves the order count and needs 2 orders the phases can separate", "[params][orders]") {
+    using Catch::Matchers::ContainsSubstring;
+    SECTION("norders 0 derives nphases / 2 + 1, the default") {
+        SIMParameters p;
+        CHECK(p.norders == 0);
+        CHECK(p.resolvedOrders() == 3);
+        p.nphases = 3;   // 2D SIM: no norders needed
+        CHECK(p.resolvedOrders() == 2);
+        REQUIRE_NOTHROW(p.validate());
+        p.norders = 2;
+        p.nphases = 4;   // an explicit count below the derived one
+        CHECK(p.resolvedOrders() == 2);
+        REQUIRE_NOTHROW(p.validate());
+    }
+    SECTION("a single order (explicit, or derived from 1 phase) is rejected") {
+        SIMParameters p;
+        p.norders = 1;
+        REQUIRE_THROWS_WITH(p.validate(), ContainsSubstring("at least 2 orders"));
+        p.norders = 0;
+        p.nphases = 1;
+        REQUIRE_THROWS_WITH(p.validate(), ContainsSubstring("at least 2 orders"));
+    }
+    SECTION("too few phases for the bands") {
+        SIMParameters p;
+        p.nphases = 4;   // derives 3 orders = 5 bands
+        REQUIRE_THROWS_WITH(p.validate(), ContainsSubstring("4 phases cannot separate 3 orders"));
+        p.nphases = 2;   // derives 2 orders = 3 bands
+        REQUIRE_THROWS_WITH(p.validate(), ContainsSubstring("2 phases cannot separate 2 orders"));
+        p.nphases = 5;
+        p.norders = 4;
+        REQUIRE_THROWS_WITH(p.validate(), ContainsSubstring("5 phases cannot separate 4 orders"));
+    }
+    SECTION("negative norders") {
+        SIMParameters p;
+        p.norders = -1;
+        REQUIRE_THROWS_AS(p.validate(), std::runtime_error);
+    }
+}
+
+TEST_CASE("validate rejects optics the reconstruction would crash on", "[params]") {
+    using Catch::Matchers::ContainsSubstring;
+    SECTION("an NA above the immersion index") {
+        // asin(na / nimm) was NaN, cast to an INT_MIN plane index: a segfault
+        SIMParameters p;
+        p.na = 1.6;
+        p.nimm = 1.515;
+        REQUIRE_THROWS_WITH(p.validate(), ContainsSubstring("nimm"));
+        p.na = p.nimm;   // a 90-degree aperture is still one
+        REQUIRE_NOTHROW(p.validate());
+    }
+    SECTION("a non-positive immersion index") {
+        SIMParameters p;
+        p.nimm = 0.0;
+        REQUIRE_THROWS_AS(p.validate(), std::runtime_error);
+        p.nimm = -1.515;
+        REQUIRE_THROWS_AS(p.validate(), std::runtime_error);
+    }
+    SECTION("NaN and infinite values, which pass every range check") {
+        SIMParameters p;
+        p.na = std::nan("");
+        REQUIRE_THROWS_WITH(p.validate(), ContainsSubstring("na must be finite"));
+        p = SIMParameters{};
+        p.dx = std::numeric_limits<double>::infinity();
+        REQUIRE_THROWS_WITH(p.validate(), ContainsSubstring("dx must be finite"));
+        p = SIMParameters{};
+        p.k0_angles = std::vector<double>{0.1, std::nan(""), 0.3};
+        REQUIRE_THROWS_WITH(p.validate(), ContainsSubstring("k0_angles"));
+    }
+    SECTION("a zoom below 1") {
+        // the assembly wrote input frequencies past the smaller output grid
+        SIMParameters p;
+        p.zoomfact = 0.5;
+        REQUIRE_THROWS_WITH(p.validate(), ContainsSubstring("zoomfact"));
+        p.zoomfact = 0.999;
+        REQUIRE_THROWS_AS(p.validate(), std::runtime_error);
+        p.zoomfact = 1.0;
+        REQUIRE_NOTHROW(p.validate());
     }
 }
 
@@ -110,34 +198,35 @@ TEST_CASE("validate enforces k0_angles size == ndirs", "[params]") {
 
 TEST_CASE("TOML round-trip preserves every serialized field", "[params][toml]") {
     SIMParameters in;
-    in.ndirs                  = 2;
-    in.nphases                = 7;
-    in.linespacing_um         = 0.2035;
-    in.k0_start_angle         = 1.234;
-    in.na                     = 1.42;
-    in.nimm                   = 1.515;
-    in.wavelength_nm          = 525.0;
-    in.k0_angles              = std::vector<double>{0.8043, 1.8555};  // size == ndirs
-    in.dx                     = 0.081;
-    in.dy                     = 0.082;
-    in.dz                     = 0.125;
-    in.dz_psf                 = 0.13;
-    in.zoomfact               = 3.0;
-    in.z_zoom                 = 2;
-    in.wiener                 = 0.001;
-    in.otfcutoff              = 0.009;
-    in.background             = 5.0;
-    in.napodize               = 12;
-    in.suppression_radius     = 8;
+    in.ndirs = 2;
+    in.nphases = 7;
+    in.norders = 2;   // default 0 (derive: 4 orders here)
+    in.linespacing_um = 0.2035;
+    in.k0_start_angle = 1.234;
+    in.na = 1.42;
+    in.nimm = 1.515;
+    in.wavelength_nm = 525.0;
+    in.k0_angles = std::vector<double>{0.8043, 1.8555};  // size == ndirs
+    in.dx = 0.081;
+    in.dy = 0.082;
+    in.dz = 0.125;
+    in.dz_psf = 0.13;
+    in.zoomfact = 3.0;
+    in.z_zoom = 2;
+    in.wiener = 0.001;
+    in.otfcutoff = 0.009;
+    in.background = 5.0;
+    in.napodize = 12;
+    in.suppression_radius = 8;
     in.suppress_singularities = false;  // default true
-    in.dampen_order0          = true;   // default false
-    in.apodize_output         = ApodizationType::None;  // default Triangle
-    in.explodefact            = 1.5;
-    in.fast_si                = true;   // default false
-    in.do_rescale             = false;  // default true
-    in.equalizez              = true;   // default false
-    in.no_kz0                 = false;  // default true
-    in.filter_overlaps        = false;  // default true
+    in.dampen_order0 = true;   // default false
+    in.apodize_output = ApodizationType::None;  // default Triangle
+    in.explodefact = 1.5;
+    in.fast_si = true;   // default false
+    in.do_rescale = false;  // default true
+    in.equalizez = true;   // default false
+    in.no_kz0 = false;  // default true
+    in.filter_overlaps = false;  // default true
 
     TempFile tf(".toml");
     saveParameters(tf.str(), in);
@@ -145,6 +234,7 @@ TEST_CASE("TOML round-trip preserves every serialized field", "[params][toml]") 
 
     REQUIRE(out.ndirs == in.ndirs);
     REQUIRE(out.nphases == in.nphases);
+    REQUIRE(out.norders == in.norders);
     REQUIRE(out.linespacing_um == Approx(in.linespacing_um));
     REQUIRE(out.k0_start_angle == Approx(in.k0_start_angle));
     REQUIRE(out.na == Approx(in.na));
@@ -179,14 +269,49 @@ TEST_CASE("TOML round-trip preserves every serialized field", "[params][toml]") 
 
 TEST_CASE("loadParameters keeps defaults for absent keys", "[params][toml]") {
     // Only override na; everything else must keep its default.
-    TempFile tf(".toml", "[optics]\nna = 1.49\n");
+    TempFile tf(".toml", "[optics]\nna = 1.25\n");
     SIMParameters out = loadParameters(tf.str());
 
     SIMParameters def;
-    REQUIRE(out.na == Approx(1.49));
+    REQUIRE(out.na == Approx(1.25));
+    REQUIRE(out.nimm == Approx(def.nimm));
     REQUIRE(out.nphases == def.nphases);
     REQUIRE(out.linespacing_um == Approx(def.linespacing_um));
     REQUIRE(out.zoomfact == Approx(def.zoomfact));
+}
+
+TEST_CASE("TOML norders: written, read, and derived when absent", "[params][toml][orders]") {
+    SECTION("a default (derived) count round-trips as derived") {
+        SIMParameters in;
+        in.nphases = 3;
+        TempFile tf(".toml");
+        saveParameters(tf.str(), in);
+        const SIMParameters out = loadParameters(tf.str());
+        CHECK(out.norders == 0);
+        CHECK(out.resolvedOrders() == 2);
+    }
+    SECTION("a hand-written norders is honoured") {
+        TempFile tf(".toml", "[optics]\nnphases = 5\nnorders = 2\n");
+        const SIMParameters out = loadParameters(tf.str());
+        CHECK(out.norders == 2);
+        CHECK(out.resolvedOrders() == 2);
+    }
+    SECTION("a 3-phase file without norders loads") {
+        TempFile tf(".toml", "[optics]\nnphases = 3\n");
+        const SIMParameters out = loadParameters(tf.str());
+        CHECK(out.resolvedOrders() == 2);
+    }
+    SECTION("an order count the phases cannot separate is refused on load") {
+        TempFile tf(".toml", "[optics]\nnphases = 3\nnorders = 3\n");
+        REQUIRE_THROWS_AS(loadParameters(tf.str()), std::runtime_error);
+    }
+}
+
+TEST_CASE("loadParameters refuses an NA the default immersion index cannot carry", "[params][toml]") {
+    // an oil objective's NA without its nimm used to load and then crash the
+    // reconstruction with a measured OTF
+    TempFile tf(".toml", "[optics]\nna = 1.49\n");
+    REQUIRE_THROWS_WITH(loadParameters(tf.str()), Catch::Matchers::ContainsSubstring("nimm"));
 }
 
 TEST_CASE("loadParameters throws on malformed TOML", "[params][toml]") {
@@ -301,6 +426,29 @@ TEST_CASE("fromLegacy maps the example config into SIMParameters", "[legacy][con
     REQUIRE(p.fast_si == false);
     REQUIRE(p.k0_angles.has_value());
     REQUIRE(p.k0_angles->size() == 3);
+}
+
+TEST_CASE("fromLegacy carries the order count of the config", "[legacy][convert][orders]") {
+    SECTION("no orders key derives them, so a 3-phase config converts") {
+        TempFile tf(".cfg", "nphases=3\n");
+        const SIMParameters p = fromLegacy(loadLegacyConfig(tf.str()));
+        CHECK(p.norders == 0);
+        CHECK(p.resolvedOrders() == 2);
+    }
+    SECTION("nordersout, what cudasirecon configs use") {
+        TempFile tf(".cfg", "nphases=5\nnordersout=2\n");
+        const SIMParameters p = fromLegacy(loadLegacyConfig(tf.str()));
+        CHECK(p.norders == 2);
+    }
+    SECTION("an explicit norders wins over nordersout") {
+        TempFile tf(".cfg", "nphases=5\nnordersout=2\nnorders=3\n");
+        const SIMParameters p = fromLegacy(loadLegacyConfig(tf.str()));
+        CHECK(p.norders == 3);
+    }
+    SECTION("an order count the phases cannot separate fails validation") {
+        TempFile tf(".cfg", "nphases=3\nnorders=3\n");
+        REQUIRE_THROWS_AS(fromLegacy(loadLegacyConfig(tf.str())), std::runtime_error);
+    }
 }
 
 TEST_CASE("fromLegacy converts apodizeoutput int to enum", "[legacy][convert]") {

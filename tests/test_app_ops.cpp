@@ -35,6 +35,7 @@
 
 #include <set>
 
+#include "sim_synthetic.hpp"
 #include "temp_path.hpp"
 
 using namespace sirius;
@@ -291,6 +292,94 @@ TEST_CASE("SIM reconstructs the bundled stack from a parameter file and reports 
         const StepOutput ideal = sim.run(loaded.asInput(), e, prog.ctx);
         CHECK(ideal.array->dims() == predicted.dims);
         CHECK(ideal.note.find("theoretical OTF") != std::string::npos);
+    }
+}
+
+TEST_CASE("SIM reconstructs a 2D stack with the step's defaults", "[app][ops][sim][2d]") {
+    // The step's defaults skip the kz = 0 plane and damp the zero order, and
+    // a 2D stack has no other plane: the result used to be all NaN. The scene
+    // is sim_synthetic.hpp's; only the optics are set, every switch keeps its
+    // default.
+    SIMParameters optics;
+    optics.ndirs = 3;
+    optics.nphases = 3;
+    optics.na = 1.2;
+    optics.nimm = 1.33;
+    optics.wavelength_nm = 530.0;
+    optics.linespacing_um = 0.30;
+    optics.k0_start_angle = 0.3;
+    optics.dx = 0.08;
+    optics.dy = 0.08;
+    const Buffer<double> raw = test::syntheticSim2d(optics, 128);
+
+    const Dims5 dims{1, 1, 9, 128, 128};
+    DatasetMeta meta = metaFor(dims, 0.08, 0.3);
+    meta.sim.present = true;
+    meta.sim.ndirs = 3;
+    meta.sim.nphases = 3;
+    auto array = std::make_shared<Array5>(dims);
+    for (Index z = 0; z < dims.z; ++z)
+        for (Index y = 0; y < dims.y; ++y)
+            for (Index x = 0; x < dims.x; ++x)
+                array->at(0, 0, z, y, x) = static_cast<float>(raw.data()[(z * dims.y + y) * dims.x + x]);
+
+    const Operation& sim = requireOperation("sim");
+    auto run = [&](const ParamSet& sp) {
+        const Validation v = sim.validate(sp, meta);
+        INFO(v.firstError());
+        REQUIRE(v.ok());
+        Progress prog;
+        StepOutput out = sim.run(inputOf(array, meta), sp, prog.ctx);
+        REQUIRE(out.array);
+        CHECK(out.array->dims() == Dims5{1, 1, 1, 256, 256});
+        Index bad = 0;
+        for (Index i = 0; i < 256 * 256; ++i) bad += std::isfinite(out.array->plane(0, 0, 0)[i]) ? 0 : 1;
+        CHECK(bad == 0);
+        return out;
+    };
+
+    SECTION("Estimate mode finds the simulated pattern") {
+        ParamSet sp = sim.defaults();
+        CHECK(sp.getBool("no_kz0", false));
+        CHECK(sp.getBool("suppress_zero_order", false));
+        sp.set("phases", std::int64_t{3});
+        sp.set("na", 1.2);
+        sp.set("nimm", 1.33);
+        sp.set("wavelength_nm", 530.0);
+        sp.set("linespacing_um", 0.30);
+        sp.set("k0_start_angle", 0.3 * 180.0 / kPi);   // degrees
+        const StepOutput out = run(sp);
+        REQUIRE(out.diagnostics.table);
+        const auto& rows = out.diagnostics.table->rows;
+        REQUIRE(rows.size() == 3);
+        CHECK(rows[0][0] == "17°");
+        CHECK(rows[1][0] == "77°");
+        CHECK(rows[2][0] == "137°");
+    }
+    SECTION("the form refuses what used to crash the run") {
+        // one order segfaulted the k0 fit; an NA above the immersion index
+        // segfaulted the filter (with a measured OTF, which is not needed to
+        // see the form refuse it)
+        ParamSet orders = sim.defaults();
+        orders.set("phases", std::int64_t{3});
+        orders.set("orders", std::int64_t{1});
+        CHECK_FALSE(sim.validate(orders, meta).ok());
+        ParamSet na = sim.defaults();
+        na.set("phases", std::int64_t{3});
+        na.set("na", 1.6);
+        const Validation v = sim.validate(na, meta);
+        REQUIRE_FALSE(v.ok());
+        CHECK(v.firstError().find("nimm") != std::string::npos);
+    }
+    SECTION("From file mode with a TOML file that leaves the orders out") {
+        // the form validated, and the run threw "3 phases cannot separate 3 orders"
+        const test::TempFile toml("sim2d", ".toml");
+        std::ofstream(toml.path) << "[optics]\nndirs = 3\nnphases = 3\nlinespacing_um = 0.30\nk0_start_angle = 0.3\n"
+                                    "na = 1.2\nnimm = 1.33\nwavelength_nm = 530.0\n";
+        ParamSet sp = sim.defaults();
+        sp.set("mode", std::string("From file"));
+        sp.set("params_file", toml.str);
+        run(sp);
     }
 }
 
