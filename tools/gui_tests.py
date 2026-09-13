@@ -38,6 +38,10 @@ class Failure(Exception):
     pass
 
 
+class Skip(Exception):
+    """The scenario cannot run here (a platform, a permission); said, not failed."""
+
+
 def check_offscreen_plugin(app: Path) -> Optional[str]:
     """Why ``-platform offscreen`` will not start, if it will not.
 
@@ -117,6 +121,24 @@ def run(app: Path, args: List[str], timeout: int = 300, env: Optional[Dict[str, 
     if code != 0:
         raise Failure(f"exit {code}: {' '.join(full)}\n{text[-4000:]}")
     return text
+
+
+def isolated_settings(tmp: Path, name: str) -> Dict[str, str]:
+    """A HOME and an XDG_CONFIG_HOME of the scenario's own.
+
+    The application keeps its settings (QSettings) and its secret store
+    (~/.sirius) under these on Linux, so a scenario that seeds or inspects them
+    neither reads the user's nor writes over them.
+    """
+    home, config = tmp / f"{name}-home", tmp / f"{name}-config"
+    home.mkdir(parents=True, exist_ok=True)
+    config.mkdir(parents=True, exist_ok=True)
+    return {"HOME": str(home), "XDG_CONFIG_HOME": str(config)}
+
+
+def settings_file(env: Dict[str, str]) -> Path:
+    """Where QSettings("sirius", "sirius-app") lives under an isolated_settings() environment."""
+    return Path(env["XDG_CONFIG_HOME"]) / "sirius" / "sirius-app.conf"
 
 
 def tool_results(output: str) -> Dict[str, List[Any]]:
@@ -357,6 +379,39 @@ def test_a_preset_fills_the_fields(app: Path, tmp: Path) -> None:
     check(abs(float(params["enhance_sigma"]) - 0.8) < 1e-9, f"sigma is {params['enhance_sigma']}")
 
 
+def test_a_token_the_secret_store_refuses_stays_in_the_settings(app: Path, tmp: Path) -> None:
+    # A token still in the plaintext settings moves into ~/.sirius/secrets.json
+    # at start-up (the HPC token is read then). When the store cannot take it,
+    # the settings entry is the only copy: deleting it anyway worked for one
+    # session and lost the token at the next launch. A store that exists but
+    # does not parse must not be written over either -- that dropped every
+    # other secret in it.
+    if not sys.platform.startswith("linux"):
+        raise Skip("QSettings is an INI file under XDG_CONFIG_HOME only on Linux")
+    if os.geteuid() == 0:
+        raise Skip("root writes through a read-only file mode")
+    env = isolated_settings(tmp, "secrets")
+    conf = settings_file(env)
+    conf.parent.mkdir(parents=True, exist_ok=True)
+    conf.write_text("[hpc]\ntoken=tok_LEGACY\n")
+    store = Path(env["HOME"]) / ".sirius" / "secrets.json"
+    store.parent.mkdir(parents=True, exist_ok=True)
+    store.write_text("{}\n")
+    store.chmod(0o400)
+    try:
+        for launch in (1, 2):
+            out = run(app, ["--quit-after", "1500"], env=env)
+            check("tok_LEGACY" in conf.read_text(), f"launch {launch} deleted the plaintext token the store refused")
+        check(out.count("could not move 'hpc/token'") == 1, "the refused migration was not reported exactly once in a launch")
+    finally:
+        store.chmod(0o600)
+    corrupt = '{"hub/token": "kept", '
+    store.write_text(corrupt)
+    run(app, ["--quit-after", "1500"], env=env)
+    check(store.read_text() == corrupt, f"a store that does not parse was written over: {store.read_text()!r}")
+    check("tok_LEGACY" in conf.read_text(), "the plaintext token went although the store could not take it")
+
+
 SCENARIOS = [
     test_ortho_view_shows_the_dataset,
     test_every_view_mode_renders,
@@ -366,6 +421,7 @@ SCENARIOS = [
     test_a_dropped_file_opens,
     test_menu_actions_reach_the_view,
     test_a_preset_fills_the_fields,
+    test_a_token_the_secret_store_refuses_stays_in_the_settings,
 ]
 
 
@@ -396,6 +452,8 @@ def main() -> int:
             except Failure as e:
                 failures += 1
                 print(f"FAIL  {name}\n      {e}", file=sys.stderr, flush=True)
+            except Skip as e:
+                print(f"skip  {name}\n      {e}", flush=True)
             else:
                 print(f"ok    {name}", flush=True)
     finally:

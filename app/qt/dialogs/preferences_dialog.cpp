@@ -107,6 +107,10 @@ namespace sirius::app {
         LlmClient client;
         QLineEdit* apiKey = nullptr;
         QCheckBox* askFirst = nullptr;
+        // The secrets as the dialog opened with them. Save writes only the
+        // ones the user changed: rewriting an untouched token into a store
+        // that refuses it is how a token that still worked got lost.
+        QString openedToken, openedHfToken;
         explicit Impl(WorkbenchBridge& b) : bridge(b) {}
     };
 
@@ -155,6 +159,7 @@ namespace sirius::app {
         impl_->port->setValue(wb.remoteConfig().port);
         impl_->token = new QLineEdit(fromStd(wb.remoteConfig().token), compute);
         impl_->token->setEchoMode(QLineEdit::Password);
+        impl_->openedToken = impl_->token->text();
         hg->addWidget(field(QStringLiteral("Host"), impl_->host, compute), 0, 0);
         hg->addWidget(field(QStringLiteral("Port"), impl_->port, compute), 0, 1);
         hg->addWidget(field(QStringLiteral("Token"), impl_->token, compute), 1, 0, 1, 2);
@@ -171,6 +176,7 @@ namespace sirius::app {
         cl->addWidget(field(QStringLiteral("Python for the local worker"), impl_->python, compute));
         impl_->hfToken = new QLineEdit(secrets::read(QStringLiteral("hub/token")), compute);
         impl_->hfToken->setEchoMode(QLineEdit::Password);
+        impl_->openedHfToken = impl_->hfToken->text();
         impl_->hfToken->setToolTip(QStringLiteral("Access token for gated or private Hugging Face repositories (huggingface.co ▸ Settings ▸ "
                                                   "Access Tokens); sent with each request that downloads a model"));
         cl->addWidget(field(QStringLiteral("Hugging Face access token (optional)"), impl_->hfToken, compute));
@@ -273,9 +279,11 @@ namespace sirius::app {
         settings.setValue(QStringLiteral("hpc/host"), impl_->host->text().trimmed());
         settings.setValue(QStringLiteral("hpc/port"), impl_->port->value());
         QStringList notStored;
-        if (!secrets::write(QStringLiteral("hpc/token"), impl_->token->text())) notStored << QStringLiteral("the HPC token");
+        if (impl_->token->text() != impl_->openedToken && !secrets::write(QStringLiteral("hpc/token"), impl_->token->text()))
+            notStored << QStringLiteral("the HPC token");
         settings.setValue(QStringLiteral("worker/python"), impl_->python->text().trimmed());
-        if (!secrets::write(QStringLiteral("hub/token"), impl_->hfToken->text().trimmed())) notStored << QStringLiteral("the Hugging Face token");
+        if (impl_->hfToken->text() != impl_->openedHfToken && !secrets::write(QStringLiteral("hub/token"), impl_->hfToken->text().trimmed()))
+            notStored << QStringLiteral("the Hugging Face token");
         AssistantSettings as;
         as.provider = impl_->provider->currentData().toString();
         as.baseUrl = impl_->baseUrl->text().trimmed();
