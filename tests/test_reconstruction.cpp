@@ -320,7 +320,11 @@ TEST_CASE("Reconstruction with the ideal OTF resembles the reference", "[reconst
     for (Eigen::Index i = 0; i < out.size(); ++i) {
         const double a = out.data()[i], b = t.expected.data()[i];
         REQUIRE(std::isfinite(a));
-        sa += a; sb += b; saa += a * a; sbb += b * b; sab += a * b;
+        sa += a;
+        sb += b;
+        saa += a * a;
+        sbb += b * b;
+        sab += a * b;
     }
     const double corr = (n * sab - sa * sb) / std::sqrt((n * saa - sa * sa) * (n * sbb - sb * sb));
     INFO("correlation with the reference reconstruction: " << corr);

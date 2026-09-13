@@ -34,19 +34,22 @@ namespace {
     struct TempFile {
         std::string path;
         explicit TempFile(std::string p) : path(std::move(p)) {}
-        ~TempFile() { std::error_code ec; std::filesystem::remove(path, ec); }
+        ~TempFile() {
+            std::error_code ec;
+            std::filesystem::remove(path, ec);
+        }
     };
 
     std::string tempTiffPath(const char* tag) {
         return test::uniqueTempPath((std::string("otf_") + tag).c_str(), ".tif").string();
     }
-}
+} // namespace
 
 // --- resampleOTF -----------------------------------------------------------
 
 TEST_CASE("resampleOTF output has (nz, ny, nx) shape", "[otf]") {
     auto radial = makeRadial(4, 4, [](int, int) { return Cplx(1.0, 0.0); });
-    auto out = resampleOTF(radial, /*nx*/8, /*ny*/6, /*nz*/5, 1.0, 1.0, 1.0, 1.0);
+    auto out = resampleOTF(radial, /*nx*/ 8, /*ny*/ 6, /*nz*/ 5, 1.0, 1.0, 1.0, 1.0);
     REQUIRE(out.dimension(0) == 5);
     REQUIRE(out.dimension(1) == 6);
     REQUIRE(out.dimension(2) == 8);
@@ -55,7 +58,7 @@ TEST_CASE("resampleOTF output has (nz, ny, nx) shape", "[otf]") {
 TEST_CASE("resampleOTF: DC is in-band, far corner is zero", "[otf]") {
     // constant OTF over the whole (kr, kz) grid
     auto radial = makeRadial(4, 4, [](int, int) { return Cplx(2.0, -1.0); });
-    auto out = resampleOTF(radial, 16, 16, 1, /*dkx*/1.0, /*dky*/1.0, /*dkrotf*/1.0, /*kzscale*/0.0);
+    auto out = resampleOTF(radial, 16, 16, 1, /*dkx*/ 1.0, /*dky*/ 1.0, /*dkrotf*/ 1.0, /*kzscale*/ 0.0);
 
     // DC voxel: kx=ky=kz=0 -> krindex=0, in band -> the constant value
     CHECK_THAT(out(0, 0, 0).real(), WithinAbs(2.0, 1e-12));
@@ -70,7 +73,7 @@ TEST_CASE("resampleOTF interpolates radially (2D case)", "[otf]") {
     // value depends only on the radial index: otf(ir, *) = ir
     auto radial = makeRadial(8, 4, [](int ir, int) { return Cplx(ir, 0.0); });
     // nz=1 collapses kz; rxscale = dkx/dkrotf = 0.5
-    auto out = resampleOTF(radial, 16, 16, 1, /*dkx*/0.5, /*dky*/0.5, /*dkrotf*/1.0, /*kzscale*/0.0);
+    auto out = resampleOTF(radial, 16, 16, 1, /*dkx*/ 0.5, /*dky*/ 0.5, /*dkrotf*/ 1.0, /*kzscale*/ 0.0);
 
     // ix=5 -> kx=5 -> krindex = 5*0.5 = 2.5 -> lerp(otf[2], otf[3], 0.5) = 2.5
     CHECK_THAT(out(0, 0, 5).real(), WithinAbs(2.5, 1e-12));
@@ -85,7 +88,7 @@ TEST_CASE("resampleOTF interpolates kz circularly across the wrap", "[otf]") {
     });
     // kx=ky=0 -> ir=0. iz=nz-1 -> kz=-1 ; kzscale=0.5 -> kzindex=-0.5+4=3.5
     // -> iz0=3, iz1=0 (wrap), az=0.5 -> 0.5*otf(0,3) + 0.5*otf(0,0) = 1.5
-    auto out = resampleOTF(radial, 4, 4, 4, 1.0, 1.0, 1.0, /*kzscale*/0.5);
+    auto out = resampleOTF(radial, 4, 4, 4, 1.0, 1.0, 1.0, /*kzscale*/ 0.5);
     CHECK_THAT(out(3, 0, 0).real(), WithinAbs(1.5, 1e-12));
     CHECK_THAT(out(3, 0, 0).imag(), WithinAbs(0.0, 1e-12));
 }
@@ -94,7 +97,7 @@ TEST_CASE("resampleOTF: full bilinear in kr and kz", "[otf]") {
     // f(ir, iz) = (ir, iz). For an in-band, non-wrapping voxel the real part
     // interpolates to krindex and the imag part to kzindex.
     auto radial = makeRadial(8, 4, [](int ir, int iz) { return Cplx(ir, iz); });
-    auto out = resampleOTF(radial, 16, 16, 8, /*dkx*/0.5, /*dky*/0.5, /*dkrotf*/1.0, /*kzscale*/1.5);
+    auto out = resampleOTF(radial, 16, 16, 8, /*dkx*/ 0.5, /*dky*/ 0.5, /*dkrotf*/ 1.0, /*kzscale*/ 1.5);
 
     // ix=3 -> kx=3 -> kxt=1.5, ky=0 -> krindex=1.5
     // iz=1 -> kz=1 -> kzindex=1.5 (iz0=1, iz1=2, no wrap)
@@ -122,7 +125,7 @@ TEST_CASE("OTFRadiallyAveraged::plane extracts one order", "[otf]") {
     auto out = resampleOTF(p, 4, 4, 1, 1.0, 1.0, 1.0, 0.0);
     REQUIRE(out.dimension(0) == 1);
 
-    REQUIRE_THROWS_AS(otf.plane(2),  std::out_of_range);
+    REQUIRE_THROWS_AS(otf.plane(2), std::out_of_range);
     REQUIRE_THROWS_AS(otf.plane(-1), std::out_of_range);
 }
 
@@ -131,13 +134,19 @@ TEST_CASE("OTFRadiallyAveraged::plane extracts one order", "[otf]") {
 TEST_CASE("loadOTF de-interleaves real/imag columns", "[otf]") {
     // raw stack (norders=1, nkr=2, 2*nzotf=4): cols = [re0, im0, re1, im1]
     ImageStack<float> raw(1, 2, 4);
-    raw(0, 0, 0) = 1; raw(0, 0, 1) = 2; raw(0, 0, 2) = 3; raw(0, 0, 3) = 4;
-    raw(0, 1, 0) = 5; raw(0, 1, 1) = 6; raw(0, 1, 2) = 7; raw(0, 1, 3) = 8;
+    raw(0, 0, 0) = 1;
+    raw(0, 0, 1) = 2;
+    raw(0, 0, 2) = 3;
+    raw(0, 0, 3) = 4;
+    raw(0, 1, 0) = 5;
+    raw(0, 1, 1) = 6;
+    raw(0, 1, 2) = 7;
+    raw(0, 1, 3) = 8;
 
     TempFile tf(tempTiffPath("load"));
     writeTiffStack<float>(tf.path, raw);
 
-    auto otf = loadOTF(tf.path, /*dkrotf*/0.25, /*dkzotf*/0.5);
+    auto otf = loadOTF(tf.path, /*dkrotf*/ 0.25, /*dkzotf*/ 0.5);
     const auto& d = otf.data();
 
     REQUIRE(d.dimension(0) == 1);
@@ -176,7 +185,7 @@ namespace {
         p.norders = 3;
         return p;
     }
-}
+} // namespace
 
 TEST_CASE("idealOTF 2D matches the paraxial pupil autocorrelation", "[otf][ideal]") {
     // At low NA the sine-condition apodization is ~1, so the in-focus OTF is

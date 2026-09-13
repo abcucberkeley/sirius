@@ -65,31 +65,38 @@ TEST_CASE("default SIMParameters validate cleanly", "[params]") {
 
 TEST_CASE("validate rejects out-of-range fields", "[params]") {
     SECTION("ndirs < 1") {
-        SIMParameters p; p.ndirs = 0;
+        SIMParameters p;
+        p.ndirs = 0;
         REQUIRE_THROWS_AS(p.validate(), std::runtime_error);
     }
     SECTION("nphases < 1") {
-        SIMParameters p; p.nphases = 0;
+        SIMParameters p;
+        p.nphases = 0;
         REQUIRE_THROWS_AS(p.validate(), std::runtime_error);
     }
     SECTION("linespacing_um <= 0") {
-        SIMParameters p; p.linespacing_um = 0.0;
+        SIMParameters p;
+        p.linespacing_um = 0.0;
         REQUIRE_THROWS_AS(p.validate(), std::runtime_error);
     }
     SECTION("na <= 0") {
-        SIMParameters p; p.na = 0.0;
+        SIMParameters p;
+        p.na = 0.0;
         REQUIRE_THROWS_AS(p.validate(), std::runtime_error);
     }
     SECTION("non-positive pixel sizes") {
-        SIMParameters p; p.dz = -0.1;
+        SIMParameters p;
+        p.dz = -0.1;
         REQUIRE_THROWS_AS(p.validate(), std::runtime_error);
     }
     SECTION("negative wiener") {
-        SIMParameters p; p.wiener = -1.0;
+        SIMParameters p;
+        p.wiener = -1.0;
         REQUIRE_THROWS_AS(p.validate(), std::runtime_error);
     }
     SECTION("z_zoom < 1") {
-        SIMParameters p; p.z_zoom = 0;
+        SIMParameters p;
+        p.z_zoom = 0;
         REQUIRE_THROWS_AS(p.validate(), std::runtime_error);
     }
 }
@@ -110,34 +117,34 @@ TEST_CASE("validate enforces k0_angles size == ndirs", "[params]") {
 
 TEST_CASE("TOML round-trip preserves every serialized field", "[params][toml]") {
     SIMParameters in;
-    in.ndirs                  = 2;
-    in.nphases                = 7;
-    in.linespacing_um         = 0.2035;
-    in.k0_start_angle         = 1.234;
-    in.na                     = 1.42;
-    in.nimm                   = 1.515;
-    in.wavelength_nm          = 525.0;
-    in.k0_angles              = std::vector<double>{0.8043, 1.8555};  // size == ndirs
-    in.dx                     = 0.081;
-    in.dy                     = 0.082;
-    in.dz                     = 0.125;
-    in.dz_psf                 = 0.13;
-    in.zoomfact               = 3.0;
-    in.z_zoom                 = 2;
-    in.wiener                 = 0.001;
-    in.otfcutoff              = 0.009;
-    in.background             = 5.0;
-    in.napodize               = 12;
-    in.suppression_radius     = 8;
+    in.ndirs = 2;
+    in.nphases = 7;
+    in.linespacing_um = 0.2035;
+    in.k0_start_angle = 1.234;
+    in.na = 1.42;
+    in.nimm = 1.515;
+    in.wavelength_nm = 525.0;
+    in.k0_angles = std::vector<double>{0.8043, 1.8555};  // size == ndirs
+    in.dx = 0.081;
+    in.dy = 0.082;
+    in.dz = 0.125;
+    in.dz_psf = 0.13;
+    in.zoomfact = 3.0;
+    in.z_zoom = 2;
+    in.wiener = 0.001;
+    in.otfcutoff = 0.009;
+    in.background = 5.0;
+    in.napodize = 12;
+    in.suppression_radius = 8;
     in.suppress_singularities = false;  // default true
-    in.dampen_order0          = true;   // default false
-    in.apodize_output         = ApodizationType::None;  // default Triangle
-    in.explodefact            = 1.5;
-    in.fast_si                = true;   // default false
-    in.do_rescale             = false;  // default true
-    in.equalizez              = true;   // default false
-    in.no_kz0                 = false;  // default true
-    in.filter_overlaps        = false;  // default true
+    in.dampen_order0 = true;   // default false
+    in.apodize_output = ApodizationType::None;  // default Triangle
+    in.explodefact = 1.5;
+    in.fast_si = true;   // default false
+    in.do_rescale = false;  // default true
+    in.equalizez = true;   // default false
+    in.no_kz0 = false;  // default true
+    in.filter_overlaps = false;  // default true
 
     TempFile tf(".toml");
     saveParameters(tf.str(), in);

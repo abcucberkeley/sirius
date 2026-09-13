@@ -33,8 +33,8 @@ namespace sirius {
             // complex_otf = raw_data[..., 0::2] + i*raw_data[..., 1::2]
             Eigen::array<Eigen::Index, 3> start_real = {0, 0, 0};
             Eigen::array<Eigen::Index, 3> start_imag = {0, 0, 1};
-            Eigen::array<Eigen::Index, 3> stop        = raw_data.dimensions();
-            Eigen::array<Eigen::Index, 3> strides     = {1, 1, 2};
+            Eigen::array<Eigen::Index, 3> stop = raw_data.dimensions();
+            Eigen::array<Eigen::Index, 3> strides = {1, 1, 2};
 
             return raw_data.stridedSlice(start_real, stop, strides).cast<Cplx>() +
                    raw_data.stridedSlice(start_imag, stop, strides).cast<Cplx>() * Cplx(0, 1);
@@ -178,11 +178,10 @@ namespace sirius {
     Eigen::Tensor<std::complex<double>, 3, Eigen::RowMajor>
     resampleOTF(const Eigen::Tensor<std::complex<double>, 2, Eigen::RowMajor>& radial_otf,
                 int nx, int ny, int nz,
-                double dkx, double dky, double dkrotf, double kzscale)
-    {
+                double dkx, double dky, double dkrotf, double kzscale) {
         using Cplx = std::complex<double>;
 
-        const Eigen::Index nkr   = radial_otf.dimension(0);
+        const Eigen::Index nkr = radial_otf.dimension(0);
         const Eigen::Index nzotf = radial_otf.dimension(1);
         const Cplx* otf = radial_otf.data();
 
@@ -199,7 +198,7 @@ namespace sirius {
             return otf[ir * nzotf + iz];
         };
 
-        #pragma omp parallel for collapse(2) schedule(static)
+#pragma omp parallel for collapse(2) schedule(static)
         for (int iz = 0; iz < nz; ++iz) {
             for (int iy = 0; iy < ny; ++iy) {
                 // signed FFT frequency indices (negative freqs in the upper half)
@@ -211,7 +210,8 @@ namespace sirius {
                 if (kzindex < 0) kzindex += nzotf;
                 const Eigen::Index izf = static_cast<Eigen::Index>(std::floor(kzindex));
                 const double az = kzindex - static_cast<double>(izf);
-                Eigen::Index iz0 = izf % nzotf; if (iz0 < 0) iz0 += nzotf;
+                Eigen::Index iz0 = izf % nzotf;
+                if (iz0 < 0) iz0 += nzotf;
                 const Eigen::Index iz1 = (iz0 + 1) % nzotf;
 
                 // ky contribution is constant across the inner loop -> hoist it
@@ -228,14 +228,13 @@ namespace sirius {
                     const Eigen::Index ir = static_cast<Eigen::Index>(std::floor(krindex));
                     const double ar = krindex - static_cast<double>(ir);
 
-                    const Cplx v00 = fetch(ir,     iz0);
-                    const Cplx v01 = fetch(ir,     iz1);
+                    const Cplx v00 = fetch(ir, iz0);
+                    const Cplx v01 = fetch(ir, iz1);
                     const Cplx v10 = fetch(ir + 1, iz0);
                     const Cplx v11 = fetch(ir + 1, iz1);
 
                     // bilinear interpolation
-                    row[ix] = (1.0 - ar) * ((1.0 - az) * v00 + az * v01)
-                            +        ar  * ((1.0 - az) * v10 + az * v11);
+                    row[ix] = (1.0 - ar) * ((1.0 - az) * v00 + az * v01) + ar * ((1.0 - az) * v10 + az * v11);
                 }
             }
         }
@@ -243,4 +242,3 @@ namespace sirius {
     }
 
 } // namespace sirius
-
