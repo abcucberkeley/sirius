@@ -339,7 +339,7 @@ namespace sirius::app {
         void setCudaDevice(int index);
         const RemoteConfig& remoteConfig() const noexcept { return remote_; }
         void setRemoteConfig(RemoteConfig c);
-        // Steps that need the Python worker (Operation::remoteCapable) get a
+        // Steps that need the Python worker (Operation::needsWorker) get a
         // local worker from this launcher when the backend is not HPC; the
         // Qt layer installs one that spawns app/python/sirius_worker. A run
         // job calls it on its own thread; loadPlugins calls it here.

@@ -84,7 +84,10 @@ namespace sirius::app {
                 ctx.report(0.6, red + " over " + reducedAxes(m));
                 reduceAxes(in->data(), extent, m, reduceOpOf(red), result->data());
                 out.array = result;
-                if (!m[1] && !m[2] && !m[3] && !m[4] && input.labels) out.labels = input.labels->clone();
+                // out.labels stays null: the executor carries the input's
+                // labels through when t, z, y and x are all kept (with the
+                // corrections painted on this step), and a reduction of any
+                // of them leaves them behind
                 out.ranOn = Backend::Cpu;
                 out.note = summaryOf(keep, red, meta) + " · CPU";
                 out.diagnostics = genericDiagnostics(input, out, summaryOf(keep, red, meta));

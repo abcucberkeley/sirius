@@ -25,6 +25,7 @@
 #include <filesystem>
 #include <fstream>
 #include <limits>
+#include <map>
 #include <string>
 #include <vector>
 
@@ -102,6 +103,10 @@ namespace {
         const char* name;
         const char* kind;
         json params;
+        // For a step that works on labels: the earlier case whose output
+        // labels are its input. The sidecar names it, and the Python side
+        // reads that case's C++ labels, so the step is compared on its own.
+        const char* labelsFrom = nullptr;
         // Run on a copy of the input with a +inf and a -inf voxel in every
         // channel (written beside the case as <name>.input.f32).
         bool infinite = false;
@@ -117,7 +122,8 @@ namespace {
                            {1, 2, 1, 6, 8, std::numeric_limits<float>::infinity()},
                            {1, 0, 0, 8, 0, -std::numeric_limits<float>::infinity()}};
 
-    // One case per behaviour the two implementations are meant to share.
+    // One case per behaviour the two implementations are meant to share,
+    // in order: a case that takes labels comes after the one that makes them.
     // Steps left out on purpose: merge (its output is a display RGB blend
     // whose channel colours come from the metadata, not from the array),
     // flatfield and load (both read files), and every worker-backed kind.
@@ -149,23 +155,25 @@ namespace {
         // +-inf voxels: the histograms span the finite values (an infinite
         // end used to write a NaN bin index out of bounds), and max / min
         // keep a real infinity instead of mistaking it for "nothing seen"
-        {"threshold_otsu_inf", "threshold", {{"channel", 0}, {"method", "Otsu"}, {"post", "Connected components"}, {"min_voxels", 0}}, true},
-        {"classic_multi_otsu_inf", "classic", {{"channel", 1}, {"method", "Multi-Otsu"}, {"sigma", 0.0}, {"opening", 0}, {"fill_holes", false}, {"post", "Connected components"}, {"min_voxels", 2}}, true},
-        {"contrast_auto_inf", "contrast", {{"min", 0.0}, {"max", 0.0}, {"gamma", 1.0}}, true},
-        {"einsum_max_c_inf", "einsum", {{"keep", "tzyx"}, {"reduction", "max"}}, true},
-        {"einsum_min_yx_inf", "einsum", {{"keep", "ctz"}, {"reduction", "min"}}, true},
-        {"maxproj_z_inf", "maxproj", {{"axis", "z"}}, true},
+        {"threshold_otsu_inf", "threshold", {{"channel", 0}, {"method", "Otsu"}, {"post", "Connected components"}, {"min_voxels", 0}}, nullptr, true},
+        {"classic_multi_otsu_inf", "classic", {{"channel", 1}, {"method", "Multi-Otsu"}, {"sigma", 0.0}, {"opening", 0}, {"fill_holes", false}, {"post", "Connected components"}, {"min_voxels", 2}}, nullptr, true},
+        {"contrast_auto_inf", "contrast", {{"min", 0.0}, {"max", 0.0}, {"gamma", 1.0}}, nullptr, true},
+        {"einsum_max_c_inf", "einsum", {{"keep", "tzyx"}, {"reduction", "max"}}, nullptr, true},
+        {"einsum_min_yx_inf", "einsum", {{"keep", "ctz"}, {"reduction", "min"}}, nullptr, true},
+        {"maxproj_z_inf", "maxproj", {{"axis", "z"}}, nullptr, true},
         // classical segmentation: one case per branch that has its own maths,
         // so the Python mirror cannot drift from the C++ on any of them
         {"classic_otsu_hmax", "classic", {{"channel", 0}, {"method", "Otsu"}, {"sigma", 1.0}, {"opening", 1}, {"post", "Watershed (distance)"}, {"seeds", "H-maxima"}, {"seed_depth", 1.5}, {"min_voxels", 4}}},
-        // No "Distance maxima" case: with those seeds this fixture puts two
-        // seeds equidistant from the ridge between them, and the two floods
-        // break that tie differently -- the application's priority queue and
-        // scikit-image's give 22 voxels of one shared boundary to different
-        // neighbours. The foreground and the object count agree; only the
-        // border moves. Matching it would mean reimplementing the C++ queue
-        // order in the mirror. The h-maxima case below covers the same
-        // watershed code with seeds that are not tied.
+        // With distance-maxima seeds this fixture puts two seeds equidistant
+        // from the ridge between them. scikit-image's flood broke that tie
+        // differently from the application's queue and moved 22 voxels of
+        // the shared boundary (h-maxima seeds were not spared either on other
+        // inputs); the mirror now floods in the C++ queue order, voxel for
+        // voxel, and this case is what holds it there.
+        {"classic_otsu_distance_maxima", "classic", {{"channel", 0}, {"method", "Otsu"}, {"sigma", 1.0}, {"opening", 1}, {"post", "Watershed (distance)"}, {"seeds", "Distance maxima"}, {"seed_distance", 3.0}, {"min_voxels", 4}}},
+        // Seeds further apart than the objects: a component no seed landed in
+        // is numbered after the seeds instead of being dropped.
+        {"threshold_watershed_far_seeds", "threshold", {{"channel", 0}, {"method", "Percentile"}, {"percentile", 85.0}, {"post", "Watershed (distance)"}, {"seed_distance", 12.0}, {"min_voxels", 0}}},
         {"classic_multi_otsu", "classic", {{"channel", 1}, {"method", "Multi-Otsu"}, {"sigma", 0.0}, {"opening", 0}, {"fill_holes", false}, {"post", "Connected components"}, {"min_voxels", 2}}},
         {"classic_local_contrast", "classic", {{"channel", 0}, {"method", "Local contrast"}, {"window", 11}, {"contrast_k", 1.2}, {"sigma", 0.0}, {"opening", 0}, {"fill_holes", false}, {"post", "Connected components"}, {"min_voxels", 2}}},
         {"classic_local_mean", "classic", {{"channel", 0}, {"method", "Local mean"}, {"window", 11}, {"local_ratio", 1.15}, {"sigma", 0.0}, {"opening", 0}, {"fill_holes", false}, {"post", "Connected components"}, {"min_voxels", 2}}},
@@ -203,6 +211,13 @@ namespace {
         // where Python's round would say 2) -- the radius the presets use
         {"classic_rolling_ball_25", "classic", {{"channel", 0}, {"background", "Rolling ball"}, {"tophat", 25}, {"method", "Otsu"}, {"sigma", 0.0}, {"opening", 0}, {"fill_holes", false}, {"post", "Connected components"}, {"min_voxels", 2}}},
         {"classic_skeleton", "classic", {{"channel", 0}, {"method", "Otsu"}, {"sigma", 0.0}, {"opening", 0}, {"fill_holes", false}, {"post", "Connected components"}, {"min_voxels", 2}, {"skeleton", true}}},
+        // Label cleanup on the three frames of a threshold, each numbered on
+        // its own: small objects go frame by frame, and the relabel gives the
+        // ids that are left one numbering over all of them (frame 0 loses its
+        // id 2, so a numbering per frame would move id 3 there). No
+        // remove_border case: every object of a 4-plane volume touches z.
+        {"cleanup_relabel", "cleanup", {{"min_voxels", 3}, {"relabel", true}}, "threshold_percentile"},
+        {"cleanup_keep_ids", "cleanup", {{"min_voxels", 2}, {"relabel", false}}, "threshold_percentile"},
         // No "Anisotropic diffusion" case: every step of it evaluates exp(),
         // and the C++ standard library and NumPy do not agree in the last bit.
         // Five iterations later a voxel can land on the other side of the
@@ -242,6 +257,7 @@ TEST_CASE("parity fixtures for the Python mirror of the operations", "[.parity][
     StepContext ctx;
     ctx.backend = Backend::Cpu;
     json index = json::array();
+    std::map<std::string, std::shared_ptr<LabelVolume>> labelsOf;   // by case name, for the steps that take labels
     for (const Case& c : kCases) {
         INFO("case " << c.name);
         const Operation* op = findOperation(c.kind);
@@ -261,11 +277,17 @@ TEST_CASE("parity fixtures for the Python mirror of the operations", "[.parity][
                         static_cast<std::size_t>(poked->numel()));
             in.array = poked;
         }
+        if (c.labelsFrom) {
+            REQUIRE(labelsOf.count(c.labelsFrom) == 1);
+            in.labels = labelsOf[c.labelsFrom];
+        }
         const StepOutput out = op->run(in, params, ctx);
         REQUIRE(out.array);
+        if (out.labels) labelsOf[c.name] = out.labels;
 
         json entry{{"name", c.name}, {"kind", c.kind}, {"params", params.toJson()}, {"dims", dimsJson(out.meta.dims)}, {"voxel_um", json::array({out.meta.voxelUm[0], out.meta.voxelUm[1], out.meta.voxelUm[2]})}, {"labels", false}};
         if (c.infinite) entry["input"] = std::string(c.name) + ".input.f32";
+        if (c.labelsFrom) entry["labels_in"] = c.labelsFrom;
         writeFloats(dir / (std::string(c.name) + ".f32"), out.array->data(),
                     static_cast<std::size_t>(out.array->numel()));
         if (out.labels && !out.labels->empty()) {

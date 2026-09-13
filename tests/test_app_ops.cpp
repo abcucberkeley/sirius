@@ -799,6 +799,53 @@ TEST_CASE("Crop / pad cuts a box and carries labels", "[app][ops][croppad]") {
     CHECK(out.labels->at(0, 0, 0, 0) == 0);
 }
 
+TEST_CASE("Crop / pad keeps what was said about the objects it carries", "[app][ops][croppad][labels]") {
+    const Dims5 dims{1, 2, 1, 12, 12};
+    const DatasetMeta meta = metaFor(dims);
+    const Operation& op = requireOperation("croppad");
+    ParamSet p = op.defaults();
+    p.set("y0", std::int64_t{2});
+    p.set("x0", std::int64_t{2});
+    p.set("y", std::int64_t{8});
+    p.set("x", std::int64_t{8});
+    StepInput in = inputOf(rampArray(dims), meta);
+    // a track of two frames, as the tracking step leaves it, with a review
+    // mark, a model confidence and flag rules of its own
+    auto labels = std::make_shared<LabelVolume>(2, 1, 12, 12);
+    for (Index t = 0; t < 2; ++t) {
+        for (Index y = 4; y < 7; ++y)
+            for (Index x = 4 + t; x < 7 + t; ++x) labels->volume(t)[y * 12 + x] = 3;
+        labels->recomputeStats(t);
+        for (LabelStats& s : labels->stats()) {
+            s.cls = "track";
+            s.confidence = t == 0 ? 0.4 : 0.9;
+        }
+    }
+    labels->setTracked(true);
+    LabelFlagRules rules;
+    rules.flagBorder = false;
+    rules.lowConfidence = 0.5;
+    labels->applyFlags(rules);
+    labels->recomputeStats(0);
+    labels->stats().front().reviewed = true;
+    in.labels = labels;
+    Progress prog;
+    const StepOutput out = op.run(in, p, prog.ctx);
+    REQUIRE(out.labels);
+    CHECK(out.labels->tracked());   // a delete on it still takes the whole track
+    CHECK(out.labels->statsT() == 0);
+    const LabelStats* s = out.labels->statsOf(3);
+    REQUIRE(s);
+    CHECK(s->cls == "track");
+    CHECK(s->reviewed);
+    CHECK(s->confidence == 0.4);
+    CHECK(s->bbox == std::array<Index, 6>{0, 1, 2, 5, 2, 5});   // measured on the new grid
+    CHECK(std::find(s->flags.begin(), s->flags.end(), "low conf") != s->flags.end());   // the rules came along
+    CHECK(out.labels->flaggedCount("touching border") == 0);
+    CHECK(out.labels->annotationOf(1, 3).confidence == 0.9);   // and the other frame's own
+    CHECK(out.labels->annotationOf(1, 3).reviewed);
+}
+
 TEST_CASE("Resample changes the voxel size", "[app][ops][resample]") {
     const Dims5 dims{1, 1, 4, 8, 8};
     const DatasetMeta meta = metaFor(dims, 0.1, 0.4);
@@ -994,6 +1041,37 @@ TEST_CASE("Threshold labels blobs and Label cleanup drops the small ones", "[app
         CHECK(r.labels->stats().size() == 4);   // the input labels are untouched
         StepInput none = inputOf(data, meta);
         CHECK_THROWS(cleanup.run(none, cp, prog.ctx));
+    }
+}
+
+TEST_CASE("Threshold and classical labels have an unknown confidence in every frame", "[app][ops][threshold][classic]") {
+    const Dims5 dims{1, 2, 5, 40, 20};
+    const DatasetMeta meta = metaFor(dims);
+    auto data = blobArray(Dims5{1, 1, 5, 40, 20}, 3, 3.0);
+    auto two = std::make_shared<Array5>(Array5::zeros(dims));
+    for (Index t = 0; t < 2; ++t)
+        for (Index z = 0; z < dims.z; ++z)
+            for (Index y = 0; y < dims.y; ++y)
+                for (Index x = 0; x < dims.x; ++x) two->at(0, t, z, y, x) = data->at(0, 0, z, y, x) * (t == 0 ? 0.5f : 1.0f);
+    Progress prog;
+    for (const char* kind : {"threshold", "classic"}) {
+        INFO(kind);
+        const Operation& op = requireOperation(kind);
+        ParamSet p = op.defaults();
+        p.set("method", std::string("Manual"));
+        p.set("value", 100.0);
+        p.set("min_voxels", std::int64_t{0});
+        if (std::string(kind) == "classic") {
+            p.set("sigma", 0.0);
+            p.set("opening", std::int64_t{0});
+            p.set("expand", 2.0);   // grows into voxels the mask called background
+        }
+        const StepOutput r = op.run(inputOf(two, meta), p, prog.ctx);
+        REQUIRE(r.labels);
+        r.labels->recomputeStats(0);   // the viewer on the first frame: the intensities were never probabilities there either
+        REQUIRE_FALSE(r.labels->stats().empty());
+        for (const LabelStats& s : r.labels->stats()) CHECK(s.confidence == 1.0);
+        CHECK(r.labels->flaggedCount("low conf") == 0);
     }
 }
 
@@ -1841,6 +1919,11 @@ TEST_CASE("Label cleanup keeps ids and confidences when asked", "[app][ops][clea
         CHECK(five->confidence == 1.0);
     }
     SECTION("relabel on numbers what is left densely") {
+        for (LabelStats& s : labels->stats())
+            if (s.id == 7) {
+                s.cls = "debris";   // the speck that goes, and whose number object 9 had better not inherit its mark with
+                s.reviewed = true;
+            }
         ParamSet cp = cleanup.defaults();
         cp.set("min_voxels", std::int64_t{2});
         cp.set("relabel", true);
@@ -1849,11 +1932,126 @@ TEST_CASE("Label cleanup keeps ids and confidences when asked", "[app][ops][clea
         CHECK(out.labels->at(0, 0, 2, 2) == 1);
         CHECK(out.labels->at(0, 0, 5, 5) == 2);
         CHECK(out.labels->maxLabel() == 2);
+        // the statistics follow the objects to their new numbers, not the numbers
+        const LabelStats* was9 = out.labels->statsOf(2);
+        REQUIRE(was9);
+        CHECK(was9->confidence == 0.3);
+        CHECK(was9->cls == "object");
+        CHECK_FALSE(was9->reviewed);
+        REQUIRE(out.labels->statsOf(1));
+        CHECK(out.labels->statsOf(1)->confidence == 1.0);
     }
     SECTION("recomputeStats without probabilities keeps a known confidence") {
         labels->recomputeStats(0);
         REQUIRE(labels->statsOf(9));
         CHECK(labels->statsOf(9)->confidence == 0.3);
+    }
+}
+
+TEST_CASE("Label cleanup numbers every frame with one map", "[app][ops][cleanup][track]") {
+    // tracked labels: track 4 in every frame, track 2 only from t = 1, and a
+    // speck of id 3 in t = 0 that the size filter drops
+    const Dims5 dims{1, 3, 1, 16, 16};
+    const DatasetMeta meta = metaFor(dims);
+    auto data = std::make_shared<Array5>(Array5::zeros(dims));
+    auto labels = std::make_shared<LabelVolume>(3, 1, 16, 16);
+    auto square = [&](Index t, Index y0, Index x0, std::uint32_t id) {
+        for (Index y = y0; y < y0 + 3; ++y)
+            for (Index x = x0; x < x0 + 3; ++x) labels->volume(t)[y * 16 + x] = id;
+    };
+    for (Index t = 0; t < 3; ++t) {
+        square(t, 10, 10, 4);
+        if (t >= 1) square(t, 2, 2, 2);
+    }
+    labels->volume(0)[15] = 3;
+    for (Index t = 0; t < 3; ++t) {
+        labels->recomputeStats(t);
+        for (LabelStats& s : labels->stats()) s.cls = "track";
+    }
+    labels->setTracked(true);
+    labels->recomputeStats(1);
+    for (LabelStats& s : labels->stats())
+        if (s.id == 4) s.reviewed = true;
+    const Operation& cleanup = requireOperation("cleanup");
+    ParamSet cp = cleanup.defaults();
+    cp.set("min_voxels", std::int64_t{2});
+    Progress prog;
+    StepInput in = inputOf(data, meta);
+    in.labels = labels;
+    const StepOutput out = cleanup.run(in, cp, prog.ctx);
+    REQUIRE(out.labels);
+    const LabelVolume& c = *out.labels;
+    CHECK(c.tracked());
+    const std::uint32_t big = c.at(0, 0, 11, 11), late = c.at(1, 0, 3, 3);
+    CHECK(big == 2);    // ids 2 and 4 are left: numbered 1 and 2 in every frame
+    CHECK(late == 1);
+    for (Index t = 0; t < 3; ++t) {
+        INFO("frame " << t);
+        CHECK(c.at(t, 0, 11, 11) == big);   // was 1 in t = 0 and 2 afterwards
+        if (t >= 1) CHECK(c.at(t, 0, 3, 3) == late);
+        CHECK(c.annotationOf(t, big).reviewed);   // the mark went with the track
+        CHECK(c.annotationOf(t, big).cls == "track");
+    }
+    CHECK(c.at(0, 0, 0, 15) == 0);
+    CHECK(c.maxLabel() == 2);
+
+    SECTION("deleting a track afterwards takes that track and nothing else") {
+        auto edited = out.labels->clone();
+        for (Index t = 0; t < 3; ++t) edited->remove(t, late);   // what Workbench::deleteLabel does on tracked labels
+        for (Index t = 0; t < 3; ++t) {
+            INFO("frame " << t);
+            CHECK(edited->at(t, 0, 11, 11) == big);
+            CHECK(edited->at(t, 0, 3, 3) == 0);
+        }
+    }
+    SECTION("without relabel the ids stay as they were") {
+        cp.set("relabel", false);
+        const StepOutput kept = cleanup.run(in, cp, prog.ctx);
+        for (Index t = 0; t < 3; ++t) CHECK(kept.labels->at(t, 0, 11, 11) == 4);
+        CHECK(kept.labels->at(2, 0, 3, 3) == 2);
+    }
+}
+
+TEST_CASE("Track objects marks its labels tracked only when it gives them track ids", "[app][ops][track]") {
+    // two objects that swap nothing but their numbering between the frames
+    const Dims5 dims{1, 2, 1, 16, 16};
+    const DatasetMeta meta = metaFor(dims);
+    auto data = std::make_shared<Array5>(Array5::zeros(dims));
+    auto labels = std::make_shared<LabelVolume>(2, 1, 16, 16);
+    auto square = [&](Index t, Index y0, Index x0, std::uint32_t id) {
+        for (Index y = y0; y < y0 + 3; ++y)
+            for (Index x = x0; x < x0 + 3; ++x) labels->volume(t)[y * 16 + x] = id;
+    };
+    square(0, 2, 2, 1);
+    square(0, 10, 10, 2);
+    square(1, 2, 3, 2);    // the first object, numbered 2 in this frame
+    square(1, 10, 11, 1);
+    for (Index t = 0; t < 2; ++t) labels->recomputeStats(t);
+    const Operation& op = requireOperation("track");
+    Progress prog;
+    StepInput in = inputOf(data, meta);
+    in.labels = labels;
+
+    ParamSet p = op.defaults();
+    const StepOutput relabelled = op.run(in, p, prog.ctx);
+    REQUIRE(relabelled.labels);
+    CHECK(relabelled.labels->tracked());
+    CHECK(relabelled.labels->at(1, 0, 3, 4) == relabelled.labels->at(0, 0, 3, 3));
+
+    p.set("relabel", false);
+    const StepOutput asSegmented = op.run(in, p, prog.ctx);
+    REQUIRE(asSegmented.labels);
+    // id 1 is a different object in each frame: a delete of "track 1" must not
+    // take both, which is what the tracked flag would make it do
+    CHECK_FALSE(asSegmented.labels->tracked());
+    CHECK(asSegmented.labels->at(1, 0, 3, 4) == 2);
+
+    SECTION("only btrack needs the Python worker") {
+        CHECK_FALSE(op.needsWorker(op.defaults()));
+        ParamSet bayes = op.defaults();
+        bayes.set("tracker", std::string("btrack (Bayesian)"));
+        CHECK(op.needsWorker(bayes));
+        CHECK(op.info().remoteCapable);   // the worker still implements it, for the HPC hints
     }
 }
 

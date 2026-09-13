@@ -1897,6 +1897,56 @@ TEST_CASE("Label edits on a step survive its re-run over the same input labels",
         CHECK(wb.output(2)->labels != edited);
         CHECK(wb.output(2)->labels->at(0, 1, 2, 2) == 0);
     }
+    SECTION("so does an edit in place on the upstream labels") {
+        // the same volume object upstream, but the object at the centre is
+        // deleted there: step 2 is stale, and its re-run has to show that
+        const Index cz = 2, cy = 8, cx = 8;
+        REQUIRE(wb.output(1)->labels->at(0, cz, cy, cx) == 1);
+        wb.view(1);
+        wb.deleteLabel(1);
+        CHECK_FALSE(wb.outputFresh(2));
+        REQUIRE(runSync(wb, 2)->succeeded());
+        REQUIRE(wb.output(2)->labels);
+        CHECK(wb.output(2)->labels->at(0, cz, cy, cx) == 0);   // was still 1: the pointer alone matched
+    }
+}
+
+TEST_CASE("Label edits survive the re-run of a step that passes its labels through", "[app][workbench][labels][executor]") {
+    // Contrast, flat-field, bleach, merge, register (channels), volrec on the
+    // native grid, einsum over c and plugins used to hand out a clone of
+    // their input labels, which the executor took for labels of their own:
+    // a correction painted on the Contrast view was gone after a gamma change.
+    registerTestOps();
+    Scratch scratch;
+    Workbench wb(scratch.dir);
+    wb.setDataset(syntheticSource(1, 1, 4, 16, 16));
+    wb.setBackend(Backend::Cpu);
+    while (wb.pipeline().size() > 1) wb.removeStep(1);
+    wb.addStep("test_labels");   // 1
+    wb.addStep("contrast");      // 2
+    wb.addStep("bleach");        // 3
+    wb.setStepCache(2, CachePolicy::Memory);   // on screen after the run below it
+    wb.setStepCache(3, CachePolicy::Memory);
+    REQUIRE(runSync(wb)->succeeded());
+
+    wb.view(2);
+    paintOne(wb, 1, 2, 2, 9);
+    REQUIRE(wb.output(2)->labels->at(0, 1, 2, 2) == 9);
+    wb.setStepParam(2, "gamma", 0.8);
+    REQUIRE(runSync(wb)->succeeded());
+    REQUIRE(wb.output(2)->labels);
+    CHECK(wb.output(2)->labels->at(0, 1, 2, 2) == 9);   // was 0: a fresh clone of step 1's
+    REQUIRE(wb.output(3)->labels);
+    CHECK(wb.output(3)->labels->at(0, 1, 2, 2) == 9);   // and carried on below
+
+    wb.view(3);
+    paintOne(wb, 1, 12, 12, 7);
+    wb.setStepParam(3, "mode", std::string("Match mean"));
+    REQUIRE(runSync(wb)->succeeded());
+    REQUIRE(wb.output(3)->labels);
+    CHECK(wb.output(3)->labels->at(0, 1, 12, 12) == 7);
+    CHECK(wb.output(3)->labels->at(0, 1, 2, 2) == 9);
+    CHECK(wb.output(1)->labels->at(0, 1, 2, 2) == 0);   // the segmentation's own stayed clean
 }
 
 TEST_CASE("Files named in a list parameter are part of the fingerprint", "[app][executor]") {
@@ -1988,6 +2038,70 @@ TEST_CASE("Label statistics follow the viewed time point", "[app][workbench][lab
     s.t = 0;
     wb.setViewState(s);
     CHECK(labels->statsT() == 0);
+}
+
+TEST_CASE("Undoing a label edit made on another frame leaves the table on the viewed one", "[app][workbench][labels]") {
+    registerTestOps();
+    Scratch scratch;
+    Workbench wb(scratch.dir);
+    wb.setDataset(syntheticSource(1, 2, 4, 16, 16));
+    wb.setBackend(Backend::Cpu);
+    while (wb.pipeline().size() > 1) wb.removeStep(1);
+    wb.addStep("test_labels");   // a ball of id 1 in frame 0, frame 1 empty
+    REQUIRE(runSync(wb)->succeeded());
+    wb.view(1);
+    std::shared_ptr<LabelVolume> labels = wb.viewedLabels();
+    REQUIRE(labels);
+    wb.setT(0);
+    REQUIRE(labels->statsOf(1));
+    wb.setLabelReviewed(1, true);
+    wb.deleteLabel(1);
+    CHECK(labels->statsOf(1) == nullptr);
+    wb.setT(1);
+    REQUIRE(labels->statsT() == 1);
+    wb.undo();   // the delete of frame 0, with frame 1 on screen
+    CHECK(labels->statsT() == 1);   // was 0: the review table showed frame 0 under frame 1's image
+    CHECK(labels->stats().empty());
+    CHECK(countLabel(*labels, 0, 1) > 0);
+    wb.setT(0);
+    REQUIRE(labels->statsOf(1));   // measured again when its frame is shown
+    CHECK(labels->statsOf(1)->voxels == countLabel(*labels, 0, 1));
+    CHECK(labels->statsOf(1)->reviewed);   // and the review mark came back with it
+    wb.setT(1);
+    wb.redo();
+    CHECK(labels->statsT() == 1);
+    CHECK(countLabel(*labels, 0, 1) == 0);
+}
+
+TEST_CASE("Duplicating a step above the viewed one keeps the view on it", "[app][workbench]") {
+    registerTestOps();
+    Scratch scratch;
+    Workbench wb(scratch.dir);
+    wb.setDataset(syntheticSource(1, 1, 4, 16, 16));
+    wb.setBackend(Backend::Cpu);
+    while (wb.pipeline().size() > 1) wb.removeStep(1);
+    wb.addStep("test_scale");    // 1
+    wb.addStep("test_labels");   // 2
+    REQUIRE(runSync(wb)->succeeded());
+    wb.view(2);
+    wb.select(1);
+    Counter counter;
+    wb.addObserver(&counter);
+    wb.duplicateStep(1);
+    wb.removeObserver(&counter);
+    REQUIRE(wb.pipeline().size() == 4);
+    CHECK(wb.pipeline().at(2).kind == "test_scale");   // the copy, right below its original
+    CHECK(wb.viewedIndex() == 3);                      // was 2: the view silently moved onto the copy
+    CHECK(wb.pipeline().at(wb.viewedIndex()).kind == "test_labels");
+    CHECK(counter.viewed == 1);
+    wb.undo();
+    CHECK(wb.viewedIndex() == 2);
+    CHECK(wb.pipeline().at(wb.viewedIndex()).kind == "test_labels");
+
+    SECTION("duplicating the viewed step or one below it leaves the index alone") {
+        wb.duplicateStep(2);
+        CHECK(wb.viewedIndex() == 2);
+    }
 }
 
 TEST_CASE("Load parameters left at zero keep the file's own axes and voxel sizes", "[app][workbench][load]") {
@@ -2321,6 +2435,29 @@ TEST_CASE("On tracked labels a delete and a merge apply to every time point", "[
         labels = wb.viewedLabels();
         REQUIRE(labels);
         CHECK_FALSE(labels->tracked());
+    }
+}
+
+TEST_CASE("The built-in tracker runs without a Python worker", "[app][workbench][track]") {
+    registerTestOps();
+    Scratch scratch;
+    Workbench wb(scratch.dir);   // no worker launcher, as when no Python is configured
+    wb.setDataset(syntheticSource(1, 3, 4, 16, 16));
+    wb.setBackend(Backend::Cpu);
+    while (wb.pipeline().size() > 1) wb.removeStep(1);
+    wb.addStep("test_labels");
+    wb.addStep("track");   // "Built-in (assignment)" by default
+    auto job = wb.createRun(-1);
+    REQUIRE(job);   // was refused: "Worker unavailable: no Python worker launcher configured"
+    job->execute();
+    wb.finishRun(job);
+    CHECK(job->succeeded());
+    CHECK(wb.output(2));
+
+    SECTION("btrack still asks for one") {
+        wb.setStepParam(2, "tracker", std::string("btrack (Bayesian)"));
+        CHECK_FALSE(wb.createRun(-1));
+        CHECK(logContains(wb, "Worker unavailable"));
     }
 }
 

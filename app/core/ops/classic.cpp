@@ -763,6 +763,7 @@ namespace sirius::app {
                 post.seedMinDistance = p.getDouble("seed_distance", 8.0);
                 post.seeds = p.getString("seeds", "H-maxima");
                 post.seedDepth = p.getDouble("seed_depth", 2.0);
+                post.poll = [&ctx] { ctx.throwIfCancelled(); };
                 const bool blobSeeds = post.seeds == "Blob centres (LoG)" && post.post.rfind("Watershed", 0) == 0;
                 // the LoG answers strongest at sigma ~ r / sqrt(3) for a ball of radius r
                 const double blobSigma = std::max(0.3, p.getDouble("blob_radius", 4.0) / std::sqrt(3.0));
@@ -965,10 +966,12 @@ namespace sirius::app {
                         for (LabelStats& st : labels->stats()) st.cls = post.className;
                         labels->applyFlags(post.flags);
                     }
+                    // intensities, not probabilities: in this frame's table,
+                    // as each frame keeps its own
+                    for (LabelStats& s : labels->stats()) s.confidence = 1.0;
+                    labels->applyFlags(post.flags);
                     total += made;
                 }
-                for (LabelStats& s : labels->stats()) s.confidence = 1.0;   // intensities, not probabilities
-                labels->applyFlags(post.flags);
                 out.labels = labels;
                 out.ranOn = Backend::Cpu;
                 out.note = cutText + " · " + std::to_string(total) + " labels · CPU";

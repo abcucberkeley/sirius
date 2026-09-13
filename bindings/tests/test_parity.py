@@ -100,6 +100,9 @@ TOLERANCES = {
     # carry the result and are compared exactly below, which is what makes
     # this the strict test of the filters, the thresholds and the seeding.
     "classic": (0.0, 0.0),
+    # Label cleanup passes the intensities through; its labels, made from the
+    # C++ labels of the case it names in "labels_in", are compared exactly.
+    "cleanup": (0.0, 0.0),
     # Both sides accumulate in float64 but in different orders -- the C++
     # folds (c, t, z) outermost and sums a plane sequentially, numpy sums
     # pairwise over the reduced axes -- so the float32 result may round
@@ -182,10 +185,16 @@ class TestParity(unittest.TestCase):
         meta = dict(self.meta)
         # a case may run on its own copy of the input (the +-inf voxel cases)
         data = _read_f32(FIXTURES / case["input"], self.input.shape) if case.get("input") else self.input
+        labels = None
+        if case.get("labels_in"):
+            # the input labels are the C++ output of the named case, so a
+            # step on labels is compared on its own and not on its upstream
+            source = next(c for c in self.cases if c["name"] == case["labels_in"])
+            labels = _read_u32(FIXTURES / f"{source['name']}.u32", tuple(source["labels_dims"]))
         with warnings.catch_warnings():
             warnings.simplefilter("error", wb.UnknownParameterWarning)
             try:
-                return wb.run_step(kind, dict(case["params"]), data, meta)
+                return wb.run_step(kind, dict(case["params"]), data, meta, labels=labels)
             except wb.NotAvailable as e:   # scipy / scikit-image missing
                 self.skipTest(f"{kind}: {e}")
 

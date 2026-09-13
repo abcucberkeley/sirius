@@ -182,7 +182,7 @@ snapshot of the C++ parameter tables and
 Kinds the Python side does not implement (`decon`, `deskew`, `volrec`,
 `stitch`, `register`) are reported as unsupported; the application runs
 those natively. A step whose parameters ask for something numpy/scipy
-cannot do (a watershed without `scikit-image`, SIM without the `sirius`
+cannot do (label post-processing without `scipy`, SIM without the `sirius`
 extension) raises `NotAvailable` naming the missing package rather than
 silently computing something else.
 

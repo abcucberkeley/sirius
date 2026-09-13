@@ -13,6 +13,7 @@
 
 #include <array>
 #include <cstdint>
+#include <functional>
 #include <limits>
 #include <vector>
 
@@ -27,8 +28,10 @@ namespace sirius::app {
     // Minimum-cost matching of `rows` rows to `cols` columns; `cost` is row
     // major and may hold kNoAssignment. Returns one entry per row: the column
     // it takes, or -1 when it is left unmatched (no feasible column, or more
-    // rows than columns).
-    std::vector<int> solveAssignment(const std::vector<double>& cost, int rows, int cols);
+    // rows than columns). `poll` is called once per row, O(rows x cols) of
+    // work apart; throw from it to stop.
+    std::vector<int> solveAssignment(const std::vector<double>& cost, int rows, int cols,
+                                     const std::function<void()>& poll = {});
 
     // One segmented object in one frame.
     struct TrackObject {
@@ -42,6 +45,10 @@ namespace sirius::app {
         double overlapWeight = 0.5;    // how much shared voxels count against distance
         Index maxGap = 1;              // frames an object may vanish for and still be the same track
         Index minLength = 1;           // tracks shorter than this are dropped
+        // Called between pieces of work -- every frame pair, every row of an
+        // assignment -- so a gap closing over thousands of tracks, O(n^3),
+        // can be cancelled. Throw from it to stop.
+        std::function<void()> poll;
     };
 
     // One object followed through time: (frame, label in that frame).

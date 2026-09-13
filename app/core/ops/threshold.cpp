@@ -109,6 +109,7 @@ namespace sirius::app {
                 post.minVoxels = p.getInt("min_voxels", 20);
                 post.seedMinDistance = p.getDouble("seed_distance", 5.0);
                 post.className = p.getString("class_name", "object");
+                post.poll = [&ctx] { ctx.throwIfCancelled(); };
                 const std::string method = p.getString("method", "Otsu");
                 std::uint32_t total = 0;
                 std::string cuts;
@@ -123,11 +124,12 @@ namespace sirius::app {
                     post.threshold = cut;
                     ctx.throwIfCancelled();
                     total += labelsFromProbabilities(vol.data(), nullptr, d.z, d.y, d.x, post, *labels, t);
+                    // the intensities are not probabilities: confidence is
+                    // unknown, in this frame's table (each frame keeps its own)
+                    for (LabelStats& s : labels->stats()) s.confidence = 1.0;
+                    labels->applyFlags(post.flags);
                     if (t == 0) cuts = formatNumber(cut, 4);
                 }
-                // the intensities are not probabilities: confidence is unknown
-                for (LabelStats& s : labels->stats()) s.confidence = 1.0;
-                labels->applyFlags(post.flags);
                 out.labels = labels;
                 out.ranOn = Backend::Cpu;
                 out.note = "threshold " + cuts + " · " + std::to_string(total) + " labels · CPU";

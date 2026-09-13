@@ -34,7 +34,7 @@ namespace sirius::app {
                 info_.defaultCache = CachePolicy::Memory;
                 info_.needsLabels = true;
                 info_.producesLabels = true;
-                info_.remoteCapable = true;   // the btrack backend runs in the Python worker
+                info_.remoteCapable = true;   // the btrack backend runs in the Python worker (needsWorker)
                 info_.helpPage = "track";
                 info_.params = {
                     choiceParam("tracker", "Tracker", {"Built-in (assignment)", "btrack (Bayesian)"},
@@ -58,9 +58,17 @@ namespace sirius::app {
 
             const OpInfo& info() const noexcept override { return info_; }
 
+            // Only btrack runs in the worker: the built-in tracker must not
+            // fail with "Worker unavailable" where no Python is configured.
+            bool needsWorker(const ParamSet& p) const override { return isBtrack(p); }
+
+            static bool isBtrack(const ParamSet& p) {
+                return p.getString("tracker", "Built-in (assignment)").rfind("btrack", 0) == 0;
+            }
+
             std::string summary(const ParamSet& p, const DatasetMeta& meta) const override {
                 const Index gap = p.getInt("max_gap", 1);
-                const bool bayes = p.getString("tracker", "Built-in (assignment)").rfind("btrack", 0) == 0;
+                const bool bayes = isBtrack(p);
                 if (bayes)
                     return joinSummary({"btrack", "≤ " + formatNumber(p.getDouble("max_distance", 10.0), 1) + " µm",
                                         p.getBool("optimise", true) ? "lineages" : "no lineages",
@@ -94,13 +102,13 @@ namespace sirius::app {
 
                 const LabelVolume& in = *input.labels;
                 const Index frames = in.t();
-                if (p.getString("tracker", "Built-in (assignment)").rfind("btrack", 0) == 0)
-                    return runBtrack(input, p, ctx, std::move(out));
+                if (isBtrack(p)) return runBtrack(input, p, ctx, std::move(out));
                 TrackOptions options;
                 options.maxDistanceUm = p.getDouble("max_distance", 10.0);
                 options.overlapWeight = p.getDouble("overlap_weight", 0.5);
                 options.maxGap = p.getInt("max_gap", 1);
                 options.minLength = p.getInt("min_length", 2);
+                options.poll = [&ctx] { ctx.throwIfCancelled(); };
 
                 std::vector<std::vector<TrackObject>> byFrame(static_cast<std::size_t>(frames));
                 for (Index t = 0; t < frames; ++t) {
@@ -141,10 +149,18 @@ namespace sirius::app {
                     }
                 }
                 ctx.report(0.95, "statistics");
-                for (Index t = 0; t < frames; ++t) labels->recomputeStats(t);
-                for (LabelStats& s : labels->stats()) s.cls = "track";
+                for (Index t = 0; t < frames; ++t) {
+                    labels->recomputeStats(t);
+                    // each frame's table: a track that ends before the last
+                    // frame is a track too
+                    for (LabelStats& s : labels->stats()) s.cls = "track";
+                }
 
-                labels->setTracked(true);   // one id, one object, every frame
+                // One id, one object, every frame -- only when the ids were
+                // rewritten by track. Without the relabel every frame keeps the
+                // segmentation's own numbering, and a delete or a merge that
+                // took the id in every frame would take unrelated objects.
+                labels->setTracked(relabel);
                 out.labels = labels;
                 out.ranOn = Backend::Cpu;
                 out.diagnostics = trackDiagnostics(linked, byFrame, meta, summary(p, meta));
@@ -201,8 +217,8 @@ namespace sirius::app {
                 for (Index t = 0; t < frames; ++t) {
                     std::copy_n(src + t * volume, volume, labels->volume(t));
                     labels->recomputeStats(t);
+                    for (LabelStats& s : labels->stats()) s.cls = "track";
                 }
-                for (LabelStats& s : labels->stats()) s.cls = "track";
                 labels->setTracked(true);   // one id, one object, every frame
                 out.labels = labels;
                 out.ranOn = ctx.backend;

@@ -10,6 +10,7 @@
 #include <stdexcept>
 #include <string>
 #include <unordered_map>
+#include <unordered_set>
 
 #include <sirius/tiff_io.hpp>
 
@@ -59,25 +60,41 @@ namespace sirius::app {
         return names[static_cast<std::size_t>(id) - 1];
     }
 
+    namespace {
+        // The class of object `id` in frame t: what its own frame says (the
+        // statistics table describes one frame, which need not be t), and
+        // "object" for an object nothing was said about.
+        std::string classOf(const LabelVolume& labels, Index t, std::uint32_t id) {
+            std::string cls = labels.annotationOf(t, id).cls;
+            return cls.empty() ? std::string("object") : cls;
+        }
+    } // namespace
+
     ClassTable classTable(const LabelVolume& labels) {
         ClassTable table;
         if (labels.empty()) return table;
+        // Every object of every frame, not the rows of the table on screen:
+        // an object absent from that frame used to be left out, and then
+        // written as background in the semantic mask. Labels nothing was
+        // said about land in "object".
         std::vector<std::string> seen;
-        for (const LabelStats& s : labels.stats())
-            if (!s.cls.empty() && std::find(seen.begin(), seen.end(), s.cls) == seen.end()) seen.push_back(s.cls);
-        std::sort(seen.begin(), seen.end());
-        table.names = std::move(seen);
-        // Labels with no statistics still have to land somewhere.
-        if (table.names.empty()) {
-            for (Index t = 0; t < labels.t() && table.names.empty(); ++t) {
-                const std::uint32_t* v = labels.volume(t);
-                for (Index i = 0, n = labels.volumeSize(); i < n; ++i)
-                    if (v[i] != 0) {
-                        table.names.emplace_back("object");
-                        break;
-                    }
+        std::unordered_set<std::uint32_t> ids;
+        for (Index t = 0; t < labels.t(); ++t) {
+            ids.clear();
+            const std::uint32_t* v = labels.volume(t);
+            std::uint32_t last = 0;
+            for (Index i = 0, n = labels.volumeSize(); i < n; ++i)
+                if (v[i] != 0 && v[i] != last) {
+                    last = v[i];
+                    ids.insert(last);
+                }
+            for (std::uint32_t id : ids) {
+                std::string cls = classOf(labels, t, id);
+                if (std::find(seen.begin(), seen.end(), cls) == seen.end()) seen.push_back(std::move(cls));
             }
         }
+        std::sort(seen.begin(), seen.end());
+        table.names = std::move(seen);
         return table;
     }
 
@@ -127,7 +144,7 @@ namespace sirius::app {
             b.cy = a.sy / n;
             b.cx = a.sx / n;
             b.touchesBorder = a.z0 == 0 || a.z1 == nz || a.y0 == 0 || a.y1 == ny || a.x0 == 0 || a.x1 == nx;
-            if (const LabelStats* s = labels.statsOf(id); s != nullptr && !s->cls.empty()) b.className = s->cls;
+            b.className = classOf(labels, t, id);
             b.classId = classes.idOf(b.className);
             out.push_back(std::move(b));
         }
@@ -144,7 +161,7 @@ namespace sirius::app {
             Index y0 = std::numeric_limits<Index>::max(), y1 = 0, x0 = std::numeric_limits<Index>::max(), x1 = 0;
             std::uint64_t pixels = 0;
         };
-        std::unordered_map<std::uint32_t, std::string> classOf;
+        std::unordered_map<std::uint32_t, int> idOf;   // class id per label, looked up once
         for (Index z = 0; z < nz; ++z) {
             std::map<std::uint32_t, Acc> acc;
             for (Index y = 0; y < ny; ++y) {
@@ -162,12 +179,9 @@ namespace sirius::app {
             }
             for (const auto& [id, a] : acc) {
                 if (a.pixels < std::max<std::uint64_t>(minPixels, 1)) continue;
-                auto it = classOf.find(id);
-                if (it == classOf.end()) {
-                    const LabelStats* s = labels.statsOf(id);
-                    it = classOf.emplace(id, s != nullptr && !s->cls.empty() ? s->cls : std::string("object")).first;
-                }
-                out.push_back(SliceBox{z, id, classes.idOf(it->second), a.y0, a.y1, a.x0, a.x1, a.pixels});
+                auto it = idOf.find(id);
+                if (it == idOf.end()) it = idOf.emplace(id, classes.idOf(classOf(labels, t, id))).first;
+                out.push_back(SliceBox{z, id, it->second, a.y0, a.y1, a.x0, a.x1, a.pixels});
             }
         }
         return out;
@@ -187,9 +201,7 @@ namespace sirius::app {
             if (id == 0) continue;
             auto it = idOf.find(id);
             if (it == idOf.end()) {
-                const LabelStats* s = labels.statsOf(id);
-                const std::string name = s != nullptr && !s->cls.empty() ? s->cls : std::string("object");
-                const int c = classes.idOf(name);
+                const int c = classes.idOf(classOf(labels, t, id));
                 it = idOf.emplace(id, static_cast<std::uint8_t>(std::clamp(c, 0, 255))).first;
             }
             dst[i] = it->second;
@@ -222,11 +234,29 @@ namespace sirius::app {
         return {};
     }
 
+    std::string validateTrainingExport(const TrainingExportOptions& o, const LabelVolume& labels, const Dims5& imageDims) {
+        if (std::string problem = validateTrainingExport(o, labels); !problem.empty()) return problem;
+        if (!(o.image || o.slices)) return {};
+        if (imageDims.t != labels.t() || imageDims.z != labels.z() || imageDims.y != labels.y() || imageDims.x != labels.x()) {
+            auto shape = [](Index t, Index z, Index y, Index x) {
+                return "t" + std::to_string(t) + " z" + std::to_string(z) + " y" + std::to_string(y) + " x" + std::to_string(x);
+            };
+            return "the image (" + shape(imageDims.t, imageDims.z, imageDims.y, imageDims.x) + ") and the labels (" +
+                   shape(labels.t(), labels.z(), labels.y(), labels.x()) +
+                   ") are not on the same grid; export the image from the step the labels belong to";
+        }
+        return {};
+    }
+
     TrainingExportResult exportTrainingData(const Array5& array, const DatasetMeta& meta, const LabelVolume& labels,
                                             const TrainingExportOptions& options,
                                             const std::function<void(double, const std::string&)>& progress,
                                             const std::function<bool()>& cancelled) {
-        if (const std::string problem = validateTrainingExport(options, labels); !problem.empty()) throw std::runtime_error(problem);
+        // An empty array writes no image (a caller that wants none passes
+        // none); one that is there has to fit the labels.
+        const std::string problem =
+            array.empty() ? validateTrainingExport(options, labels) : validateTrainingExport(options, labels, array.dims());
+        if (!problem.empty()) throw std::runtime_error(problem);
         auto report = [&](double f, const std::string& what) {
             if (progress) progress(std::clamp(f, 0.0, 1.0), what);
         };
@@ -253,20 +283,24 @@ namespace sirius::app {
             if (!ec) result.bytes += size;
         };
 
-        const ClassTable classes = classTable(labels);
-        result.classes = classes.size();
+        const ClassTable own = classTable(labels);
+        result.classes = own.size();
         const std::string sampleName = dir.filename().string();
 
         // The class table belongs to the dataset, not to one sample: written
-        // (and grown) at the root so every sample agrees on the ids.
+        // (and grown) at the root so every sample agrees on the ids -- and
+        // the ids this sample writes (semantic mask, boxes, YOLO) are
+        // positions in it. A sample's own sorted table numbered "cell" 1 in
+        // a dataset whose classes.txt already said "nucleus, cell".
+        ClassTable classes;
         {
-            std::vector<std::string> known;
+            std::vector<std::string>& known = classes.names;
             if (std::ifstream in(root / "classes.txt"); in) {
                 for (std::string line; std::getline(in, line);)
                     if (!line.empty()) known.push_back(line);
             }
             bool grew = false;
-            for (const std::string& name : classes.names)
+            for (const std::string& name : own.names)
                 if (std::find(known.begin(), known.end(), name) == known.end()) {
                     known.push_back(name);
                     grew = true;
@@ -394,7 +428,7 @@ namespace sirius::app {
             const Index ny = labels.y(), nx = labels.x();
             const int zWidth = static_cast<int>(std::to_string(std::max<Index>(labels.z() - 1, 0)).size());
             const int tWidth = static_cast<int>(std::to_string(std::max<Index>(labels.t() - 1, 0)).size());
-            const bool haveImage = !array.empty() && array.dims().z == labels.z() && array.dims().y == ny && array.dims().x == nx;
+            const bool haveImage = !array.empty();   // on the labels' grid: validated above
             for (Index t = 0; t < labels.t(); ++t)
                 for (Index z = 0; z < labels.z(); ++z) {
                     checkCancel();
@@ -405,8 +439,7 @@ namespace sirius::app {
                     txt.close();
                     if (!haveImage) continue;
                     // 8 bit, scaled per plane: what a 2D detector reads
-                    const Index at = std::min(t, array.dims().t - 1);
-                    const float* src = array.plane(0, at, z);
+                    const float* src = array.plane(0, t, z);
                     float lo = std::numeric_limits<float>::max(), hi = std::numeric_limits<float>::lowest();
                     for (Index i = 0, n = ny * nx; i < n; ++i) {
                         lo = std::min(lo, src[i]);

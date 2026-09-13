@@ -106,8 +106,9 @@ namespace sirius::app {
                 // Labels are one volume per time point, so a time alignment
                 // moves them with the images; a channel alignment leaves them
                 // where they are (they belong to whichever channel was
-                // segmented, usually the fixed one).
-                std::shared_ptr<LabelVolume> labels = input.labels ? input.labels->clone() : nullptr;
+                // segmented, usually the fixed one) -- to the executor, which
+                // carries them through with the corrections painted on this step.
+                std::shared_ptr<LabelVolume> labels = input.labels && alignTime ? input.labels->clone() : nullptr;
                 auto shiftLabels = [&](Index t, const std::array<Index, 3>& shift) {
                     if (!labels || t >= labels->t()) return;
                     const Index lz = labels->z(), ly = labels->y(), lx = labels->x();

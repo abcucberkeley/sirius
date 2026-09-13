@@ -179,7 +179,8 @@ namespace sirius::app {
                 std::snprintf(nb, sizeof nb, "%g – %g", mn, mx);
                 std::string note = nb;
                 out.array = result;
-                out.labels = input.labels ? input.labels->clone() : nullptr;
+                // out.labels stays null: the executor carries the input's
+                // labels through, and the corrections painted on this step with them
                 out.ranOn = Backend::Cpu;
                 out.note = note + " · CPU";
                 out.diagnostics = contrastDiagnostics(StepInput{meta, in, nullptr, nullptr}, params, 0,

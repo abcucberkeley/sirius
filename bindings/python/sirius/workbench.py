@@ -1167,15 +1167,39 @@ def _distance_seeds(mask: np.ndarray, min_distance: float) -> Tuple[np.ndarray, 
 
 
 def _watershed(landscape: np.ndarray, mask: np.ndarray, seeds: np.ndarray) -> np.ndarray:
-    """Marker-based flooding of `landscape` (higher = ridge) from `seeds`
-    inside `mask`, 6-connected -- scikit-image's watershed, which is the same
-    priority flood as the application's."""
-    try:
-        from skimage.segmentation import watershed  # type: ignore
-    except ImportError as e:
-        raise NotAvailable("watershed post-processing needs 'scikit-image' (pip install scikit-image); "
-                           "choose post = Connected components to run without it") from e
-    return watershed(landscape, markers=seeds, mask=mask, connectivity=1).astype(np.uint32)
+    """``watershed`` (labels.cpp): Meyer's priority flood of `landscape`
+    (higher = ridge) from `seeds` inside `mask`, 6-connected, in the
+    application's order. The queue is keyed by (height, insertion sequence),
+    the seeds entering in raster order and a voxel's neighbours in the order
+    -z, +z, -y, +y, -x, +x, so a plateau is shared out exactly as the C++
+    shares it. scikit-image's flood is the same algorithm but breaks those
+    ties its own way, which moved boundaries between the two."""
+    import heapq
+    shape = np.shape(mask)
+    nz, ny, nx = (1,) * (3 - len(shape)) + tuple(shape)   # (z, y, x); a plane is one z
+    plane = ny * nx
+    flat_inside = np.asarray(mask, dtype=bool).reshape(-1)
+    start = np.where(flat_inside, np.asarray(seeds, dtype=np.uint32).reshape(-1), 0).astype(np.uint32)
+    # plain lists: indexing one is several times cheaper than indexing numpy
+    lab = start.tolist()
+    inside = flat_inside.tolist()
+    height = np.asarray(landscape, dtype=np.float32).reshape(-1).tolist()
+    queue = [(height[i], k, i) for k, i in enumerate(np.flatnonzero(start).tolist())]
+    heapq.heapify(queue)   # keys are unique, so the pop order is the sequential pushes'
+    seq = len(queue)
+    pop, push = heapq.heappop, heapq.heappush
+    while queue:
+        i = pop(queue)[2]
+        label = lab[i]
+        iz, rest = divmod(i, plane)
+        iy, ix = divmod(rest, nx)
+        for j, ok in ((i - plane, iz > 0), (i + plane, iz + 1 < nz), (i - nx, iy > 0),
+                      (i + nx, iy + 1 < ny), (i - 1, ix > 0), (i + 1, ix + 1 < nx)):
+            if ok and inside[j] and not lab[j]:
+                lab[j] = label
+                push(queue, (height[j], seq, j))
+                seq += 1
+    return np.array(lab, dtype=np.uint32).reshape(shape)
 
 
 def _compact_ids(labels: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
@@ -1232,6 +1256,12 @@ def _labels_from_probabilities(fg: np.ndarray, boundary: Optional[np.ndarray], t
         else:
             landscape = boundary if boundary is not None else -distance
             labels = _watershed(landscape, mask, marks)
+            # a component no seed landed in is still an object: numbered
+            # after the seeds, in raster order, as segment_common.cpp does
+            rest = mask & (labels == 0)
+            if rest.any():
+                extra = _label_components(rest)
+                labels = np.where(extra > 0, extra + np.uint32(n), labels).astype(np.uint32)
     else:
         labels = _label_components(mask)
     return _remove_small(labels, min_voxels)
@@ -2026,7 +2056,10 @@ def _expand_labels(labels: np.ndarray, distance: float, z_aspect: float) -> np.n
     """``expandLabels``: a Dijkstra from every labelled voxel at once over the
     6-neighbourhood (a z step costs z_aspect, the planes being that much
     further apart than the pixels). A voxel the same distance
-    from two labels stays background so the two cannot fuse."""
+    from two labels stays background so the two cannot fuse. Equal distances
+    leave the queue in the order they entered it, labelled voxels first in
+    raster order, exactly as the C++ heap is keyed: a tied voxel passes on
+    the label that reached it first, and the two sides must agree on which."""
     import heapq
     if distance <= 0.0 or labels.size == 0:
         return labels
@@ -2037,14 +2070,16 @@ def _expand_labels(labels: np.ndarray, distance: float, z_aspect: float) -> np.n
     came_from = np.zeros(shape, dtype=np.uint32)
     tied = np.zeros(shape, dtype=bool)
     queue = []
+    seq = 0
     for idx in zip(*np.nonzero(labels)):
         best[idx] = 0.0
         came_from[idx] = labels[idx]
-        heapq.heappush(queue, (0.0, idx))
+        heapq.heappush(queue, (0.0, seq, idx))
+        seq += 1
     offsets = (((-1, 0, 0), step_z), ((1, 0, 0), step_z), ((0, -1, 0), 1.0),
                ((0, 1, 0), 1.0), ((0, 0, -1), 1.0), ((0, 0, 1), 1.0))
     while queue:
-        d, idx = heapq.heappop(queue)
+        d, _, idx = heapq.heappop(queue)
         if d > best[idx] or d >= distance:
             continue
         for (dz, dy, dx), step in offsets:
@@ -2060,7 +2095,8 @@ def _expand_labels(labels: np.ndarray, distance: float, z_aspect: float) -> np.n
                 best[j] = nd
                 came_from[j] = came_from[idx]
                 tied[j] = False
-                heapq.heappush(queue, (nd, j))
+                heapq.heappush(queue, (nd, seq, j))
+                seq += 1
             elif abs(nd - best[j]) <= 1e-9 and came_from[idx] != came_from[j]:
                 tied[j] = True
     grown = labels.copy()
@@ -2562,9 +2598,9 @@ _CLEANUP = StepSpec(
 def step_cleanup(a: np.ndarray, params: Dict[str, Any], meta: Dict[str, Any],
                  labels: Optional[np.ndarray] = None) -> StepResult:
     """Label cleanup (cleanup.cpp) on the labels of the segmentation step
-    upstream: remove_border, min_voxels, relabel (densely); low_conf and
-    size_outlier_factor only set review flags (reported in info["flags"]).
-    The intensities pass through."""
+    upstream: remove_border, min_voxels, relabel (densely, one numbering for
+    every frame); low_conf and size_outlier_factor only set review flags
+    (reported in info["flags"]). The intensities pass through."""
     if labels is None or not labels.size:
         raise ValueError("Label cleanup needs labels: add a segmentation step before it")
     min_voxels = _int(params, "min_voxels", 50)
@@ -2583,10 +2619,16 @@ def step_cleanup(a: np.ndarray, params: Dict[str, Any], meta: Dict[str, Any],
             drop = _border_labels(vol)
             if drop.size:
                 vol[np.isin(vol, drop)] = 0
-        if min_voxels > 0 or relabel:
-            vol = _remove_small(vol, min_voxels, relabel)
+        # small objects are judged frame by frame, but the ids stay
+        if min_voxels > 0:
+            vol = _remove_small(vol, min_voxels, False)
         out[t] = vol
-        for key, ids in _label_flags(vol, low_conf, outlier).items():
+    if relabel:
+        # one numbering for every frame, as LabelVolume::relabelDensely: a
+        # track keeps one id, and a late object never takes an earlier one's
+        out = _remove_small(out, 0, True)
+    for t in range(out.shape[0]):
+        for key, ids in _label_flags(out[t], low_conf, outlier).items():
             have = flags.setdefault(key, [])
             have.extend(i for i in ids if i not in have)
     kept = int(np.count_nonzero(np.unique(out)))

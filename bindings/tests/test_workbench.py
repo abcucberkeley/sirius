@@ -419,7 +419,7 @@ class TestSteps(unittest.TestCase):
         self.assertEqual(int(seeds.max()), 2)
         self.assertTrue(mask[seeds > 0].all())
 
-    @unittest.skipUnless(_HAVE_SCIPY and _HAVE_SKIMAGE, "watershed needs scipy and scikit-image")
+    @unittest.skipUnless(_HAVE_SCIPY, "watershed seeds need scipy")
     def test_watershed_splits_touching_blobs(self):
         # two overlapping disks: the distance transform has one maximum in each
         # and a saddle at the waist, so distanceSeeds accepts exactly two seeds
@@ -434,14 +434,42 @@ class TestSteps(unittest.TestCase):
         r = wb.run_step("threshold", dict(p, post="Connected components"), a)
         self.assertEqual(int(r.labels.max()), 1)
 
+    def test_watershed_floods_in_the_application_order(self):
+        # Equal heights leave the queue in the order they entered it (seeds in
+        # raster order, neighbours -z, +z, -y, +y, -x, +x), as in labels.cpp:
+        # seed 2 enters first and takes the low row before seed 1's turn at
+        # the tied voxels below it. test_app_labels.cpp pins the C++ to the
+        # same answer; scikit-image's flood gave the bottom row to seed 1.
+        land = np.array([[[1, 0, 0], [1, 1, 1]]], np.float32)
+        seeds = np.array([[[2, 0, 0], [1, 0, 0]]], np.uint32)
+        out = wb._watershed(land, np.ones((1, 2, 3), bool), seeds)
+        self.assertEqual(out.tolist(), [[[2, 2, 2], [1, 2, 2]]])
+        # nothing leaves the mask, and a seed outside it is no seed
+        mask = np.array([[[True, True, False], [False, True, True]]])
+        out = wb._watershed(land, mask, seeds)
+        self.assertEqual(out.tolist(), [[[2, 2, 0], [0, 2, 2]]])
+
+    def test_expand_labels_passes_ties_on_in_the_application_order(self):
+        # the case test_app_labels.cpp pins the C++ to (its heap used to give
+        # (1, 0) .. (3, 1) another answer): (1, 1) is tied and stays
+        # background, and what it passes on is the label that reached it first
+        lab = np.array([[[0, 1, 0], [0, 0, 2], [0, 0, 0], [0, 0, 0]]], np.uint32)
+        grown = wb._expand_labels(lab, 4.0, 3.0)
+        self.assertEqual(grown.tolist(), [[[1, 1, 0], [1, 0, 2], [1, 0, 2], [1, 0, 2]]])
+
     @unittest.skipUnless(_HAVE_SCIPY, "label post-processing needs scipy")
-    def test_watershed_without_skimage_is_reported(self):
-        if _HAVE_SKIMAGE:
-            self.skipTest("scikit-image is installed")
-        a = np.zeros((1, 1, 1, 8, 8), np.float32)
-        a[0, 0, 0, 2:6, 2:6] = 1.0
-        with self.assertRaises(wb.NotAvailable):
-            wb.run_step("threshold", {"method": "Manual", "value": 0.5, "post": "Watershed (distance)"}, a)
+    def test_watershed_keeps_a_component_no_seed_reached(self):
+        # two 7 x 7 squares two pixels apart: with seed_distance 10 only the
+        # first gets a seed, and the second used to vanish from the labels
+        a = np.zeros((1, 1, 1, 12, 20), np.float32)
+        a[0, 0, 0, 2:9, 2:9] = 1.0
+        a[0, 0, 0, 2:9, 11:18] = 1.0
+        p = {"method": "Manual", "value": 0.5, "post": "Watershed (distance)", "seed_distance": 10.0,
+             "min_voxels": 0}
+        r = wb.run_step("threshold", p, a)
+        self.assertEqual(int(r.labels.max()), 2)
+        self.assertEqual(int(np.count_nonzero(r.labels)), 98)
+        self.assertEqual(len(np.unique(r.labels[0, 0, 2:9, 11:18])), 1)
 
     @unittest.skipUnless(_HAVE_SCIPY, "classical segmentation needs scipy")
     def test_classic_segmentation_finds_blobs(self):
@@ -492,6 +520,22 @@ class TestSteps(unittest.TestCase):
         # the label_cleanup alias names the same step
         r2 = wb.run_step("label_cleanup", {"min_voxels": 2}, a, labels=labels)
         self.assertEqual(r2.info["labels"], 2)
+
+    @unittest.skipUnless(_HAVE_SCIPY, "label post-processing needs scipy")
+    def test_cleanup_numbers_every_frame_with_one_map(self):
+        # track 4 in every frame, track 2 from t = 1, a speck of 3 in t = 0
+        a = np.zeros((1, 3, 1, 16, 16), np.float32)
+        labels = np.zeros((3, 1, 16, 16), np.uint32)
+        labels[:, 0, 10:13, 10:13] = 4
+        labels[1:, 0, 2:5, 2:5] = 2
+        labels[0, 0, 0, 15] = 3
+        r = wb.run_step("cleanup", {"min_voxels": 2, "relabel": True}, a, labels=labels)
+        # one id per object in every frame, as cleanup.cpp: a numbering per
+        # frame made the track 1 at t = 0 and 2 afterwards
+        self.assertEqual(r.labels[:, 0, 11, 11].tolist(), [2, 2, 2])
+        self.assertEqual(r.labels[1:, 0, 3, 3].tolist(), [1, 1])
+        self.assertEqual(int(r.labels[0, 0, 0, 15]), 0)
+        self.assertEqual(r.info["labels"], 2)
 
     def test_resample_keeps_the_physical_field(self):
         a = np.ones((1, 2, 4, 8, 8), np.float32)
