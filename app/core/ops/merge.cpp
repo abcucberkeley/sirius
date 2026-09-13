@@ -13,20 +13,33 @@ namespace sirius::app {
     namespace {
 
         std::string colorName(const std::array<float, 3>& c) {
-            struct Named { const char* name; std::array<float, 3> rgb; };
+            struct Named {
+                const char* name;
+                std::array<float, 3> rgb;
+            };
             static const Named names[] = {
-                {"green", {0x63 / 255.f, 0xe0 / 255.f, 0x8a / 255.f}},   {"orange", {0xff / 255.f, 0x7a / 255.f, 0x5c / 255.f}},
-                {"magenta", {0xe8 / 255.f, 0x71 / 255.f, 0xd9 / 255.f}}, {"blue", {0x7c / 255.f, 0x9c / 255.f, 0xff / 255.f}},
-                {"red", {1.f, 0.f, 0.f}},   {"green", {0.f, 1.f, 0.f}},   {"blue", {0.f, 0.f, 1.f}},
-                {"cyan", {0.f, 1.f, 1.f}},  {"yellow", {1.f, 1.f, 0.f}},  {"magenta", {1.f, 0.f, 1.f}},
-                {"white", {1.f, 1.f, 1.f}}, {"gray", {0.5f, 0.5f, 0.5f}},
+                {"green", {0x63 / 255.f, 0xe0 / 255.f, 0x8a / 255.f}},
+                {"orange", {0xff / 255.f, 0x7a / 255.f, 0x5c / 255.f}},
+                {"magenta", {0xe8 / 255.f, 0x71 / 255.f, 0xd9 / 255.f}},
+                {"blue", {0x7c / 255.f, 0x9c / 255.f, 0xff / 255.f}},
+                {"red", {1.f, 0.f, 0.f}},
+                {"green", {0.f, 1.f, 0.f}},
+                {"blue", {0.f, 0.f, 1.f}},
+                {"cyan", {0.f, 1.f, 1.f}},
+                {"yellow", {1.f, 1.f, 0.f}},
+                {"magenta", {1.f, 0.f, 1.f}},
+                {"white", {1.f, 1.f, 1.f}},
+                {"gray", {0.5f, 0.5f, 0.5f}},
             };
             const Named* best = nullptr;
             float bestD = 1e9f;
             for (const Named& n : names) {
                 float d = 0.f;
                 for (int k = 0; k < 3; ++k) d += (n.rgb[static_cast<std::size_t>(k)] - c[static_cast<std::size_t>(k)]) * (n.rgb[static_cast<std::size_t>(k)] - c[static_cast<std::size_t>(k)]);
-                if (d < bestD) { bestD = d; best = &n; }
+                if (d < bestD) {
+                    bestD = d;
+                    best = &n;
+                }
             }
             return best ? best->name : "custom";
         }
@@ -51,9 +64,7 @@ namespace sirius::app {
                         .withHelp("Additive is physically faithful; screen avoids clipping; max keeps the brightest channel"),
                     colors,
                     doubleListParam("weights", "Weights", {}).withHelp("Per-channel gain; empty = 1"),
-                    doubleParam("normalize_percentile", "Normalize at percentile", 99.9).range(50.0, 100.0, 0.1, 2).withUnit("%")
-                        .withHelp("Each channel is scaled so this percentile maps to 1 (data already in 0..1 is left alone)")
-                        .asAdvanced(),
+                    doubleParam("normalize_percentile", "Normalize at percentile", 99.9).range(50.0, 100.0, 0.1, 2).withUnit("%").withHelp("Each channel is scaled so this percentile maps to 1 (data already in 0..1 is left alone)").asAdvanced(),
                 };
             }
 
@@ -65,7 +76,9 @@ namespace sirius::app {
                 for (Index c = 0; c < in.dims.c; ++c) {
                     std::array<float, 3> col{1.f, 1.f, 1.f};
                     if (static_cast<std::size_t>(c) < hex.size()) {
-                        try { col = colorFromHex(hex[static_cast<std::size_t>(c)]); } catch (const std::exception&) {}
+                        try {
+                            col = colorFromHex(hex[static_cast<std::size_t>(c)]);
+                        } catch (const std::exception&) {}
                     } else if (static_cast<std::size_t>(c) < in.channels.size()) {
                         col = in.channels[static_cast<std::size_t>(c)].color;
                     }

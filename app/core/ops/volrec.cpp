@@ -33,10 +33,8 @@ namespace sirius::app {
                     choiceParam("method", "Method", {"Ray casting", "Maximum intensity", "Isosurface"}, "Ray casting"),
                     choiceParam("resample", "Resample to", {kIsoSmallest, kIsoTarget, kKeep}, kIsoSmallest),
                     doubleParam("target_voxel_um", "Target voxel", 0.104).range(0.001, 100.0, 0.001, 3).withUnit("µm"),
-                    doubleParam("step_size", "Step size", 0.5).range(0.1, 4.0, 0.05, 2).withUnit("voxel")
-                        .withHelp("Ray sampling distance; smaller is smoother and slower"),
-                    doubleParam("opacity_lo", "Opacity ramp start", 0.2).range(0.0, 1.0, 0.01, 2)
-                        .withHelp("Intensity (0..1 of the range) where the transfer function starts to become opaque"),
+                    doubleParam("step_size", "Step size", 0.5).range(0.1, 4.0, 0.05, 2).withUnit("voxel").withHelp("Ray sampling distance; smaller is smoother and slower"),
+                    doubleParam("opacity_lo", "Opacity ramp start", 0.2).range(0.0, 1.0, 0.01, 2).withHelp("Intensity (0..1 of the range) where the transfer function starts to become opaque"),
                     doubleParam("opacity_hi", "Opacity ramp end", 0.7).range(0.0, 1.0, 0.01, 2),
                     doubleParam("iso_level", "Isosurface level", 0.5).range(0.0, 1.0, 0.01, 2),
                     choiceParam("interpolation", "Interpolation", {"linear", "nearest"}, "linear").asAdvanced(),
