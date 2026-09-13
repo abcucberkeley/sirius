@@ -63,11 +63,18 @@ target_sources(sirius
 target_link_libraries(sirius
     PUBLIC
         Eigen3::Eigen
+        # Public, like Eigen: every translation unit that instantiates Eigen
+        # must agree on the instruction set, because it decides
+        # EIGEN_MAX_ALIGN_BYTES. A consumer built without -mavx2 allocates
+        # 16-byte-aligned matrices that the library's AVX code then reads with
+        # aligned loads (segfault in separationMatrix and the stitching global
+        # fit on the fiona-avx2-* presets), and the linker may pick either
+        # copy of an inline Eigen function.
+        sirius_simd
     PRIVATE
         TIFF::TIFF
         OpenMP::OpenMP_CXX
         ${SIRIUS_FFTW_TARGETS}
-        sirius_simd
         # Header-only and used only inside the .cpp files: they are compiled
         # into the archive and contribute nothing to a consumer's link line.
         # BUILD_INTERFACE keeps them out of the exported usage requirements,
