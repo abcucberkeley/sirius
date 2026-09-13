@@ -381,6 +381,35 @@ def test_the_wheel_zooms(app: Path, tmp: Path) -> None:
     check(float(state["view"]["zoom"]) > 1.0, f"zoom is {state['view']['zoom']} after scrolling in")
 
 
+def test_the_wheel_zooms_about_the_cursor_in_compare(app: Path, tmp: Path) -> None:
+    # Compare zoomed about a point of the XY pane, which is hidden there (a
+    # stale view, another size), so the image slid out from under the cursor.
+    out = run(
+        app,
+        [
+            "--dataset",
+            str(RAW),
+            "--tool",
+            '{"name":"set_view","args":{"mode":"compare"}}',
+            "--wheel",
+            "10,10,3",
+            "--tool",
+            '{"name":"get_state","args":{}}',
+            "--settle",
+            "600",
+            "--quit-after",
+            "6000",
+        ],
+        env=isolated_settings(tmp, "compare-wheel"),
+    )
+    state = only(tool_results(out), "get_state")
+    check(float(state["view"]["zoom"]) > 1.0, f"zoom is {state['view']['zoom']} after scrolling in")
+    m = re.search(r"wheel: .* on compareStepPane .*under the cursor now \(([-\d.]+), ([-\d.]+)\)", out)
+    check(m is not None, "the wheel did not report the compare pane")
+    x, y = float(m.group(1)), float(m.group(2))
+    check(abs(x - 10.0) < 0.05 and abs(y - 10.0) < 0.05, f"voxel (10, 10) under the cursor became ({x}, {y})")
+
+
 def test_a_dropped_file_opens(app: Path, tmp: Path) -> None:
     out = run(app, ["--drop", str(RAW), "--tool", '{"name":"get_state","args":{}}', "--settle", "900", "--quit-after", "6000"])
     state = only(tool_results(out), "get_state")
@@ -618,6 +647,7 @@ SCENARIOS = [
     test_compare_shows_raw_beside_the_result,
     test_painting_reaches_the_labels,
     test_the_wheel_zooms,
+    test_the_wheel_zooms_about_the_cursor_in_compare,
     test_a_dropped_file_opens,
     test_menu_actions_reach_the_view,
     test_a_preset_fills_the_fields,

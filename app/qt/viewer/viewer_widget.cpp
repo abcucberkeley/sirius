@@ -329,10 +329,17 @@ namespace sirius::app {
         // Compare's own plane when View ▸ Sync Z / T is off.
         Index compareZ() const;
         Index compareT() const;
+        // The raw pane has voxels of its own size (layoutPanes scales it by
+        // the voxel-size ratio): the raw plane at compareZ()'s physical
+        // position, and a point of the raw pane in the step's voxels.
+        Index compareRawZ() const;
+        QPointF rawToStep(const QPointF& rawVoxel) const;
         Index cmpZ = 0, cmpT = 0;      // the raw pane's plane while unsynced
         bool cmpPinned = false;        // set when the sync is switched off
         void setZoomPan(double zoom, double panX, double panY);
-        void zoomAround(double factor, const QPointF& xyScreen);
+        // `anchor` is in the coordinates of `pane` (the XY pane when null)
+        // and stays over the same point of the data.
+        void zoomAround(double factor, const QPointF& anchor, const SlicePane* pane = nullptr);
         void fit();
         void setCursorFor(ViewerTool t);
 
@@ -342,7 +349,7 @@ namespace sirius::app {
         void onXYReleased(const QPointF& v, Qt::MouseButton b, Qt::KeyboardModifiers m, bool moved);
         void paintAt(const QPointF& v, bool erase);
         std::uint32_t labelAt(Index z, Index y, Index x) const;
-        void hover(SlicePane::Kind kind, const QPointF& v);
+        void hover(SlicePane::Kind kind, const QPointF& v, bool rawPane = false);
     };
 
     // --- building ----------------------------------------------------------------
@@ -781,20 +788,24 @@ namespace sirius::app {
             });
         }
 
-        // compare panes share the XY transform
+        // compare panes share the XY transform; the raw pane's voxels are
+        // the raw data's, so what it reports goes through rawToStep()
         for (SlicePane* p : {cmpLeft, cmpRight}) {
-            QObject::connect(p, &SlicePane::dragged, q, [this](QPointF v, QPointF d, Qt::MouseButton b, Qt::KeyboardModifiers) {
-                if (b == Qt::MiddleButton || (b == Qt::LeftButton && vs().tool == ViewerTool::Navigate))
-                    setZoomPan(vs().zoom, vs().panX + d.x(), vs().panY + d.y());
-                else if (b == Qt::LeftButton && probe() && model.valid())
-                    wb.setCrosshair(clampIndex(v.x(), nx()), clampIndex(v.y(), ny()), curZ());
-            });
-            QObject::connect(p, &SlicePane::pressed, q, [this](QPointF v, Qt::MouseButton b, Qt::KeyboardModifiers) {
-                if (b == Qt::LeftButton && probe() && model.valid())
-                    wb.setCrosshair(clampIndex(v.x(), nx()), clampIndex(v.y(), ny()), curZ());
-            });
             const bool raw = p == cmpLeft;
-            QObject::connect(p, &SlicePane::wheeled, q, [this, raw](QPointF s, double steps, Qt::KeyboardModifiers m) {
+            QObject::connect(p, &SlicePane::dragged, q, [this, raw](QPointF v, QPointF d, Qt::MouseButton b, Qt::KeyboardModifiers) {
+                if (b == Qt::MiddleButton || (b == Qt::LeftButton && vs().tool == ViewerTool::Navigate)) {
+                    setZoomPan(vs().zoom, vs().panX + d.x(), vs().panY + d.y());
+                } else if (b == Qt::LeftButton && probe() && model.valid()) {
+                    const QPointF sv = raw ? rawToStep(v) : v;
+                    wb.setCrosshair(clampIndex(sv.x(), nx()), clampIndex(sv.y(), ny()), curZ());
+                }
+            });
+            QObject::connect(p, &SlicePane::pressed, q, [this, raw](QPointF v, Qt::MouseButton b, Qt::KeyboardModifiers) {
+                if (b != Qt::LeftButton || !probe() || !model.valid()) return;
+                const QPointF sv = raw ? rawToStep(v) : v;
+                wb.setCrosshair(clampIndex(sv.x(), nx()), clampIndex(sv.y(), ny()), curZ());
+            });
+            QObject::connect(p, &SlicePane::wheeled, q, [this, raw, p](QPointF s, double steps, Qt::KeyboardModifiers m) {
                 // With View ▸ Sync Z / T off, shift + wheel over the raw pane
                 // moves its own plane -- the point of switching the sync off.
                 if (raw && !vs().syncZT && m.testFlag(Qt::ShiftModifier)) {
@@ -804,10 +815,10 @@ namespace sirius::app {
                     scheduleUpdate();
                     return;
                 }
-                zoomAround(std::pow(kWheelZoomBase, steps), s);
+                zoomAround(std::pow(kWheelZoomBase, steps), s, p);
             });
             QObject::connect(p, &SlicePane::doubleClicked, q, [this](QPointF, Qt::KeyboardModifiers) { fit(); });
-            QObject::connect(p, &SlicePane::hovered, q, [this](QPointF v) { hover(SlicePane::Kind::Compare, v); });
+            QObject::connect(p, &SlicePane::hovered, q, [this, raw](QPointF v) { hover(SlicePane::Kind::Compare, v, raw); });
             QObject::connect(p, &SlicePane::resized, q, [this] { layoutPanes(); dirty.cmp = true; scheduleUpdate(); });
         }
 
@@ -1384,13 +1395,14 @@ namespace sirius::app {
         yz->setTitle(QStringLiteral("YZ"));
         xz->setTitle(QStringLiteral("XZ"));
         mip->setTitle(QStringLiteral("MIP · Z"));
-        const QString rawZt = st.syncZT
-                                  ? zt
-                                  : QStringLiteral("z %1 / %2  t %3 / %4  unsynced")
-                                        .arg(compareZ())
-                                        .arg(nz() - 1)
-                                        .arg(compareT())
-                                        .arg(nt() - 1);
+        // the raw pane's own plane and extent (a step may resample z)
+        const Index rawNz = rawModel.valid() ? rawModel.dims().z : nz();
+        const QString rawZt = QStringLiteral("z %1 / %2  t %3 / %4  %5")
+                                  .arg(compareRawZ())
+                                  .arg(rawNz - 1)
+                                  .arg(compareT())
+                                  .arg(nt() - 1)
+                                  .arg(st.syncZT ? QStringLiteral("%1 %").arg(std::lround(st.zoom * 100.0)) : QStringLiteral("unsynced"));
         cmpLeft->setTitle(QStringLiteral("01 Load · raw  ") + rawZt);
         const int viewed = wb.viewedIndex();
         const QString name = viewed >= 0 && viewed < wb.pipeline().size()
@@ -1495,7 +1507,7 @@ namespace sirius::app {
             if (dirty.cmp) {
                 if (rawModel.valid()) {
                     const Index rt = std::clamp<Index>(compareT(), 0, rawModel.dims().t - 1);
-                    const Index rz = std::clamp<Index>(compareZ(), 0, rawModel.dims().z - 1);
+                    const Index rz = compareRawZ();
                     cmpLeftRegion = renderRegion(cmpLeft, cmpLeftFactor, rawModel.dims().x, rawModel.dims().y);
                     rawModel.renderXY(rt, rz, s, cmpLeftFactor, cmpLeftImg, cmpLeftRegion);
                     cmpLeft->setContent(cmpLeftImg, cmpLeftFactor, rawModel.dims().x, rawModel.dims().y, cmpLeftRegion.topLeft());
@@ -1600,18 +1612,25 @@ namespace sirius::app {
         wb.setViewState(s);
     }
 
-    void ViewerWidget::Impl::zoomAround(double factor, const QPointF& anchor) {
+    void ViewerWidget::Impl::zoomAround(double factor, const QPointF& anchor, const SlicePane* pane) {
         if (!model.valid()) return;
         const ViewState& s = vs();
         const double newZoom = std::clamp(s.zoom * factor, kMinZoom, kMaxZoom);
         if (newZoom == s.zoom) return;
-        const SlicePane::View v = xy->view();
+        // Compare lays both of its panes out from the step pane (layoutPanes):
+        // its view and size are what zoom and pan mean there, and the raw
+        // pane shares its origin, so a point of either pane is the same
+        // point of the step pane. Using the XY pane -- hidden in Compare,
+        // with a stale view and another size -- let the image slide away
+        // from under the cursor.
+        const SlicePane* ref = pane == cmpLeft || pane == cmpRight ? cmpRight : xy;
+        const SlicePane::View v = ref->view();
         const double fz = v.zx / s.zoom;   // px per voxel at fit
-        const QPointF voxel = xy->toVoxel(anchor);
+        const QPointF voxel = ref->toVoxel(anchor);
         const double z2 = fz * newZoom;
         const double ox = anchor.x() - voxel.x() * z2, oy = anchor.y() - voxel.y() * z2;
-        const double panX = ox - (xy->width() - nx() * z2) / 2.0;
-        const double panY = oy - (xy->height() - ny() * z2) / 2.0;
+        const double panX = ox - (ref->width() - nx() * z2) / 2.0;
+        const double panY = oy - (ref->height() - ny() * z2) / 2.0;
         setZoomPan(newZoom, panX, panY);
     }
 
@@ -1627,6 +1646,26 @@ namespace sirius::app {
 
     Index ViewerWidget::Impl::compareT() const {
         return vs().syncZT ? curT() : std::clamp<Index>(cmpT, 0, std::max<Index>(nt() - 1, 0));
+    }
+
+    // The raw plane holding the middle of the step's plane compareZ(): a step
+    // that resamples z (10x coarser, say) has other plane numbers than the
+    // raw data, and the raw pane showed raw plane 5 beside step plane 5.
+    Index ViewerWidget::Impl::compareRawZ() const {
+        if (!rawModel.valid()) return compareZ();
+        const Index rawNz = std::max<Index>(rawModel.dims().z, 1);
+        const double dzStep = model.meta().dz(), dzRaw = rawModel.meta().dz();
+        Index z = compareZ();
+        if (dzStep > 0.0 && dzRaw > 0.0 && model.valid())
+            z = static_cast<Index>(std::floor((static_cast<double>(z) + 0.5) * dzStep / dzRaw));
+        return std::clamp<Index>(z, 0, rawNz - 1);
+    }
+
+    QPointF ViewerWidget::Impl::rawToStep(const QPointF& v) const {
+        if (!rawModel.valid() || !model.valid()) return v;
+        const double sx = model.meta().dx(), sy = model.meta().dy(), rx = rawModel.meta().dx(), ry = rawModel.meta().dy();
+        if (sx <= 0.0 || sy <= 0.0 || rx <= 0.0 || ry <= 0.0) return v;
+        return {v.x() * rx / sx, v.y() * ry / sy};
     }
 
     // --- tools ---------------------------------------------------------------------------
@@ -1878,8 +1917,34 @@ namespace sirius::app {
         return text;
     }
 
-    void ViewerWidget::Impl::hover(SlicePane::Kind kind, const QPointF& v) {
+    void ViewerWidget::Impl::hover(SlicePane::Kind kind, const QPointF& v, bool rawPane) {
         if (!model.valid()) return;
+        // The raw side of Compare reads the raw data under the cursor, in
+        // the raw data's own voxels: it used to look the step's output up at
+        // those coordinates, a value from somewhere else entirely.
+        if (rawPane && rawModel.valid()) {
+            const Dims5& d = rawModel.dims();
+            const Index x = static_cast<Index>(std::floor(v.x())), y = static_cast<Index>(std::floor(v.y()));
+            if (x < 0 || y < 0 || x >= d.x || y >= d.y) {
+                cursorText = QStringLiteral("cursor —");
+            } else {
+                Index c = 0;
+                for (Index i = 0; i < d.c; ++i)
+                    if (vs().channelOn(i)) {
+                        c = i;
+                        break;
+                    }
+                const Index z = compareRawZ(), t = std::clamp<Index>(compareT(), 0, std::max<Index>(d.t - 1, 0));
+                const std::optional<float> val = rawModel.valueAt(c, t, z, y, x);
+                cursorText = QStringLiteral("cursor %1, %2, %3 · %4 · raw")
+                                 .arg(x)
+                                 .arg(y)
+                                 .arg(z)
+                                 .arg(val ? QString::number(*val, 'g', 5) : QStringLiteral("—"));
+            }
+            emit q->cursorChanged(cursorText);
+            return;
+        }
         Index x = curX(), y = curY(), z = curZ();
         bool inside = true;
         switch (kind) {
@@ -1949,7 +2014,8 @@ namespace sirius::app {
             if (impl_->volume) impl_->volume->setZoom(impl_->volume->zoom() * kButtonZoomFactor);
             return;
         }
-        impl_->zoomAround(kButtonZoomFactor, QPointF(impl_->xy->width() / 2.0, impl_->xy->height() / 2.0));
+        const SlicePane* pane = impl_->vs().mode == ViewMode::Compare ? impl_->cmpRight : impl_->xy;
+        impl_->zoomAround(kButtonZoomFactor, QPointF(pane->width() / 2.0, pane->height() / 2.0), pane);
     }
 
     void ViewerWidget::zoomOut() {
@@ -1957,7 +2023,8 @@ namespace sirius::app {
             if (impl_->volume) impl_->volume->setZoom(impl_->volume->zoom() / kButtonZoomFactor);
             return;
         }
-        impl_->zoomAround(1.0 / kButtonZoomFactor, QPointF(impl_->xy->width() / 2.0, impl_->xy->height() / 2.0));
+        const SlicePane* pane = impl_->vs().mode == ViewMode::Compare ? impl_->cmpRight : impl_->xy;
+        impl_->zoomAround(1.0 / kButtonZoomFactor, QPointF(pane->width() / 2.0, pane->height() / 2.0), pane);
     }
 
     void ViewerWidget::fitToWindow() {
@@ -2044,7 +2111,8 @@ namespace sirius::app {
     }
 
     void ViewerWidget::syntheticWheel(const QPointF& atVoxel, double steps) {
-        SlicePane* pane = impl_->xy;
+        // the XY pane, or in Compare the step's pane (the XY pane is hidden there)
+        SlicePane* pane = impl_->vs().mode == ViewMode::Compare ? impl_->cmpRight : impl_->xy;
         if (!pane || !impl_->model.valid()) return;
         const QPointF pos = pane->toScreen(atVoxel);
         QElapsedTimer clock;
@@ -2055,7 +2123,9 @@ namespace sirius::app {
         QCoreApplication::processEvents();
         QCoreApplication::sendPostedEvents();
         QCoreApplication::processEvents();
-        qInfo("wheel: %.1f steps at (%.0f, %.0f) in %lld ms", steps, atVoxel.x(), atVoxel.y(), static_cast<long long>(clock.elapsed()));
+        const QPointF under = pane->toVoxel(pos);   // where the anchor ended up: the same voxel when zoom keeps it
+        qInfo("wheel: %.1f steps at (%.0f, %.0f) on %s in %lld ms; under the cursor now (%.2f, %.2f)", steps, atVoxel.x(), atVoxel.y(),
+              qPrintable(pane->objectName()), static_cast<long long>(clock.elapsed()), under.x(), under.y());
     }
 
     QString ViewerWidget::cursorText() const { return impl_->cursorText; }

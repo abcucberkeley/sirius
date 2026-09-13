@@ -72,7 +72,7 @@ int main(int argc, char** argv) {
                                      QStringLiteral("path"));
     const QCommandLineOption strokeOpt(QStringLiteral("stroke"), QStringLiteral("Drag on the XY pane: x0,y0,x1,y1,moves in voxels (repeatable, after the tools)"),
                                        QStringLiteral("spec"));
-    const QCommandLineOption wheelOpt(QStringLiteral("wheel"), QStringLiteral("Wheel on the XY pane: x,y,steps in voxels (repeatable, before the strokes)"),
+    const QCommandLineOption wheelOpt(QStringLiteral("wheel"), QStringLiteral("Wheel on the XY pane (the step pane in Compare): x,y,steps in voxels (repeatable, before the strokes)"),
                                       QStringLiteral("spec"));
     const QCommandLineOption actionOpt(QStringLiteral("action"), QStringLiteral("Trigger a menu action by its text (repeatable)"),
                                        QStringLiteral("text"));
