@@ -176,8 +176,11 @@ snapshot of the C++ parameter tables and
   required here -- the theoretical OTF exists only in the application.
 * `load`: `path`, `read_as`, `tile`, `page_order`, `c`, `t`, `z`,
   `voxel_x`, `voxel_y`, `voxel_z`, `sim_ndirs`, `sim_nphases`, `sim_fast`,
-  `sheet_angle`. `run_pipeline` reads the dataset itself, so a `load` step
-  in a pipeline only overrides the metadata.
+  `sheet_angle`. `run_pipeline` reads the dataset itself, the way the
+  application's Load step does: `page_order` and the counts shape the TIFF
+  pages (a count left at 0 keeps the OME / ImageJ metadata's), length units
+  and resolution tags give the voxel size, and the voxel and SIM parameters
+  then override the metadata.
 
 Kinds the Python side does not implement (`decon`, `deskew`, `volrec`,
 `stitch`, `register`) are reported as unsupported; the application runs

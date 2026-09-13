@@ -862,6 +862,31 @@ TEST_CASE("Resample changes the voxel size", "[app][ops][resample]") {
     const StepOutput r = op.run(inputOf(rampArray(dims), meta), p, prog.ctx);
     REQUIRE(r.array);
     CHECK(r.array->dims() == out.dims);
+
+    SECTION("the last plane and column the extent promises are sampled, not filled") {
+        // 63 * 0.3 / 0.1 is 189 to within rounding, so 190 planes; the last
+        // one's centre, 189 * (0.1 / 0.3), rounds past plane 63. Along x the
+        // step is added once per column, and 63 additions of 0.2 pass 63 too.
+        const Dims5 d{1, 1, 64, 2, 64};
+        const DatasetMeta m = metaFor(d, 0.5, 0.3);
+        const auto ones = std::make_shared<Array5>(d);
+        std::fill(ones->data(), ones->data() + ones->numel(), 1.0f);
+        ParamSet q = op.defaults();
+        q.set("voxel_z", 0.1);
+        q.set("voxel_x", 0.1);
+        for (const char* interp : {"linear", "cubic", "nearest"}) {
+            INFO(interp);
+            q.set("interpolation", std::string(interp));
+            const StepOutput s = op.run(inputOf(ones, m), q, prog.ctx);
+            REQUIRE(s.array);
+            const Dims5& o = s.array->dims();
+            REQUIRE(o.z == 190);
+            REQUIRE(o.x == 316);
+            CHECK(s.array->at(0, 0, o.z - 1, 0, 0) == 1.0f);
+            CHECK(s.array->at(0, 0, 0, 0, o.x - 1) == 1.0f);
+            CHECK(s.array->at(0, 0, o.z - 1, 1, o.x - 1) == 1.0f);
+        }
+    }
 }
 
 TEST_CASE("Volume reconstruction resamples to isotropic voxels", "[app][ops][volrec]") {

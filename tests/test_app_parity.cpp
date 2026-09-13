@@ -7,8 +7,8 @@
 // failure that would corrupt someone's results without saying anything.
 //
 // This case runs a fixed list of (kind, params) through the real Operation on
-// one deterministic synthetic array and writes every result as raw float32
-// with a JSON sidecar. bindings/tests/test_parity.py replays the same list
+// one deterministic synthetic array (and a few on the same array as 16-bit
+// camera counts) and writes every result as raw float32 with a JSON sidecar. bindings/tests/test_parity.py replays the same list
 // through sirius.workbench.run_step on the same input and compares.
 //
 //     SIRIUS_PARITY_OUT=<dir> sirius_tests "[parity]"
@@ -30,6 +30,8 @@
 #include <vector>
 
 #include <nlohmann/json.hpp>
+
+#include <sirius/tiff_io.hpp>
 
 #include "core/operation.hpp"
 #include "core/ops/builtin.hpp"
@@ -71,6 +73,16 @@ namespace {
                             a->at(c, t, z, y, x) = static_cast<float>(v);
                         }
         return a;
+    }
+
+    // The same array as 16-bit camera counts: whole numbers, a few tens of
+    // counts of signal on an offset of 12000. A step that differences large
+    // sums there (the local variance of Local contrast) needs float64 to
+    // agree with itself, which values of 0..3 never show.
+    std::shared_ptr<Array5> cameraCounts(const Array5& a) {
+        auto out = std::make_shared<Array5>(a.dims());
+        for (Index i = 0; i < a.numel(); ++i) out->data()[i] = static_cast<float>(std::round(a.data()[i] * 40.0 + 12000.0));
+        return out;
     }
 
     DatasetMeta syntheticMeta(Dims5 d) {
@@ -124,9 +136,10 @@ namespace {
 
     // One case per behaviour the two implementations are meant to share,
     // in order: a case that takes labels comes after the one that makes them.
-    // Steps left out on purpose: merge (its output is a display RGB blend
-    // whose channel colours come from the metadata, not from the array),
-    // flatfield and load (both read files), and every worker-backed kind.
+    // Steps left out on purpose: flatfield and load (both read files; the
+    // loader has its own fixture below), and every worker-backed kind.
+    // Merge takes its colours from the metadata: the fixture's channels have
+    // none, so both sides give them the palette (normalizeChannels).
     const std::vector<Case> kCases = {
         {"einsum_mean_t", "einsum", {{"keep", "czyx"}, {"reduction", "mean"}}},
         {"einsum_sum_zyx", "einsum", {{"keep", "ct"}, {"reduction", "sum"}}},
@@ -139,6 +152,9 @@ namespace {
         {"contrast_percentiles", "contrast", {{"min", 0.0}, {"max", 0.0}, {"lo_percentile", 5.0}, {"hi_percentile", 95.0}}},
         {"contrast_manual", "contrast", {{"min", 0.25}, {"max", 0.8}, {"gamma", 1.0}}},
         {"contrast_gamma", "contrast", {{"min", 0.1}, {"max", 0.9}, {"gamma", 0.45}}},
+        {"merge_additive", "merge", json::object()},
+        {"merge_screen_weights", "merge", {{"blend", "Screen"}, {"weights", json::array({0.5, 2.0})}, {"normalize_percentile", 90.0}}},
+        {"merge_max_colors", "merge", {{"blend", "Max"}, {"colors", json::array({"#ff8000", "#0080ff"})}}},
         {"croppad_crop", "croppad", {{"z0", 1}, {"y0", 2}, {"x0", 3}, {"z", 2}, {"y", 4}, {"x", 5}}},
         {"croppad_pad", "croppad", {{"z0", -1}, {"y0", -2}, {"x0", -2}, {"z", 6}, {"y", 12}, {"x", 14}, {"fill", 0.25}}},
         {"croppad_to_edge", "croppad", {{"z0", 1}, {"y0", 1}, {"x0", 1}}},
@@ -148,6 +164,9 @@ namespace {
         {"resample_linear", "resample", {{"voxel_x", 0.16}, {"voxel_y", 0.16}, {"voxel_z", 0.2}, {"interpolation", "linear"}}},
         {"resample_up_linear", "resample", {{"voxel_x", 0.06}, {"voxel_y", 0.08}, {"voxel_z", 0.0}, {"interpolation", "linear"}}},
         {"resample_cubic", "resample", {{"voxel_x", 0.16}, {"voxel_y", 0.16}, {"voxel_z", 0.2}, {"interpolation", "cubic"}}},
+        // the last x column and z plane of these grids used to read as fill
+        // on one side or both (a running sum / product a few ulps past the edge)
+        {"resample_edges", "resample", {{"voxel_x", 0.04}, {"voxel_y", 0.04}, {"voxel_z", 0.1}, {"interpolation", "linear"}}},
         {"resample_nearest", "resample", {{"voxel_x", 0.16}, {"voxel_y", 0.16}, {"voxel_z", 0.2}, {"interpolation", "nearest"}}},
         {"threshold_otsu", "threshold", {{"channel", 0}, {"method", "Otsu"}, {"post", "Connected components"}, {"min_voxels", 0}}},
         {"threshold_manual", "threshold", {{"channel", 1}, {"method", "Manual"}, {"value", 0.6}, {"post", "Connected components"}, {"min_voxels", 4}}},
@@ -226,12 +245,69 @@ namespace {
         // tests/test_app_labels.cpp.
     };
 
+    // Cases run on cameraCounts() of the same input ("input16").
+    const std::vector<Case> kCameraCases = {
+        {"classic_local_contrast_16bit", "classic", {{"channel", 0}, {"method", "Local contrast"}, {"window", 11}, {"contrast_k", 1.2}, {"sigma", 0.0}, {"opening", 0}, {"fill_holes", false}, {"post", "Connected components"}, {"min_voxels", 2}}},
+        {"classic_local_contrast_hysteresis_16bit", "classic", {{"channel", 1}, {"method", "Local contrast"}, {"window", 7}, {"contrast_k", 0.8}, {"hysteresis", true}, {"hysteresis_ratio", 0.5}, {"sigma", 0.0}, {"opening", 0}, {"fill_holes", false}, {"post", "Connected components"}, {"min_voxels", 1}}},
+        {"classic_local_mean_16bit", "classic", {{"channel", 0}, {"method", "Local mean"}, {"window", 11}, {"local_ratio", 1.0005}, {"local_offset", 2.0}, {"sigma", 0.0}, {"opening", 0}, {"fill_holes", false}, {"post", "Connected components"}, {"min_voxels", 2}}},
+    };
+
+    // The Load step on TIFFs, for the Python loader: each case is a file the
+    // fixture writes (pages, ImageDescription, pixel size in the resolution
+    // tags, 0 = none) and the Load parameters it is opened with.
+    struct LoadCase {
+        const char* name;
+        const char* description;
+        Index pages;
+        double pixelUm;
+        json params;
+    };
+
+    const char* const kOmeZcyx =
+        "<?xml version=\"1.0\" encoding=\"UTF-8\"?><OME xmlns=\"http://www.openmicroscopy.org/Schemas/OME/2016-06\">"
+        "<Image ID=\"Image:0\"><Pixels ID=\"Pixels:0\" DimensionOrder=\"XYZCT\" Type=\"uint16\" SizeX=\"5\" SizeY=\"6\" "
+        "SizeC=\"2\" SizeT=\"1\" SizeZ=\"3\" PhysicalSizeX=\"65\" PhysicalSizeXUnit=\"nm\" PhysicalSizeY=\"70\" "
+        "PhysicalSizeYUnit=\"nm\" PhysicalSizeZ=\"0.25\" PhysicalSizeZUnit=\"\xc2\xb5m\">"
+        "<Channel ID=\"Channel:0:0\" Name=\"DAPI\" EmissionWavelength=\"461\"/>"
+        "<Channel ID=\"Channel:0:1\" Name=\"G&amp;FP\" EmissionWavelength=\"0.51\" EmissionWavelengthUnit=\"\xc2\xb5m\" "
+        "Color=\"-16711681\"/></Pixels></Image></OME>";
+    const char* const kOmeTime =
+        "<OME xmlns=\"http://www.openmicroscopy.org/Schemas/OME/2016-06\"><Image ID=\"Image:0\">"
+        "<Pixels ID=\"Pixels:0\" DimensionOrder=\"XYCTZ\" Type=\"uint16\" SizeX=\"5\" SizeY=\"6\" SizeC=\"1\" SizeT=\"4\" "
+        "SizeZ=\"1\" PhysicalSizeX=\"0.2\" TimeIncrement=\"500\" TimeIncrementUnit=\"ms\"><Channel ID=\"Channel:0:0\"/>"
+        "</Pixels></Image></OME>";
+    const char* const kImageJHyperstack =
+        "ImageJ=1.54f\nimages=12\nchannels=2\nslices=3\nframes=2\nhyperstack=true\nunit=nm\nspacing=300\nfinterval=2\nloop=false\n";
+
+    const std::vector<LoadCase> kLoadCases = {
+        // ImageJ and OME files with three axes or fewer: the metadata's
+        // channels / frames, not pages as z
+        {"ij_cyx", "ImageJ=1.54f\nimages=2\nchannels=2\nmode=composite\nloop=false\n", 2, 0.0, json::object()},
+        {"ij_tyx", "ImageJ=1.54f\nimages=3\nframes=3\nfinterval=1.5\nloop=false\n", 3, 0.0, json::object()},
+        // units: nm spacing, the resolution tag in cm winning over the ImageJ unit
+        {"ij_hyperstack", kImageJHyperstack, 12, 0.065, json::object()},
+        {"ij_hyperstack_c3", kImageJHyperstack, 12, 0.065, {{"c", 3}}},
+        {"ij_pixel_unit", "ImageJ=1.54f\nimages=4\nslices=4\nunit=pixel\nspacing=2\n", 4, 0.05, json::object()},
+        // OME: physical sizes in nm / µm, z-fastest pages, channel names,
+        // wavelengths in two units, an explicit colour, milliseconds
+        {"ome_zcyx", kOmeZcyx, 6, 0.0, json::object()},
+        {"ome_zcyx_tzc", kOmeZcyx, 6, 0.0, {{"z", 3}, {"page_order", "tzc"}}},
+        {"ome_time", kOmeTime, 4, 0.12, json::object()},
+        // plain pages: counts that do not divide them fall back to z
+        {"plain_z4", "", 12, 0.08, {{"z", 4}}},
+        {"plain_c3", "", 12, 0.0, {{"c", 3}}},
+        {"plain_zct_c2", "", 12, 0.0, {{"c", 2}, {"page_order", "zct"}}},
+        {"plain_voxel", "", 6, 0.08, {{"voxel_z", 0.5}}},
+    };
+
     ParamSet paramsOf(const json& j) {
         ParamSet p;
         for (auto it = j.begin(); it != j.end(); ++it) {
             if (it->is_boolean()) p.set(it.key(), it->get<bool>());
             else if (it->is_number_integer()) p.set(it.key(), it->get<std::int64_t>());
             else if (it->is_number_float()) p.set(it.key(), it->get<double>());
+            else if (it->is_array() && !it->empty() && it->front().is_string()) p.set(it.key(), it->get<std::vector<std::string>>());
+            else if (it->is_array()) p.set(it.key(), it->get<std::vector<double>>());
             else p.set(it.key(), it->get<std::string>());
         }
         return p;
@@ -250,7 +326,10 @@ TEST_CASE("parity fixtures for the Python mirror of the operations", "[.parity][
     const DatasetMeta meta = syntheticMeta(dims);
     const std::shared_ptr<Array5> array = syntheticArray(dims);
 
+    const std::shared_ptr<Array5> camera = cameraCounts(*array);
+
     writeFloats(dir / "input.f32", array->data(), static_cast<std::size_t>(array->numel()));
+    writeFloats(dir / "input16.f32", camera->data(), static_cast<std::size_t>(camera->numel()));
     writeJson(dir / "input.json", json{{"dims", dimsJson(dims)},
                                        {"voxel_um", json::array({meta.voxelUm[0], meta.voxelUm[1], meta.voxelUm[2]})}});
 
@@ -258,7 +337,12 @@ TEST_CASE("parity fixtures for the Python mirror of the operations", "[.parity][
     ctx.backend = Backend::Cpu;
     json index = json::array();
     std::map<std::string, std::shared_ptr<LabelVolume>> labelsOf;   // by case name, for the steps that take labels
-    for (const Case& c : kCases) {
+    std::vector<std::pair<const Case*, const char*>> runs;
+    for (const Case& c : kCases) runs.emplace_back(&c, "input");
+    for (const Case& c : kCameraCases) runs.emplace_back(&c, "input16");
+    for (const auto& [cp, inputName] : runs) {
+        const Case& c = *cp;
+        const std::shared_ptr<Array5>& source = std::string(inputName) == "input" ? array : camera;
         INFO("case " << c.name);
         const Operation* op = findOperation(c.kind);
         REQUIRE(op != nullptr);
@@ -269,9 +353,9 @@ TEST_CASE("parity fixtures for the Python mirror of the operations", "[.parity][
         params.applyDefaults(op->info().params);
         StepInput in;
         in.meta = meta;
-        in.array = array;
+        in.array = source;
         if (c.infinite) {
-            auto poked = std::make_shared<Array5>(array->clone());
+            auto poked = std::make_shared<Array5>(source->clone());
             for (const Poke& k : kPokes) poked->at(k.c, k.t, k.z, k.y, k.x) = k.value;
             writeFloats(dir / (std::string(c.name) + ".input.f32"), poked->data(),
                         static_cast<std::size_t>(poked->numel()));
@@ -285,8 +369,8 @@ TEST_CASE("parity fixtures for the Python mirror of the operations", "[.parity][
         REQUIRE(out.array);
         if (out.labels) labelsOf[c.name] = out.labels;
 
-        json entry{{"name", c.name}, {"kind", c.kind}, {"params", params.toJson()}, {"dims", dimsJson(out.meta.dims)}, {"voxel_um", json::array({out.meta.voxelUm[0], out.meta.voxelUm[1], out.meta.voxelUm[2]})}, {"labels", false}};
-        if (c.infinite) entry["input"] = std::string(c.name) + ".input.f32";
+        json entry{{"name", c.name}, {"kind", c.kind}, {"params", params.toJson()}, {"dims", dimsJson(out.meta.dims)}, {"voxel_um", json::array({out.meta.voxelUm[0], out.meta.voxelUm[1], out.meta.voxelUm[2]})}, {"labels", false}, {"input", inputName}};
+        if (c.infinite) entry["input_file"] = std::string(c.name) + ".input.f32";
         if (c.labelsFrom) entry["labels_in"] = c.labelsFrom;
         writeFloats(dir / (std::string(c.name) + ".f32"), out.array->data(),
                     static_cast<std::size_t>(out.array->numel()));
@@ -309,4 +393,51 @@ TEST_CASE("parity fixtures for the Python mirror of the operations", "[.parity][
         index.push_back(entry);
     }
     writeJson(dir / "cases.json", json{{"version", 1}, {"cases", index}});
+}
+
+TEST_CASE("parity fixtures for the Python TIFF loader", "[.parity][app]") {
+    const char* outDir = std::getenv("SIRIUS_PARITY_OUT");
+    if (!outDir || !*outDir) SKIP("set SIRIUS_PARITY_OUT to a directory to write the parity fixtures");
+    const std::filesystem::path dir(outDir);
+    std::filesystem::create_directories(dir);
+
+    registerBuiltinOperations();
+    const Operation* load = findOperation("load");
+    REQUIRE(load != nullptr);
+    constexpr Index kRows = 6, kCols = 5;
+    json index = json::array();
+    for (const LoadCase& c : kLoadCases) {
+        INFO("case " << c.name);
+        const std::filesystem::path file = dir / (std::string("load_") + c.name + ".tif");
+        Buffer<std::uint16_t> pages(Shape{c.pages, kRows, kCols});
+        for (Index p = 0; p < c.pages; ++p)
+            for (Index y = 0; y < kRows; ++y)
+                for (Index x = 0; x < kCols; ++x) pages.data()[(p * kRows + y) * kCols + x] = static_cast<std::uint16_t>(p * 31 + y * 7 + x);
+        TiffWriteOptions o;
+        o.description = c.description;
+        o.xPixelUm = o.yPixelUm = c.pixelUm;
+        writeTiffStack<std::uint16_t>(file.string(), pages.view(), o);
+
+        ParamSet params = paramsOf(c.params);
+        params.set("path", file.string());
+        params.set("read_as", std::string("Full load to RAM"));
+        params.applyDefaults(load->info().params);
+        StepContext ctx;
+        const StepOutput out = load->run(StepInput{}, params, ctx);
+        REQUIRE(out.array);
+        // only cases where the metadata describes the array that was read
+        REQUIRE(out.meta.dims == out.array->dims());
+        writeFloats(dir / (std::string("load_") + c.name + ".f32"), out.array->data(), static_cast<std::size_t>(out.array->numel()));
+        json channels = json::array();
+        for (const ChannelInfo& ch : out.meta.channels) channels.push_back({{"label", ch.label}, {"wavelength_nm", ch.wavelengthNm}, {"color", ch.hexColor()}});
+        index.push_back({{"name", c.name},
+                         {"file", file.filename().string()},
+                         {"params", c.params},
+                         {"dims", dimsJson(out.meta.dims)},
+                         {"voxel_um", json::array({out.meta.voxelUm[0], out.meta.voxelUm[1], out.meta.voxelUm[2]})},
+                         {"frame_interval_s", out.meta.frameIntervalS},
+                         {"format", out.meta.format},
+                         {"channels", channels}});
+    }
+    writeJson(dir / "loader.json", json{{"version", 1}, {"cases", index}});
 }

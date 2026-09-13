@@ -14,6 +14,8 @@ import os
 import socket
 import sys
 import tempfile
+import threading
+import time
 import unittest
 
 import numpy as np
@@ -480,6 +482,213 @@ class TestHubMethods(ServerTestCase, _CacheCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class _FileServer:
+    """A local HTTP server standing in for the Hub's storage: GET /file sends
+    `size` bytes in `chunk`-byte pieces `delay` seconds apart; GET /redirect
+    answers 302 to `redirect_to`. It records the Authorization header of
+    every request, by path."""
+
+    def __init__(self, size=1 << 20, chunk=1 << 16, delay=0.0, host="127.0.0.1"):
+        import http.server
+
+        self.size, self.chunk, self.delay = size, chunk, delay
+        self.redirect_to = ""
+        self.auth: dict = {}
+        outer = self
+
+        class Handler(http.server.BaseHTTPRequestHandler):
+            def log_message(self, *args):
+                pass
+
+            def do_GET(self):
+                outer.auth[self.path] = self.headers.get("Authorization")
+                if self.path == "/redirect":
+                    self.send_response(302)
+                    self.send_header("Location", outer.redirect_to)
+                    self.send_header("Content-Length", "0")
+                    self.end_headers()
+                    return
+                self.send_response(200)
+                self.send_header("Content-Length", str(outer.size))
+                self.end_headers()
+                sent = 0
+                try:
+                    while sent < outer.size:
+                        n = min(outer.chunk, outer.size - sent)
+                        self.wfile.write(bytes([sent % 251]) * n)
+                        sent += n
+                        if outer.delay:
+                            time.sleep(outer.delay)
+                except OSError:
+                    pass   # the client went away (a cancelled download)
+
+        self.httpd = http.server.ThreadingHTTPServer((host, 0), Handler)
+        self.httpd.daemon_threads = True
+        self.port = self.httpd.server_address[1]
+        self.thread = threading.Thread(target=self.httpd.serve_forever, daemon=True)
+        self.thread.start()
+
+    def url(self, path, host="127.0.0.1"):
+        return f"http://{host}:{self.port}{path}"
+
+    def close(self):
+        self.httpd.shutdown()
+        self.httpd.server_close()
+
+
+def _expected_bytes(size, chunk):
+    return b"".join(bytes([k % 251]) * min(chunk, size - k) for k in range(0, size, chunk))
+
+
+class TestStreamedDownload(_CacheCase):
+    """hub_download streams the file itself, so it reports progress as the
+    bytes arrive and a cancel stops it between chunks. The Hub is replaced by
+    a local server: _hub_file_source is the only part that talks to it."""
+
+    def setUp(self):
+        super().setUp()
+        self._source = models._hub_file_source
+        self._have_hf = models.family_available("hf")[0]
+        if not self._have_hf:
+            self.skipTest("huggingface_hub missing")
+
+    def tearDown(self):
+        models._hub_file_source = self._source
+        super().tearDown()
+
+    def _serve(self, **kw):
+        server = _FileServer(**kw)
+        self.addCleanup(server.close)
+        return server
+
+    def test_the_file_streams_into_the_cache_with_progress(self):
+        server = self._serve(size=3 << 20, chunk=1 << 18, delay=0.02)
+        models._hub_file_source = lambda repo, filename, token: (server.url("/file"), {}, 3 << 20)
+        seen = []
+        path = models.hub_download("owner/repo", "sub/net.onnx", lambda f, m: seen.append((f, m)))
+        self.assertEqual(path, str((models.repo_dir("owner/repo") / "sub" / "net.onnx").resolve()))
+        with open(path, "rb") as f:
+            self.assertEqual(f.read(), _expected_bytes(3 << 20, 1 << 18))
+        fractions = [f for f, _ in seen]
+        self.assertEqual(fractions[0], 0.0)
+        self.assertEqual(fractions[-1], 1.0)
+        self.assertTrue(any(0.0 < f < 1.0 for f in fractions), "no progress while the bytes arrived")
+        self.assertEqual(fractions, sorted(fractions))
+        self.assertEqual(os.listdir(os.path.dirname(path)), ["net.onnx"])   # no partial file left behind
+        self.assertEqual(models.cached_path("owner/repo", "sub/net.onnx"), path)
+
+    def test_a_cancel_stops_the_download_between_chunks(self):
+        server = self._serve(size=64 << 20, chunk=1 << 16, delay=0.01)   # ~10 s in full
+        models._hub_file_source = lambda repo, filename, token: (server.url("/file"), {}, 64 << 20)
+        flag = threading.Event()
+        threading.Timer(0.5, flag.set).start()
+        t0 = time.monotonic()
+        with self.assertRaises(RuntimeError):
+            models.hub_download("owner/repo", "big.pt", lambda f, m: None, cancelled=flag.is_set)
+        self.assertLess(time.monotonic() - t0, 3.0)
+        d = models.repo_dir("owner/repo")
+        self.assertEqual(os.listdir(d) if d.exists() else [], [])   # neither the file nor a partial one
+
+    def test_a_short_download_is_not_kept(self):
+        server = self._serve(size=1000, chunk=100)
+        models._hub_file_source = lambda repo, filename, token: (server.url("/file"), {}, 2000)   # the Hub said 2000
+        with self.assertRaises(models.ModelError):
+            models.hub_download("owner/repo", "m.pt")
+        self.assertIsNone(models.cached_path("owner/repo", "m.pt"))
+
+    def test_a_file_name_cannot_leave_the_repository_directory(self):
+        models._hub_file_source = lambda repo, filename, token: self.fail("nothing may be fetched")
+        with self.assertRaises(models.ModelError):
+            models.hub_download("owner/repo", "../../escape.pt")
+
+    def test_the_token_does_not_follow_a_redirect_to_another_host(self):
+        hub = self._serve(size=10)
+        storage = self._serve(size=4096, chunk=1024, host="127.0.0.1")
+        hub.redirect_to = storage.url("/file", host="localhost")   # another host name, as a CDN would be
+        models._hub_file_source = lambda repo, filename, token: (hub.url("/redirect"), {"authorization": "Bearer s3"},
+                                                                 4096)
+        path = models.hub_download("owner/repo", "m.pt")
+        self.assertEqual(os.path.getsize(path), 4096)
+        self.assertEqual(hub.auth["/redirect"], "Bearer s3")
+        self.assertIsNone(storage.auth["/file"])
+
+    def test_the_hub_head_request_decides_where_the_token_goes(self):
+        import huggingface_hub
+
+        class Meta:
+            location = "https://cdn-lfs.example.org/abc?signature=x"
+            size = 5
+
+        originals = (huggingface_hub.get_hf_file_metadata, huggingface_hub.hf_hub_url)
+        try:
+            huggingface_hub.hf_hub_url = lambda repo_id, filename: f"https://huggingface.co/{repo_id}/resolve/main/{filename}"
+            huggingface_hub.get_hf_file_metadata = lambda url, token=None: Meta()
+            url, headers, size = self._source("owner/repo", "m.pt", "hf_secret")
+            self.assertEqual((url, size), (Meta.location, 5))
+            self.assertNotIn("authorization", {k.lower() for k in headers})
+            Meta.location = "https://huggingface.co/owner/renamed/resolve/main/m.pt"   # same host: keep it
+            _, headers, _ = self._source("owner/repo", "m.pt", "hf_secret")
+            self.assertIn("Bearer hf_secret", headers.values())
+            Meta.location = "https://cas-bridge.example.org/xyz"
+            Meta.xet_file_data = object()   # Xet storage: the resolve URL, whose redirect drops the token
+            url, headers, _ = self._source("owner/repo", "m.pt", "hf_secret")
+            self.assertEqual(url, "https://huggingface.co/owner/repo/resolve/main/m.pt")
+            self.assertIn("Bearer hf_secret", headers.values())
+        finally:
+            huggingface_hub.get_hf_file_metadata, huggingface_hub.hf_hub_url = originals
+
+
+class TestHubDownloadOverTheSocket(ServerTestCase, _CacheCase):
+    def setUp(self):
+        _CacheCase.setUp(self)
+        if not models.family_available("hf")[0]:
+            self.skipTest("huggingface_hub missing")
+        self._source = models._hub_file_source
+
+    def tearDown(self):
+        models._hub_file_source = self._source
+        _CacheCase.tearDown(self)
+
+    def test_cancel_answers_promptly_and_the_worker_is_free_again(self):
+        # before: progress and cancellation both depended on a tqdm hook the
+        # installed huggingface_hub refused, so a cancel waited for the whole
+        # file, the application gave up after 15 s and later requests got
+        # "busy"
+        slow = _FileServer(size=64 << 20, chunk=1 << 16, delay=0.01)
+        fast = _FileServer(size=2048, chunk=512)
+        self.addCleanup(slow.close)
+        self.addCleanup(fast.close)
+        models._hub_file_source = lambda repo, filename, token: (
+            (slow if filename == "big.pt" else fast).url("/file"), {}, (64 << 20) if filename == "big.pt" else 2048)
+        c = _Client(self.port, self.token)
+        try:
+            c.hello()
+            rid = c.request("hub_download", {"repo": "owner/repo", "file": "big.pt"})
+            header, _ = c.read()
+            self.assertEqual(header["type"], "progress")
+            while True:   # wait for bytes to be flowing
+                header, _ = c.read()
+                if header["type"] != "progress" or header["fraction"] > 0.0:
+                    break
+            t0 = time.monotonic()
+            cancel_id = c.request("cancel", {"id": rid})
+            replies = {}
+            while len(replies) < 2:
+                header, _ = c.read()
+                if header["type"] != "progress":
+                    replies[header["id"]] = header
+            self.assertLess(time.monotonic() - t0, 3.0)
+            self.assertEqual(replies[cancel_id]["type"], "result")
+            self.assertEqual(replies[rid]["type"], "error")
+            self.assertEqual(replies[rid]["message"], "cancelled")
+            self.assertIsNone(models.cached_path("owner/repo", "big.pt"))
+            progress, header, _ = c.call("hub_download", {"repo": "owner/repo", "file": "small.pt"})
+            self.assertEqual(header["type"], "result", header)   # not "busy"
+            self.assertEqual(header["result"]["bytes"], 2048)
+        finally:
+            c.close()
 
 
 class TestCachePathJail(unittest.TestCase):

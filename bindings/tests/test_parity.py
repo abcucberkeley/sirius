@@ -133,6 +133,8 @@ TOLERANCES = {
     # would mean giving the mirror the C++ loop order, five times slower in
     # numpy for no numerical gain.
     "resample": (2.0 * ULP, 1e-6),
+    # The RGB blend is float32 on both sides in the same order: exact.
+    "merge": (0.0, 0.0),
 }
 
 
@@ -176,6 +178,10 @@ class TestParity(unittest.TestCase):
         with open(FIXTURES / "input.json", encoding="utf-8") as f:
             spec = json.load(f)
         cls.input = _read_f32(FIXTURES / "input.f32", tuple(spec["dims"]))
+        # the same array as 16-bit camera counts, for the cases that name it
+        cls.inputs = {"input": cls.input}
+        if (FIXTURES / "input16.f32").is_file():
+            cls.inputs["input16"] = _read_f32(FIXTURES / "input16.f32", tuple(spec["dims"]))
         cls.meta = {"voxel_um": list(spec["voxel_um"]), "dims": {}}
         with open(FIXTURES / "cases.json", encoding="utf-8") as f:
             cls.cases = json.load(f)["cases"]
@@ -183,8 +189,10 @@ class TestParity(unittest.TestCase):
     def _run(self, case):
         kind = case["kind"]
         meta = dict(self.meta)
-        # a case may run on its own copy of the input (the +-inf voxel cases)
-        data = _read_f32(FIXTURES / case["input"], self.input.shape) if case.get("input") else self.input
+        # a case may run on its own copy of its input (the +-inf voxel cases)
+        source_array = self.inputs[case.get("input", "input")]
+        data = (_read_f32(FIXTURES / case["input_file"], source_array.shape) if case.get("input_file")
+                else source_array)
         labels = None
         if case.get("labels_in"):
             # the input labels are the C++ output of the named case, so a
@@ -244,6 +252,41 @@ class TestParity(unittest.TestCase):
         kinds = {c["kind"] for c in self.cases}
         self.assertEqual(kinds, set(TOLERANCES),
                          "TOLERANCES and the fixture kinds have drifted apart")
+
+
+@unittest.skipIf(wb is None, f"sirius.workbench did not import: {_LOAD_ERROR}")
+@unittest.skipIf(FIXTURES is None or not (FIXTURES / "loader.json").is_file(),
+                 "no loader fixtures: run SIRIUS_PARITY_OUT=<dir> sirius_tests \"[parity]\" first")
+class TestLoaderParity(unittest.TestCase):
+    """The TIFFs the fixture writer made, opened by the application's Load
+    step and by run_pipeline's loader: the same array, dimensions, voxel size,
+    frame interval and channels, exactly. The dimensions are where the two
+    used to part: ImageJ / OME files with three axes or fewer, counts that do
+    not divide the pages, length units."""
+
+    def test_every_file(self):
+        with open(FIXTURES / "loader.json", encoding="utf-8") as f:
+            cases = json.load(f)["cases"]
+        self.assertTrue(cases)
+        for case in cases:
+            with self.subTest(case=case["name"]):
+                pipeline = [{"kind": "load", "params": dict(case["params"])}]
+                try:
+                    with warnings.catch_warnings():
+                        warnings.simplefilter("error", wb.UnknownParameterWarning)
+                        got, meta = wb.run_pipeline(str(FIXTURES / case["file"]), pipeline)
+                except wb.NotAvailable as e:   # neither tifffile nor the extension
+                    self.skipTest(str(e))
+                name = case["name"]
+                self.assertEqual(list(got.shape), case["dims"], f"load[{name}]: dimensions")
+                expected = _read_f32(FIXTURES / f"load_{name}.f32", tuple(case["dims"]))
+                self.assertTrue(np.array_equal(got, expected), f"load[{name}]: the planes differ")
+                self.assertEqual(meta["voxel_um"], case["voxel_um"], f"load[{name}]: voxel size")
+                self.assertEqual(meta["frame_interval_s"], case["frame_interval_s"], f"load[{name}]: frame interval")
+                self.assertEqual(meta["format"], case["format"])
+                self.assertEqual([[ch["label"], ch["wavelength_nm"], ch["color"]] for ch in meta["channels"]],
+                                 [[ch["label"], ch["wavelength_nm"], ch["color"]] for ch in case["channels"]],
+                                 f"load[{name}]: channels")
 
 
 if __name__ == "__main__":

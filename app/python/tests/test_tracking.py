@@ -72,6 +72,14 @@ class TestBtrack(unittest.TestCase):
             tracking.run_btrack(moving_labels(), (1.0, 1.0, 1.0), {"config": "/no/such/config.json"})
         self.assertIn("config", str(cm.exception).lower())
 
+    def test_a_2d_time_series_is_tracked(self):
+        # (t, 1, y, x): every 2-D series reaches run_btrack like this, and a
+        # (y, x) scale for it made btrack raise before tracking anything
+        labels = moving_labels(z=4)[:, 1:2]
+        out, info = tracking.run_btrack(labels, (0.5, 0.5, 2.0), {"max_distance": 4.0, "min_length": 2})
+        self.assertEqual(info["tracks"], 3)
+        self.assertEqual(int((out > 0).sum()), int((labels > 0).sum()))
+
 
 class _StubTrack:
     """One btrack tracklet: the frames it was seen in and where it was."""
@@ -81,9 +89,14 @@ class _StubTrack:
 
 
 class _StubTracker:
-    """Enough of BayesianTracker to reach run_btrack's own relabelling."""
+    """Enough of BayesianTracker to reach run_btrack's own relabelling. Like
+    btrack, it tracks only the objects it was given: without append() its
+    queue is empty and it returns no tracks."""
 
-    tracks: list = []
+    planned: list = []   # what tracking the appended objects "finds"
+
+    def __init__(self):
+        self.objects = None
 
     def __enter__(self):
         return self
@@ -95,13 +108,24 @@ class _StubTracker:
         pass
 
     def append(self, objects):
-        pass
+        self.objects = list(objects)
 
     def track(self, **kwargs):
         pass
 
     def optimize(self):
         pass
+
+    @property
+    def tracks(self):
+        return list(_StubTracker.planned) if self.objects else []
+
+
+def _stub_segmentation_to_objects(labels, scale=None):
+    """btrack's check: one scale per spatial axis of a frame."""
+    if scale is not None and len(scale) != labels.ndim - 1:
+        raise ValueError(f"Scale dimensions do not match segmentation: {scale}.")
+    return ["object"] * 3
 
 
 class TestRelabelling(unittest.TestCase):
@@ -110,7 +134,7 @@ class TestRelabelling(unittest.TestCase):
 
     def setUp(self):
         stub = types.ModuleType("btrack")
-        stub.utils = types.SimpleNamespace(segmentation_to_objects=lambda labels: ["object"] * 3)
+        stub.utils = types.SimpleNamespace(segmentation_to_objects=_stub_segmentation_to_objects)
         stub.BayesianTracker = _StubTracker
         stub.datasets = types.SimpleNamespace(cell_config=lambda: "config")
         stub.libwrapper = types.SimpleNamespace(get_library=lambda: None)
@@ -131,7 +155,7 @@ class TestRelabelling(unittest.TestCase):
         radius = (yy - 10) ** 2 + (xx - 10) ** 2
         labels[:, 0][:, (radius <= 64) & (radius >= 25)] = 1
         self.assertEqual(int(labels[0, 0, 10, 10]), 0, "the centroid is meant to be on the background")
-        _StubTracker.tracks = [_StubTrack(1, [0, 1, 2], [0, 0, 0], [10.0] * 3, [10.0] * 3)]
+        _StubTracker.planned = [_StubTrack(1, [0, 1, 2], [0, 0, 0], [10.0] * 3, [10.0] * 3)]
 
         out, info = tracking.run_btrack(labels, (1.0, 1.0, 1.0), {"min_length": 2})
         self.assertEqual(info["tracks"], 1)
@@ -139,14 +163,31 @@ class TestRelabelling(unittest.TestCase):
             self.assertEqual(int((out[t] > 0).sum()), int((labels[t] > 0).sum()), f"frame {t} lost its object")
             self.assertEqual(set(np.unique(out[t][labels[t] == 1]).tolist()), {1})
 
+    def test_the_objects_are_handed_to_the_tracker(self):
+        labels = np.zeros((2, 1, 10, 10), np.uint32)
+        labels[:, 0, 2:5, 2:5] = 1
+        _StubTracker.planned = [_StubTrack(1, [0, 1], [0, 0], [3.0, 3.0], [3.0, 3.0])]
+        out, info = tracking.run_btrack(labels, (1.0, 1.0, 1.0), {"min_length": 2})
+        self.assertEqual(info["tracks"], 1)
+        self.assertEqual(int((out > 0).sum()), int((labels > 0).sum()))
+
+    def test_a_2d_series_is_scaled_on_every_axis_of_a_frame(self):
+        # (t, 1, y, x) frames are 3-D to btrack; a two-number scale is refused
+        labels = np.zeros((2, 1, 10, 10), np.uint32)
+        labels[:, 0, 2:5, 2:5] = 1
+        _StubTracker.planned = [_StubTrack(1, [0, 1], [0.0, 0.0], [1.5, 1.5], [1.5, 1.5])]
+        out, info = tracking.run_btrack(labels, (0.5, 0.5, 2.0), {"min_length": 2})
+        self.assertEqual(info["tracks"], 1)
+        self.assertEqual(int((out > 0).sum()), int((labels > 0).sum()))
+
     def test_one_division_is_one_division(self):
         # btrack gives every daughter the mother's id as its parent, so a
         # division is seen twice if the daughters are what gets counted
         labels = np.zeros((2, 1, 10, 10), np.uint32)
         labels[:, 0, 2:5, 2:5] = 1
         labels[:, 0, 6:9, 6:9] = 2
-        _StubTracker.tracks = [_StubTrack(1, [0, 1], [0, 0], [3.0, 3.0], [3.0, 3.0], parent=1),
-                               _StubTrack(2, [0, 1], [0, 0], [7.0, 7.0], [7.0, 7.0], parent=1)]
+        _StubTracker.planned = [_StubTrack(1, [0, 1], [0, 0], [3.0, 3.0], [3.0, 3.0], parent=1),
+                                _StubTrack(2, [0, 1], [0, 0], [7.0, 7.0], [7.0, 7.0], parent=1)]
         _, info = tracking.run_btrack(labels, (1.0, 1.0, 1.0), {"min_length": 2})
         self.assertEqual(info["tracks"], 2)
         self.assertEqual(info["divisions"], 1)
