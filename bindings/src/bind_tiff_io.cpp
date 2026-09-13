@@ -1,6 +1,5 @@
 #include "py_common.hpp"
 
-#include <nanobind/eigen/tensor.h>
 #include <nanobind/stl/optional.h>
 #include <nanobind/stl/string.h>
 #include <nanobind/stl/vector.h>
@@ -9,6 +8,8 @@
 
 #include <optional>
 #include <sstream>
+#include <string>
+#include <vector>
 
 using namespace sirius;
 using sirius_py::pixelTypeFromDtype;
@@ -26,20 +27,60 @@ namespace {
 
     const Stream& streamOrNull(const Stream* s) { return s ? *s : Stream::null(); }
 
-    // Legacy Eigen writers: one instantiation per pixel type and rank.
-    template <typename T>
-    void writeImage(const std::string& path, const Image<T>& image, TiffCompression comp) {
-        writeTiff<T>(path, image, comp);
-    }
-    template <typename T>
-    void writeStack(const std::string& path, const ImageStack<T>& stack, TiffCompression comp) {
-        writeTiffStack<T>(path, stack, comp);
+    // write_tiff's image: any host array. nanobind copies a non-contiguous one
+    // (a transpose, a stepped slice) to C order; the dtype is checked below.
+    // It used to be one Eigen::Tensor overload per dtype and rank, int8
+    // first, and the caster converts: an array no overload matched exactly
+    // -- int64, numpy's default integer, or any non-contiguous view -- was
+    // cast to int8 and written with wraparound, without a word.
+    using WriteArray = nb::ndarray<nb::ro, nb::c_contig, nb::device::cpu>;
+
+    // numpy's name of a DLPack dtype, for the error message.
+    std::string dtypeName(nb::dlpack::dtype dt) {
+        using nb::dlpack::dtype_code;
+        switch (static_cast<dtype_code>(dt.code)) {
+            case dtype_code::Int: return "int" + std::to_string(dt.bits);
+            case dtype_code::UInt: return "uint" + std::to_string(dt.bits);
+            case dtype_code::Float: return "float" + std::to_string(dt.bits);
+            case dtype_code::Complex: return "complex" + std::to_string(dt.bits);
+            case dtype_code::Bool: return "bool";
+            default: return "an unsupported dtype";
+        }
     }
 
-    template <typename T>
-    void defWriters(nb::module_& m) {
-        m.def("write_tiff", &writeImage<T>, nb::arg("path"), nb::arg("image"), nb::arg("comp") = TiffCompression::None);
-        m.def("write_tiff", &writeStack<T>, nb::arg("path"), nb::arg("image"), nb::arg("comp") = TiffCompression::None);
+    std::optional<PixelType> writablePixelType(nb::dlpack::dtype dt) {
+        if (dt == nb::dtype<std::uint8_t>()) return PixelType::UInt8;
+        if (dt == nb::dtype<std::int8_t>()) return PixelType::Int8;
+        if (dt == nb::dtype<std::uint16_t>()) return PixelType::UInt16;
+        if (dt == nb::dtype<std::int16_t>()) return PixelType::Int16;
+        if (dt == nb::dtype<std::uint32_t>()) return PixelType::UInt32;
+        if (dt == nb::dtype<std::int32_t>()) return PixelType::Int32;
+        if (dt == nb::dtype<float>()) return PixelType::Float32;
+        if (dt == nb::dtype<double>()) return PixelType::Float64;
+        return std::nullopt;
+    }
+
+    void writeArray(const std::string& path, const WriteArray& image, TiffCompression comp) {
+        if (image.ndim() != 2 && image.ndim() != 3)
+            throw nb::type_error(("write_tiff: image must be 2-D (rows, cols) or 3-D (pages, rows, cols), got " +
+                                  std::to_string(image.ndim()) + "-D")
+                                     .c_str());
+        const std::optional<PixelType> t = writablePixelType(image.dtype());
+        if (!t)
+            throw nb::type_error(("write_tiff: cannot write " + dtypeName(image.dtype()) +
+                                  " (supported: u/int 8/16/32, float32, float64); convert first, "
+                                  "e.g. image.astype(np.uint16)")
+                                     .c_str());
+        std::vector<Index> dims(image.ndim());
+        for (std::size_t i = 0; i < image.ndim(); ++i) dims[i] = static_cast<Index>(image.shape(i));
+        const Shape shape(dims.begin(), dims.end());
+        withPixelType(*t, [&](auto tag) {
+            using T = decltype(tag);
+            const BufferView<const T> view(static_cast<const T*>(image.data()), shape, Device::cpu());
+            nb::gil_scoped_release release;
+            if (shape.rank() == 2) writeTiff<T>(path, view, comp);
+            else writeTiffStack<T>(path, view, comp);
+        });
     }
 } // anonymous namespace
 
@@ -165,12 +206,8 @@ void bind_tiff_io(nb::module_& m) {
               })); }, nb::arg("path"), nb::arg("dtype") = nb::none(), nb::arg("device") = Device::cpu(), nb::arg("allow_cpu_fallback") = true, "Read a whole TIFF stack as (pages, height, width). Returns numpy on the CPU and a "
                                                                                                                                                                                                                                          "sirius.Buffer (DLPack) on CUDA devices.");
 
-    defWriters<int8_t>(m);
-    defWriters<uint8_t>(m);
-    defWriters<int16_t>(m);
-    defWriters<uint16_t>(m);
-    defWriters<int32_t>(m);
-    defWriters<uint32_t>(m);
-    defWriters<float>(m);
-    defWriters<double>(m);
+    m.def("write_tiff", &writeArray, nb::arg("path"), nb::arg("image"), nb::arg("comp") = TiffCompression::None,
+          "Write a 2-D (rows, cols) image or a 3-D (pages, rows, cols) stack in its own dtype: "
+          "u/int 8/16/32, float32 or float64. Any other dtype (int64, bool, float16, ...) raises "
+          "TypeError rather than being narrowed; a non-contiguous array is copied first.");
 }
