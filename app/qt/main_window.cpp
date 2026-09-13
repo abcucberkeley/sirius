@@ -1048,8 +1048,12 @@ namespace sirius::app {
             const bool sidecar = options.includePipeline;
             options.includePipeline = false;
             if (sidecar) {
+                // Pipeline::save, not Workbench::savePipeline: that one makes
+                // the file the pipeline's own, so Ctrl+S after an export
+                // overwrote <export>.pipeline.toml and the title named it.
                 try {
-                    wb().savePipeline(pipelinePath);
+                    wb().pipeline().save(pipelinePath);
+                    wb().logLine("Pipeline sidecar written to " + pipelinePath);
                 } catch (const std::exception& e) {
                     wb().logLine(std::string("Pipeline sidecar: ") + e.what());
                 }
