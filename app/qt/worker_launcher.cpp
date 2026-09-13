@@ -156,10 +156,13 @@ namespace sirius::app {
             std::lock_guard<std::mutex> g(mutex_);
             if (!python_.isEmpty()) return python_;
         }
-        const QString fromSettings = QSettings().value(QStringLiteral("worker/python")).toString();
-        if (!fromSettings.isEmpty()) return fromSettings;
+        // The environment first, as Preferences and RemoteConfig say: a
+        // setting that won used to pin a Save's "python3" over a
+        // $SIRIUS_PYTHON pointing at the interpreter with torch.
         const QByteArray env = qgetenv("SIRIUS_PYTHON");
         if (!env.isEmpty()) return QString::fromLocal8Bit(env);
+        const QString fromSettings = QSettings().value(QStringLiteral("worker/python")).toString().trimmed();
+        if (!fromSettings.isEmpty()) return fromSettings;
         return QStringLiteral("python3");
     }
 

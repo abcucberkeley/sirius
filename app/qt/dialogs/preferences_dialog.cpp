@@ -192,8 +192,17 @@ namespace sirius::app {
         hpcNote->setWordWrap(true);
         cl->addWidget(hpcNote);
         cl->addWidget(new Rule(2, Qt::Horizontal, compute));
-        impl_->python = new QLineEdit(settings.value(QStringLiteral("worker/python"), QStringLiteral("python3")).toString(), compute);
-        impl_->python->setToolTip(QStringLiteral("Interpreter with numpy (and torch for segmentation); SIRIUS_PYTHON overrides"));
+        // Empty unless the user chose one: a default written back by Save
+        // is a choice nobody made (see WorkerLauncher::python).
+        impl_->python = new QLineEdit(settings.value(QStringLiteral("worker/python")).toString(), compute);
+        const QString envPython = qEnvironmentVariable("SIRIUS_PYTHON");
+        impl_->python->setPlaceholderText(envPython.isEmpty() ? QStringLiteral("python3")
+                                                              : QStringLiteral("%1 (from $SIRIUS_PYTHON)").arg(envPython));
+        impl_->python->setToolTip(envPython.isEmpty()
+                                      ? QStringLiteral("Interpreter with numpy (and torch for segmentation); empty = python3. "
+                                                       "$SIRIUS_PYTHON, when set, overrides this field")
+                                      : QStringLiteral("Interpreter with numpy (and torch for segmentation). $SIRIUS_PYTHON is set "
+                                                       "and overrides this field"));
         cl->addWidget(field(QStringLiteral("Python for the local worker"), impl_->python, compute));
         impl_->hfToken = new QLineEdit(secrets::read(QStringLiteral("hub/token")), compute);
         impl_->hfToken->setEchoMode(QLineEdit::Password);
@@ -304,7 +313,8 @@ namespace sirius::app {
         QStringList notStored;
         if (impl_->token->text() != impl_->openedToken && !secrets::write(QStringLiteral("hpc/token"), impl_->token->text()))
             notStored << QStringLiteral("the HPC token");
-        settings.setValue(QStringLiteral("worker/python"), impl_->python->text().trimmed());
+        if (const QString python = impl_->python->text().trimmed(); python.isEmpty()) settings.remove(QStringLiteral("worker/python"));
+        else settings.setValue(QStringLiteral("worker/python"), python);
         if (impl_->hfToken->text() != impl_->openedHfToken && !secrets::write(QStringLiteral("hub/token"), impl_->hfToken->text().trimmed()))
             notStored << QStringLiteral("the Hugging Face token");
         AssistantSettings as;
