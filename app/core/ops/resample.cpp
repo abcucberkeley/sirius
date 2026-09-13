@@ -57,7 +57,7 @@ namespace sirius::app {
                 const DatasetMeta& meta = input.meta;
                 const ResampleGeometry g = geometry(p, meta);
                 const std::string interpName = p.getString("interpolation", "linear");
-                const Interpolation interp = interpName == "cubic" ? Interpolation::Cubic
+                const Interpolation interp = interpName == "cubic"     ? Interpolation::Cubic
                                              : interpName == "nearest" ? Interpolation::Nearest
                                                                        : Interpolation::Linear;
                 StepOutput out;
