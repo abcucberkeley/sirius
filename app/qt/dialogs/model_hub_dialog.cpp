@@ -19,6 +19,7 @@
 #include <QPointer>
 #include <QProgressBar>
 #include <QPushButton>
+#include <QSettings>
 #include <QStyle>
 #include <QTabWidget>
 #include <QTableWidget>
@@ -49,13 +50,27 @@ namespace sirius::app {
         public:
             std::atomic<bool> cancel{false};
 
-            RemoteWorker& worker() {
+            // The configured HPC worker instead of a local one, for the calls
+            // where "which machine" is the whole question. A bundle registry is
+            // a directory on the cluster: a local worker would list a path that
+            // does not exist on this machine and report it empty. Hugging Face
+            // downloads are the opposite -- they belong in this machine's cache
+            // -- so this is per call, not per dialog.
+            void useRemote(const RemoteConfig& config) { remoteConfig_ = config; }
+
+            RemoteWorker& worker(bool preferRemote = false) {
+                if (preferRemote && !remoteConfig_.host.empty()) {
+                    if (!hpc_ || !hpc_->isOpen())
+                        hpc_ = RemoteWorker::connect(remoteConfig_.host, remoteConfig_.port, remoteConfig_.token);
+                    return *hpc_;
+                }
                 if (!launcher_) launcher_ = std::make_unique<WorkerLauncher>();
                 if (!remote_ || !remote_->isOpen()) remote_ = launcher_->connect();
                 return *remote_;
             }
 
             ~HubClient() override {
+                hpc_.reset();
                 remote_.reset();
                 launcher_.reset();   // stops the worker process
             }
@@ -63,6 +78,8 @@ namespace sirius::app {
         private:
             std::unique_ptr<WorkerLauncher> launcher_;
             std::unique_ptr<RemoteWorker> remote_;
+            std::unique_ptr<RemoteWorker> hpc_;
+            RemoteConfig remoteConfig_;
         };
 
         QString countText(long long n) {
@@ -137,12 +154,126 @@ namespace sirius::app {
         QLabel* cacheNote = nullptr;
         QPushButton* deleteCached = nullptr;
 
+        // the foundation-bundle registry
+        QTabWidget* tabs = nullptr;
+        int bundlesTab = -1;
+        QLineEdit* registryDir = nullptr;
+        QTableWidget* bundles = nullptr;
+        QLabel* bundleNote = nullptr;
+        QPushButton* useBundle = nullptr;
+
         Impl(ModelHubDialog* d, WorkbenchBridge& b) : dialog(d), bridge(b) {}
 
         void choose(const QString& spec) {
             chosen = spec;
             selected->setText(spec.isEmpty() ? QStringLiteral("No model chosen") : QStringLiteral("Model: %1").arg(spec));
             ok->setEnabled(!spec.isEmpty());
+        }
+
+        // Where the bundles are. Remembered, and seeded from the environment so
+        // that a cluster deployment can point every user at one directory
+        // instead of each of them having to find it.
+        static QString storedRegistry() {
+            const QString saved = QSettings().value(QStringLiteral("foundation/registry")).toString();
+            if (!saved.isEmpty()) return saved;
+            return QString::fromLocal8Bit(qgetenv("SIRIUS_BUNDLE_REGISTRY"));
+        }
+
+        // Listed by the worker, not by this process: on a cluster the worker is
+        // what can see the filesystem the bundles are on, and it is also what
+        // reads a manifest out of one.
+        void listBundles() {
+            const QString dir = registryDir->text().trimmed();
+            bundles->setRowCount(0);
+            useBundle->setEnabled(false);
+            if (dir.isEmpty()) {
+                bundleNote->setText(QStringLiteral("Give the directory the .ltb bundles are in. On a cluster that is a "
+                                                   "directory the worker can read, which need not be one this machine can."));
+                return;
+            }
+            QSettings().setValue(QStringLiteral("foundation/registry"), dir);
+            bundleNote->setText(QString());
+            const bool onHpc = bridge.wb().backend() == Backend::Hpc;
+            callWorker(QStringLiteral("Listing bundles in ") + dir, {{"dir", toStd(dir)}}, "list_bundles", [this, dir](const nlohmann::json& r) { fillBundles(dir, r); }, false, onHpc);
+        }
+
+        void fillBundles(const QString& dir, const nlohmann::json& r) {
+            const nlohmann::json list = r.contains("bundles") ? r["bundles"] : nlohmann::json::array();
+            bundles->setRowCount(0);
+            if (list.empty()) {
+                bundleNote->setText(QStringLiteral("No .ltb bundles in %1.").arg(dir));
+                return;
+            }
+            int row = 0;
+            for (const nlohmann::json& b : list) {
+                const QString path = fromStd(b.value("path", std::string()));
+                const QString task = fromStd(b.value("task", std::string()));
+                QString voxelText;
+                for (double v : b.value("voxel_um", std::vector<double>{}))
+                    voxelText += (voxelText.isEmpty() ? QString() : QStringLiteral(" x ")) + QString::number(v, 'g', 3);
+                bundles->insertRow(row);
+                auto* name = new QTableWidgetItem(fromStd(b.value("name", std::string())));
+                name->setData(Qt::UserRole, path);
+                name->setData(Qt::UserRole + 1, fromStd(b.dump()));
+                name->setToolTip(path);
+                bundles->setItem(row, 0, name);
+                bundles->setItem(row, 1, new QTableWidgetItem(task.isEmpty() ? QStringLiteral("?") : task));
+                bundles->setItem(row, 2,
+                                 new QTableWidgetItem(voxelText.isEmpty() ? QStringLiteral("?")
+                                                                          : voxelText + QStringLiteral(" µm")));
+                const bool hasThreshold = b.contains("peak_threshold") && b["peak_threshold"].is_number();
+                bundles->setItem(row, 3,
+                                 new QTableWidgetItem(hasThreshold ? QString::number(b["peak_threshold"].get<double>(), 'g', 3)
+                                                                   : QStringLiteral("?")));
+                bundles->setItem(row, 4, new QTableWidgetItem(bytesText(b.value("size_bytes", 0LL))));
+                ++row;
+            }
+            bundleNote->setText(QStringLiteral("%1 bundle(s) in %2. A '?' is a bundle whose manifest could not be read: it "
+                                               "can still be chosen, but the step cannot default to the thresholds it was "
+                                               "validated at.")
+                                    .arg(row)
+                                    .arg(dir));
+        }
+
+        void chooseSelectedBundle() {
+            const QList<QTableWidgetItem*> items = bundles->selectedItems();
+            if (items.isEmpty()) return;
+            choose(bundles->item(items.first()->row(), 0)->data(Qt::UserRole).toString());
+        }
+
+        // What the manifest says about the bundle now selected, under the table.
+        void bundleSelected() {
+            const QList<QTableWidgetItem*> items = bundles->selectedItems();
+            useBundle->setEnabled(!items.isEmpty());
+            if (items.isEmpty()) return;
+            QTableWidgetItem* first = bundles->item(items.first()->row(), 0);
+            nlohmann::json b;
+            try {
+                b = nlohmann::json::parse(toStd(first->data(Qt::UserRole + 1).toString()));
+            } catch (const std::exception&) {
+                return;
+            }
+            QStringList facts;
+            if (b.contains("min_separation_um") && b["min_separation_um"].is_number())
+                facts << QStringLiteral("min. separation %1 um").arg(b["min_separation_um"].get<double>(), 0, 'g', 3);
+            const std::vector<double> patch = b.value("patch", std::vector<double>{});
+            if (patch.size() == 3)
+                facts << QStringLiteral("patch %1 x %2 x %3")
+                             .arg(patch[0], 0, 'g', 3)
+                             .arg(patch[1], 0, 'g', 3)
+                             .arg(patch[2], 0, 'g', 3);
+            if (b.contains("channels") && b["channels"].is_array() && !b["channels"].empty()) {
+                QStringList names;
+                for (const nlohmann::json& c : b["channels"])
+                    names << fromStd(c.is_string() ? c.get<std::string>() : c.dump());
+                facts << QStringLiteral("channels %1").arg(names.join(QStringLiteral(", ")));
+            }
+            QString text = facts.join(QStringLiteral(" \u00b7 "));
+            const std::string notes = b.value("notes", std::string());
+            if (!notes.empty()) text += (text.isEmpty() ? QString() : QStringLiteral("\n")) + fromStd(notes);
+            if (!b.value("manifest", false))
+                text = QStringLiteral("The manifest could not be read. ") + text;
+            bundleNote->setText(text.isEmpty() ? first->data(Qt::UserRole).toString() : text);
         }
 
         void setStatus(const QString& text, bool error) {
@@ -154,7 +285,8 @@ namespace sirius::app {
         // dialog's; a throw becomes a status line. Results cross threads as
         // JSON text. Progress frames (downloads) reach onProgress.
         void callWorker(const QString& what, nlohmann::json params, const std::string& method,
-                        std::function<void(const nlohmann::json&)> done, bool withProgress = false) {
+                        std::function<void(const nlohmann::json&)> done, bool withProgress = false,
+                        bool preferRemote = false) {
             setStatus(what + QStringLiteral("…"), false);
             progressPrefix = what;
             // gated / private repositories: the access token from the settings
@@ -167,11 +299,11 @@ namespace sirius::app {
             Impl* impl = this;
             QMetaObject::invokeMethod(
                 c,
-                [self, c, impl, what, params, method, done, withProgress] {
+                [self, c, impl, what, params, method, done, withProgress, preferRemote] {
                     std::string text;
                     std::string error;
                     try {
-                        RemoteWorker& w = c->worker();
+                        RemoteWorker& w = c->worker(preferRemote);
                         std::function<void(double, const std::string&)> progress;
                         if (withProgress)
                             progress = [self, impl](double f, const std::string& m) {
@@ -392,6 +524,9 @@ namespace sirius::app {
         resize(720, 640);
 
         impl_->client = new HubClient();
+        // Before the move to the worker thread: the settings this dialog may
+        // need to reach the cluster's worker rather than a local one.
+        impl_->client->useRemote(bridge.wb().remoteConfig());
         impl_->client->moveToThread(&impl_->thread);
         impl_->thread.setObjectName(QStringLiteral("sirius-model-hub"));
         impl_->thread.start();
@@ -401,14 +536,16 @@ namespace sirius::app {
         root->setSpacing(12);
         root->addWidget(widgets::heading(QStringLiteral("Model hub"), theme::kH4Px, this));
         auto* intro = widgets::label(
-            QStringLiteral("Segmentation models for the Segmentation step: a TorchScript / ONNX file from Hugging Face, one "
-                           "already in the cache, or a file on this machine. A package family the worker provides "
-                           "(cellpose:cpsam, microsam:vit_b_lm) can be typed straight into the step's Model field."),
+            QStringLiteral("Models for the step that runs them. Segmentation takes a TorchScript / ONNX file from Hugging "
+                           "Face, one already in the cache, or a file on this machine; a package family the worker provides "
+                           "(cellpose:cpsam, microsam:vit_b_lm) can be typed straight into the step's Model field. The "
+                           "foundation model takes a bundle from the registry, under Bundles."),
             11, theme::kNeutral600, -1, this);
         intro->setWordWrap(true);
         root->addWidget(intro);
 
         auto* tabs = new QTabWidget(this);
+        impl_->tabs = tabs;
         tabs->setDocumentMode(true);
 
         // --- Local
@@ -487,6 +624,46 @@ namespace sirius::app {
         hl->addWidget(impl_->fileNote);
         tabs->addTab(hf, QStringLiteral("Hugging Face"));
 
+        // --- Bundles (the foundation model's registry)
+        auto* reg = new QWidget(tabs);
+        auto* rl = new QVBoxLayout(reg);
+        rl->setContentsMargins(0, 12, 0, 0);
+        rl->setSpacing(8);
+        auto* dirRow = new QHBoxLayout();
+        dirRow->setSpacing(6);
+        impl_->registryDir = new QLineEdit(Impl::storedRegistry(), reg);
+        impl_->registryDir->setPlaceholderText(QStringLiteral("directory of .ltb bundles, as the worker sees it"));
+        impl_->registryDir->setToolTip(QStringLiteral("Where the bundles are. Read by the worker, so on a cluster this is a "
+                                                      "path on the cluster. SIRIUS_BUNDLE_REGISTRY sets the default."));
+        auto* browseDir = new QPushButton(QStringLiteral("Browse…"), reg);
+        widgets::setButtonClass(browseDir, "secondary small");
+        browseDir->setToolTip(QStringLiteral("Only useful when the worker runs on this machine"));
+        auto* refreshBundles = new QPushButton(QStringLiteral("Refresh"), reg);
+        widgets::setButtonClass(refreshBundles, "secondary small");
+        dirRow->addWidget(new CaptionLabel(QStringLiteral("Registry"), reg));
+        dirRow->addWidget(impl_->registryDir, 1);
+        dirRow->addWidget(browseDir);
+        dirRow->addWidget(refreshBundles);
+        rl->addLayout(dirRow);
+        // No "µm" in a header: the theme uppercases header sections, which turns
+        // the micro sign into a Greek capital mu that the bundled face has no
+        // glyph for. The unit goes in the cells, which are not transformed.
+        impl_->bundles = makeTable({QStringLiteral("Bundle"), QStringLiteral("Task"), QStringLiteral("Voxel"),
+                                    QStringLiteral("Threshold"), QStringLiteral("Size")},
+                                   0, reg);
+        rl->addWidget(impl_->bundles, 1);
+        impl_->bundleNote = widgets::label(QString(), 11, theme::kNeutral600, -1, reg);
+        impl_->bundleNote->setWordWrap(true);
+        rl->addWidget(impl_->bundleNote);
+        auto* bundleRow = new QHBoxLayout();
+        impl_->useBundle = new QPushButton(QStringLiteral("Use"), reg);
+        widgets::setButtonClass(impl_->useBundle, "primary small");
+        impl_->useBundle->setEnabled(false);
+        bundleRow->addStretch(1);
+        bundleRow->addWidget(impl_->useBundle);
+        rl->addLayout(bundleRow);
+        impl_->bundlesTab = tabs->addTab(reg, QStringLiteral("Bundles"));
+
         root->addWidget(tabs, 1);
 
         // --- status and buttons
@@ -538,6 +715,22 @@ namespace sirius::app {
                                                            QStringLiteral("Models (*.pt *.pts *.pth *.onnx);;All files (*)"));
             if (!f.isEmpty()) impl_->choose(f);
         });
+        connect(refreshBundles, &QPushButton::clicked, this, [this] { impl_->listBundles(); });
+        connect(impl_->registryDir, &QLineEdit::returnPressed, this, [this] { impl_->listBundles(); });
+        connect(browseDir, &QPushButton::clicked, this, [this] {
+            const QString d = QFileDialog::getExistingDirectory(this, QStringLiteral("Bundle registry"),
+                                                                impl_->registryDir->text());
+            if (d.isEmpty()) return;
+            impl_->registryDir->setText(d);
+            impl_->listBundles();
+        });
+        connect(impl_->bundles, &QTableWidget::itemSelectionChanged, this, [this] { impl_->bundleSelected(); });
+        connect(impl_->bundles, &QTableWidget::itemDoubleClicked, this, [this](QTableWidgetItem*) {
+            if (!impl_->useBundle->isEnabled()) return;
+            impl_->chooseSelectedBundle();
+            accept();
+        });
+        connect(impl_->useBundle, &QPushButton::clicked, this, [this] { impl_->chooseSelectedBundle(); });
         connect(impl_->cache, &QTableWidget::itemSelectionChanged, this, [this, useCached] {
             const bool any = !impl_->cache->selectedItems().isEmpty();
             useCached->setEnabled(any);
@@ -572,5 +765,13 @@ namespace sirius::app {
     }
 
     QString ModelHubDialog::chosenModel() const { return impl_->chosen; }
+
+    void ModelHubDialog::showBundles() {
+        if (impl_->bundlesTab < 0) return;
+        impl_->tabs->setCurrentIndex(impl_->bundlesTab);
+        // Listing spawns a worker, so it waits for the tab that needs it rather
+        // than happening when any tab is opened.
+        if (!impl_->registryDir->text().trimmed().isEmpty()) impl_->listBundles();
+    }
 
 } // namespace sirius::app

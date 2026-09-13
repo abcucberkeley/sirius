@@ -31,10 +31,12 @@ is not installed.
 from __future__ import annotations
 
 import copy
+import json
 import os
 import sys
 import threading
-from typing import Any, Callable, Dict, Optional, Sequence, Tuple
+import zipfile
+from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
 
@@ -153,6 +155,85 @@ def model_info(path: str) -> Dict[str, Any]:
         "notes": man.notes,
         "tasks": _tasks(man),
     }
+
+
+def manifest_of(path: str) -> Dict[str, Any]:
+    """A bundle's manifest without its weights.
+
+    `model_info` answers the same questions by loading the bundle, which for a
+    directory listing would mean reading every file on disk, and the worker
+    keeps one bundle resident so listing would also evict whatever is loaded.
+    A bundle is a zip, so the manifest can be read on its own. Returns {} when
+    it cannot be, which is not an error here: the listing still names the file
+    and the application can ask `model_info` about the one the user picks.
+    """
+    try:
+        with zipfile.ZipFile(path) as z:
+            names = z.namelist()
+            want = [n for n in names if os.path.basename(n).lower() in ("manifest.json", "meta.json")]
+            # else the shallowest .json in the archive
+            if not want:
+                want = sorted((n for n in names if n.lower().endswith(".json")), key=lambda n: (n.count("/"), n))
+            for name in want:
+                try:
+                    got = json.loads(z.read(name))
+                except (ValueError, OSError):
+                    continue
+                # Some other .json in the archive is not a manifest, and showing
+                # its numbers as calibration would be worse than showing none:
+                # a bundle listed with a voxel size it was not trained at reads
+                # as fact. Require something only a manifest has.
+                if isinstance(got, dict) and any(k in got for k in ("task", "peak_threshold", "voxel_size", "patch")):
+                    return got
+    except (zipfile.BadZipFile, OSError):
+        return {}
+    return {}
+
+
+def list_bundles(directory: str) -> List[Dict[str, Any]]:
+    """Every .ltb in `directory`, with what its manifest says about it.
+
+    The application shows this as the list a user picks a model from, so a
+    bundle whose manifest cannot be read is still listed, with `manifest`
+    empty: a file that is there and unreadable is something the user needs to
+    see, not something to hide. Sorted by name so the list does not reorder
+    itself between calls. Not recursive: a registry is a directory of bundles,
+    and walking a filesystem the worker shares with a cluster is not something
+    to do behind a dialog opening.
+    """
+    if not directory:
+        raise ValueError("no registry directory given")
+    if not os.path.isdir(directory):
+        raise NotADirectoryError(f"not a directory: {directory}")
+    out: List[Dict[str, Any]] = []
+    with os.scandir(directory) as entries:
+        for e in sorted(entries, key=lambda e: e.name.lower()):
+            if not e.is_file() or not e.name.lower().endswith(".ltb"):
+                continue
+            try:
+                stat = e.stat()
+                size, mtime = int(stat.st_size), float(stat.st_mtime)
+            except OSError:
+                size, mtime = 0, 0.0
+            man = manifest_of(e.path)
+            out.append({
+                "path": os.path.abspath(e.path),
+                "file": e.name,
+                "name": str(man.get("name") or os.path.splitext(e.name)[0]),
+                "task": str(man.get("task") or ""),
+                "encoder": man.get("encoder") or {},
+                "patch": list(man.get("patch") or []),
+                "crop": list(man.get("crop") or []),
+                "voxel_um": list(man.get("voxel_size") or man.get("voxel_um") or []),
+                "peak_threshold": man.get("peak_threshold"),
+                "min_separation_um": man.get("min_separation_um"),
+                "channels": man.get("channels"),
+                "notes": str(man.get("notes") or ""),
+                "size_bytes": size,
+                "mtime": mtime,
+                "manifest": bool(man),
+            })
+    return out
 
 
 def _as_ctzyx(a: np.ndarray) -> np.ndarray:

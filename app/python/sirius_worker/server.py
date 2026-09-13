@@ -186,7 +186,7 @@ class WorkerServer:
         wb = workbench()
         methods = ["hello", "ping", "model_info", "run", "cancel", "shutdown", "list_plugins", "reload_plugins",
                    "hub_search", "hub_files", "hub_download", "models_list", "models_delete", "install",
-                   "model_prepare"]
+                   "model_prepare", "list_bundles"]
         kinds = list(_SPECIAL_KINDS) + [k for k in wb.step_kinds() if k not in _SPECIAL_KINDS] + ["plugin"]
         methods += [f"run:{k}" for k in kinds]
         cuda = False
@@ -360,6 +360,15 @@ class WorkerServer:
                     break
                 elif method == "model_info":
                     reply(rid, self.model_info(str(params.get("spec") or params.get("path") or params.get("model") or "")))
+                elif method == "list_bundles":
+                    # The registry the application offers as a list of models.
+                    # Served from the worker rather than read by the
+                    # application because on a cluster the worker is the
+                    # process that can see the filesystem the bundles are on.
+                    from . import foundation as foundation_model
+
+                    directory = str(params.get("dir") or params.get("directory") or "")
+                    reply(rid, {"dir": directory, "bundles": foundation_model.list_bundles(directory)})
                 elif method == "hub_search":
                     model_hub.set_hub_token(str(params.get("token", "") or ""))
                     reply(rid, {"models": model_hub.hub_search(str(params.get("query", "")),
