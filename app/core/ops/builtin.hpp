@@ -117,6 +117,9 @@ namespace sirius::app {
         std::uint32_t externalSeedCount = 0;
         LabelFlagRules flags;
         std::string className = "object";
+        // Called during the long loops (the distance seeds); the step sets it
+        // to throw when its run is cancelled.
+        std::function<void()> poll;
     };
     std::uint32_t labelsFromProbabilities(const float* foreground, const float* boundary, Index z, Index y, Index x,
                                           const LabelPostOptions& options, LabelVolume& labels, Index t);

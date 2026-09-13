@@ -1039,7 +1039,7 @@ namespace sirius::app {
     }
 
     std::uint32_t distanceSeeds(const std::uint8_t* mask, Index z, Index y, Index x, double minDistance,
-                                std::uint32_t* out) {
+                                std::uint32_t* out, const std::function<void()>& poll) {
         requireExtent(z, y, x, "distanceSeeds");
         const Index plane = y * x, n = z * plane;
         std::vector<float> dist(static_cast<std::size_t>(n));
@@ -1049,7 +1049,8 @@ namespace sirius::app {
         // every 26-neighbour
         std::vector<Index> candidates;
         for (Index iz = 0; iz < z; ++iz)
-            for (Index iy = 0; iy < y; ++iy)
+            for (Index iy = 0; iy < y; ++iy) {
+                if (poll) poll();
                 for (Index ix = 0; ix < x; ++ix) {
                     const Index i = (iz * y + iy) * x + ix;
                     const float d = dist[static_cast<std::size_t>(i)];
@@ -1067,13 +1068,16 @@ namespace sirius::app {
                             }
                     if (maximal) candidates.push_back(i);
                 }
+            }
         // deepest first; a candidate closer than minDistance to an accepted
         // seed is the same object's plateau, not a new one
         std::stable_sort(candidates.begin(), candidates.end(),
                          [&](Index a, Index b) { return dist[static_cast<std::size_t>(a)] > dist[static_cast<std::size_t>(b)]; });
         const double minD2 = std::max(minDistance, 1.0) * std::max(minDistance, 1.0);
         std::vector<Voxel> accepted;
-        for (Index i : candidates) {
+        for (std::size_t k = 0; k < candidates.size(); ++k) {
+            if (poll && (k & 255) == 0) poll();
+            const Index i = candidates[k];
             const Voxel c{i / plane, (i / x) % y, i % x};
             bool ok = true;
             for (const Voxel& a : accepted) {

@@ -762,6 +762,7 @@ namespace sirius::app {
                 post.seedMinDistance = p.getDouble("seed_distance", 8.0);
                 post.seeds = p.getString("seeds", "H-maxima");
                 post.seedDepth = p.getDouble("seed_depth", 2.0);
+                post.poll = [&ctx] { ctx.throwIfCancelled(); };
                 const bool blobSeeds = post.seeds == "Blob centres (LoG)" && post.post.rfind("Watershed", 0) == 0;
                 // the LoG answers strongest at sigma ~ r / sqrt(3) for a ball of radius r
                 const double blobSigma = std::max(0.3, p.getDouble("blob_radius", 4.0) / std::sqrt(3.0));

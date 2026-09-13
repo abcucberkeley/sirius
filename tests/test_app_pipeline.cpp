@@ -2041,6 +2041,29 @@ TEST_CASE("On tracked labels a delete and a merge apply to every time point", "[
     }
 }
 
+TEST_CASE("The built-in tracker runs without a Python worker", "[app][workbench][track]") {
+    registerTestOps();
+    Scratch scratch;
+    Workbench wb(scratch.dir);   // no worker launcher, as when no Python is configured
+    wb.setDataset(syntheticSource(1, 3, 4, 16, 16));
+    wb.setBackend(Backend::Cpu);
+    while (wb.pipeline().size() > 1) wb.removeStep(1);
+    wb.addStep("test_labels");
+    wb.addStep("track");   // "Built-in (assignment)" by default
+    auto job = wb.createRun(-1);
+    REQUIRE(job);   // was refused: "Worker unavailable: no Python worker launcher configured"
+    job->execute();
+    wb.finishRun(job);
+    CHECK(job->succeeded());
+    CHECK(wb.output(2));
+
+    SECTION("btrack still asks for one") {
+        wb.setStepParam(2, "tracker", std::string("btrack (Bayesian)"));
+        CHECK_FALSE(wb.createRun(-1));
+        CHECK(logContains(wb, "Worker unavailable"));
+    }
+}
+
 TEST_CASE("A choice has to be named in full", "[app][pipeline][params]") {
     registerBuiltinOperations();
     Pipeline p;

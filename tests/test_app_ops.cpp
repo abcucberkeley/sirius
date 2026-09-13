@@ -1790,6 +1790,49 @@ TEST_CASE("Label cleanup numbers every frame with one map", "[app][ops][cleanup]
     }
 }
 
+TEST_CASE("Track objects marks its labels tracked only when it gives them track ids", "[app][ops][track]") {
+    // two objects that swap nothing but their numbering between the frames
+    const Dims5 dims{1, 2, 1, 16, 16};
+    const DatasetMeta meta = metaFor(dims);
+    auto data = std::make_shared<Array5>(Array5::zeros(dims));
+    auto labels = std::make_shared<LabelVolume>(2, 1, 16, 16);
+    auto square = [&](Index t, Index y0, Index x0, std::uint32_t id) {
+        for (Index y = y0; y < y0 + 3; ++y)
+            for (Index x = x0; x < x0 + 3; ++x) labels->volume(t)[y * 16 + x] = id;
+    };
+    square(0, 2, 2, 1);
+    square(0, 10, 10, 2);
+    square(1, 2, 3, 2);    // the first object, numbered 2 in this frame
+    square(1, 10, 11, 1);
+    for (Index t = 0; t < 2; ++t) labels->recomputeStats(t);
+    const Operation& op = requireOperation("track");
+    Progress prog;
+    StepInput in = inputOf(data, meta);
+    in.labels = labels;
+
+    ParamSet p = op.defaults();
+    const StepOutput relabelled = op.run(in, p, prog.ctx);
+    REQUIRE(relabelled.labels);
+    CHECK(relabelled.labels->tracked());
+    CHECK(relabelled.labels->at(1, 0, 3, 4) == relabelled.labels->at(0, 0, 3, 3));
+
+    p.set("relabel", false);
+    const StepOutput asSegmented = op.run(in, p, prog.ctx);
+    REQUIRE(asSegmented.labels);
+    // id 1 is a different object in each frame: a delete of "track 1" must not
+    // take both, which is what the tracked flag would make it do
+    CHECK_FALSE(asSegmented.labels->tracked());
+    CHECK(asSegmented.labels->at(1, 0, 3, 4) == 2);
+
+    SECTION("only btrack needs the Python worker") {
+        CHECK_FALSE(op.needsWorker(op.defaults()));
+        ParamSet bayes = op.defaults();
+        bayes.set("tracker", std::string("btrack (Bayesian)"));
+        CHECK(op.needsWorker(bayes));
+        CHECK(op.info().remoteCapable);   // the worker still implements it, for the HPC hints
+    }
+}
+
 TEST_CASE("Flat-field checks the dark image's size like the flat's", "[app][ops][flatfield]") {
     const Dims5 dims{1, 1, 2, 4, 4};
     const DatasetMeta meta = metaFor(dims);

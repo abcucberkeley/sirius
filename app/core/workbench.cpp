@@ -1207,7 +1207,7 @@ namespace sirius::app {
                 logLine("Step " + Step::number(i) + " " + s.name + " cannot run: " + v.firstError());
                 return nullptr;
             }
-            if (s.op().info().remoteCapable && !executor_.isFresh(pipeline_, i)) needsWorker = true;
+            if (s.op().needsWorker(s.params) && !executor_.isFresh(pipeline_, i)) needsWorker = true;
         }
         endPaintStroke();
         auto job = std::make_shared<RunJob>();

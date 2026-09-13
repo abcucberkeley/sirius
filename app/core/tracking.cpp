@@ -14,7 +14,7 @@ namespace sirius::app {
         constexpr double kBig = 1e12;
     } // namespace
 
-    std::vector<int> solveAssignment(const std::vector<double>& cost, int rows, int cols) {
+    std::vector<int> solveAssignment(const std::vector<double>& cost, int rows, int cols, const std::function<void()>& poll) {
         if (rows < 0 || cols < 0) throw std::invalid_argument("solveAssignment: negative extent");
         if (static_cast<std::size_t>(rows) * static_cast<std::size_t>(cols) != cost.size())
             throw std::invalid_argument("solveAssignment: cost size does not match rows x cols");
@@ -34,6 +34,7 @@ namespace sirius::app {
         std::vector<double> u(static_cast<std::size_t>(n) + 1, 0.0), v(static_cast<std::size_t>(m) + 1, 0.0);
         std::vector<int> p(static_cast<std::size_t>(m) + 1, 0), way(static_cast<std::size_t>(m) + 1, 0);
         for (int i = 1; i <= n; ++i) {
+            if (poll) poll();
             p[0] = i;
             int j0 = 0;
             std::vector<double> minv(static_cast<std::size_t>(m) + 1, std::numeric_limits<double>::max());
@@ -167,7 +168,9 @@ namespace sirius::app {
             return trackOf[t][i];
         };
 
+        const std::function<void()>& poll = options.poll;
         for (std::size_t t = 0; t + 1 < frames; ++t) {
+            if (poll) poll();
             const std::vector<TrackObject>& a = byFrame[t];
             const std::vector<TrackObject>& b = byFrame[t + 1];
             if (a.empty() || b.empty()) continue;
@@ -186,7 +189,7 @@ namespace sirius::app {
                     }
                     cost[i * b.size() + j] = c;
                 }
-            const std::vector<int> match = solveAssignment(cost, static_cast<int>(a.size()), static_cast<int>(b.size()));
+            const std::vector<int> match = solveAssignment(cost, static_cast<int>(a.size()), static_cast<int>(b.size()), poll);
             for (std::size_t i = 0; i < a.size(); ++i) {
                 if (trackOf[t][i] < 0) startTrack(t, i);
                 const int j = match[i];
@@ -219,7 +222,8 @@ namespace sirius::app {
                 starts.push_back(k);
             }
             std::vector<double> cost(ends.size() * starts.size(), kNoAssignment);
-            for (std::size_t r = 0; r < ends.size(); ++r)
+            for (std::size_t r = 0; r < ends.size(); ++r) {
+                if (poll) poll();
                 for (std::size_t c = 0; c < starts.size(); ++c) {
                     const std::size_t from = ends[r], to = starts[c];
                     if (from == to) continue;
@@ -230,7 +234,8 @@ namespace sirius::app {
                     if (d > maxD * static_cast<double>(gap)) continue;
                     cost[r * starts.size() + c] = d / maxD + 0.25 * static_cast<double>(gap - 1);
                 }
-            const std::vector<int> match = solveAssignment(cost, static_cast<int>(ends.size()), static_cast<int>(starts.size()));
+            }
+            const std::vector<int> match = solveAssignment(cost, static_cast<int>(ends.size()), static_cast<int>(starts.size()), poll);
             // Applied in order. A track that was merged away has had its
             // points moved into another one, so a later link out of it
             // continues from where they went: an object missed twice is one

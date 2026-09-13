@@ -1154,6 +1154,19 @@ TEST_CASE("On a tracked volume the class and review mark follow the id", "[app][
     CHECK(l.statsOf(6)->cls == "track");
 }
 
+TEST_CASE("distanceSeeds can be cancelled", "[app][labels]") {
+    Mask m(5, 40, 40);
+    for (int k = 0; k < 4; ++k) m.sphere(2, 6 + 9 * k, 20, 4.0);
+    std::vector<std::uint32_t> seeds(m.v.size());
+    int calls = 0;
+    const auto stop = [&calls] {
+        if (++calls == 5) throw std::runtime_error("cancelled");
+    };
+    CHECK_THROWS_AS(distanceSeeds(m.v.data(), m.z, m.y, m.x, 5.0, seeds.data(), stop), std::runtime_error);
+    CHECK(calls == 5);
+    CHECK(distanceSeeds(m.v.data(), m.z, m.y, m.x, 5.0, seeds.data()) >= 4);   // no poll, no change
+}
+
 TEST_CASE("recomputeStats copes with an id near 2^32", "[app][labels]") {
     // a table indexed by id would ask for 3e9 entries
     LabelVolume l(1, 1, 4, 4);

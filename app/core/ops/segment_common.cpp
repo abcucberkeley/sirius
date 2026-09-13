@@ -38,7 +38,7 @@ namespace sirius::app {
             } else if (options.seeds == "H-maxima") {
                 seeds = hMaximaSeeds(distance.data(), mask.data(), z, y, x, options.seedDepth, out);
             } else {
-                seeds = distanceSeeds(mask.data(), z, y, x, options.seedMinDistance, out);
+                seeds = distanceSeeds(mask.data(), z, y, x, options.seedMinDistance, out, options.poll);
             }
             if (seeds == 0) {
                 count = connectedComponents(mask.data(), z, y, x, out);

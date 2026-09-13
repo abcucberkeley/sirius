@@ -108,6 +108,7 @@ namespace sirius::app {
                 post.minVoxels = p.getInt("min_voxels", 20);
                 post.seedMinDistance = p.getDouble("seed_distance", 5.0);
                 post.className = p.getString("class_name", "object");
+                post.poll = [&ctx] { ctx.throwIfCancelled(); };
                 const std::string method = p.getString("method", "Otsu");
                 std::uint32_t total = 0;
                 std::string cuts;

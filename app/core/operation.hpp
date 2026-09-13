@@ -156,6 +156,11 @@ namespace sirius::app {
         // Parameters a freshly added step should start with, given its input
         // (Contrast takes its window from the data). Default: the defaults.
         virtual ParamSet initialParams(const ParamSet& defaults, const StepInput&) const { return defaults; }
+        // Whether a run with these parameters needs the Python worker, which
+        // a run then starts (or refuses to run without). Default: whether the
+        // worker implements the operation at all (OpInfo::remoteCapable); a
+        // step with a local method besides a remote one says which is chosen.
+        virtual bool needsWorker(const ParamSet&) const { return info().remoteCapable; }
 
         // Convenience for implementations.
         const std::string& kind() const noexcept { return info().kind; }

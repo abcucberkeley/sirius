@@ -232,8 +232,11 @@ namespace sirius::app {
 
     // Seeds for a watershed of a foreground probability map: local maxima of
     // the distance transform of fg > threshold, at least `minDistance` apart.
+    // Every candidate is checked against every seed accepted before it, which
+    // on a large foreground runs long: `poll` is called between batches of
+    // candidates (throw from it to stop).
     std::uint32_t distanceSeeds(const std::uint8_t* mask, Index z, Index y, Index x, double minDistance,
-                                std::uint32_t* out);
+                                std::uint32_t* out, const std::function<void()>& poll = {});
 
     // Euclidean distance transform of mask > 0 (distance to the nearest 0), 3D.
     void distanceTransform(const std::uint8_t* mask, Index z, Index y, Index x, float* out);
