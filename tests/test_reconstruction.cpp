@@ -17,6 +17,8 @@
 #include "sirius/sim_reconstruction.hpp"
 #include "sirius/tiff_io.hpp"
 
+#include "sim_synthetic.hpp"
+
 using namespace sirius;
 using namespace std::filesystem;
 
@@ -342,4 +344,140 @@ TEST_CASE("Reconstruction with the ideal OTF resembles the reference", "[reconst
     const double corr = (n * sab - sa * sb) / std::sqrt((n * saa - sa * sa) * (n * sbb - sb * sb));
     INFO("correlation with the reference reconstruction: " << corr);
     CHECK(corr > 0.8);
+}
+
+// --- 2D and thin stacks ---------------------------------------------------------
+
+namespace {
+
+    // 2D-SIM optics of the synthetic scene: 3 directions x 3 phases and a
+    // 0.30 um pattern inside the 1.2 NA passband. Everything else is a
+    // library default -- no_kz0 on, the order count derived.
+    SIMParameters params2d() {
+        SIMParameters p;
+        p.ndirs = 3;
+        p.nphases = 3;
+        p.na = 1.2;
+        p.nimm = 1.33;
+        p.wavelength_nm = 530.0;
+        p.linespacing_um = 0.30;
+        p.k0_start_angle = 0.3;
+        p.dx = 0.08;
+        p.dy = 0.08;
+        return p;
+    }
+
+    Index nonFinite(const Buffer<double>& v) {
+        Index bad = 0;
+        for (Index i = 0; i < v.size(); ++i) bad += std::isfinite(v.data()[i]) ? 0 : 1;
+        return bad;
+    }
+
+    // The simulated pattern, to a fraction of a percent. The data do not fix
+    // the sign of k0, so the angle is compared modulo pi.
+    void checkPattern2d(const SimFit& fit, const SIMParameters& p) {
+        REQUIRE(fit.k0.size() == 3);
+        for (int d = 0; d < 3; ++d) {
+            const double mag = std::hypot(fit.k0[d][0], fit.k0[d][1]);
+            const double angle = std::atan2(fit.k0[d][1], fit.k0[d][0]);
+            const double off = std::remainder(angle - (p.k0_start_angle + d * kPi / 3.0), kPi);
+            REQUIRE(fit.amps[d].size() == 2);
+            INFO("direction " << d << ": spacing " << 1.0 / mag << " um, angle off by " << off << " rad, |amp1| "
+                              << std::abs(fit.amps[d][1]));
+            CHECK(std::abs(1.0 / mag - p.linespacing_um) < 0.005 * p.linespacing_um);
+            CHECK(std::abs(off) < 0.01);
+            // a real modulation was measured (the unmodulated background keeps
+            // it well below the simulated 0.8 in the reference's convention)
+            CHECK(std::abs(fit.amps[d][1]) > 0.05);
+            CHECK(std::abs(fit.amps[d][1]) < 1.0);
+        }
+    }
+
+    // nz planes from the middle of the 9-plane test stack
+    Eigen::Tensor<double, 3, Eigen::RowMajor> thinStack(const TestData& t, int nz) {
+        Eigen::Tensor<double, 3, Eigen::RowMajor> sub(15 * nz, 64, 64);
+        const int z0 = (9 - nz) / 2;
+        for (int d = 0; d < 3; ++d)
+            for (int z = 0; z < nz; ++z)
+                for (int ph = 0; ph < 5; ++ph)
+                    for (int y = 0; y < 64; ++y)
+                        for (int x = 0; x < 64; ++x)
+                            sub((d * nz + z) * 5 + ph, y, x) = t.raw((d * 9 + z0 + z) * 5 + ph, y, x);
+        return sub;
+    }
+
+} // namespace
+
+TEST_CASE("A 2D stack reconstructs at the default settings", "[reconstruction][2d]") {
+    // no_kz0 (on by default) used to skip the only kz plane a 2D stack has:
+    // every overlap came out empty, the modulation amplitudes 0/0 and every
+    // output voxel NaN. The order-0 damping the application turns on divided
+    // by its zero axial limit and did the same.
+    SIMParameters p = params2d();
+    REQUIRE(p.no_kz0);
+    REQUIRE(p.resolvedOrders() == 2);
+    const Buffer<double> raw = test::syntheticSim2d(p, 128);
+    const OTFRadiallyAveraged otf = idealOTF(p, /*threeD=*/false);
+
+    SECTION("library defaults") {}
+    SECTION("the order-0 damping on") { p.dampen_order0 = true; }
+    SECTION("no_kz0 off gives the same pattern") { p.no_kz0 = false; }
+
+    SimReconstructor recon(p, otf, Device::cpu(), PlanRigor::Estimate);
+    const Buffer<double> out = recon.reconstruct(raw.view());
+    REQUIRE(out.shape() == Shape({1, 256, 256}));
+    CHECK(nonFinite(out) == 0);
+    checkPattern2d(recon.lastFit(), p);
+}
+
+TEST_CASE("Thin z stacks reconstruct at the settings of the test data", "[reconstruction][thin]") {
+    // The config has no_kz0 (default) and dampenOrder0 on. With 2 or 4 planes
+    // kz = +-1 lies outside the OTF's axial support, with 3 the filter keeps
+    // kz = 0 alone, and with 5 kz = +-1 is inside the support but holds no
+    // overlap sample above otfcutoff: all four used to come out 100 % NaN.
+    TestData t = loadTestData();
+    const int nz = GENERATE(2, 3, 4, 5);
+    INFO(nz << " planes");
+    const auto raw = thinStack(t, nz);
+    SimReconstructor recon(t.params, t.otf, Device::cpu(), PlanRigor::Estimate);
+    const Buffer<double> out = recon.reconstruct(raw);
+    REQUIRE(out.shape() == Shape({nz, 128, 128}));
+    CHECK(nonFinite(out) == 0);
+    checkK0(recon.lastFit(), t.params);
+}
+
+TEST_CASE("CPU and GPU agree on 2D and thin stacks", "[reconstruction][cuda][2d][thin]") {
+    if (!cudaAvailable()) SKIP("no CUDA device available");
+    const Device gpu = Device::cuda(0);
+    auto compare = [&](const SIMParameters& p, const OTFRadiallyAveraged& otf, BufferView<const double> raw) {
+        SimReconstructor cpuRecon(p, otf, Device::cpu(), PlanRigor::Estimate);
+        const Buffer<double> cpuOut = cpuRecon.reconstruct(raw);
+        SimReconstructor gpuRecon(p, otf, gpu, PlanRigor::Estimate);
+        Stream stream(gpu);
+        const Buffer<double> dRaw = toDevice(raw, gpu, stream);
+        stream.synchronize();
+        const Buffer<double> gpuOut = gpuRecon.reconstruct(dRaw.view()).to(Device::cpu());
+        REQUIRE(gpuOut.shape() == cpuOut.shape());
+        CHECK(nonFinite(cpuOut) == 0);
+        double peak = 0.0, diff = 0.0;
+        for (Index i = 0; i < cpuOut.size(); ++i) {
+            peak = std::max(peak, std::abs(cpuOut.data()[i]));
+            diff = std::max(diff, std::abs(cpuOut.data()[i] - gpuOut.data()[i]));
+        }
+        REQUIRE(peak > 0.0);
+        INFO("max |cpu-gpu| / max |cpu| = " << diff / peak);
+        CHECK(diff / peak < 1e-6);
+    };
+
+    SECTION("2D, order-0 damping on") {
+        SIMParameters p = params2d();
+        p.dampen_order0 = true;
+        const Buffer<double> raw = test::syntheticSim2d(p, 128);
+        compare(p, idealOTF(p, /*threeD=*/false), raw.view());
+    }
+    SECTION("3 planes of the test data") {
+        TestData t = loadTestData();
+        const Eigen::Tensor<double, 3, Eigen::RowMajor> raw = thinStack(t, 3);
+        compare(t.params, t.otf, BufferView<const double>(raw.data(), Shape(raw), Device::cpu()));
+    }
 }

@@ -115,9 +115,12 @@ namespace sirius::simdetail {
     }
 
     // Smooth high-pass for the widefield order (port of dev_order0damping).
+    // A zero axial limit -- a 2D or thin stack, whose filter keeps kz = 0
+    // alone -- has no axial term: the reference's 0/0 there made every
+    // output voxel NaN.
     SIRIUS_HD double order0Damping(double radius, double zindex, double rlimit, double zlimit) {
         const double rfrac = radius / rlimit;
-        const double zfrac = fabs(zindex / zlimit);
+        const double zfrac = zlimit > 0.0 ? fabs(zindex / zlimit) : 0.0;
         return rfrac * rfrac + zfrac * zfrac * zfrac;
     }
 

@@ -90,7 +90,9 @@ namespace sirius {
         Index xdim = 0, ydim = 0, zdim = 0;
         double dkx = 0, dky = 0, dkz = 0;
         double rdistcutoff = 0;
+        double axialSupport = 0;     // axial half-extent of the OTF support, in data kz planes
         int zdistcutoff = 0;         // axial cutoff used by the overlaps
+        bool noKz0 = false;          // p.no_kz0 where this shape allows it (see bindShape)
         double lambdaEm = 0;         // emission wavelength in-sample (um)
 
         std::optional<RealFFT> bandFft;          // batched (nz, ny, nx) r2c
@@ -190,7 +192,8 @@ namespace sirius {
                                    1.0 / (2.0 * std::max(p.dx, p.dy)));
 
             const double alpha = std::asin(p.na / p.nimm);
-            zdistcutoff = static_cast<int>(std::ceil(((1.0 - std::cos(alpha)) / lambdaEm) / dkz));
+            axialSupport = ((1.0 - std::cos(alpha)) / lambdaEm) / dkz;
+            zdistcutoff = static_cast<int>(std::ceil(axialSupport));
             // The overlap volumes hold 2 * zdistcutoff + 1 signed planes in
             // nz slots: with an even nz, kz = -nz/2 and kz = +nz/2 would map
             // to the same slot and two threads would write it with different
@@ -198,6 +201,19 @@ namespace sirius {
             // strictly inside the volume.
             if (2 * zdistcutoff + 1 > static_cast<int>(nz))
                 zdistcutoff = std::max((static_cast<int>(nz) - 1) / 2, 0);
+
+            // no_kz0 leaves the kz = 0 plane of the widefield order out of the
+            // k0 fit and the Wiener filter, which only works while another
+            // plane carries that information: a kz != 0 plane inside the OTF
+            // support (more than one kz step deep) that the overlaps and the
+            // filter both visit. A 2D stack has kz = 0 alone, and a thin one
+            // can have its first plane outside the support (nz = 4 of the test
+            // data) or outside the filter's range (nz = 3); skipping kz = 0
+            // there empties every overlap -- a 0/0 modulation amplitude and an
+            // all-NaN result -- and drops the whole widefield band, so the
+            // flag does not apply to such a stack. (computeOverlaps also falls
+            // back to kz = 0 when the other planes turn out empty.)
+            noKz0 = p.no_kz0 && axialSupport > 1.0 && zdistcutoff >= 1 && zdistCutoffs()[0] >= 1;
 
             xdim = static_cast<Index>(std::lround(p.zoomfact * static_cast<double>(nx)));
             ydim = static_cast<Index>(std::lround(p.zoomfact * static_cast<double>(ny)));
@@ -234,7 +250,7 @@ namespace sirius {
 
         // ---- overlaps and the modulation-amplitude machinery -------------
 
-        simdetail::OverlapCtx overlapCtx(int order1, int order2, double k0x, double k0y) const {
+        simdetail::OverlapCtx overlapCtx(int order1, int order2, double k0x, double k0y, bool skipKz0) const {
             simdetail::OverlapCtx c{};
             c.nx = nx;
             c.ny = ny;
@@ -245,7 +261,7 @@ namespace sirius {
             c.rdistcutoff = rdistcutoff;
             c.otfcutoff = p.otfcutoff;
             c.order02factor = nz > 1 ? 5.0 : 1.0;
-            c.noKz0 = p.no_kz0 ? 1 : 0;
+            c.noKz0 = skipKz0 ? 1 : 0;
             c.kx = k0x * (order2 - order1);
             c.ky = k0y * (order2 - order1);
             c.order1 = order1;
@@ -257,12 +273,23 @@ namespace sirius {
         // Rebuild the two whitened overlap volumes for (order1, order2) at
         // the trial vector k0 and bring them to real space.
         void computeOverlaps(int d, int order1, int order2, double k0x, double k0y) {
-            detail::memsetBytes(ovF0.data(), dev, 0, ovF0.bytes(), stream);
-            detail::memsetBytes(ovF1.data(), dev, 0, ovF1.bytes(), stream);
-            const auto c = overlapCtx(order1, order2, k0x, k0y);
-            backend->makeOverlaps(c, asCd(bandRe(d, order1)), asCd(bandIm(d, order1)),
-                                  asCd(bandRe(d, order2)), asCd(bandIm(d, order2)),
-                                  asCd(ovF0.data()), asCd(ovF1.data()), zdistcutoff);
+            const auto fill = [&](bool skipKz0) {
+                detail::memsetBytes(ovF0.data(), dev, 0, ovF0.bytes(), stream);
+                detail::memsetBytes(ovF1.data(), dev, 0, ovF1.bytes(), stream);
+                const auto c = overlapCtx(order1, order2, k0x, k0y, skipKz0);
+                backend->makeOverlaps(c, asCd(bandRe(d, order1)), asCd(bandIm(d, order1)),
+                                      asCd(bandRe(d, order2)), asCd(bandIm(d, order2)),
+                                      asCd(ovF0.data()), asCd(ovF1.data()), zdistcutoff);
+            };
+            fill(noKz0);
+            // Near the axial edge of the support the kz != 0 planes can hold
+            // no sample above otfcutoff at all (5 planes of the test data):
+            // without kz = 0 the overlap is empty and its amplitude 0/0. Such
+            // a pair is measured with kz = 0 after all.
+            if (noKz0) {
+                const auto energy = backend->modampReduce(asCd(ovF0.data()), asCd(ovF1.data()), nz, ny, nx, 0.0, 0.0);
+                if (!(energy.sumX > 0.0) || !(energy.sumY > 0.0)) fill(false);
+            }
             volFft->ifft(ovF0.data(), ov0.data(), stream);   // unnormalized, cuFFT convention
             volFft->ifft(ovF1.data(), ov1.data(), stream);
         }
@@ -451,10 +478,9 @@ namespace sirius {
 
         // Per-order axial cutoffs (port of the non-Bessel zdistcutoff block).
         std::vector<int> zdistCutoffs() const {
-            const double alpha = std::asin(p.na / p.nimm);
             const double lambdaexc = 0.88 * lambdaEm;
             std::vector<int> zd(static_cast<std::size_t>(norders), 0);
-            zd[0] = static_cast<int>(std::ceil(((1.0 - std::cos(alpha)) / lambdaEm) / dkz));
+            zd[0] = static_cast<int>(std::ceil(axialSupport));
             zd[static_cast<std::size_t>(norders - 1)] = static_cast<int>(1.3 * zd[0]);
             for (int order = 1; order < norders - 1; ++order)
                 zd[static_cast<std::size_t>(order)] =
@@ -507,7 +533,7 @@ namespace sirius {
             fc.zd0 = zd[0];
             fc.suppressSingularities = p.suppress_singularities ? 1 : 0;
             fc.dampenOrder0 = p.dampen_order0 ? 1 : 0;
-            fc.noKz0 = p.no_kz0 ? 1 : 0;
+            fc.noKz0 = noKz0 ? 1 : 0;
             fc.filterOverlaps = p.filter_overlaps ? 1 : 0;
             fc.apodizeOutput = static_cast<int>(p.apodize_output);
             fc.k0all = k0Ptr;
