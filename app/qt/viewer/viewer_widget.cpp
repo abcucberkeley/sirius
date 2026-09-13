@@ -1846,8 +1846,12 @@ namespace sirius::app {
         menu.addSeparator();
         QAction* fit = menu.addAction(QStringLiteral("Fit to window"));
         QAction* chosen = menu.exec(xy->mapToGlobal(screen));
+        // exec() runs an event loop, and a run finishing inside it rebuilds
+        // the output and clears the annotations: the items were enabled for
+        // the state the menu opened on, so the one chosen checks again.
         if (chosen == clear) clearAnnotations();
         else if (chosen == last) {
+            if (annotations.empty()) return;
             annotations.pop_back();
             pushAnnotations();
         } else if (chosen == fit) q->fitToWindow();
