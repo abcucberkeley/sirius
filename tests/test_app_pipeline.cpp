@@ -1841,6 +1841,56 @@ TEST_CASE("Label edits on a step survive its re-run over the same input labels",
         CHECK(wb.output(2)->labels != edited);
         CHECK(wb.output(2)->labels->at(0, 1, 2, 2) == 0);
     }
+    SECTION("so does an edit in place on the upstream labels") {
+        // the same volume object upstream, but the object at the centre is
+        // deleted there: step 2 is stale, and its re-run has to show that
+        const Index cz = 2, cy = 8, cx = 8;
+        REQUIRE(wb.output(1)->labels->at(0, cz, cy, cx) == 1);
+        wb.view(1);
+        wb.deleteLabel(1);
+        CHECK_FALSE(wb.outputFresh(2));
+        REQUIRE(runSync(wb, 2)->succeeded());
+        REQUIRE(wb.output(2)->labels);
+        CHECK(wb.output(2)->labels->at(0, cz, cy, cx) == 0);   // was still 1: the pointer alone matched
+    }
+}
+
+TEST_CASE("Label edits survive the re-run of a step that passes its labels through", "[app][workbench][labels][executor]") {
+    // Contrast, flat-field, bleach, merge, register (channels), volrec on the
+    // native grid, einsum over c and plugins used to hand out a clone of
+    // their input labels, which the executor took for labels of their own:
+    // a correction painted on the Contrast view was gone after a gamma change.
+    registerTestOps();
+    Scratch scratch;
+    Workbench wb(scratch.dir);
+    wb.setDataset(syntheticSource(1, 1, 4, 16, 16));
+    wb.setBackend(Backend::Cpu);
+    while (wb.pipeline().size() > 1) wb.removeStep(1);
+    wb.addStep("test_labels");   // 1
+    wb.addStep("contrast");      // 2
+    wb.addStep("bleach");        // 3
+    wb.setStepCache(2, CachePolicy::Memory);   // on screen after the run below it
+    wb.setStepCache(3, CachePolicy::Memory);
+    REQUIRE(runSync(wb)->succeeded());
+
+    wb.view(2);
+    paintOne(wb, 1, 2, 2, 9);
+    REQUIRE(wb.output(2)->labels->at(0, 1, 2, 2) == 9);
+    wb.setStepParam(2, "gamma", 0.8);
+    REQUIRE(runSync(wb)->succeeded());
+    REQUIRE(wb.output(2)->labels);
+    CHECK(wb.output(2)->labels->at(0, 1, 2, 2) == 9);   // was 0: a fresh clone of step 1's
+    REQUIRE(wb.output(3)->labels);
+    CHECK(wb.output(3)->labels->at(0, 1, 2, 2) == 9);   // and carried on below
+
+    wb.view(3);
+    paintOne(wb, 1, 12, 12, 7);
+    wb.setStepParam(3, "mode", std::string("Match mean"));
+    REQUIRE(runSync(wb)->succeeded());
+    REQUIRE(wb.output(3)->labels);
+    CHECK(wb.output(3)->labels->at(0, 1, 12, 12) == 7);
+    CHECK(wb.output(3)->labels->at(0, 1, 2, 2) == 9);
+    CHECK(wb.output(1)->labels->at(0, 1, 2, 2) == 0);   // the segmentation's own stayed clean
 }
 
 TEST_CASE("Files named in a list parameter are part of the fingerprint", "[app][executor]") {

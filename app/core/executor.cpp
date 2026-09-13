@@ -57,9 +57,11 @@ namespace sirius::app {
         std::size_t bytes = 0;
         bool arrayOnDisk = false;
         std::weak_ptr<const StepOutput> restored;   // the reloaded copy while someone holds it
-        // The input labels the output's labels were shared from: a re-run
-        // over the same input keeps the user's edits (editedLabelsOf).
+        // The input labels the output's labels were shared from, and their
+        // edit generation then: a re-run over the same, unedited input keeps
+        // the user's edits (editedLabelsOf).
         std::shared_ptr<const LabelVolume> labelsFrom;
+        std::uint64_t labelsFromGeneration = 0;
     };
 
     Executor::Executor(std::filesystem::path scratchDir) : scratch_(std::move(scratchDir)) {
@@ -240,6 +242,9 @@ namespace sirius::app {
         if (it == entries_.end() || !it->second || !it->second->output) return nullptr;
         const Entry& e = *it->second;
         if (!e.output->labels || !e.output->labels->edited() || e.labelsFrom != from) return nullptr;
+        // the same volume, but edited in place upstream since (a delete on
+        // the segmentation step): new input, which supersedes the edits here
+        if (e.labelsFromGeneration != from->generation()) return nullptr;
         return e.output->labels;
     }
 
@@ -278,6 +283,9 @@ namespace sirius::app {
             e.diskPath = std::move(diskPath);
             e.arrayOnDisk = !e.diskPath.empty();
             e.output = std::move(out);
+            // label edits are refused during a run, so this is the generation
+            // the step carried through
+            e.labelsFromGeneration = labelsFrom ? labelsFrom->generation() : 0;
             e.labelsFrom = std::move(labelsFrom);
             e.restored.reset();
             // "Recompute" keeps nothing beyond the most recent result: drop the

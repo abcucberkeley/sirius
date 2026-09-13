@@ -94,7 +94,7 @@ namespace sirius::app {
                 const double tv = targetVoxel(params, meta);
                 if (tv <= 0) {
                     out.array = input.materialize([&](double f, const std::string& m) { ctx.report(f, m); });
-                    out.labels = input.labels ? input.labels->clone() : nullptr;
+                    // the labels are the executor's to carry through (with the edits on this step)
                     out.note = "native grid";
                 } else {
                     const ResampleGeometry g = resampleGeometry(meta.dims.z, meta.dims.y, meta.dims.x, meta.dz(),

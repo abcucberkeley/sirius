@@ -92,6 +92,11 @@ namespace sirius::app {
         // undo / redo of one) has touched this volume: what the executor
         // keeps when the step that carries it is run again.
         bool edited() const noexcept { return edited_; }
+        // Counts the changes to the voxels made through the edits (paint,
+        // fill, merge, delete, split, apply, relabelDensely): the same volume
+        // edited in place is not the same input any more. Annotations do not
+        // count; a copy starts again at 0.
+        std::uint64_t generation() const noexcept { return generation_; }
         // True when one id names the same object at every time point (the
         // tracking step's output): a merge or a delete then applies to the
         // whole track, not to the frame on screen.
@@ -213,6 +218,7 @@ namespace sirius::app {
         std::shared_ptr<const AnnotationTable> trackAnnotations_;
         std::optional<LabelFlagRules> flagRules_;       // the last applyFlags()
         std::uint32_t maxLabel_ = 0;
+        std::uint64_t generation_ = 0;
         bool edited_ = false;
         bool tracked_ = false;
     };

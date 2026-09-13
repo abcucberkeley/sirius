@@ -222,12 +222,11 @@ namespace sirius::app {
                     for (Index t = 0; t < outLabels->t(); ++t) outLabels->recomputeStats(t);
                     outLabels->applyFlags(LabelFlagRules{});
                     out.labels = outLabels;
-                } else if (input.labels && outArray && input.labels->t() == outArray->dims().t && input.labels->z() == outArray->dims().z &&
-                           input.labels->y() == outArray->dims().y && input.labels->x() == outArray->dims().x) {
-                    // the input's labels follow only onto the same grid (a
-                    // plugin that resamples or crops leaves them behind)
-                    out.labels = input.labels->clone();
                 }
+                // Without labels of its own the executor carries the input's
+                // through, onto the same grid only (a plugin that resamples
+                // or crops leaves them behind), and with them the corrections
+                // painted on this step.
                 out.diagnostics = toDiagnostics(diagnostics, images, out);
                 out.ranOn = ctx.backend;
                 out.seconds = seconds;

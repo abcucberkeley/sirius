@@ -1014,6 +1014,22 @@ TEST_CASE("A LabelVolume remembers that it was edited", "[app][labels]") {
     untouched.recomputeStats(0);
     (void)untouched.volume(0);   // a mutable accessor alone is not an edit
     CHECK_FALSE(untouched.edited());
+
+    SECTION("the generation counts the edits that changed voxels") {
+        const std::uint64_t g = v.generation();
+        CHECK(g == 1);
+        CHECK(v.paint(0, 0, 4, 4, 1.0, 0, 3).empty());   // nothing to change
+        CHECK(v.generation() == g);
+        v.stats().clear();                               // annotations are not voxels
+        v.recomputeStats(0);
+        CHECK(v.generation() == g);
+        const LabelDiff d = v.remove(0, 3);
+        CHECK(v.generation() == g + 1);
+        v.apply(d, false);
+        CHECK(v.generation() == g + 2);
+        CHECK(v.clone()->generation() == 0);
+        CHECK(untouched.generation() == 0);
+    }
 }
 
 TEST_CASE("removeSmall and dropSmall cope with an id near 2^32", "[app][labels]") {

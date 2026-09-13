@@ -483,6 +483,7 @@ namespace sirius::app {
                 }
         }
         maxLabel_ = std::max(maxLabel_, label);
+        if (!diff.empty()) ++generation_;
         return diff;
     }
 
@@ -519,6 +520,7 @@ namespace sirius::app {
         diff.before.assign(diff.indices.size(), from);
         diff.after.assign(diff.indices.size(), label);
         maxLabel_ = std::max(maxLabel_, label);
+        ++generation_;
         return diff;
     }
 
@@ -545,6 +547,7 @@ namespace sirius::app {
             diff.after.push_back(target);
             v[i] = target;
         }
+        if (!diff.empty()) ++generation_;
         return diff;
     }
 
@@ -563,6 +566,7 @@ namespace sirius::app {
             diff.after.push_back(0);
             v[i] = 0;
         }
+        if (!diff.empty()) ++generation_;
         return diff;
     }
 
@@ -631,7 +635,10 @@ namespace sirius::app {
                     diff.after.push_back(newId);
                     v[i] = newId;
                 }
-        if (!diff.empty()) maxLabel_ = std::max(maxLabel_, newId);
+        if (!diff.empty()) {
+            maxLabel_ = std::max(maxLabel_, newId);
+            ++generation_;
+        }
         return diff;
     }
 
@@ -654,6 +661,7 @@ namespace sirius::app {
             v[i] = values[k];
             maxLabel_ = std::max(maxLabel_, values[k]);
         }
+        if (count) ++generation_;
     }
 
     std::shared_ptr<LabelVolume> LabelVolume::clone() const {
@@ -1197,6 +1205,7 @@ namespace sirius::app {
         for (auto& frame : frameAnnotations_) frame = renumbered(frame);
         trackAnnotations_ = renumbered(trackAnnotations_);
         maxLabel_ = next;
+        ++generation_;
         return next;
     }
 

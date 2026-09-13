@@ -71,7 +71,8 @@ namespace sirius::app {
                     }
                 }
                 out.array = result;
-                out.labels = input.labels ? input.labels->clone() : nullptr;
+                // out.labels stays null: the executor carries the input's
+                // labels through, and the corrections painted on this step with them
                 out.ranOn = Backend::Cpu;
                 out.note = summary(params, meta) + " · CPU";
                 out.diagnostics = genericDiagnostics(input, out, summary(params, meta));
