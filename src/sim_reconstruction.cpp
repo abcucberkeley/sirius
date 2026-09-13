@@ -178,6 +178,22 @@ namespace sirius {
                 throw std::invalid_argument("SimReconstructor: nx and ny must be even and >= 4, got " +
                                             std::to_string(nxIn) + " x " + std::to_string(nyIn));
             if (nzIn < 1) throw std::invalid_argument("SimReconstructor: the raw stack has no sections");
+
+            // The plans and buffers below are rebuilt one after another, so a
+            // throw part way (an allocation or a plan that fails, a cutoff
+            // that is not finite) leaves some of them sized for the previous
+            // shape. The shape members must not then claim the new one: the
+            // next call with it would skip the rebuild and run on those
+            // (a heap-use-after-free in reorderFrames, a double free). Until
+            // the rebuild completes the reconstructor has no shape.
+            struct ForgetShapeUnlessBound {
+                Impl& self;
+                bool bound = false;
+                ~ForgetShapeUnlessBound() {
+                    if (!bound) self.nx = self.ny = self.nz = -1;
+                }
+            } guard{*this};
+
             nx = nxIn;
             ny = nyIn;
             nz = nzIn;
@@ -262,6 +278,7 @@ namespace sirius {
                                          HostMemory::Pageable, stream);
             }
             hostPlane.resize(static_cast<std::size_t>(ny * nx));
+            guard.bound = true;
         }
 
         // ---- overlaps and the modulation-amplitude machinery -------------

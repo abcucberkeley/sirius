@@ -157,11 +157,16 @@ TEST_CASE("The reconstructor refuses optics and zooms that used to crash it", "[
         SIMParameters p = t.params;
         p.dz = 1e308;
         SimReconstructor recon = construct(p);
-        try {
-            recon.reconstruct(t.raw);
-            FAIL("reconstructed with an infinite axial cutoff");
-        } catch (const std::invalid_argument& e) {
-            CHECK_THAT(e.what(), Catch::Matchers::ContainsSubstring("not finite"));
+        // twice: the failed first call must not leave the shape bound to
+        // buffers it never finished allocating (the retry was a double free)
+        for (int attempt = 0; attempt < 2; ++attempt) {
+            INFO("attempt " << attempt);
+            try {
+                recon.reconstruct(t.raw);
+                FAIL("reconstructed with an infinite axial cutoff");
+            } catch (const std::invalid_argument& e) {
+                CHECK_THAT(e.what(), Catch::Matchers::ContainsSubstring("not finite"));
+            }
         }
     }
     SECTION("a stack without sections") {
@@ -169,6 +174,32 @@ TEST_CASE("The reconstructor refuses optics and zooms that used to crash it", "[
         const Buffer<double> empty(Shape{0, 64, 64});
         CHECK_THROWS_AS(recon.reconstruct(empty.view()), std::invalid_argument);
     }
+}
+
+TEST_CASE("A shape that fails to bind is rebuilt on the next call, not reused half-built",
+          "[reconstruction][rebind]") {
+    // bindShape stored the new shape before rebuilding the plans and buffers.
+    // When a later step threw (out of memory, a failed plan) the retry with the
+    // same shape took the "already bound" early return and ran on the previous
+    // shape's buffers: a heap-use-after-free under ASan. Here the plan for the
+    // second shape throws deterministically (its FFT size overflows int), so
+    // no real allocation failure is needed; its data is never read.
+    TestData t = loadTestData();
+    SimReconstructor recon(t.params, t.otf, Device::cpu(), PlanRigor::Estimate);
+    const auto first = toEigen<3>(recon.reconstruct(t.raw));
+
+    const std::vector<double> tiny(64);
+    const BufferView<const double> huge(tiny.data(), Shape{135, 65536, 65536}, Device::cpu());
+    CHECK_THROWS(recon.reconstruct(huge));
+    CHECK_THROWS(recon.reconstruct(huge));   // was: no rebuild, reads of the tiny buffer as 65536 x 65536
+
+    // and the reconstructor still works for the shape it had before
+    const auto again = toEigen<3>(recon.reconstruct(t.raw));
+    REQUIRE(again.size() == first.size());
+    Eigen::Index differing = 0;
+    for (Eigen::Index i = 0; i < first.size(); ++i)
+        if (again.data()[i] != first.data()[i]) ++differing;
+    CHECK(differing == 0);
 }
 
 TEST_CASE("Repeated CPU reconstructions of the same input are bit-identical",
