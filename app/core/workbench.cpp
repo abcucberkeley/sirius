@@ -647,8 +647,12 @@ namespace sirius::app {
         if (refuseIfRunning("edit parameters")) return;
         const Snapshot before = snapshot();
         pipeline_.setParams(index, params);
-        if (pipeline_.at(index).params == ParamSet::fromJson(before.pipeline["steps"][static_cast<std::size_t>(index)]["params"]))
-            return;   // nothing changed after coercion
+        // Nothing changed after coercion: compared as values. A set read back
+        // from the snapshot's JSON lists its keys sorted, the step's in spec
+        // order, so every step with two parameters or more looked edited, and
+        // the undo entry of a no-op commit (a field losing focus) wiped the redo.
+        if (pipeline_.at(index).params.toJson() == before.pipeline["steps"][static_cast<std::size_t>(index)]["params"])
+            return;
         pushEdit(label.empty() ? "Edit " + pipeline_.at(index).name : label, before, mergeKey);
         // the values themselves, not just the label: a reader wants what was
         // set, on which kind of step, not a sentence about it

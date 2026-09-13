@@ -2337,6 +2337,57 @@ TEST_CASE("A choice has to be named in full", "[app][pipeline][params]") {
     CHECK(p.at(1).params.getString("interpolation") != "cubic");
 }
 
+TEST_CASE("A pipeline file with a value its parameter cannot take is refused, naming it", "[app][pipeline][params]") {
+    registerBuiltinOperations();
+    const auto write = [](const test::TempFile& file, const std::string& method, const std::string& minVoxels) {
+        std::ofstream(file.path) << "version = 1\n"
+                                    "[[steps]]\nkind = \"load\"\n"
+                                    "[[steps]]\nkind = \"threshold\"\n[steps.params]\nmethod = \""
+                                 << method << "\"\n"
+                                 << "min_voxels = " << minVoxels << "\n";
+    };
+    test::TempFile file("pipeline", ".sirius.toml");
+    write(file, "Triangel", "4");
+    // was loaded with Otsu in place of the misspelt method, silently
+    CHECK_THROWS_WITH(Pipeline::load(file.str), Catch::Matchers::ContainsSubstring("step 02 (threshold)") &&
+                                                    Catch::Matchers::ContainsSubstring("'Triangel' is not one of"));
+    write(file, "otsu", "\"many\"");
+    CHECK_THROWS_WITH(Pipeline::load(file.str), Catch::Matchers::ContainsSubstring("min_voxels"));
+    write(file, "otsu", "4");   // case is still forgiven
+    CHECK(Pipeline::load(file.str).at(1).params.getString("method") == "Otsu");
+    // an undo snapshot is read leniently: it is always well formed
+    const json snapshot = {{"steps", json::array({{{"kind", "load"}}, {{"kind", "threshold"}, {"params", {{"method", "Triangel"}}}}})}};
+    CHECK(Pipeline::fromJson(snapshot).at(1).params.getString("method") == "Otsu");
+    // the pipeline the repository ships loads
+    CHECK_NOTHROW(Pipeline::load(SIRIUS_TEST_DATA_DIR "/../../examples/sim_bundled.sirius.toml"));
+}
+
+TEST_CASE("An edit that changes no value is not an undo entry", "[app][workbench][history][params]") {
+    registerTestOps();
+    Scratch scratch;
+    Workbench wb(scratch.dir);
+    wb.setDataset(syntheticSource(1, 1, 2, 8, 8));
+    for (const char* kind : {"test_labels", "test_scale", "contrast"}) {
+        INFO(kind);
+        wb.addStep(kind);
+        const int i = wb.pipeline().size() - 1;
+        const ParamSet p = wb.pipeline().at(i).params;
+        REQUIRE(p.size() >= 1);
+        const std::size_t before = wb.history().size();
+        wb.setStepParam(i, p.items().front().first, p.items().front().second);
+        CHECK(wb.history().size() == before);   // was one more for every step with two parameters or more
+        wb.setStepParams(i, p, "unchanged");
+        CHECK(wb.history().size() == before);
+    }
+    // a field losing focus commits its unchanged value: the redo survives it
+    wb.undo();
+    REQUIRE(wb.history().canRedo());
+    const int last = wb.pipeline().size() - 1;
+    const auto first = wb.pipeline().at(last).params.items().front();
+    wb.setStepParam(last, first.first, first.second);
+    CHECK(wb.history().canRedo());
+}
+
 TEST_CASE("On tracked labels a split travels along the track", "[app][workbench][labels][track]") {
     registerTestOps();
     Scratch scratch;

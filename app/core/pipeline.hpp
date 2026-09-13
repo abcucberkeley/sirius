@@ -72,8 +72,11 @@ namespace sirius::app {
         nlohmann::json toJson() const;
         // A step of a kind nothing registered provides gets a stand-in
         // operation (registerMissingOperation) and keeps its parameters as written.
-        static Pipeline fromJson(const nlohmann::json& j);
-        // TOML on disk (".sirius.toml").
+        // `strict`: a value that does not fit its parameter (a choice that is
+        // not one of the choices, text for a number) throws, naming the step
+        // and the parameter, instead of the default taking its place.
+        static Pipeline fromJson(const nlohmann::json& j, bool strict = false);
+        // TOML on disk (".sirius.toml"); read strictly.
         void save(const std::string& path) const;
         static Pipeline load(const std::string& path);
         // Python script that reproduces the pipeline with the sirius package.

@@ -157,7 +157,7 @@ namespace sirius::app {
         return {{"version", 1}, {"steps", steps}};
     }
 
-    Pipeline Pipeline::fromJson(const json& j) {
+    Pipeline Pipeline::fromJson(const json& j, bool strict) {
         Pipeline p;
         std::vector<Step> steps;
         if (!j.contains("steps") || !j["steps"].is_array()) throw std::runtime_error("pipeline: missing 'steps'");
@@ -182,6 +182,20 @@ namespace sirius::app {
             s.params = ParamSet::fromJson(sj.value("params", json::object()));
             if (op && !op->info().missing) {
                 s.params.applyDefaults(op->info().params);
+                if (strict) {
+                    // coerce() puts the default in place of a value that does not
+                    // fit: a misspelt method in a file became another method
+                    for (const ParamSpec& spec : op->info().params) {
+                        const ParamValue* v = s.params.find(spec.key);
+                        if (!v) continue;
+                        try {
+                            (void)coerceToSpec(spec, sirius::app::toJson(*v));
+                        } catch (const std::exception& e) {
+                            throw std::runtime_error("pipeline: step " + Step::number(static_cast<int>(steps.size())) + " (" + s.kind +
+                                                     "): " + e.what());
+                        }
+                    }
+                }
                 s.params.coerce(op->info().params);
             }
             // TOML integers arrive as signed 64-bit, so is_number_unsigned()
@@ -282,7 +296,7 @@ namespace sirius::app {
         } catch (const toml::parse_error& e) {
             throw std::runtime_error("cannot parse pipeline file " + path + ": " + std::string(e.description()));
         }
-        return fromJson(tomlToJson(root));
+        return fromJson(tomlToJson(root), true);
     }
 
     std::string Pipeline::toPythonScript(const std::string& datasetPath) const {
