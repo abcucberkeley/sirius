@@ -122,11 +122,12 @@ namespace sirius::app {
                     post.threshold = cut;
                     ctx.throwIfCancelled();
                     total += labelsFromProbabilities(vol.data(), nullptr, d.z, d.y, d.x, post, *labels, t);
+                    // the intensities are not probabilities: confidence is
+                    // unknown, in this frame's table (each frame keeps its own)
+                    for (LabelStats& s : labels->stats()) s.confidence = 1.0;
+                    labels->applyFlags(post.flags);
                     if (t == 0) cuts = formatNumber(cut, 4);
                 }
-                // the intensities are not probabilities: confidence is unknown
-                for (LabelStats& s : labels->stats()) s.confidence = 1.0;
-                labels->applyFlags(post.flags);
                 out.labels = labels;
                 out.ranOn = Backend::Cpu;
                 out.note = "threshold " + cuts + " · " + std::to_string(total) + " labels · CPU";

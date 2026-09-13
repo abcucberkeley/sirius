@@ -1030,3 +1030,141 @@ TEST_CASE("removeSmall and dropSmall cope with an id near 2^32", "[app][labels]"
     CHECK(removeSmall(d.data(), static_cast<Index>(d.size()), 2) == 2);
     CHECK(d == std::vector<std::uint32_t>{0, 1, 1, 1, 2, 2, 0, 0, 0, 1});
 }
+
+TEST_CASE("Annotations stay with the time point they were made on", "[app][labels]") {
+    // untracked: each frame numbers its own objects, so id 3 of frame 0 and
+    // id 3 of frame 1 are two different objects
+    LabelVolume l(2, 1, 16, 16);
+    auto square = [&l](Index t, Index y0, Index x0, std::uint32_t id) {
+        for (Index y = y0; y < y0 + 3; ++y)
+            for (Index x = x0; x < x0 + 3; ++x) l.volume(t)[y * 16 + x] = id;
+    };
+    square(0, 2, 2, 3);
+    square(0, 10, 10, 4);
+    square(1, 10, 2, 3);
+    l.recomputeStats(0);
+    for (LabelStats& s : l.stats()) {
+        if (s.id == 3) {
+            s.reviewed = true;
+            s.confidence = 0.2;
+            s.cls = "nucleus";
+        }
+        if (s.id == 4) s.reviewed = true;
+    }
+    l.applyFlags(LabelFlagRules{});
+
+    SECTION("another frame's object under the same id does not inherit them") {
+        l.recomputeStats(1);
+        const LabelStats* other = l.statsOf(3);
+        REQUIRE(other);
+        CHECK_FALSE(other->reviewed);
+        CHECK(other->confidence == 1.0);
+        CHECK(other->cls == "object");
+        CHECK(std::find(other->flags.begin(), other->flags.end(), "low conf") == other->flags.end());
+        // and coming back finds them all, the mark of an id frame 1 lacks included
+        l.recomputeStats(0);
+        REQUIRE(l.statsOf(3));
+        REQUIRE(l.statsOf(4));
+        CHECK(l.statsOf(4)->reviewed);
+        CHECK(l.statsOf(3)->reviewed);
+        CHECK(l.statsOf(3)->confidence == 0.2);
+        CHECK(l.statsOf(3)->cls == "nucleus");
+    }
+    SECTION("annotationOf answers for any frame, whichever the table is on") {
+        CHECK(l.annotationOf(0, 3).cls == "nucleus");
+        CHECK(l.annotationOf(1, 3).cls == "object");
+        l.recomputeStats(1);
+        CHECK(l.annotationOf(0, 3).cls == "nucleus");
+        CHECK(l.annotationOf(0, 3).confidence == 0.2);
+        CHECK(l.annotationOf(0, 4).reviewed);
+        CHECK_FALSE(l.annotationOf(1, 3).reviewed);
+    }
+    SECTION("share() and clone() take the annotations of every frame along") {
+        l.recomputeStats(1);
+        auto c = l.clone();
+        c->recomputeStats(0);
+        REQUIRE(c->statsOf(3));
+        CHECK(c->statsOf(3)->cls == "nucleus");
+        // and the copies are independent
+        c->stats().front().cls = "changed";
+        c->recomputeStats(1);
+        l.recomputeStats(0);
+        CHECK(l.statsOf(3)->cls == "nucleus");
+    }
+    SECTION("an undone delete gets its annotations back") {
+        const LabelDiff d = l.remove(0, 3);
+        l.updateStats(d);
+        CHECK(l.statsOf(3) == nullptr);
+        l.apply(d, false);
+        l.updateStats(d);
+        REQUIRE(l.statsOf(3));
+        CHECK(l.statsOf(3)->reviewed);
+        CHECK(l.statsOf(3)->cls == "nucleus");
+    }
+}
+
+TEST_CASE("Per-frame confidences survive moving the table between frames", "[app][labels]") {
+    // what a model segmentation leaves: every frame measured its own
+    LabelVolume l(2, 1, 8, 8);
+    for (Index t = 0; t < 2; ++t)
+        for (Index i = 0; i < 16; ++i) l.volume(t)[i] = 1;
+    std::vector<float> low(64, 0.3f), high(64, 0.9f);
+    l.recomputeStats(0, low.data());
+    l.recomputeStats(1, high.data());
+    l.recomputeStats(0);   // the viewer goes back to the first frame
+    REQUIRE(l.statsOf(1));
+    CHECK_THAT(l.statsOf(1)->confidence, WithinAbs(0.3, 1e-6));   // its own, not the last frame's
+    l.recomputeStats(1);
+    CHECK_THAT(l.statsOf(1)->confidence, WithinAbs(0.9, 1e-6));
+}
+
+TEST_CASE("On a tracked volume the class and review mark follow the id", "[app][labels][track]") {
+    LabelVolume l(3, 1, 8, 8);
+    for (Index t = 0; t < 3; ++t) {
+        for (Index i = 0; i < 8; ++i) l.volume(t)[i] = 5;
+        if (t < 2) l.volume(t)[27] = 6;
+    }
+    std::vector<float> p;
+    for (Index t = 0; t < 3; ++t) {
+        p.assign(64, 0.4f + 0.2f * static_cast<float>(t));
+        l.recomputeStats(t, p.data());
+        for (LabelStats& s : l.stats()) s.cls = "track";
+    }
+    l.setTracked(true);
+    l.recomputeStats(0);
+    for (LabelStats& s : l.stats())
+        if (s.id == 5) s.reviewed = true;
+    CHECK(l.annotationOf(2, 5).reviewed);   // before the table moves
+    l.recomputeStats(2);
+    REQUIRE(l.statsOf(5));
+    CHECK(l.statsOf(5)->reviewed);
+    CHECK(l.statsOf(5)->cls == "track");
+    CHECK_THAT(l.statsOf(5)->confidence, WithinAbs(0.8, 1e-6));   // the measurement stays the frame's
+    CHECK_FALSE(l.annotationOf(1, 6).reviewed);
+    // taking the mark back on another frame takes it back for the track
+    for (LabelStats& s : l.stats()) s.reviewed = false;
+    l.recomputeStats(1);
+    REQUIRE(l.statsOf(5));
+    CHECK_FALSE(l.statsOf(5)->reviewed);
+    // an id painted into a frame where the track was absent is still the track
+    l.recomputeStats(2);
+    const LabelDiff d = l.paint(2, 0, 3, 3, 0.0, 0, 6);
+    l.updateStats(d);
+    REQUIRE(l.statsOf(6));
+    CHECK(l.statsOf(6)->cls == "track");
+}
+
+TEST_CASE("recomputeStats copes with an id near 2^32", "[app][labels]") {
+    // a table indexed by id would ask for 3e9 entries
+    LabelVolume l(1, 1, 4, 4);
+    l.volume(0)[5] = 3000000000u;
+    l.volume(0)[6] = 3000000000u;
+    l.volume(0)[9] = 2;
+    REQUIRE_NOTHROW(l.recomputeStats(0));
+    REQUIRE(l.stats().size() == 2);
+    CHECK(l.stats()[0].id == 2);
+    CHECK(l.stats()[1].id == 3000000000u);
+    CHECK(l.stats()[1].voxels == 2);
+    CHECK(l.stats()[1].bbox == std::array<Index, 6>{0, 1, 1, 2, 1, 3});
+    CHECK(l.maxLabel() == 3000000000u);
+}

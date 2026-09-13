@@ -577,6 +577,53 @@ TEST_CASE("Crop / pad cuts a box and carries labels", "[app][ops][croppad]") {
     CHECK(out.labels->at(0, 0, 0, 0) == 0);
 }
 
+TEST_CASE("Crop / pad keeps what was said about the objects it carries", "[app][ops][croppad][labels]") {
+    const Dims5 dims{1, 2, 1, 12, 12};
+    const DatasetMeta meta = metaFor(dims);
+    const Operation& op = requireOperation("croppad");
+    ParamSet p = op.defaults();
+    p.set("y0", std::int64_t{2});
+    p.set("x0", std::int64_t{2});
+    p.set("y", std::int64_t{8});
+    p.set("x", std::int64_t{8});
+    StepInput in = inputOf(rampArray(dims), meta);
+    // a track of two frames, as the tracking step leaves it, with a review
+    // mark, a model confidence and flag rules of its own
+    auto labels = std::make_shared<LabelVolume>(2, 1, 12, 12);
+    for (Index t = 0; t < 2; ++t) {
+        for (Index y = 4; y < 7; ++y)
+            for (Index x = 4 + t; x < 7 + t; ++x) labels->volume(t)[y * 12 + x] = 3;
+        labels->recomputeStats(t);
+        for (LabelStats& s : labels->stats()) {
+            s.cls = "track";
+            s.confidence = t == 0 ? 0.4 : 0.9;
+        }
+    }
+    labels->setTracked(true);
+    LabelFlagRules rules;
+    rules.flagBorder = false;
+    rules.lowConfidence = 0.5;
+    labels->applyFlags(rules);
+    labels->recomputeStats(0);
+    labels->stats().front().reviewed = true;
+    in.labels = labels;
+    Progress prog;
+    const StepOutput out = op.run(in, p, prog.ctx);
+    REQUIRE(out.labels);
+    CHECK(out.labels->tracked());   // a delete on it still takes the whole track
+    CHECK(out.labels->statsT() == 0);
+    const LabelStats* s = out.labels->statsOf(3);
+    REQUIRE(s);
+    CHECK(s->cls == "track");
+    CHECK(s->reviewed);
+    CHECK(s->confidence == 0.4);
+    CHECK(s->bbox == std::array<Index, 6>{0, 1, 2, 5, 2, 5});   // measured on the new grid
+    CHECK(std::find(s->flags.begin(), s->flags.end(), "low conf") != s->flags.end());   // the rules came along
+    CHECK(out.labels->flaggedCount("touching border") == 0);
+    CHECK(out.labels->annotationOf(1, 3).confidence == 0.9);   // and the other frame's own
+    CHECK(out.labels->annotationOf(1, 3).reviewed);
+}
+
 TEST_CASE("Resample changes the voxel size", "[app][ops][resample]") {
     const Dims5 dims{1, 1, 4, 8, 8};
     const DatasetMeta meta = metaFor(dims, 0.1, 0.4);
@@ -772,6 +819,37 @@ TEST_CASE("Threshold labels blobs and Label cleanup drops the small ones", "[app
         CHECK(r.labels->stats().size() == 4);   // the input labels are untouched
         StepInput none = inputOf(data, meta);
         CHECK_THROWS(cleanup.run(none, cp, prog.ctx));
+    }
+}
+
+TEST_CASE("Threshold and classical labels have an unknown confidence in every frame", "[app][ops][threshold][classic]") {
+    const Dims5 dims{1, 2, 5, 40, 20};
+    const DatasetMeta meta = metaFor(dims);
+    auto data = blobArray(Dims5{1, 1, 5, 40, 20}, 3, 3.0);
+    auto two = std::make_shared<Array5>(Array5::zeros(dims));
+    for (Index t = 0; t < 2; ++t)
+        for (Index z = 0; z < dims.z; ++z)
+            for (Index y = 0; y < dims.y; ++y)
+                for (Index x = 0; x < dims.x; ++x) two->at(0, t, z, y, x) = data->at(0, 0, z, y, x) * (t == 0 ? 0.5f : 1.0f);
+    Progress prog;
+    for (const char* kind : {"threshold", "classic"}) {
+        INFO(kind);
+        const Operation& op = requireOperation(kind);
+        ParamSet p = op.defaults();
+        p.set("method", std::string("Manual"));
+        p.set("value", 100.0);
+        p.set("min_voxels", std::int64_t{0});
+        if (std::string(kind) == "classic") {
+            p.set("sigma", 0.0);
+            p.set("opening", std::int64_t{0});
+            p.set("expand", 2.0);   // grows into voxels the mask called background
+        }
+        const StepOutput r = op.run(inputOf(two, meta), p, prog.ctx);
+        REQUIRE(r.labels);
+        r.labels->recomputeStats(0);   // the viewer on the first frame: the intensities were never probabilities there either
+        REQUIRE_FALSE(r.labels->stats().empty());
+        for (const LabelStats& s : r.labels->stats()) CHECK(s.confidence == 1.0);
+        CHECK(r.labels->flaggedCount("low conf") == 0);
     }
 }
 

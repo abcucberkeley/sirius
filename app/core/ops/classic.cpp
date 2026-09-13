@@ -964,10 +964,12 @@ namespace sirius::app {
                         for (LabelStats& st : labels->stats()) st.cls = post.className;
                         labels->applyFlags(post.flags);
                     }
+                    // intensities, not probabilities: in this frame's table,
+                    // as each frame keeps its own
+                    for (LabelStats& s : labels->stats()) s.confidence = 1.0;
+                    labels->applyFlags(post.flags);
                     total += made;
                 }
-                for (LabelStats& s : labels->stats()) s.confidence = 1.0;   // intensities, not probabilities
-                labels->applyFlags(post.flags);
                 out.labels = labels;
                 out.ranOn = Backend::Cpu;
                 out.note = cutText + " · " + std::to_string(total) + " labels · CPU";

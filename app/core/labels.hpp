@@ -24,6 +24,7 @@
 #include <memory>
 #include <optional>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 #include <sirius/buffer.hpp>
@@ -43,6 +44,17 @@ namespace sirius::app {
         bool reviewed = false;
 
         std::string flagText() const;           // first flag or ""
+    };
+
+    // What is said about one object rather than measured on it: the part of
+    // LabelStats a recompute cannot derive from the voxels. Kept per time
+    // point (LabelVolume::annotationOf), so that id 3 of one frame never
+    // lends its class, confidence or review mark to a different id 3 of
+    // another.
+    struct LabelAnnotation {
+        std::string cls = "object";
+        double confidence = 1.0;
+        bool reviewed = false;
     };
 
     // Voxel diff of one edit: linear indices into one (z, y, x) volume of
@@ -109,6 +121,13 @@ namespace sirius::app {
         // way, and the flags are refreshed with the rules of the last
         // applyFlags(). The statistics describe one time point, the last
         // one computed (statsT()).
+        //
+        // "Known" is per time point: before the table moves to another
+        // frame, the class, confidence and review mark of every row are put
+        // aside for the frame it described, and the new frame's rows take
+        // their own frame's. On a tracked volume class and review mark
+        // belong to the track and follow the id into every frame; the
+        // confidence, a measurement, stays with its frame.
         void recomputeStats(Index t, const float* probabilities = nullptr);
         // Brings the statistics up to date after an edit, touching only the
         // labels the diff changed (each is rescanned within its bounding
@@ -116,13 +135,27 @@ namespace sirius::app {
         // after every other edit, undo and redo. Falls back to a full
         // recompute when the diff is for another time point than the
         // statistics, or when none were computed yet. Confidence and class
-        // of a known label are kept; new labels start at 1.0 / "object".
+        // of a known label are kept; a label new to the table takes what its
+        // frame (or its track) said about that id before -- an undone delete
+        // gets its review mark back -- and otherwise starts at 1.0 / "object".
         // The flags are refreshed with the rules of the last applyFlags().
         void updateStats(const LabelDiff& diff);
         Index statsT() const noexcept { return statsT_; }   // -1: none computed
+        // The table of statsT(). Writing a row's class, confidence or review
+        // mark through it annotates that object in that frame (and, when
+        // tracked, the track).
         const std::vector<LabelStats>& stats() const noexcept { return stats_; }
         std::vector<LabelStats>& stats() noexcept { return stats_; }
         const LabelStats* statsOf(std::uint32_t id) const noexcept;
+        // Class, confidence and review mark of `id` at time point t, whichever
+        // frame the table is on: what an export of every frame reads.
+        LabelAnnotation annotationOf(Index t, std::uint32_t id) const;
+        // Takes over another volume's statistics and everything said about
+        // its objects -- per-frame annotations, flag rules, the tracked flag,
+        // the highest id -- for a volume made from its voxels on another grid
+        // (a crop). The voxels are not touched; recompute the statistics after
+        // filling them.
+        void copyAnnotationsFrom(const LabelVolume& other);
         void applyFlags(const LabelFlagRules& rules);
         Index reviewedCount() const noexcept;
         Index flaggedCount(const std::string& flag) const noexcept;
@@ -146,18 +179,32 @@ namespace sirius::app {
 
         // A deep copy: its own voxels from the start.
         std::shared_ptr<LabelVolume> clone() const;
-        // A volume over the same voxels (and a copy of the statistics) that
-        // takes a private copy on its first write; see the header note.
+        // A volume over the same voxels (and a copy of the statistics and
+        // the annotations) that takes a private copy on its first write; see
+        // the header note.
         std::shared_ptr<LabelVolume> share() const;
 
     private:
+        using AnnotationTable = std::unordered_map<std::uint32_t, LabelAnnotation>;
+
         void detach();                       // own the voxels before writing
         LabelStats* mutableStatsOf(std::uint32_t id) noexcept;
+        // Puts the annotations of `rows` aside for frame `t` (and the track).
+        void saveAnnotations(Index t, const std::vector<const LabelStats*>& rows);
+        void saveAnnotations();              // every row of the table, for statsT_
+        // What was put aside for `id` at frame t; defaults when nothing was.
+        LabelAnnotation savedAnnotation(Index t, std::uint32_t id) const;
 
         Index t_ = 0, z_ = 0, y_ = 0, x_ = 0;
         std::shared_ptr<Buffer<std::uint32_t>> data_;   // never null
         std::vector<LabelStats> stats_;
         Index statsT_ = -1;
+        // The annotations of the frames the table has left, one table per
+        // time point (empty until the first move). Replaced, never written
+        // in place, so share() and clone() copy pointers.
+        std::vector<std::shared_ptr<const AnnotationTable>> frameAnnotations_;
+        // Tracked volumes: the class and review mark of each track.
+        std::shared_ptr<const AnnotationTable> trackAnnotations_;
         std::optional<LabelFlagRules> flagRules_;       // the last applyFlags()
         std::uint32_t maxLabel_ = 0;
         bool edited_ = false;
