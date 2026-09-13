@@ -21,6 +21,7 @@
 #include "core/cancel.hpp"
 #include "core/executor.hpp"
 #include "core/history.hpp"
+#include "core/manifest.hpp"
 #include "core/pipeline.hpp"
 #include "core/tool_api.hpp"
 #include "core/workbench.hpp"
@@ -1926,6 +1927,187 @@ TEST_CASE("Load parameters left at zero keep the file's own axes and voxel sizes
     const OpenResult voxel = sirius::app::openDataset(path.string(), oneVoxel);
     CHECK(voxel.meta.voxelUm[2] == 0.7);
     CHECK(voxel.meta.voxelUm[0] == plain.meta.voxelUm[0]);   // the file's, not 0
+}
+
+namespace {
+    // A plain float32 TIFF of `pages` 4 x 4 pages, each page's value its index.
+    std::string writePages(const std::filesystem::path& path, Index pages, const std::string& description = {}) {
+        Buffer<float> b(Shape{pages, 4, 4});
+        for (Index i = 0; i < b.size(); ++i) b.data()[i] = static_cast<float>(i / 16);
+        TiffWriteOptions w;
+        w.description = description;
+        writeTiffStack<float>(path.string(), b.view(), w);
+        return path.string();
+    }
+} // namespace
+
+TEST_CASE("The Load step's dims are the source's, whatever the axes asked for", "[app][workbench][load]") {
+    registerTestOps();
+    Scratch scratch;
+    const Operation* loadOp = findOperation("load");
+    REQUIRE(loadOp);
+    const Operation& load = *loadOp;
+    Executor ex(scratch.dir / "cache");
+    StepContext ctx;
+
+    // an ImageJ hyperstack of 2 channels x 10 planes: 20 pages, which 2
+    // channels x 4 time points do not divide
+    const std::string path = writePages(scratch.dir / "hyper.tif", 20, "ImageJ=1.53t\nimages=20\nchannels=2\nslices=10\nhyperstack=true\n");
+    Pipeline p;
+    ParamSet lp = p.at(0).params;
+    lp.set("path", path);
+    lp.set("t", std::int64_t{4});
+    p.setParams(0, lp);
+    std::shared_ptr<const StepOutput> out = ex.run(p, 0, ctx);
+    REQUIRE(out->source);
+    // was c1 t4 z5 over a source serving c1 t1 z20: a reader of one volume
+    // allocated 5 planes and the source wrote 20 into them
+    REQUIRE(out->meta.dims == out->source->dims());
+    CHECK(out->meta.dims == Dims5{1, 1, 20, 4, 4});
+    const Buffer<float> volume = out->asInput().readVolume(0, 0);
+    CHECK(volume.shape()[0] == 20);
+    // what the step predicts is what it produces, and it says why
+    CHECK(load.outputMeta(p.at(0).params, DatasetMeta{}).dims == out->meta.dims);
+    const Validation v = load.validate(p.at(0).params, DatasetMeta{});
+    CHECK(v.ok());
+    REQUIRE(v.warnings.size() == 1);
+    CHECK_THAT(v.warnings.front(), Catch::Matchers::ContainsSubstring("do not fit"));
+
+    SECTION("a layout that fits is applied, by the prediction and the run alike") {
+        lp.set("t", std::int64_t{0});
+        lp.set("c", std::int64_t{4});   // 20 = 4 x 5
+        p.setParams(0, lp);
+        const std::shared_ptr<const StepOutput> four = ex.run(p, 0, ctx);
+        CHECK(four->meta.dims == Dims5{4, 1, 5, 4, 4});
+        CHECK(four->source->dims() == four->meta.dims);
+        CHECK(load.outputMeta(p.at(0).params, DatasetMeta{}).dims == four->meta.dims);
+        CHECK(load.validate(p.at(0).params, DatasetMeta{}).warnings.empty());
+    }
+
+    SECTION("a folder takes its axes from its manifest, and says so") {
+        const std::filesystem::path folder = scratch.dir / "frames";
+        std::filesystem::create_directories(folder);
+        writePages(folder / "f0.tif", 3);
+        writePages(folder / "f1.tif", 3);
+        manifestOfOneStack(folder).save(folder);
+        ParamSet fp = load.defaults();
+        fp.set("path", folder.string());
+        fp.set("t", std::int64_t{6});
+        const Validation fv = load.validate(fp, DatasetMeta{});
+        CHECK_FALSE(fv.ok());
+        CHECK_THAT(fv.firstError(), Catch::Matchers::ContainsSubstring("manifest"));
+        Pipeline q;
+        q.setParams(0, fp);
+        CHECK_THROWS_WITH(ex.run(q, 0, ctx), Catch::Matchers::ContainsSubstring("manifest"));
+        fp.set("t", std::int64_t{0});
+        q.setParams(0, fp);
+        CHECK(ex.run(q, 0, ctx)->meta.dims == Dims5{1, 2, 3, 4, 4});
+    }
+}
+
+TEST_CASE("Opening another dataset starts from the Load step's defaults", "[app][workbench][load]") {
+    registerTestOps();
+    Scratch scratch;
+    const std::string a = writePages(scratch.dir / "a.tif", 12), b = writePages(scratch.dir / "b.tif", 8);
+    Workbench wb(scratch.dir / "wb");
+    wb.setBackend(Backend::Cpu);
+    OpenOptions oa;
+    oa.voxelUm = std::array<double, 3>{0.05, 0.05, 0.3};
+    oa.pageOrder = PageOrder{"czt", 3, 1, 4};
+    wb.openDataset(a, oa);
+    CHECK(wb.dataset().dims == Dims5{3, 1, 4, 4, 4});
+    CHECK(wb.pipeline().at(0).params.getDouble("voxel_x") == 0.05);
+
+    wb.openDataset(b);   // a recent file, a drop, --dataset: no options
+    const ParamSet& lp = wb.pipeline().at(0).params;
+    CHECK(lp.getString("path") == b);
+    CHECK(lp.getInt("c") == 0);   // was A's 3
+    CHECK(lp.getInt("z") == 0);   // was A's 4
+    CHECK(lp.getDouble("voxel_x") == 0.0);   // was A's 0.05
+    CHECK(wb.dataset().dims == Dims5{1, 1, 8, 4, 4});
+    // the next time the Load step runs it opens B as B
+    wb.setStepParam(0, "read_as", std::string("Full load to RAM"));
+    REQUIRE(runSync(wb, 0)->succeeded());
+    const std::shared_ptr<const StepOutput> reloaded = wb.executor().cached(wb.pipeline(), 0);
+    REQUIRE(reloaded);
+    CHECK(reloaded->meta.dims == Dims5{1, 1, 8, 4, 4});
+    CHECK(reloaded->meta.voxelUm[0] == wb.dataset().voxelUm[0]);
+    CHECK(reloaded->meta.voxelUm[0] != 0.05);
+}
+
+TEST_CASE("A voxel size given for one axis keeps the dataset's for the others", "[app][workbench][load]") {
+    registerTestOps();
+    Scratch scratch;
+    const std::filesystem::path folder = scratch.dir / "frames";
+    std::filesystem::create_directories(folder);
+    writePages(folder / "f0.tif", 3);
+    writePages(folder / "f1.tif", 3);
+    DatasetManifest m = manifestOfOneStack(folder);
+    m.voxelUm = {0.2, 0.2, 0.5};
+    m.save(folder);
+    ParamSet p = requireOperation("load").defaults();
+    p.set("path", folder.string());
+    p.set("voxel_z", 0.7);
+    const OpenResult r = sirius::app::openDataset(folder.string(), Workbench::openOptionsFromLoadParams(p));
+    CHECK(r.meta.voxelUm[0] == 0.2);   // was 0: the whole vector replaced the manifest's
+    CHECK(r.meta.voxelUm[1] == 0.2);
+    CHECK(r.meta.voxelUm[2] == 0.7);
+    CHECK(requireOperation("load").outputMeta(p, DatasetMeta{}).voxelUm == r.meta.voxelUm);
+}
+
+TEST_CASE("An edited Load step is not re-seeded with the data it replaced", "[app][workbench][load][executor]") {
+    registerTestOps();
+    Scratch scratch;
+    const std::string path = writePages(scratch.dir / "stack.tif", 12);
+    Workbench wb(scratch.dir / "wb");
+    wb.setBackend(Backend::Cpu);
+    wb.openDataset(path);
+    wb.replacePipeline(Pipeline(), "clear");
+    wb.addStep("test_scale");
+    REQUIRE(runSync(wb)->succeeded());
+    CHECK(wb.output(1)->meta.dims == Dims5{1, 1, 12, 4, 4});
+
+    wb.setStepParam(0, "c", std::int64_t{3});
+    CHECK_FALSE(wb.outputFresh(0));
+    REQUIRE(runSync(wb)->succeeded());
+    CHECK(wb.output(1)->meta.dims == Dims5{3, 1, 4, 4, 4});
+    CHECK(wb.output(0)->meta.dims == Dims5{3, 1, 4, 4, 4});   // step 01 shows what it ran, not what was opened
+    CHECK(wb.dataset().dims == Dims5{3, 1, 4, 4, 4});
+    wb.clearAllCaches();
+    CHECK(wb.outputFresh(0));
+    REQUIRE(runSync(wb)->succeeded());
+    CHECK(wb.output(1)->meta.dims == Dims5{3, 1, 4, 4, 4});   // was c1 z12: the opened source re-seeded under c = 3
+
+    SECTION("an edit that has not run is not seeded either") {
+        wb.setStepParam(0, "c", std::int64_t{4});
+        wb.clearAllCaches();
+        CHECK_FALSE(wb.outputFresh(0));
+        REQUIRE(runSync(wb)->succeeded());
+        CHECK(wb.output(1)->meta.dims == Dims5{4, 1, 3, 4, 4});
+    }
+    SECTION("undoing the edit runs the step with the old parameters again") {
+        wb.undo();
+        CHECK(wb.pipeline().at(0).params.getInt("c") == 0);
+        CHECK_FALSE(wb.outputFresh(0));
+        REQUIRE(runSync(wb)->succeeded());
+        CHECK(wb.output(1)->meta.dims == Dims5{1, 1, 12, 4, 4});
+        CHECK(wb.dataset().dims == Dims5{1, 1, 12, 4, 4});
+    }
+    SECTION("a pipeline naming the same file with other Load parameters opens it that way") {
+        Pipeline q;
+        ParamSet ql = wb.pipeline().at(0).params;
+        ql.set("c", std::int64_t{4});
+        ql.set("sheet_angle", 30.0);
+        q.setParams(0, ql);
+        q.add("test_scale");
+        test::TempFile file("wb", ".sirius.toml");
+        q.save(file.str);
+        wb.loadPipeline(file.str);
+        CHECK(wb.dataset().dims == Dims5{4, 1, 3, 4, 4});   // was still c3 z4: the path matched, so nothing was opened
+        CHECK(wb.outputFresh(0));
+        CHECK(wb.pipeline().at(0).params.getInt("c") == 4);
+        CHECK(wb.pipeline().at(0).params.getDouble("sheet_angle") == 30.0);   // not an open option, and kept
+    }
 }
 
 TEST_CASE("A recorded session marks the strokes and the review decisions", "[app][workbench][session]") {

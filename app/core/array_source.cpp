@@ -574,7 +574,9 @@ namespace sirius::app {
                 for (int k = 0; k < 3; ++k)
                     if ((*options->voxelUm)[k] > 0.0) voxel[k] = (*options->voxelUm)[k];   // 0 = the file's
             const bool knownXy = voxel[0] > 0.0 && voxel[1] > 0.0;
-            if (!knownXy) voxel[0] = voxel[1] = 0.1;
+            // per axis: an x given without a y is still the x
+            for (int k = 0; k < 2; ++k)
+                if (voxel[k] <= 0.0) voxel[k] = 0.1;
             if (voxel[2] <= 0.0) voxel[2] = knownXy ? voxel[0] * 2.0 : 0.2;
             m.voxelUm = voxel;
             if (knownXy) summary << " · voxel " << m.voxelString();
@@ -719,9 +721,13 @@ namespace sirius::app {
                 };
                 voxel = {sc(Axis::X), sc(Axis::Y), sc(Axis::Z)};
             }
-            if (options && options->voxelUm) voxel = *options->voxelUm;
+            // an override of 0 keeps the store's scale for that axis
+            if (options && options->voxelUm)
+                for (std::size_t k = 0; k < 3; ++k)
+                    if ((*options->voxelUm)[k] > 0.0) voxel[k] = (*options->voxelUm)[k];
             const bool known = voxel[0] > 0.0 && voxel[1] > 0.0;
-            if (!known) voxel[0] = voxel[1] = 0.1;
+            for (std::size_t k = 0; k < 2; ++k)
+                if (voxel[k] <= 0.0) voxel[k] = 0.1;
             if (voxel[2] <= 0.0) voxel[2] = known ? voxel[0] * 2.0 : 0.2;
             m.voxelUm = voxel;
             if (info.scale.size() == static_cast<std::size_t>(rank) && r.map.dimOf[static_cast<std::size_t>(Axis::T)] >= 0)
@@ -916,7 +922,11 @@ namespace sirius::app {
                 const std::uintmax_t size = fs::file_size(manifestFilePath(folder, f), ec);
                 if (!ec) meta.bytesOnDisk += static_cast<std::uint64_t>(size);
             }
-            meta.voxelUm = options && options->voxelUm ? *options->voxelUm : m.voxelUm;
+            // an override of 0 keeps the manifest's size for that axis
+            meta.voxelUm = m.voxelUm;
+            if (options && options->voxelUm)
+                for (std::size_t k = 0; k < 3; ++k)
+                    if ((*options->voxelUm)[k] > 0.0) meta.voxelUm[k] = (*options->voxelUm)[k];
             meta.frameIntervalS = m.frameIntervalS;
             meta.channels = options && options->channels ? *options->channels : m.channels;
             meta.acquisition = m.acquisition;
@@ -943,16 +953,22 @@ namespace sirius::app {
         return out;
     }
 
-    DatasetMeta probeDataset(const std::string& path) {
-        std::error_code ec;
-        if (!fs::exists(path, ec)) throw std::runtime_error("no such file or directory: " + path);
-        if (isFolderDataset(path)) return probeFolder(path, nullptr).meta;
-        if (fs::is_directory(path, ec)) {
-            if (!isZarrStore(path)) throw std::runtime_error("not a zarr / N5 store: " + path);
-            return probeZarr(path, nullptr).meta;
+    namespace {
+        DatasetMeta probeWith(const std::string& path, const OpenOptions* options) {
+            std::error_code ec;
+            if (!fs::exists(path, ec)) throw std::runtime_error("no such file or directory: " + path);
+            if (isFolderDataset(path)) return probeFolder(path, options).meta;
+            if (fs::is_directory(path, ec)) {
+                if (!isZarrStore(path)) throw std::runtime_error("not a zarr / N5 store: " + path);
+                return probeZarr(path, options).meta;
+            }
+            return probeTiff(path, options).meta;
         }
-        return probeTiff(path, nullptr).meta;
-    }
+    } // namespace
+
+    DatasetMeta probeDataset(const std::string& path) { return probeWith(path, nullptr); }
+
+    DatasetMeta probeDataset(const std::string& path, const OpenOptions& options) { return probeWith(path, &options); }
 
     OpenResult openDataset(const std::string& path, const OpenOptions& options) {
         std::error_code ec;
