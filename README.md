@@ -478,7 +478,23 @@ ctest --preset linux-gcc-app-dev                    # library + app core tests
 build/linux-gcc-app-dev/app/sirius-app --pipeline examples/sim_bundled.sirius.toml --run
 ```
 
-Command line: `--dataset`, `--pipeline`, `--run`, and for scripting and smoke tests
+**Installing on Linux** puts the workbench, its help pages, the Python worker and the
+example plugins under a prefix, with a menu entry and icon:
+
+```
+cmake --install build/linux-gcc-app-dev --component app --prefix ~/.local   # or /opt/sirius, /usr/local
+update-desktop-database ~/.local/share/applications                         # optional: refresh "Open with"
+```
+
+That gives `bin/sirius-app`, `share/sirius/{help,python,plugins}`,
+`share/applications/sirius-app.desktop` (the menu entry, and *Open with* for TIFF files)
+and the icon in the hicolor theme; a CUDA build's nvTIFF / nvCOMP go to `lib/sirius` and
+are found relative to the executable. The installed application reads its own help pages
+and starts its own copy of the worker (`ctest -R app.install` checks both). Files named
+on the command line open as though dropped on the window: `sirius-app stack.tif` or
+`sirius-app steps.sirius.toml`.
+
+Command line: `--dataset`, `--pipeline`, `--run`, `[files...]`, and for scripting and smoke tests
 `--tool '{"name":"set_view","args":{"mode":"3d"}}'` (any assistant tool), `--action
 "Export result"` (a menu item by text), `--ask "…"` (a message to the assistant),
 `--screenshot out.png` (grab the window, and any dialog, after the run and quit),

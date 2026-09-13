@@ -149,6 +149,10 @@ namespace sirius::app {
         int port = 0;                          // 0 = pick a free port
         std::string device = "auto";           // "cuda", "cpu", "auto"
     };
+    // The first directory holding sirius_worker/__main__.py of: `scriptDir`,
+    // an installed tree's share/sirius/python, the copy beside the executable
+    // (core/app_paths.hpp), $SIRIUS_WORKER_DIR, ./python, the source tree's
+    // app/python; "" when none does.
     std::string workerScriptPath(const std::string& scriptDir = {});
 
 } // namespace sirius::app

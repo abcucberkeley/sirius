@@ -1,5 +1,6 @@
 #include "core/rpc.hpp"
 
+#include "core/app_paths.hpp"
 #include "core/cancel.hpp"
 
 #include "core/errors.hpp"
@@ -493,6 +494,9 @@ namespace sirius::app {
         namespace fs = std::filesystem;
         std::vector<fs::path> candidates;
         if (!scriptDir.empty()) candidates.push_back(fs::path(scriptDir));
+        // an installed tree, then the copy the build puts beside the executable
+        if (std::string installed = installedDataDirectory("python"); !installed.empty()) candidates.push_back(fs::path(installed));
+        if (std::string beside = besideApplication("python"); !beside.empty()) candidates.push_back(fs::path(beside));
         if (const char* env = std::getenv("SIRIUS_WORKER_DIR")) candidates.push_back(fs::path(env));
         candidates.push_back(fs::current_path() / "python");
 #ifdef SIRIUS_APP_SOURCE_DIR

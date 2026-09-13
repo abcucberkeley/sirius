@@ -78,6 +78,18 @@ namespace sirius::app {
 
         constexpr const char* kIssuesUrl = "https://github.com/abcucberkeley/sirius/issues";
 
+        // A warning that does not hold up the signal it answers. exec() in a
+        // runFinished or taskFinished slot ran a nested event loop before the
+        // slots connected after this one saw the signal: the panels refreshed
+        // only once the box was closed, a scripted run (--tool run, the
+        // assistant) waited on it, and a headless --run waited out its 600 s
+        // deadline for a box nobody was there to close.
+        void warnWithoutBlocking(QWidget* parent, const QString& title, const QString& text) {
+            auto* box = new QMessageBox(QMessageBox::Warning, title, text, QMessageBox::Ok, parent);
+            box->setAttribute(Qt::WA_DeleteOnClose);
+            box->open();
+        }
+
         // "✦ Assistant" toggle: 26 px, 1.5 px border, accent fill when open.
         // (The sparkle is painted, like every other icon: see widgets/icons.hpp.)
         class AssistantButton : public QAbstractButton {
@@ -1399,7 +1411,7 @@ namespace sirius::app {
             refreshAllLater();
             // A cancelled run arrives with an empty error (workbench_bridge),
             // so there is no message text to recognise here.
-            if (!ok && !error.isEmpty()) QMessageBox::warning(this, QStringLiteral("Run failed"), error);
+            if (!ok && !error.isEmpty()) warnWithoutBlocking(this, QStringLiteral("Run failed"), error);
         });
         connect(&bridge, &WorkbenchBridge::taskStarted, this, [this](const QString& name) {
             impl_->progressClock.start();
@@ -1413,7 +1425,7 @@ namespace sirius::app {
         connect(&bridge, &WorkbenchBridge::taskFinished, this, [this](bool ok, const QString& error) {
             impl_->statusProgress->hide();
             impl_->refreshActions();
-            if (!ok && !error.isEmpty()) QMessageBox::warning(this, impl_->bridge.taskLabel(), error);
+            if (!ok && !error.isEmpty()) warnWithoutBlocking(this, impl_->bridge.taskLabel(), error);
         });
         connect(&bridge, &WorkbenchBridge::logged, this, [this](const QString& line) { impl_->showLogLine(line, 4000); });
         // Both edges of the run: the workbench refuses edits between them, and

@@ -1,0 +1,6 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="256" height="256" viewBox="0 0 256 256">
+  <!-- SIRIUS workbench: the viewer ground, the brand's accent square, and Sirius (a four-point star) -->
+  <rect x="18" y="18" width="220" height="220" fill="#0a0909" stroke="#605d5d" stroke-width="4"/>
+  <rect x="44" y="44" width="44" height="44" fill="#ec3013"/>
+  <path d="M140 56 C145 118 158 131 220 136 C158 141 145 154 140 216 C135 154 122 141 60 136 C122 131 135 118 140 56 Z" fill="#f3f2f2"/>
+</svg>

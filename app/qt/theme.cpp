@@ -137,8 +137,13 @@ namespace sirius::app::theme {
         // the fallbacks theme::font() sets (and with them every character
         // Archivo does not carry, such as the Greek in "Emission λ").
         // QApplication::setFont in applyTheme carries the face instead.
+        // No universal rule either: "* { font-size; color }" matched every
+        // widget, and the style sheet engine re-applies a matching rule when
+        // it polishes one, so every widgets::label size and colour (and every
+        // setPalette(WindowText) in the panels) came out as 13 px body text.
+        // The body size and colour are the application font and palette
+        // (applyTheme), which a widget's own setFont / setPalette override.
         qss += QStringLiteral(
-                   "* { font-size: 13px; color: %1; }\n"
                    "QMainWindow, QDialog, QDockWidget, QWidget#Panel { background: %2; }\n"
                    "QMainWindow::separator { background: %3; width: 2px; height: 2px; }\n"
                    "QMainWindow::separator:hover { background: %4; }\n"

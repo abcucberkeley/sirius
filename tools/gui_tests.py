@@ -417,6 +417,84 @@ def test_a_dropped_file_opens(app: Path, tmp: Path) -> None:
     check(state["dataset"]["name"].startswith("raw"), f"opened {state['dataset']['name']}")
 
 
+def test_files_named_on_the_command_line_open(app: Path, tmp: Path) -> None:
+    # what a file manager's "Open with" (app/linux/sirius-app.desktop, Exec=sirius-app %F) passes
+    out = run(app, [str(RAW), "--tool", '{"name":"get_state","args":{}}', "--settle", "900", "--quit-after", "6000"])
+    state = only(tool_results(out), "get_state")
+    check(state["dataset"] is not None and state["dataset"]["name"].startswith("raw"), f"the dataset is {state['dataset']}")
+    out = run(app, [str(PIPELINE), "--tool", '{"name":"get_state","args":{}}', "--settle", "900", "--quit-after", "6000"])
+    kinds = [s["kind"] for s in only(tool_results(out), "get_state")["steps"]]
+    check("sim" in kinds, f"the pipeline file did not open: steps {kinds}")
+
+
+def test_an_invalid_step_says_so_in_the_error_colour(app: Path, tmp: Path) -> None:
+    # A step whose parameters do not validate shows why in its row, in the
+    # error colour. A universal "* { color }" rule in the style sheet used to
+    # repaint every palette colour in body text, so the line was there but read
+    # like any other summary. The same pipeline with and without a missing OTF
+    # differs only by that line, so the red it adds is the line's text.
+    try:
+        from PIL import Image  # noqa: PLC0415 - optional, as in image_is_not_blank
+    except ImportError:
+        raise Skip("needs Pillow to read the screenshot") from None
+    text = PIPELINE.read_text()
+    check("../tests/data/otf.tif" in text, f"{PIPELINE} no longer names ../tests/data/otf.tif")
+    data = (ROOT / "tests" / "data").as_posix()
+    valid = tmp / "valid.sirius.toml"
+    valid.write_text(text.replace("../tests/data/", data + "/"))
+    invalid = tmp / "invalid.sirius.toml"
+    missing = (tmp / "missing-otf.tif").as_posix()
+    invalid.write_text(text.replace("../tests/data/otf.tif", missing).replace("../tests/data/", data + "/"))
+
+    def red_pixels(pipeline: Path) -> int:
+        shot = tmp / f"{pipeline.stem}.png"
+        run(app, ["--pipeline", str(pipeline), "--screenshot", str(shot), "--settle", "900", "--quit-after", "6000"])
+        image_is_not_blank(shot)
+        with Image.open(shot) as im:
+            return sum(1 for r, g, b in im.convert("RGB").getdata() if r > 140 and g < 100 and b < 80 and r - g > 90)
+
+    added = red_pixels(invalid) - red_pixels(valid)
+    check(added > 60, f"the invalid step added {added} red pixels: its error line is not in the error colour")
+
+
+def test_a_run_that_fails_in_the_worker_ends_a_headless_run(app: Path, tmp: Path) -> None:
+    # A step that raises while it runs (as a CUDA error inside a model does)
+    # used to leave a headless --run waiting for its 600 s deadline: the "Run
+    # failed" message box blocked in the window's runFinished handler, and the
+    # handler that ends the headless run is connected after it.
+    env = isolated_settings(tmp, "failing")
+    plugins = Path(env["HOME"]) / ".sirius" / "plugins"
+    plugins.mkdir(parents=True, exist_ok=True)
+    (plugins / "fails_while_running.py").write_text(
+        "STEP = {'kind': 'fails_while_running', 'name': 'Fails while running', 'group': 'Intensity', 'params': []}\n"
+        "\n"
+        "def run(data, params, meta, ctx):\n"
+        "    raise RuntimeError('CUDA error: an illegal memory access was encountered')\n"
+    )
+    pipeline = tmp / "failing.sirius.toml"
+    pipeline.write_text(
+        "version = 1\n\n"
+        '[[steps]]\nkind = "load"\nname = "Load"\n[steps.params]\n'
+        f'path = "{RAW.as_posix()}"\n\n'
+        '[[steps]]\nkind = "fails_while_running"\nname = "Fails"\n'
+    )
+    shot = tmp / "failing.png"
+    args = ["--pipeline", str(pipeline), "--run", "--tool", '{"name":"get_log","args":{}}', "--screenshot", str(shot)]
+    try:
+        out = run(app, args, timeout=120, env=env)
+    except Failure as e:
+        out = str(e)
+        if out.startswith("timed out"):
+            raise Failure("a run that failed in the worker did not end the headless run (the Run failed box blocked)") from None
+        if "Plugins unavailable" in out or "not loaded" in out:
+            raise Skip("no Python worker to serve the failing step (set SIRIUS_PYTHON to an interpreter with numpy)") from None
+        check(out.startswith("exit 1:"), f"expected the failed run's exit status 1, got: {out[:300]}")
+    else:
+        raise Failure("the failing step's run exited 0")
+    check("illegal memory access" in out, "the worker's error is not in the log")
+    check(shot.is_file(), "no screenshot: the run ended without the grab")
+
+
 def test_menu_actions_reach_the_view(app: Path, tmp: Path) -> None:
     out = run(
         app,
@@ -649,6 +727,9 @@ SCENARIOS = [
     test_the_wheel_zooms,
     test_the_wheel_zooms_about_the_cursor_in_compare,
     test_a_dropped_file_opens,
+    test_files_named_on_the_command_line_open,
+    test_an_invalid_step_says_so_in_the_error_colour,
+    test_a_run_that_fails_in_the_worker_ends_a_headless_run,
     test_menu_actions_reach_the_view,
     test_a_preset_fills_the_fields,
     test_a_token_the_secret_store_refuses_stays_in_the_settings,
