@@ -20,7 +20,6 @@
 #include <QVector>
 
 #include "core/tracks.hpp"
-#include "qt/viewer/slice_pane.hpp"
 
 class QPainter;
 
@@ -34,10 +33,12 @@ namespace sirius::app {
         QRectF bounds;             // of the points, for skipping paths off screen
     };
 
-    // The paths as seen by a pane of `kind`: XY and MIP draw (x, y), XZ (x, z)
-    // and YZ (z, y), matching the panes' column and row axes. `only` (non-zero)
-    // builds that track alone.
-    QVector<TrackPath> trackPaths(const TrackIndex& index, SlicePane::Kind kind, std::uint32_t only = 0);
+    // Which plane a pane shows, as columns and rows: XY (and the z projection)
+    // is (x, y), XZ is (x, z), YZ is (z, y).
+    enum class TrackPlane { XY, XZ, YZ };
+
+    // The paths as seen in `plane`. `only` (non-zero) builds that track alone.
+    QVector<TrackPath> trackPaths(const TrackIndex& index, TrackPlane plane, std::uint32_t only = 0);
 
     struct TrackPaintOptions {
         Index t = 0;                    // the time point on screen

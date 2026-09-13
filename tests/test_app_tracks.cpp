@@ -23,6 +23,7 @@
 
 #include "core/array_source.hpp"
 #include "core/labels.hpp"
+#include "core/tool_api.hpp"
 #include "core/tracks.hpp"
 #include "core/workbench.hpp"
 
@@ -425,6 +426,21 @@ TEST_CASE("The workbench reviews tracks: summaries, focus, follow, and edits kep
         const TrackIndex& index = *wb.viewedLabels()->tracks();
         CHECK(index.pointAt(3, 1).has_value());
         requireSame(index, TrackIndex(*wb.viewedLabels()));
+    }
+
+    SECTION("the assistant's tools list and focus tracks") {
+        ToolApi api(wb);
+        const nlohmann::json list = api.call("list_tracks", {{"limit", 2}});
+        CHECK(list.at("total") == 4);
+        CHECK(list.at("divisions") == 1);
+        CHECK(list.at("tracks").size() == 2);
+        const nlohmann::json focus = api.call("focus_track", {{"id", 4}});
+        CHECK(focus.at("ok") == true);
+        CHECK(wb.viewState().selectedLabel == 4);
+        CHECK(api.call("focus_track", {{"id", 99}}).at("ok") == false);
+        api.call("set_view", {{"follow_track", true}, {"trajectories", false}});
+        CHECK(wb.viewState().followTrack);
+        CHECK_FALSE(wb.viewState().trajectories);
     }
 
     SECTION("the view state keeps the track settings") {

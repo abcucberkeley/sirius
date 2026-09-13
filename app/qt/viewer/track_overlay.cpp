@@ -1,6 +1,7 @@
 #include "qt/viewer/track_overlay.hpp"
 
 #include <algorithm>
+#include <limits>
 #include <map>
 
 #include <QPainter>
@@ -12,13 +13,14 @@
 namespace sirius::app {
 
     namespace {
-        QPointF planeOf(const TrackPoint& p, SlicePane::Kind kind) {
+        QPointF planeOf(const TrackPoint& p, TrackPlane plane) {
             const double z = p.centroid[0], y = p.centroid[1], x = p.centroid[2];
-            switch (kind) {
-                case SlicePane::Kind::XZ: return {x, z};
-                case SlicePane::Kind::YZ: return {z, y};
-                default: return {x, y};
+            switch (plane) {
+                case TrackPlane::XZ: return {x, z};
+                case TrackPlane::YZ: return {z, y};
+                case TrackPlane::XY: break;
             }
+            return {x, y};
         }
 
         // The pane's voxel (i, j) covers [i, i + 1): a centroid at 3.0 is the
@@ -28,12 +30,12 @@ namespace sirius::app {
         enum class Style { Past, PastGap, Future, FutureGap };
     } // namespace
 
-    QVector<TrackPath> trackPaths(const TrackIndex& index, SlicePane::Kind kind, std::uint32_t only) {
+    QVector<TrackPath> trackPaths(const TrackIndex& index, TrackPlane plane, std::uint32_t only) {
         std::map<std::uint32_t, TrackPath> byId;
         index.forEachPoint([&](std::uint32_t id, const TrackPoint& point) {
             if (only && id != only) return;
             TrackPath& path = byId[id];
-            const QPointF at = planeOf(point, kind) + QPointF(kVoxelCentre, kVoxelCentre);
+            const QPointF at = planeOf(point, plane) + QPointF(kVoxelCentre, kVoxelCentre);
             if (path.points.isEmpty()) {
                 path.id = id;
                 const auto c = labelColor(id);

@@ -34,6 +34,7 @@
 
 #include "core/array_source.hpp"
 #include "core/ops/builtin.hpp"
+#include "core/tracks.hpp"
 #include "qt/qt_strings.hpp"
 #include "qt/theme.hpp"
 #include "qt/trace.hpp"
@@ -41,6 +42,7 @@
 #include "qt/viewer/dims_strip.hpp"
 #include "qt/viewer/display_model.hpp"
 #include "qt/viewer/slice_pane.hpp"
+#include "qt/viewer/track_overlay.hpp"
 #include "qt/viewer/viewer_constants.hpp"
 #include "qt/viewer/viewer_loader.hpp"
 #include "qt/viewer/viewer_widgets.hpp"
@@ -155,6 +157,7 @@ namespace sirius::app {
         QString viewingHtml;
         TokenCheck* labelsCheck = nullptr;
         TokenCheck* soloCheck = nullptr;     // only the selected label
+        TokenCheck* tracksCheck = nullptr;   // trajectories of tracked labels
         TokenCheck* crossCheck = nullptr;
         TokenCheck* boxCheck = nullptr;
         QWidget* swatchHost = nullptr;
@@ -269,6 +272,18 @@ namespace sirius::app {
         QPointF lastPaint;
         bool painting = false;
         quint64 labelsVersion = 0;   // bumps on every label edit: the 3D label texture follows
+        // Trajectory paths per plane, rebuilt when the labels (or the solo
+        // track) change and handed to the panes on every update.
+        struct TrackPaths {
+            // weak: a strong reference here would make every label edit copy
+            // the index (LabelVolume shares it copy-on-write)
+            std::weak_ptr<const TrackIndex> index;
+            quint64 version = ~quint64{0};
+            std::uint32_t only = 0;
+            std::shared_ptr<const QVector<TrackPath>> xy, xz, yz;
+        } trackCache;
+        void refreshTracks();
+        void followTrackIntoView();   // zoomed in and following: keep the crosshair on screen
         QTimer playTimer;
         QString cursorText = QStringLiteral("cursor —");
         QString zoomText = QStringLiteral("100 %");
@@ -456,10 +471,14 @@ namespace sirius::app {
         soloCheck = new TokenCheck(QStringLiteral("Solo"), bar);
         soloCheck->setToolTip(QStringLiteral("Show only the selected label, in the slices and in 3D; selecting a label jumps to it") +
                               shortcutSuffix(QKeySequence(Qt::Key_O)));
+        tracksCheck = new TokenCheck(QStringLiteral("Tracks"), bar);
+        tracksCheck->setToolTip(QStringLiteral("Draw each track's path over time on tracked labels: solid up to this time "
+                                               "point, faint after it, dotted where the track is missing from a frame"));
         crossCheck = new TokenCheck(QStringLiteral("Crosshair"), bar);
         boxCheck = new TokenCheck(QStringLiteral("Bounding box"), bar);
         bl->addWidget(labelsCheck);
         bl->addWidget(soloCheck);
+        bl->addWidget(tracksCheck);
         bl->addWidget(crossCheck);
         bl->addWidget(boxCheck);
         swatchHost = new QWidget(bar);
@@ -618,6 +637,11 @@ namespace sirius::app {
         });
         QObject::connect(labelsCheck, &QAbstractButton::clicked, q, [this] { wb.toggleLabels(); });
         QObject::connect(soloCheck, &QAbstractButton::clicked, q, [this] { wb.toggleSoloLabel(); });
+        QObject::connect(tracksCheck, &QAbstractButton::clicked, q, [this] {
+            ViewState s = vs();
+            s.trajectories = !s.trajectories;
+            wb.setViewState(s);
+        });
         QObject::connect(crossCheck, &QAbstractButton::clicked, q, [this] { wb.toggleCrosshair(); });
         QObject::connect(boxCheck, &QAbstractButton::clicked, q, [this] {
             ViewState s = vs();
@@ -691,7 +715,7 @@ namespace sirius::app {
         // Tab order: the toolbar left to right, then the tool strip top to
         // bottom, then the panes, then the dims strip. The channel swatches
         // are rebuilt with the output, so refreshSwatches() re-links them.
-        QWidget* chain[] = {modeSeg, labelsCheck, soloCheck, crossCheck, boxCheck, autoBtn, resetBtn,
+        QWidget* chain[] = {modeSeg, labelsCheck, soloCheck, tracksCheck, crossCheck, boxCheck, autoBtn, resetBtn,
                             tools[0], tools[1], tools[2], tools[3], tools[4], zin, zout,
                             zfit, xy, yz, xz, mip, dims};
         for (std::size_t i = 0; i + 1 < sizeof chain / sizeof chain[0]; ++i) QWidget::setTabOrder(chain[i], chain[i + 1]);
@@ -1091,6 +1115,14 @@ namespace sirius::app {
         soloCheck->setEnabled(model.hasLabels());
         soloCheck->setCaption(s.soloLabel ? (s.selectedLabel ? QStringLiteral("label %1").arg(s.selectedLabel) : QStringLiteral("select a label"))
                                           : QString());
+        {
+            const LabelVolume* labels = model.labels();
+            const bool tracked = labels && labels->tracked() && labels->tracks();
+            tracksCheck->setVisible(tracked && s.mode != ViewMode::Volume);
+            tracksCheck->setChecked(s.trajectories);
+            tracksCheck->setEnabled(s.labels);
+            tracksCheck->setCaption(tracked && s.followTrack ? QStringLiteral("following") : QString());
+        }
         crossCheck->setChecked(s.crosshair);
         crossCheck->setCaption(s.tool == ViewerTool::Probe ? QString() : QStringLiteral("locked"));
         crossCheck->setVisible(s.mode != ViewMode::Volume);
@@ -1232,6 +1264,8 @@ namespace sirius::app {
                 if (s.mode == ViewMode::Compare) dirty.cmp = true;
             }
             if (s.syncZT != prev.syncZT) dirty.cmp = true;
+            if (s.followTrack && (s.t != prev.t || s.cx != prev.cx || s.cy != prev.cy || !prev.followTrack))
+                QTimer::singleShot(0, q, [this] { followTrackIntoView(); });
             // yaw / pitch / clip / bounding box need no re-upload: the volume
             // view keeps its own orientation state and repaints itself.
             prev = s;
@@ -1517,7 +1551,50 @@ namespace sirius::app {
                 dirty.vol = false;
             }
         }
+        refreshTracks();
         layoutPanes();
+    }
+
+    void ViewerWidget::Impl::refreshTracks() {
+        const ViewState& s = vs();
+        const LabelVolume* labels = model.labels();
+        std::shared_ptr<const TrackIndex> index =
+            labels && labels->tracked() && s.labels && s.trajectories && s.mode != ViewMode::Volume ? labels->tracks() : nullptr;
+        const std::uint32_t only = s.soloLabel ? s.selectedLabel : 0u;
+        const bool sameIndex = !trackCache.index.owner_before(index) && !index.owner_before(trackCache.index) &&
+                               (index != nullptr) == !trackCache.index.expired();
+        if (!sameIndex || labelsVersion != trackCache.version || only != trackCache.only) {
+            trackCache.index = index;
+            trackCache.version = labelsVersion;
+            trackCache.only = only;
+            if (index) {
+                trackCache.xy = std::make_shared<const QVector<TrackPath>>(trackPaths(*index, TrackPlane::XY, only));
+                trackCache.xz = std::make_shared<const QVector<TrackPath>>(trackPaths(*index, TrackPlane::XZ, only));
+                trackCache.yz = std::make_shared<const QVector<TrackPath>>(trackPaths(*index, TrackPlane::YZ, only));
+            } else {
+                trackCache.xy = trackCache.xz = trackCache.yz = nullptr;
+            }
+        }
+        TrackPaintOptions o;
+        o.t = curT();
+        o.selected = s.selectedLabel;
+        xy->setTracks(trackCache.xy, o);
+        mip->setTracks(trackCache.xy, o);
+        xz->setTracks(trackCache.xz, o);
+        yz->setTracks(trackCache.yz, o);
+        cmpRight->setTracks(s.mode == ViewMode::Compare ? trackCache.xy : nullptr, o);
+    }
+
+    void ViewerWidget::Impl::followTrackIntoView() {
+        const ViewState& s = vs();
+        if (!s.followTrack || !model.valid() || s.mode != ViewMode::Ortho || s.zoom <= 1.0) return;
+        // only when the crosshair nears the edge: recentring on every frame
+        // would make the image swim under a track that barely moves
+        const QPointF at = xy->toScreen(QPointF(curX() + 0.5, curY() + 0.5));
+        const QRectF comfort = QRectF(xy->rect()).adjusted(xy->width() * 0.2, xy->height() * 0.2, -xy->width() * 0.2, -xy->height() * 0.2);
+        if (comfort.contains(at)) return;
+        const double zx = xy->view().zx, zy = xy->view().zy;
+        setZoomPan(s.zoom, (nx() / 2.0 - curX() - 0.5) * zx, (ny() / 2.0 - curY() - 0.5) * zy);
     }
 
     void ViewerWidget::Impl::renderVolume() {

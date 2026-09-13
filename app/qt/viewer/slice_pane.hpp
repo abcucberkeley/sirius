@@ -19,7 +19,11 @@
 #include <QVector>
 #include <QWidget>
 
+#include <memory>
+
 #include <sirius/buffer.hpp>
+
+#include "qt/viewer/track_overlay.hpp"
 
 namespace sirius::app {
 
@@ -77,6 +81,10 @@ namespace sirius::app {
             bool pending = false;
         };
         void setAnnotations(const QVector<Annotation>& annotations);
+        // Trajectories of tracked labels (track_overlay.hpp), drawn over the
+        // image and under the annotations; null draws none. The paths are
+        // shared with the viewer, which rebuilds them only when the labels change.
+        void setTracks(std::shared_ptr<const QVector<TrackPath>> paths, const TrackPaintOptions& options);
         void setMessage(const QString& text);             // centred notice ("volume too large")
         // What this pane's axes are called, for the accessible description
         // and the key navigation ("XY", "z" ...).
@@ -124,6 +132,8 @@ namespace sirius::app {
         bool brush_ = false;
         double brushRadius_ = 0.0;
         QVector<Annotation> annotations_;
+        std::shared_ptr<const QVector<TrackPath>> tracks_;
+        TrackPaintOptions trackOptions_;
         bool smooth_ = false;
         QPointF mouse_{-1, -1};
         bool mouseIn_ = false;
