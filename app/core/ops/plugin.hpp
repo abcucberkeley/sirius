@@ -26,6 +26,9 @@ namespace sirius::app {
 
     struct PluginLoadResult {
         std::vector<std::string> kinds;      // registered (or re-registered) operation kinds
+        // Kinds registered before that no listed file provides any more: now
+        // stand-ins (OpInfo::missing) that keep the steps naming them.
+        std::vector<std::string> removed;
         std::vector<std::string> errors;     // "file: reason" for plugins that did not load
         std::vector<std::string> dirs;       // directories the worker searched
         struct Entry {
@@ -37,7 +40,9 @@ namespace sirius::app {
     std::string userPluginDirectory(bool create = false);
     // Asks the worker for its plugins (re-importing them when `reload`) and
     // registers every valid one; a kind that collides with a built-in
-    // operation is reported as an error, not registered.
+    // operation is reported as an error, not registered. A kind registered
+    // by an earlier call whose file the worker no longer lists is replaced by
+    // a stand-in (PluginLoadResult::removed).
     PluginLoadResult registerPluginOperations(RemoteWorker& worker, bool reload);
     // Kinds registered so far by registerPluginOperations.
     std::vector<std::string> pluginKinds();

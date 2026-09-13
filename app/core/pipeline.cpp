@@ -55,6 +55,8 @@ namespace sirius::app {
 
     StepId Pipeline::add(const std::string& kind, int at) {
         const Operation& op = requireOperation(kind);
+        // a stand-in keeps a step that names it; it is not something to add
+        if (op.info().missing) throw std::out_of_range("operation kind '" + kind + "' is not loaded");
         Step s;
         s.kind = kind;
         s.name = op.info().name;
@@ -165,13 +167,20 @@ namespace sirius::app {
             const Operation* op = findOperation(s.kind);
             // The Load step is structural: it needs no registered operation
             // (tests and tools may run without the built-ins).
-            if (!op && s.kind != "load") throw std::runtime_error("pipeline: unknown operation '" + s.kind + "'");
+            if (!op && s.kind != "load") {
+                if (s.kind.empty()) throw std::runtime_error("pipeline: a step without a kind");
+                // A kind nothing here provides (a plugin that is not loaded, a
+                // pipeline shared by someone who has it) keeps its step and its
+                // parameters as written: a stand-in says what is missing when
+                // the step is validated, and the file saves back unchanged.
+                op = registerMissingOperation(s.kind);
+            }
             s.name = sj.value("name", op ? op->info().name : std::string("Load"));
             s.enabled = sj.value("enabled", true);
             s.cache = cachePolicyFromString(sj.value("cache", "recompute"))
                           .value_or(op ? op->info().defaultCache : CachePolicy::Recompute);
             s.params = ParamSet::fromJson(sj.value("params", json::object()));
-            if (op) {
+            if (op && !op->info().missing) {
                 s.params.applyDefaults(op->info().params);
                 s.params.coerce(op->info().params);
             }
@@ -296,7 +305,8 @@ namespace sirius::app {
     Pipeline Pipeline::example() {
         Pipeline p;
         auto addIf = [&](const char* kind, bool enabled, CachePolicy cache) {
-            if (!findOperation(kind)) return;
+            const Operation* op = findOperation(kind);
+            if (!op || op->info().missing) return;
             const StepId id = p.add(kind);
             p.setEnabled(p.indexOf(id), enabled);
             p.setCache(p.indexOf(id), cache);

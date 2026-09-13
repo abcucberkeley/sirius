@@ -397,6 +397,60 @@ TEST_CASE("Pipeline round-trips through JSON and TOML with ids", "[app][pipeline
     CHECK(py.find("test_maxz") != std::string::npos);
 }
 
+TEST_CASE("A step whose operation is not loaded keeps its place and its parameters", "[app][pipeline][plugin]") {
+    registerTestOps();
+    const json written = {{"sigma", 2.5}, {"mode", "fast"}, {"sizes", {1, 2, 3}}};
+    const json j = {{"version", 1},
+                    {"steps", json::array({{{"kind", "load"}},
+                                           {{"kind", "test_scale"}, {"params", {{"factor", 3.0}}}},
+                                           {{"kind", "test_not_loaded"}, {"name", "My plugin"}, {"cache", "memory"}, {"params", written}}})}};
+    const Pipeline p = Pipeline::fromJson(j);   // was: "pipeline: unknown operation 'test_not_loaded'"
+    REQUIRE(p.size() == 3);
+    const Step& s = p.at(2);
+    CHECK(s.kind == "test_not_loaded");
+    CHECK(s.name == "My plugin");
+    CHECK(s.cache == CachePolicy::Memory);
+    REQUIRE(s.op().info().missing);
+    CHECK(p.toJson()["steps"][2]["params"] == written);   // saved back as written, no defaults of a guess
+    const Validation v = s.op().validate(s.params, DatasetMeta{});
+    CHECK_FALSE(v.ok());
+    CHECK_THAT(v.firstError(), Catch::Matchers::ContainsSubstring("not loaded"));
+    // a stand-in is not something to add, list or look up help for
+    Pipeline copy = p;
+    CHECK_THROWS_AS(copy.add("test_not_loaded"), std::out_of_range);
+    for (const Operation* op : allOperations()) CHECK(op->kind() != "test_not_loaded");
+    for (const auto& group : operationGroups())
+        for (const Operation* op : group.second) CHECK(op->kind() != "test_not_loaded");
+    for (const json& op : operationSchemas()["operations"]) CHECK(op["kind"] != "test_not_loaded");
+    CHECK_THROWS_WITH(Pipeline::fromJson({{"steps", json::array({{{"kind", "load"}}, json::object()})}}),
+                      Catch::Matchers::ContainsSubstring("without a kind"));
+
+    test::TempFile file("pipeline", ".sirius.toml");
+    p.save(file.str);
+    CHECK(Pipeline::load(file.str).toJson()["steps"][2]["params"] == written);
+
+    Scratch scratch;
+    Workbench wb(scratch.dir);
+    wb.setDataset(syntheticSource());
+    wb.setBackend(Backend::Cpu);
+    wb.replacePipeline(p, "Load pipeline");
+    CHECK(wb.stepSummary(2) == "not loaded");
+    CHECK_FALSE(wb.createRun());   // refused with the reason, not thrown
+    CHECK(logContains(wb, "not loaded"));
+    CHECK(runSync(wb, 1)->succeeded());   // the steps above it still run
+    wb.removeStep(2);
+    CHECK(wb.pipeline().size() == 2);
+    wb.undo();   // the snapshot names the kind: restoring it does not throw
+    REQUIRE(wb.pipeline().size() == 3);
+    CHECK(wb.pipeline().at(2).kind == "test_not_loaded");
+    CHECK(wb.pipeline().at(2).params.toJson() == written);
+    wb.redo();
+    CHECK(wb.pipeline().size() == 2);
+    ToolApi api(wb);
+    CHECK(api.call("add_step", {{"kind", "test_not_loaded"}}).contains("error"));
+    for (const json& op : api.call("list_operations", json::object())) CHECK(op["kind"] != "test_not_loaded");
+}
+
 // --- Executor -------------------------------------------------------------------
 
 TEST_CASE("Executor caches per fingerprint and invalidates downstream only", "[app][executor]") {

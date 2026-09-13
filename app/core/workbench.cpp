@@ -745,6 +745,9 @@ namespace sirius::app {
         replacePipeline(p, "Load pipeline " + std::filesystem::path(path).filename().string());
         pipelinePath_ = path;
         logLine("Loaded pipeline " + path);
+        for (int i = 1; i < pipeline_.size(); ++i)
+            if (pipeline_.at(i).op().info().missing)
+                logLine("Step " + Step::number(i) + " '" + pipeline_.at(i).kind + "' is not loaded: reload plugins once its plugin is installed");
         // A pipeline that names its dataset opens it (relative paths resolve
         // against the pipeline file, then the working directory).
         const std::string dataset = pipeline_.at(0).params.getString("path");
@@ -1184,7 +1187,25 @@ namespace sirius::app {
             for (const std::string& k : r.kinds) kinds += (kinds.empty() ? "" : ", ") + k;
             logLine(r.kinds.empty() ? "Plugins: none found" + (r.dirs.empty() ? std::string() : " in " + r.dirs.back())
                                     : "Plugins: " + kinds);
+            for (const std::string& k : r.removed) logLine("Plugins: no file provides '" + k + "' any more");
+            // A step of a kind that is loaded now (a pipeline opened before its
+            // plugin was) takes the parameters the operation declares; a step
+            // whose plugin went is shown as not loaded.
+            bool stepsChanged = false;
+            for (int i = 1; i < pipeline_.size(); ++i) {
+                const std::string& kind = pipeline_.at(i).kind;
+                if (std::find(r.kinds.begin(), r.kinds.end(), kind) != r.kinds.end()) {
+                    pipeline_.setParams(i, pipeline_.at(i).params);
+                    stepsChanged = true;
+                } else if (std::find(r.removed.begin(), r.removed.end(), kind) != r.removed.end()) {
+                    stepsChanged = true;
+                }
+            }
             notify(&Observer::operationsChanged);
+            if (stepsChanged) {
+                notify(&Observer::pipelineChanged);
+                notify(&Observer::outputsChanged);
+            }
             return static_cast<int>(r.kinds.size());
         } catch (const std::exception& e) {
             logLine(std::string("Plugins unavailable: ") + e.what());

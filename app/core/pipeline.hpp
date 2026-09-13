@@ -47,7 +47,8 @@ namespace sirius::app {
         int enabledCount() const noexcept;
 
         // Appends (or inserts at `at` >= 1) a step of `kind` with its default
-        // parameters; returns its id. Throws for an unknown kind.
+        // parameters; returns its id. Throws std::out_of_range for an unknown
+        // kind or one only a stand-in stands for (OpInfo::missing).
         StepId add(const std::string& kind, int at = -1);
         StepId insertStep(Step step, int at = -1);    // step.id assigned when 0
         void remove(int index);                       // no-op for the Load step
@@ -69,6 +70,8 @@ namespace sirius::app {
         void reserveIds(StepId next) noexcept { nextId_ = std::max(nextId_, next); }
 
         nlohmann::json toJson() const;
+        // A step of a kind nothing registered provides gets a stand-in
+        // operation (registerMissingOperation) and keeps its parameters as written.
         static Pipeline fromJson(const nlohmann::json& j);
         // TOML on disk (".sirius.toml").
         void save(const std::string& path) const;

@@ -331,6 +331,7 @@ namespace sirius::app {
         std::set<std::string> builtins;   // a name a built-in owns stays a built-in
         for (const Operation* op : allOperations())
             if (!op->info().plugin) builtins.insert(op->kind());
+        std::set<std::string> unloadable;   // files the worker lists that did not become an operation
         for (const json& spec : r.result["plugins"]) {
             const std::string file = spec.value("file", "?");
             PluginLoadResult::Entry entry{spec.value("kind", ""), spec.value("name", ""), file, ""};
@@ -339,6 +340,7 @@ namespace sirius::app {
                 entry.error = err;
                 result.entries.push_back(entry);
                 result.errors.push_back(file + ": " + err.substr(0, err.find('\n')));
+                unloadable.insert(file);
                 continue;
             }
             result.entries.push_back(entry);
@@ -347,6 +349,7 @@ namespace sirius::app {
                 const std::string kind = op->kind();
                 if (builtins.count(kind)) {
                     result.errors.push_back(file + ": kind '" + kind + "' is a built-in operation");
+                    unloadable.insert(file);
                     continue;
                 }
                 registerHelpPage(kind, static_cast<PluginOperation*>(op.get())->help());
@@ -358,7 +361,33 @@ namespace sirius::app {
                 result.kinds.push_back(kind);
             } catch (const std::exception& e) {
                 result.errors.push_back(file + ": " + e.what());
+                unloadable.insert(file);
             }
+        }
+        // A kind registered earlier that no file provides any more (its file
+        // was deleted, moved away, or now declares another kind) is gone from
+        // the add menu, the tools, the help and pluginKinds(). The steps and
+        // undo snapshots that name it still resolve, to a stand-in that says
+        // it is not loaded. A file that is still listed but fails to load now
+        // keeps its last good registration: a typo being fixed is not a removal.
+        // (Matching by kind alone would not do: a file that fails to import is
+        // listed under its file name.)
+        std::vector<std::string> previous;
+        {
+            std::lock_guard<std::mutex> g(kindsMutex());
+            previous.assign(registeredKinds().begin(), registeredKinds().end());
+        }
+        for (const std::string& kind : previous) {
+            if (std::find(result.kinds.begin(), result.kinds.end(), kind) != result.kinds.end()) continue;
+            const Operation* op = findOperation(kind);
+            if (op && !op->info().missing && unloadable.count(op->info().source)) continue;
+            registerOperation(makeMissingOperation(kind));
+            registerHelpPage(kind, std::string());   // an empty page is no page
+            {
+                std::lock_guard<std::mutex> g(kindsMutex());
+                registeredKinds().erase(kind);
+            }
+            result.removed.push_back(kind);
         }
         return result;
     }
