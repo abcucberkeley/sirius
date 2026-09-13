@@ -356,6 +356,21 @@ TEST_CASE("SIM reconstructs a 2D stack with the step's defaults", "[app][ops][si
         CHECK(rows[1][0] == "77°");
         CHECK(rows[2][0] == "137°");
     }
+    SECTION("the form refuses what used to crash the run") {
+        // one order segfaulted the k0 fit; an NA above the immersion index
+        // segfaulted the filter (with a measured OTF, which is not needed to
+        // see the form refuse it)
+        ParamSet orders = sim.defaults();
+        orders.set("phases", std::int64_t{3});
+        orders.set("orders", std::int64_t{1});
+        CHECK_FALSE(sim.validate(orders, meta).ok());
+        ParamSet na = sim.defaults();
+        na.set("phases", std::int64_t{3});
+        na.set("na", 1.6);
+        const Validation v = sim.validate(na, meta);
+        REQUIRE_FALSE(v.ok());
+        CHECK(v.firstError().find("nimm") != std::string::npos);
+    }
     SECTION("From file mode with a TOML file that leaves the orders out") {
         // the form validated, and the run threw "3 phases cannot separate 3 orders"
         const test::TempFile toml("sim2d", ".toml");
