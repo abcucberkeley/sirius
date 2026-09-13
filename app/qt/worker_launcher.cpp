@@ -3,7 +3,6 @@
 #include <exception>
 #include <stdexcept>
 
-#include <QCoreApplication>
 #include <QDir>
 #include <QFileInfo>
 #include <QJsonDocument>
@@ -173,9 +172,8 @@ namespace sirius::app {
         }
         const QString fromSettings = QSettings().value(QStringLiteral("worker/dir")).toString();
         if (!fromSettings.isEmpty()) return fromSettings;
-        // next to the executable (the build copies app/python there), then the source tree
-        const QString beside = QCoreApplication::applicationDirPath() + QStringLiteral("/python");
-        if (QFileInfo::exists(beside + QStringLiteral("/sirius_worker/__main__.py"))) return beside;
+        // an installed tree, next to the executable (the build copies
+        // app/python there), then the environment and the source tree
         return fromStd(workerScriptPath());
     }
 

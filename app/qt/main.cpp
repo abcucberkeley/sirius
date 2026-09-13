@@ -1,10 +1,13 @@
 // sirius-app: the SIRIUS microscopy workbench (docs/design/README.md).
 //
-//   sirius-app [--dataset stack.tif] [--pipeline steps.sirius.toml] [--run]
+//   sirius-app [--dataset stack.tif] [--pipeline steps.sirius.toml] [--run] [files...]
 //
 // Everything can also be opened from the File menu; --run runs every
-// enabled step as soon as the window is up.
+// enabled step as soon as the window is up. Files named without an option
+// open as though dropped on the window, which is what a file manager's
+// "Open with" passes (app/linux/sirius-app.desktop).
 
+#include <algorithm>
 #include <chrono>
 #include <filesystem>
 #include <functional>
@@ -17,6 +20,7 @@
 #include <QEventLoop>
 #include <QDialog>
 #include <QFileInfo>
+#include <QIcon>
 #include <QMenu>
 #include <QDockWidget>
 #include <QJsonDocument>
@@ -26,6 +30,8 @@
 #include <QStandardPaths>
 #include <QTimer>
 
+#include "core/app_paths.hpp"
+#include "core/help_pages.hpp"
 #include "core/operation.hpp"
 #include "core/tool_api.hpp"
 #include "core/workbench.hpp"
@@ -43,6 +49,19 @@ int main(int argc, char** argv) {
     QCoreApplication::setApplicationName(QStringLiteral("sirius-app"));
     QCoreApplication::setOrganizationName(QStringLiteral("sirius"));
     QCoreApplication::setApplicationVersion(QStringLiteral("0.2"));
+    // The window's app id on Wayland and its WM_CLASS on X11: how a desktop
+    // matches the window to sirius-app.desktop for its icon and name.
+    QGuiApplication::setDesktopFileName(QStringLiteral("sirius-app"));
+    {
+        // PNGs rather than the SVG: an SVG icon needs Qt's SVG plugin, which
+        // a deployment may not carry (app/qt/resources/icons/app/README.md)
+        QIcon icon;
+        for (int px : {16, 24, 32, 48, 64, 128, 256})
+            icon.addFile(QStringLiteral(":/icons/app/sirius-app-%1.png").arg(px), QSize(px, px));
+        QApplication::setWindowIcon(icon);
+    }
+    // the help pages, the worker and the plugins are found relative to it
+    sirius::app::setApplicationDirectory(sirius::app::toStd(QCoreApplication::applicationDirPath()));
     sirius::app::theme::applyTheme(app);
 
     QCommandLineParser parser;
@@ -82,7 +101,11 @@ int main(int argc, char** argv) {
     const QCommandLineOption settleOpt(QStringLiteral("settle"), QStringLiteral("Milliseconds to wait before the screenshot (default 600)"),
                                        QStringLiteral("ms"));
     parser.addOptions({datasetOpt, pipelineOpt, runOpt, screenshotOpt, quitAfterOpt, toolOpt, actionOpt, keyOpt, askOpt, settleOpt, strokeOpt, wheelOpt, dropOpt, recordOpt});
+    parser.addPositionalArgument(QStringLiteral("files"), QStringLiteral("Datasets or pipeline files to open, as though dropped on the window"),
+                                 QStringLiteral("[files...]"));
     parser.process(app);
+    const QStringList files = parser.positionalArguments();
+    const bool filesHavePipeline = std::any_of(files.begin(), files.end(), [](const QString& f) { return f.endsWith(QStringLiteral(".toml"), Qt::CaseInsensitive); });
 
     sirius::app::registerBuiltinOperations();
 
@@ -107,7 +130,7 @@ int main(int argc, char** argv) {
     // User operations come from the Python worker. A pipeline given on the
     // command line may use them, so load them first in that case; otherwise
     // after the window is up so start-up stays quick.
-    if (parser.isSet(pipelineOpt)) workbench.loadPlugins(false);
+    if (parser.isSet(pipelineOpt) || filesHavePipeline) workbench.loadPlugins(false);
     else QTimer::singleShot(400, &window, [&workbench] { workbench.loadPlugins(false); });
     if (parser.isSet(pipelineOpt)) window.openPipelinePath(parser.value(pipelineOpt));
     // recording starts before anything scripted happens, so the run is in it
@@ -125,9 +148,12 @@ int main(int argc, char** argv) {
         const QString dataset = parser.value(datasetOpt);
         QTimer::singleShot(0, &window, [&window, dataset] { window.openDatasetPath(dataset); });
     }
+    if (!files.isEmpty()) QTimer::singleShot(0, &window, [&window, files] { window.dropPaths(files); });
     const QStringList toolCalls = parser.values(toolOpt);
     const QStringList actions = parser.values(actionOpt);
     sirius::app::ToolApi tools(workbench);
+    // get_help answers from the pages the application reads, as it does for the assistant
+    tools.setHelpHook([](const std::string& kind) { return sirius::app::loadHelpPage(kind).markdown; });
     // Scripted runs block on the worker thread the way the assistant does.
     tools.setRunHook([&bridge](int target) {
         QEventLoop loop;

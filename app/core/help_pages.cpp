@@ -1,5 +1,7 @@
 #include "core/help_pages.hpp"
 
+#include "core/app_paths.hpp"
+
 #include <algorithm>
 #include <cctype>
 #include <cstdlib>
@@ -1170,12 +1172,20 @@ namespace sirius::app {
         auto usable = [](const std::string& dir) { return !dir.empty() && fs::is_directory(dir); };
         if (const char* env = std::getenv("SIRIUS_HELP_DIR"); env && usable(env)) return env;
         if (usable(hint)) return hint;
+        // An installed tree before the checkout: an install on the machine it
+        // was built on must still read its own pages, or a test of the
+        // install proves nothing.
+        if (std::string installed = installedDataDirectory("help"); !installed.empty()) return installed;
 #ifdef SIRIUS_APP_SOURCE_DIR
         {
+            // the checkout before the build tree's copy, so "Edit page" in a
+            // development build changes the file under version control
             const std::string src = std::string(SIRIUS_APP_SOURCE_DIR) + "/help";
             if (usable(src)) return src;
         }
 #endif
+        // a build tree moved away from its checkout (or a checkout deleted)
+        if (std::string beside = besideApplication("help"); !beside.empty()) return beside;
         if (!hint.empty()) return hint;
         return "help";
     }

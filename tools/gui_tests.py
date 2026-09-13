@@ -417,6 +417,16 @@ def test_a_dropped_file_opens(app: Path, tmp: Path) -> None:
     check(state["dataset"]["name"].startswith("raw"), f"opened {state['dataset']['name']}")
 
 
+def test_files_named_on_the_command_line_open(app: Path, tmp: Path) -> None:
+    # what a file manager's "Open with" (app/linux/sirius-app.desktop, Exec=sirius-app %F) passes
+    out = run(app, [str(RAW), "--tool", '{"name":"get_state","args":{}}', "--settle", "900", "--quit-after", "6000"])
+    state = only(tool_results(out), "get_state")
+    check(state["dataset"] is not None and state["dataset"]["name"].startswith("raw"), f"the dataset is {state['dataset']}")
+    out = run(app, [str(PIPELINE), "--tool", '{"name":"get_state","args":{}}', "--settle", "900", "--quit-after", "6000"])
+    kinds = [s["kind"] for s in only(tool_results(out), "get_state")["steps"]]
+    check("sim" in kinds, f"the pipeline file did not open: steps {kinds}")
+
+
 def test_an_invalid_step_says_so_in_the_error_colour(app: Path, tmp: Path) -> None:
     # A step whose parameters do not validate shows why in its row, in the
     # error colour. A universal "* { color }" rule in the style sheet used to
@@ -679,6 +689,7 @@ SCENARIOS = [
     test_the_wheel_zooms,
     test_the_wheel_zooms_about_the_cursor_in_compare,
     test_a_dropped_file_opens,
+    test_files_named_on_the_command_line_open,
     test_an_invalid_step_says_so_in_the_error_colour,
     test_menu_actions_reach_the_view,
     test_a_preset_fills_the_fields,

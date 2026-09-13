@@ -1,0 +1,13 @@
+[Desktop Entry]
+Type=Application
+Name=SIRIUS
+GenericName=Microscopy Workbench
+Comment=Reconstruct, segment and inspect fluorescence microscopy data
+Exec=sirius-app %F
+Icon=sirius-app
+Terminal=false
+Categories=Science;Biology;DataVisualization;
+Keywords=microscopy;fluorescence;SIM;structured illumination;segmentation;TIFF;OME-TIFF;zarr;
+MimeType=image/tiff;
+StartupNotify=true
+StartupWMClass=sirius-app

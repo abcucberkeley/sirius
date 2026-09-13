@@ -14,9 +14,12 @@
 #include <catch2/matchers/catch_matchers_string.hpp>
 
 #include <atomic>
+#include <filesystem>
+#include <fstream>
 #include <limits>
 #include <thread>
 
+#include "core/app_paths.hpp"
 #include "core/cancel.hpp"
 #include "core/errors.hpp"
 #include "core/rpc.hpp"
@@ -335,6 +338,32 @@ TEST_CASE("A worker that ignores a cancel is given up after the grace period", "
 TEST_CASE("connectTcp reports an unreachable port", "[app][rpc]") {
     CHECK_THROWS(rpc::connectTcp("127.0.0.1", 1, std::chrono::milliseconds(500)));
     (void)workerScriptPath("/definitely/not/here");   // must not throw
+}
+
+TEST_CASE("workerScriptPath finds an installed worker before the build tree's and the checkout's", "[app][rpc]") {
+    namespace fs = std::filesystem;
+    const fs::path prefix = fs::temp_directory_path() / "sirius-installed-worker-test";
+    fs::remove_all(prefix);
+    const fs::path bin = prefix / "bin";
+    auto plant = [](const fs::path& dir) {
+        fs::create_directories(dir / "sirius_worker");
+        std::ofstream(dir / "sirius_worker" / "__main__.py") << "\n";
+        return dir.lexically_normal();
+    };
+    const fs::path installed = plant(bin / installedDataDirectoryFromBindir() / "python");
+    const fs::path beside = plant(bin / "python");
+    struct Restore {
+        ~Restore() { setApplicationDirectory({}); }
+    } restore;
+    setApplicationDirectory(bin.string());
+    CHECK(fs::path(workerScriptPath()) == installed);
+    // a directory the caller names (Preferences) wins over both
+    const fs::path chosen = plant(prefix / "chosen");
+    CHECK(fs::path(workerScriptPath(chosen.string())) == chosen);
+    // not installed: the copy the build puts beside the executable
+    fs::remove_all(prefix / "share");
+    CHECK(fs::path(workerScriptPath()) == beside);
+    fs::remove_all(prefix);
 }
 
 // --- the real Python worker ------------------------------------------------------
