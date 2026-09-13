@@ -85,6 +85,36 @@ class ListBundles(unittest.TestCase):
             self.assertEqual(got[1]["name"], "nameless")
             self.assertEqual(got[0]["task"], "")
 
+    def test_a_manifest_with_unexpected_types_does_not_break_the_listing(self):
+        # The manifest is written by a version of latents this worker does not
+        # choose, so a field of the wrong shape must cost that field, not the
+        # whole directory: the user still has to be able to see what is there.
+        with tempfile.TemporaryDirectory() as box:
+            write_bundle(box, "good.ltb")
+            write_bundle(box, "odd.ltb", manifest={
+                "name": ["not", "a", "string"],
+                "task": 7,
+                "voxel_size": 0.15,                 # a scalar where a list belongs
+                "patch": [4, "sixteen", 16],
+                "peak_threshold": "0.42",           # a string where a number belongs
+                "min_separation_um": True,          # a bool is not a measurement
+                "channels": "dapi",
+                "notes": None,
+            })
+            got = {b["file"]: b for b in foundation.list_bundles(box)}
+            self.assertEqual(sorted(got), ["good.ltb", "odd.ltb"])
+            self.assertEqual(got["good.ltb"]["name"], "nuclei-5d")
+            odd = got["odd.ltb"]
+            self.assertEqual(odd["name"], "odd")            # the file name stands in
+            self.assertEqual(odd["task"], "")
+            self.assertEqual(odd["voxel_um"], [])
+            self.assertEqual(odd["patch"], [4.0, 16.0])     # the numbers that are numbers
+            self.assertIsNone(odd["peak_threshold"])
+            self.assertIsNone(odd["min_separation_um"])
+            self.assertIsNone(odd["channels"])
+            self.assertEqual(odd["notes"], "")
+            self.assertTrue(odd["manifest"])                 # it did have one, such as it is
+
     def test_sorted_by_name_so_the_list_does_not_reshuffle(self):
         with tempfile.TemporaryDirectory() as box:
             for name in ("Zeta.ltb", "alpha.ltb", "Beta.ltb"):

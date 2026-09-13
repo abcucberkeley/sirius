@@ -190,6 +190,28 @@ def manifest_of(path: str) -> Dict[str, Any]:
     return {}
 
 
+# A manifest is written elsewhere, by a version of latents this worker does not
+# choose. So every field is read defensively: a bundle whose manifest says
+# something unexpected is listed with that field blank, rather than taking the
+# whole directory listing down and leaving the user with a dialog that says the
+# registry is unreadable.
+def _text(man: Dict[str, Any], key: str) -> str:
+    got = man.get(key)
+    return got if isinstance(got, str) else ""
+
+
+def _number(man: Dict[str, Any], key: str) -> Optional[float]:
+    got = man.get(key)
+    return float(got) if isinstance(got, (int, float)) and not isinstance(got, bool) else None
+
+
+def _numbers(man: Dict[str, Any], key: str) -> List[float]:
+    got = man.get(key)
+    if not isinstance(got, (list, tuple)):
+        return []
+    return [float(v) for v in got if isinstance(v, (int, float)) and not isinstance(v, bool)]
+
+
 def list_bundles(directory: str) -> List[Dict[str, Any]]:
     """Every .ltb in `directory`, with what its manifest says about it.
 
@@ -219,16 +241,16 @@ def list_bundles(directory: str) -> List[Dict[str, Any]]:
             out.append({
                 "path": os.path.abspath(e.path),
                 "file": e.name,
-                "name": str(man.get("name") or os.path.splitext(e.name)[0]),
-                "task": str(man.get("task") or ""),
-                "encoder": man.get("encoder") or {},
-                "patch": list(man.get("patch") or []),
-                "crop": list(man.get("crop") or []),
-                "voxel_um": list(man.get("voxel_size") or man.get("voxel_um") or []),
-                "peak_threshold": man.get("peak_threshold"),
-                "min_separation_um": man.get("min_separation_um"),
-                "channels": man.get("channels"),
-                "notes": str(man.get("notes") or ""),
+                "name": _text(man, "name") or os.path.splitext(e.name)[0],
+                "task": _text(man, "task"),
+                "encoder": man.get("encoder") if isinstance(man.get("encoder"), dict) else {},
+                "patch": _numbers(man, "patch"),
+                "crop": _numbers(man, "crop"),
+                "voxel_um": _numbers(man, "voxel_size") or _numbers(man, "voxel_um"),
+                "peak_threshold": _number(man, "peak_threshold"),
+                "min_separation_um": _number(man, "min_separation_um"),
+                "channels": man.get("channels") if isinstance(man.get("channels"), list) else None,
+                "notes": _text(man, "notes"),
                 "size_bytes": size,
                 "mtime": mtime,
                 "manifest": bool(man),
