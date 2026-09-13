@@ -1137,7 +1137,7 @@
           "key": "sheet_angle",
           "label": "Sheet angle",
           "max": 89.0,
-          "min": 1.0,
+          "min": 0.0,
           "read_only": false,
           "type": "double",
           "unit": "°"
@@ -1547,7 +1547,16 @@
           "key": "moving_channel",
           "label": "Moving channel",
           "read_only": false,
-          "type": "channel"
+          "type": "channel",
+          "visible_when": [
+            {
+              "key": "mode",
+              "negate": false,
+              "values": [
+                "Align channels"
+              ]
+            }
+          ]
         },
         {
           "advanced": false,
@@ -1557,7 +1566,16 @@
           "max": 1000000.0,
           "min": 0.0,
           "read_only": false,
-          "type": "int"
+          "type": "int",
+          "visible_when": [
+            {
+              "key": "mode",
+              "negate": false,
+              "values": [
+                "Align time points to reference"
+              ]
+            }
+          ]
         },
         {
           "advanced": false,
