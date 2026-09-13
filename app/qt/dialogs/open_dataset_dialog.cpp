@@ -307,86 +307,19 @@ namespace sirius::app {
             const auto items = impl_->recent->selectedItems();
             if (!items.isEmpty()) impl_->path->setText(impl_->recent->item(items.first()->row(), 0)->data(Qt::UserRole).toString());
         });
-        connect(impl_->recent, &QTableWidget::itemDoubleClicked, this, [this](QTableWidgetItem*) {
-            if (impl_->probeOk) accept();
-        });
+        connect(impl_->recent, &QTableWidget::itemDoubleClicked, this, [this](QTableWidgetItem*) { accept(); });
         impl_->probeTimer.setSingleShot(true);
         impl_->probeTimer.setInterval(250);
-        connect(&impl_->probeTimer, &QTimer::timeout, this, [this] {
-            const QString p = impl_->path->text().trimmed();
+        connect(&impl_->probeTimer, &QTimer::timeout, this, [this] { probe(); });
+        connect(impl_->path, &QLineEdit::textChanged, this, [this] {
+            // What was probed describes the previous path: nothing opens
+            // until this one is probed, or a recent row double-clicked within
+            // the probe's delay opened the new file with the old one's layout.
             impl_->probeOk = false;
-            impl_->isFolder = false;
-            impl_->error->hide();
-            impl_->oneStack->hide();
-            impl_->layoutBox->setVisible(true);
-            if (p.isEmpty() || !QFileInfo::exists(p)) {
-                impl_->facts->setText(p.isEmpty() ? QStringLiteral("Choose a TIFF / OME-TIFF file, a zarr / N5 store or a folder of TIFF files.")
-                                                  : QStringLiteral("No such file or directory."));
-                impl_->open->setEnabled(false);
-                return;
-            }
-            const bool folder = QFileInfo(p).isDir() && isFolderDataset(toStd(p));
-            if (!folder && QFileInfo(p).isDir()) {
-                // a folder of TIFFs without a manifest is not yet a dataset
-                const int tiffs = tiffCount(p);
-                if (tiffs > 0) {
-                    impl_->facts->setText(QStringLiteral("Folder of %1 TIFF file(s) without a %2 manifest. "
-                                                         "Open as one stack reads them in name order, one time point each. "
-                                                         "%3")
-                                              .arg(tiffs)
-                                              .arg(QLatin1String(DatasetManifest::kFileName),
-                                                   impl_->bridge ? QStringLiteral("For channels, tiles or another order, use Folder….")
-                                                                 : QStringLiteral("For anything else, File ▸ Open folder….")));
-                    impl_->open->setEnabled(false);
-                    impl_->oneStack->setVisible(impl_->bridge != nullptr);
-                    updatePageCheck();
-                    return;
-                }
-            }
-            try {
-                impl_->probed = probeDataset(toStd(p));
-                impl_->probeOk = true;
-                impl_->isFolder = folder;
-                impl_->layoutBox->setVisible(!folder);   // the manifest settles layout, voxel size and channels
-                const DatasetMeta& m = impl_->probed;
-                impl_->pages = m.dims.planes();
-                impl_->dimsFromMetadata = folder || m.format != "tiff";   // plain TIFF: the page mapping is the user's call
-                QString facts = QStringLiteral("%1 · %2 · %3 · %4 · %5 channel(s)")
-                                    .arg(fromStd(m.format), fromStd(m.shapeString()), QString::fromLatin1(toString(m.sourceType)),
-                                         widgets::bytesText(m.bytesOnDisk))
-                                    .arg(m.channels.size());
-                if (m.hasTiles()) facts += QStringLiteral(" · %1 tiles").arg(m.tiles.size());
-                impl_->facts->setText(facts);
-                {
-                    QSignalBlocker b1(impl_->c), b2(impl_->t), b3(impl_->z);
-                    impl_->c->setValue(static_cast<int>(m.dims.c));
-                    impl_->t->setValue(static_cast<int>(m.dims.t));
-                    impl_->z->setValue(static_cast<int>(m.dims.z));
-                }
-                if (m.voxelUm[0] > 0.0) impl_->vx->setValue(m.voxelUm[0]);
-                if (m.voxelUm[1] > 0.0) impl_->vy->setValue(m.voxelUm[1]);
-                if (m.voxelUm[2] > 0.0) impl_->vz->setValue(m.voxelUm[2]);
-                QStringList names;
-                for (const ChannelInfo& ch : m.channels) {
-                    QString n = fromStd(ch.label);
-                    if (ch.wavelengthNm > 0) n.prepend(QString::number(static_cast<int>(std::lround(ch.wavelengthNm))) + QLatin1Char(' '));
-                    names << n;
-                }
-                impl_->channels->setText(names.join(QStringLiteral(", ")));
-                impl_->sim->setChecked(m.sim.present);
-                impl_->dirs->setValue(m.sim.ndirs);
-                impl_->phases->setValue(m.sim.nphases);
-                impl_->fastSi->setChecked(m.sim.fastSi);
-                impl_->open->setEnabled(true);
-            } catch (const std::exception& e) {
-                impl_->facts->clear();
-                impl_->error->setText(QString::fromUtf8(e.what()));
-                impl_->error->show();
-                impl_->open->setEnabled(false);
-            }
-            updatePageCheck();
+            impl_->open->setEnabled(false);
+            impl_->pageCheck->clear();
+            impl_->probeTimer.start();
         });
-        connect(impl_->path, &QLineEdit::textChanged, this, [this] { impl_->probeTimer.start(); });
         auto pageCheck = [this] { updatePageCheck(); };
         connect(impl_->c, qOverload<int>(&QSpinBox::valueChanged), this, pageCheck);
         connect(impl_->t, qOverload<int>(&QSpinBox::valueChanged), this, pageCheck);
@@ -476,6 +409,96 @@ namespace sirius::app {
     }
 
     OpenDatasetDialog::~OpenDatasetDialog() = default;
+
+    // The facts, the page layout and the metadata fields for the path as it
+    // is now. Runs 250 ms after the last edit of the path, and at once when
+    // the dialog is accepted before that.
+    void OpenDatasetDialog::probe() {
+        const QString p = impl_->path->text().trimmed();
+        impl_->probeOk = false;
+        impl_->isFolder = false;
+        impl_->error->hide();
+        impl_->oneStack->hide();
+        impl_->layoutBox->setVisible(true);
+        if (p.isEmpty() || !QFileInfo::exists(p)) {
+            impl_->facts->setText(p.isEmpty() ? QStringLiteral("Choose a TIFF / OME-TIFF file, a zarr / N5 store or a folder of TIFF files.")
+                                              : QStringLiteral("No such file or directory."));
+            impl_->open->setEnabled(false);
+            return;
+        }
+        const bool folder = QFileInfo(p).isDir() && isFolderDataset(toStd(p));
+        if (!folder && QFileInfo(p).isDir()) {
+            // a folder of TIFFs without a manifest is not yet a dataset
+            const int tiffs = tiffCount(p);
+            if (tiffs > 0) {
+                impl_->facts->setText(QStringLiteral("Folder of %1 TIFF file(s) without a %2 manifest. "
+                                                     "Open as one stack reads them in name order, one time point each. "
+                                                     "%3")
+                                          .arg(tiffs)
+                                          .arg(QLatin1String(DatasetManifest::kFileName),
+                                               impl_->bridge ? QStringLiteral("For channels, tiles or another order, use Folder….")
+                                                             : QStringLiteral("For anything else, File ▸ Open folder….")));
+                impl_->open->setEnabled(false);
+                impl_->oneStack->setVisible(impl_->bridge != nullptr);
+                updatePageCheck();
+                return;
+            }
+        }
+        try {
+            impl_->probed = probeDataset(toStd(p));
+            impl_->probeOk = true;
+            impl_->isFolder = folder;
+            impl_->layoutBox->setVisible(!folder);   // the manifest settles layout, voxel size and channels
+            const DatasetMeta& m = impl_->probed;
+            impl_->pages = m.dims.planes();
+            impl_->dimsFromMetadata = folder || m.format != "tiff";   // plain TIFF: the page mapping is the user's call
+            QString facts = QStringLiteral("%1 · %2 · %3 · %4 · %5 channel(s)")
+                                .arg(fromStd(m.format), fromStd(m.shapeString()), QString::fromLatin1(toString(m.sourceType)),
+                                     widgets::bytesText(m.bytesOnDisk))
+                                .arg(m.channels.size());
+            if (m.hasTiles()) facts += QStringLiteral(" · %1 tiles").arg(m.tiles.size());
+            impl_->facts->setText(facts);
+            {
+                QSignalBlocker b1(impl_->c), b2(impl_->t), b3(impl_->z);
+                impl_->c->setValue(static_cast<int>(m.dims.c));
+                impl_->t->setValue(static_cast<int>(m.dims.t));
+                impl_->z->setValue(static_cast<int>(m.dims.z));
+            }
+            if (m.voxelUm[0] > 0.0) impl_->vx->setValue(m.voxelUm[0]);
+            if (m.voxelUm[1] > 0.0) impl_->vy->setValue(m.voxelUm[1]);
+            if (m.voxelUm[2] > 0.0) impl_->vz->setValue(m.voxelUm[2]);
+            QStringList names;
+            for (const ChannelInfo& ch : m.channels) {
+                QString n = fromStd(ch.label);
+                if (ch.wavelengthNm > 0) n.prepend(QString::number(static_cast<int>(std::lround(ch.wavelengthNm))) + QLatin1Char(' '));
+                names << n;
+            }
+            impl_->channels->setText(names.join(QStringLiteral(", ")));
+            impl_->sim->setChecked(m.sim.present);
+            impl_->dirs->setValue(m.sim.ndirs);
+            impl_->phases->setValue(m.sim.nphases);
+            impl_->fastSi->setChecked(m.sim.fastSi);
+            impl_->open->setEnabled(true);
+        } catch (const std::exception& e) {
+            impl_->facts->clear();
+            impl_->error->setText(QString::fromUtf8(e.what()));
+            impl_->error->show();
+            impl_->open->setEnabled(false);
+        }
+        updatePageCheck();
+    }
+
+    void OpenDatasetDialog::accept() {
+        // A path picked or typed a moment ago is probed now, so the options
+        // that go with it are its own; one that does not open is not accepted
+        // (the Open button is disabled for it too).
+        if (impl_->probeTimer.isActive()) {
+            impl_->probeTimer.stop();
+            probe();
+        }
+        if (!impl_->probeOk || !impl_->open->isEnabled()) return;
+        QDialog::accept();
+    }
 
     void OpenDatasetDialog::updatePageCheck() {
         if (!impl_->probeOk) {
