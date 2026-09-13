@@ -19,6 +19,7 @@
 #include <cmath>
 #include <filesystem>
 #include <fstream>
+#include <limits>
 #include <numeric>
 #include <optional>
 #include <random>
@@ -474,6 +475,138 @@ TEST_CASE("Contrast rescales every channel into 0..1 and reports histograms", "[
         p.set("lo_percentile", 60.0);
         p.set("hi_percentile", 60.0);
         CHECK_FALSE(op.validate(p, meta).ok());
+    }
+}
+
+TEST_CASE("Infinite voxels leave the contrast window and the Otsu cuts to the finite values", "[app][ops][contrast][threshold]") {
+    // One +-inf voxel crashed the application as a dataset opened: the
+    // histograms spanned [min, inf], and (inf - lo) * (bins / inf) is a NaN
+    // bin index that was written outside the counts.
+    const float inf = std::numeric_limits<float>::infinity();
+    const Dims5 dims{1, 1, 9, 40, 20};
+    const DatasetMeta meta = metaFor(dims);
+    const auto finite = blobArray(dims, 3, 3.0);   // 0 and 1000
+    auto data = std::make_shared<Array5>(finite->clone());
+    data->at(0, 0, 4, 1, 1) = inf;
+    data->at(0, 0, 0, 39, 19) = -inf;
+    Progress prog;
+
+    SECTION("Otsu's cut is the cut of the finite values") {
+        std::vector<float> values(finite->data(), finite->data() + finite->numel());
+        const float cut = otsuThreshold(values.data(), static_cast<Index>(values.size()));
+        CHECK(cut > 0.0f);
+        CHECK(cut < 1000.0f);
+        values.push_back(inf);
+        values.push_back(-inf);
+        CHECK(otsuThreshold(values.data(), static_cast<Index>(values.size())) == cut);
+        // nothing finite: a cut nothing lies above
+        const std::vector<float> none{inf, -inf, std::numeric_limits<float>::quiet_NaN()};
+        CHECK(otsuThreshold(none.data(), 3) == inf);
+    }
+    SECTION("Threshold (Otsu) labels the blobs and the +inf voxel") {
+        const Operation& op = requireOperation("threshold");
+        ParamSet p = op.defaults();
+        p.set("method", std::string("Otsu"));
+        p.set("min_voxels", std::int64_t{0});
+        const StepOutput r = op.run(inputOf(data, meta), p, prog.ctx);
+        REQUIRE(r.labels);
+        CHECK(r.labels->stats().size() == 4);
+        CHECK(r.labels->at(0, 4, 1, 1) != 0);
+        CHECK(r.labels->at(0, 0, 39, 19) == 0);
+    }
+    SECTION("Classic Multi-Otsu still separates the core from the halo") {
+        const Dims5 d3{1, 1, 8, 48, 48};
+        auto three = std::make_shared<Array5>(Array5::zeros(d3));
+        for (Index z = 2; z < 5; ++z)
+            for (Index y = 8; y < 40; ++y)
+                for (Index x = 8; x < 40; ++x) three->at(0, 0, z, y, x) = 400.0f;   // halo
+        for (Index y = 20; y < 26; ++y)
+            for (Index x = 20; x < 26; ++x) three->at(0, 0, 3, y, x) = 4000.0f;   // core
+        three->at(0, 0, 0, 0, 0) = inf;
+        three->at(0, 0, 7, 47, 47) = -inf;
+        const Operation& op = requireOperation("classic");
+        ParamSet p = op.defaults();
+        p.set("sigma", 0.0);
+        p.set("opening", std::int64_t{0});
+        p.set("fill_holes", false);
+        p.set("min_voxels", std::int64_t{1});
+        p.set("post", std::string("Connected components"));
+        p.set("method", std::string("Multi-Otsu"));
+        const StepOutput r = op.run(inputOf(three, metaFor(d3)), p, prog.ctx);
+        REQUIRE(r.labels);
+        CHECK(r.labels->stats().size() == 2);        // the core and the +inf voxel
+        CHECK(r.labels->at(0, 3, 22, 22) != 0);
+        CHECK(r.labels->at(0, 3, 10, 10) == 0);      // the halo
+        CHECK(r.labels->at(0, 0, 0, 0) != 0);
+        CHECK(r.labels->at(0, 7, 47, 47) == 0);
+    }
+    SECTION("Contrast opens on them and maps them to the ends of the window") {
+        const Operation& op = requireOperation("contrast");
+        const StepInput in = inputOf(data, meta);
+        const ParamSet p = op.initialParams(op.defaults(), in);   // what a new step (or a dataset opening) computes
+        CHECK(p.getDouble("min", -1.0) == 0.0);
+        CHECK(p.getDouble("max", -1.0) == 1000.0);
+        const StepOutput out = op.run(in, p, prog.ctx);
+        REQUIRE(out.array);
+        CHECK(out.array->at(0, 0, 4, 1, 1) == 1.0f);
+        CHECK(out.array->at(0, 0, 0, 39, 19) == 0.0f);
+        REQUIRE(out.diagnostics.histograms.size() == 1);
+        const DiagnosticHistogram& h = out.diagnostics.histograms[0];
+        CHECK(h.binLo == 0.0f);
+        CHECK(h.binHi == 1000.0f);
+        CHECK(std::accumulate(h.bins.begin(), h.bins.end(), 0.0) == static_cast<double>(data->numel() - 2));
+        CHECK(contrastPreview(in, p).histograms.size() == 1);
+    }
+}
+
+TEST_CASE("Otsu and Multi-Otsu break exact ties the way bindings/tests/test_workbench.py expects", "[app][ops][threshold]") {
+    // A histogram symmetric about its centre scores a split and its mirror
+    // image exactly the same; which one wins is decided by the last bit of the
+    // between-class variance, so the Python mirror has to evaluate it in the
+    // order these loops do. Same data and cuts as
+    // TestIntensityHelpers.test_otsu_cuts_break_ties_as_the_application.
+    // Values sit at bin centres of [0, bins]: `pairs` holds (bin, count), each
+    // mirrored to bins - 1 - bin, and the two ends pin the range.
+    const auto symmetric = [](float bins, int ends, std::initializer_list<std::pair<int, int>> pairs) {
+        std::vector<float> values(static_cast<std::size_t>(ends), 0.0f);
+        values.insert(values.end(), static_cast<std::size_t>(ends), bins);
+        for (const auto& [bin, count] : pairs)
+            for (int i = 0; i < count; ++i) {
+                values.push_back(static_cast<float>(bin) + 0.5f);
+                values.push_back(bins - 1.0f - static_cast<float>(bin) + 0.5f);
+            }
+        return values;
+    };
+    const auto labelsAbove = [](const char* kind, ParamSet p, const std::vector<float>& values, float cut) {
+        const Dims5 dims{1, 1, 1, 1, static_cast<Index>(values.size())};
+        auto data = std::make_shared<Array5>(dims);
+        std::copy(values.begin(), values.end(), data->data());
+        const Operation& op = requireOperation(kind);
+        ParamSet params = op.defaults();
+        for (const auto& [key, value] : p.items()) params.set(key, value);
+        Progress prog;
+        const StepOutput r = op.run(inputOf(data, metaFor(dims)), params, prog.ctx);
+        REQUIRE(r.labels);
+        for (std::size_t i = 0; i < values.size(); ++i) {
+            INFO(kind << ": value " << values[i]);
+            CHECK((r.labels->at(0, 0, 0, static_cast<Index>(i)) != 0) == (values[i] > cut));
+        }
+    };
+    SECTION("Otsu: 0 + 256 * 37 / 256, not the 139 of the mirror image") {
+        ParamSet p;
+        p.set("method", std::string("Otsu"));
+        p.set("min_voxels", std::int64_t{0});
+        labelsAbove("threshold", p, symmetric(256.0f, 3, {{36, 6}, {117, 17}}), 37.0f);
+    }
+    SECTION("Multi-Otsu: 0 + 128 * 93 / 128, not the 71 of the mirror image") {
+        ParamSet p;
+        p.set("sigma", 0.0);
+        p.set("opening", std::int64_t{0});
+        p.set("fill_holes", false);
+        p.set("min_voxels", std::int64_t{1});
+        p.set("post", std::string("Connected components"));
+        p.set("method", std::string("Multi-Otsu"));
+        labelsAbove("classic", p, symmetric(128.0f, 1, {{2, 2}, {36, 2}, {44, 6}, {58, 5}}), 93.0f);
     }
 }
 

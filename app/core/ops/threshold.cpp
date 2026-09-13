@@ -13,9 +13,10 @@
 namespace sirius::app {
 
     float otsuThreshold(const float* v, Index n) {
+        // over the finite values: an infinite end has no bins to split
         float mn = std::numeric_limits<float>::infinity(), mx = -mn;
         for (Index i = 0; i < n; ++i) {
-            if (std::isnan(v[i])) continue;
+            if (!std::isfinite(v[i])) continue;
             mn = std::min(mn, v[i]);
             mx = std::max(mx, v[i]);
         }

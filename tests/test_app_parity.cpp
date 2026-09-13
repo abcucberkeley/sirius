@@ -24,6 +24,7 @@
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
+#include <limits>
 #include <string>
 #include <vector>
 
@@ -101,7 +102,20 @@ namespace {
         const char* name;
         const char* kind;
         json params;
+        // Run on a copy of the input with a +inf and a -inf voxel in every
+        // channel (written beside the case as <name>.input.f32).
+        bool infinite = false;
     };
+
+    // The voxels an `infinite` case overwrites: (c, t, z, y, x), value.
+    struct Poke {
+        Index c, t, z, y, x;
+        float value;
+    };
+    const Poke kPokes[] = {{0, 0, 2, 4, 5, std::numeric_limits<float>::infinity()},
+                           {0, 1, 3, 0, 10, -std::numeric_limits<float>::infinity()},
+                           {1, 2, 1, 6, 8, std::numeric_limits<float>::infinity()},
+                           {1, 0, 0, 8, 0, -std::numeric_limits<float>::infinity()}};
 
     // One case per behaviour the two implementations are meant to share.
     // Steps left out on purpose: merge (its output is a display RGB blend
@@ -132,6 +146,15 @@ namespace {
         {"threshold_otsu", "threshold", {{"channel", 0}, {"method", "Otsu"}, {"post", "Connected components"}, {"min_voxels", 0}}},
         {"threshold_manual", "threshold", {{"channel", 1}, {"method", "Manual"}, {"value", 0.6}, {"post", "Connected components"}, {"min_voxels", 4}}},
         {"threshold_percentile", "threshold", {{"channel", 0}, {"method", "Percentile"}, {"percentile", 92.0}, {"post", "Connected components"}, {"min_voxels", 0}}},
+        // +-inf voxels: the histograms span the finite values (an infinite
+        // end used to write a NaN bin index out of bounds), and max / min
+        // keep a real infinity instead of mistaking it for "nothing seen"
+        {"threshold_otsu_inf", "threshold", {{"channel", 0}, {"method", "Otsu"}, {"post", "Connected components"}, {"min_voxels", 0}}, true},
+        {"classic_multi_otsu_inf", "classic", {{"channel", 1}, {"method", "Multi-Otsu"}, {"sigma", 0.0}, {"opening", 0}, {"fill_holes", false}, {"post", "Connected components"}, {"min_voxels", 2}}, true},
+        {"contrast_auto_inf", "contrast", {{"min", 0.0}, {"max", 0.0}, {"gamma", 1.0}}, true},
+        {"einsum_max_c_inf", "einsum", {{"keep", "tzyx"}, {"reduction", "max"}}, true},
+        {"einsum_min_yx_inf", "einsum", {{"keep", "ctz"}, {"reduction", "min"}}, true},
+        {"maxproj_z_inf", "maxproj", {{"axis", "z"}}, true},
         // classical segmentation: one case per branch that has its own maths,
         // so the Python mirror cannot drift from the C++ on any of them
         {"classic_otsu_hmax", "classic", {{"channel", 0}, {"method", "Otsu"}, {"sigma", 1.0}, {"opening", 1}, {"post", "Watershed (distance)"}, {"seeds", "H-maxima"}, {"seed_depth", 1.5}, {"min_voxels", 4}}},
@@ -231,10 +254,18 @@ TEST_CASE("parity fixtures for the Python mirror of the operations", "[.parity][
         StepInput in;
         in.meta = meta;
         in.array = array;
+        if (c.infinite) {
+            auto poked = std::make_shared<Array5>(array->clone());
+            for (const Poke& k : kPokes) poked->at(k.c, k.t, k.z, k.y, k.x) = k.value;
+            writeFloats(dir / (std::string(c.name) + ".input.f32"), poked->data(),
+                        static_cast<std::size_t>(poked->numel()));
+            in.array = poked;
+        }
         const StepOutput out = op->run(in, params, ctx);
         REQUIRE(out.array);
 
         json entry{{"name", c.name}, {"kind", c.kind}, {"params", params.toJson()}, {"dims", dimsJson(out.meta.dims)}, {"voxel_um", json::array({out.meta.voxelUm[0], out.meta.voxelUm[1], out.meta.voxelUm[2]})}, {"labels", false}};
+        if (c.infinite) entry["input"] = std::string(c.name) + ".input.f32";
         writeFloats(dir / (std::string(c.name) + ".f32"), out.array->data(),
                     static_cast<std::size_t>(out.array->numel()));
         if (out.labels && !out.labels->empty()) {

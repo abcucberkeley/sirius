@@ -34,16 +34,19 @@ namespace sirius {
             switch (op) {
                 case ReduceOp::Sum:
                 case ReduceOp::Mean: acc += v; break;
-                // `v > acc` is false for NaN, so NaN never replaces the running extreme
-                case ReduceOp::Max: acc = v > acc ? v : acc; break;
-                case ReduceOp::Min: acc = v < acc ? v : acc; break;
+                // `v > acc` is false for NaN, so NaN never replaces the running
+                // extreme. Max and Min start from NaN ("nothing seen yet"),
+                // which the first number replaces: an all-NaN run stays NaN and
+                // a real +-inf is a value like any other.
+                case ReduceOp::Max: acc = v > acc || std::isnan(acc) ? v : acc; break;
+                case ReduceOp::Min: acc = v < acc || std::isnan(acc) ? v : acc; break;
             }
         }
 
         inline double initialAccumulator(ReduceOp op) noexcept {
             switch (op) {
-                case ReduceOp::Max: return -kInf;
-                case ReduceOp::Min: return kInf;
+                case ReduceOp::Max:
+                case ReduceOp::Min: return std::numeric_limits<double>::quiet_NaN();
                 default: return 0.0;
             }
         }
@@ -164,12 +167,6 @@ namespace sirius {
                 float* dst = out + op_ * outPlane;
                 if (op == ReduceOp::Mean)
                     for (Index i = 0; i < outPlane; ++i) dst[i] = static_cast<float>(acc[static_cast<std::size_t>(i)] / count);
-                else if (op == ReduceOp::Max || op == ReduceOp::Min)
-                    // an all-NaN run leaves the sentinel: report NaN, not +-inf
-                    for (Index i = 0; i < outPlane; ++i) {
-                        const double a = acc[static_cast<std::size_t>(i)];
-                        dst[i] = std::isinf(a) ? std::numeric_limits<float>::quiet_NaN() : static_cast<float>(a);
-                    }
                 else
                     for (Index i = 0; i < outPlane; ++i) dst[i] = static_cast<float>(acc[static_cast<std::size_t>(i)]);
             }
@@ -398,6 +395,9 @@ namespace sirius {
         std::vector<double> counts(static_cast<std::size_t>(bins), 0.0);
         if (n <= 0 || !(hi > lo)) return counts;
         const double scale = bins / (static_cast<double>(hi) - static_cast<double>(lo));
+        // An infinite bound has no finite bin width: (v - lo) * 0 is NaN for an
+        // infinite v, and a NaN bin index wrote outside the counts.
+        if (!std::isfinite(lo) || !std::isfinite(hi) || !(scale > 0.0) || !std::isfinite(scale)) return counts;
         // per-thread histograms merged at the end: no atomics on the hot loop
 #pragma omp parallel
         {
@@ -405,9 +405,9 @@ namespace sirius {
 #pragma omp for schedule(static) nowait
             for (Index i = 0; i < n; ++i) {
                 const float v = values[i];
-                if (!(v >= lo) || v > hi) continue;   // NaN and out-of-range values are not counted
+                if (!(v >= lo) || v > hi) continue;   // NaN, +-inf and out-of-range values are not counted
                 int b = static_cast<int>((static_cast<double>(v) - lo) * scale);
-                if (b >= bins) b = bins - 1;   // v == hi lands in the last bin
+                b = std::clamp(b, 0, bins - 1);   // v == hi lands in the last bin
                 local[static_cast<std::size_t>(b)] += 1.0;
             }
 #pragma omp critical

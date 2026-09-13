@@ -188,9 +188,10 @@ namespace sirius::app {
         // 128-bin histogram: the upper cut keeps only the brightest class,
         // which separates objects from a bright halo the single cut merges.
         std::pair<float, float> multiOtsuThresholds(const float* v, Index n) {
+            // over the finite values, as otsuThreshold
             float mn = std::numeric_limits<float>::infinity(), mx = -mn;
             for (Index i = 0; i < n; ++i) {
-                if (std::isnan(v[i])) continue;
+                if (!std::isfinite(v[i])) continue;
                 mn = std::min(mn, v[i]);
                 mx = std::max(mx, v[i]);
             }

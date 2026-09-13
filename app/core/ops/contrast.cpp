@@ -49,9 +49,10 @@ namespace sirius::app {
             const auto pct = percentiles(samples.data(), n, loPct, hiPct);
             w.lo = pct.first;
             w.hi = pct.second;
+            // the histogram spans the finite values: a +-inf voxel has no bin
             float mn = std::numeric_limits<float>::infinity(), mx = -mn;
             for (float v : samples) {
-                if (std::isnan(v)) continue;
+                if (!std::isfinite(v)) continue;
                 mn = std::min(mn, v);
                 mx = std::max(mx, v);
             }

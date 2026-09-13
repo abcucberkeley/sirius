@@ -5,6 +5,7 @@
 #include <catch2/catch_test_macros.hpp>
 #include <catch2/matchers/catch_matchers_floating_point.hpp>
 
+#include <algorithm>
 #include <array>
 #include <cmath>
 #include <cstddef>
@@ -12,6 +13,7 @@
 #include <limits>
 #include <numeric>
 #include <type_traits>
+#include <utility>
 #include <vector>
 
 #include "sirius/image_ops.hpp"
@@ -103,6 +105,42 @@ TEST_CASE("reduceAxes max and min ignore NaN", "[image_ops]") {
     std::vector<float> allNan{nan, nan};
     reduceAxes(allNan.data(), Extent5{1, 1, 1, 1, 2}, {false, false, false, false, true}, ReduceOp::Max, &out);
     CHECK(std::isnan(out));
+}
+
+TEST_CASE("reduceAxes max and min keep a real infinity", "[image_ops]") {
+    // +-inf used to double as the "nothing seen yet" sentinel, so a run whose
+    // extreme was infinite came out NaN
+    const float inf = std::numeric_limits<float>::infinity(), nan = std::numeric_limits<float>::quiet_NaN();
+    const std::array<bool, 5> alongX{false, false, false, false, true};
+    const auto reduce = [&](std::vector<float> in, ReduceOp op) {
+        float out = 0.0f;
+        reduceAxes(in.data(), Extent5{1, 1, 1, 1, static_cast<Index>(in.size())}, alongX, op, &out);
+        return out;
+    };
+    CHECK(reduce({1.0f, inf, -2.0f}, ReduceOp::Max) == inf);
+    CHECK(reduce({1.0f, inf, -2.0f}, ReduceOp::Min) == -2.0f);
+    CHECK(reduce({3.0f, -inf, nan}, ReduceOp::Min) == -inf);
+    CHECK(reduce({3.0f, -inf, nan}, ReduceOp::Max) == 3.0f);
+    CHECK(reduce({-inf, -inf}, ReduceOp::Max) == -inf);
+    CHECK(reduce({inf, nan}, ReduceOp::Min) == inf);
+    CHECK(std::isnan(reduce({nan, nan, nan}, ReduceOp::Min)));
+
+    SECTION("over several axes and output voxels") {
+        // (c=2, y=2, x=3) reduced over x: every row's own extreme
+        std::vector<float> in{inf, 1, 2, nan, nan, nan, -inf, -inf, 0, 5, -inf, nan};
+        std::vector<float> mx(4), mn(4);
+        const std::array<bool, 5> m{false, true, true, false, true};
+        reduceAxes(in.data(), Extent5{2, 1, 1, 2, 3}, m, ReduceOp::Max, mx.data());
+        reduceAxes(in.data(), Extent5{2, 1, 1, 2, 3}, m, ReduceOp::Min, mn.data());
+        CHECK(mx[0] == inf);
+        CHECK(std::isnan(mx[1]));
+        CHECK(mx[2] == 0.0f);
+        CHECK(mx[3] == 5.0f);
+        CHECK(mn[0] == 1.0f);
+        CHECK(std::isnan(mn[1]));
+        CHECK(mn[2] == -inf);
+        CHECK(mn[3] == -inf);
+    }
 }
 
 TEST_CASE("resampleAffine identity and translation", "[image_ops]") {
@@ -297,6 +335,19 @@ TEST_CASE("percentiles, rescaleGamma and histogram", "[image_ops]") {
         CHECK(bins[1] == 0.0);
         CHECK(bins[2] == 1.0);   // 0.5
         CHECK(bins[3] == 1.0);   // 1.0 lands in the last bin; 2.0 and NaN are dropped
+    }
+    SECTION("histogram drops infinite values and counts nothing between infinite bounds") {
+        // an infinite bound made the bin width 0 and (inf - lo) * 0 a NaN
+        // bin index, which was written outside the counts
+        const float inf = std::numeric_limits<float>::infinity();
+        std::vector<float> h{-inf, 0.0f, 0.5f, 1.0f, inf};
+        const std::vector<double> bins = histogram(h.data(), 5, 4, 0.0f, 1.0f);
+        CHECK(bins == std::vector<double>{1.0, 0.0, 1.0, 1.0});
+        for (const auto& [lo, hi] : {std::pair{0.0f, inf}, std::pair{-inf, 1.0f}, std::pair{-inf, inf}}) {
+            const std::vector<double> none = histogram(h.data(), 5, 30, lo, hi);
+            REQUIRE(none.size() == 30);
+            CHECK(std::all_of(none.begin(), none.end(), [](double c) { return c == 0.0; }));
+        }
     }
 }
 

@@ -248,6 +248,41 @@ class TestIntensityHelpers(unittest.TestCase):
         two = np.array([0.0, 1.0], np.float32)
         self.assertAlmostEqual(wb._otsu_threshold(two), 1.0 / 256, places=7)
 
+    def test_histograms_and_otsu_cuts_leave_out_infinities(self):
+        # an infinite voxel made the C++ histogram write out of bounds (the
+        # application crashed opening the dataset) and these raise ValueError;
+        # both now work on the finite values, as tests/test_app_ops.cpp checks
+        inf = np.float32(np.inf)
+        np.testing.assert_array_equal(wb._histogram(np.array([-inf, 0, 0.5, 1, inf], np.float32), 4, 0.0, 1.0),
+                                      [1, 0, 1, 1])
+        for lo, hi in ((0.0, np.inf), (-np.inf, 1.0), (-np.inf, np.inf)):
+            np.testing.assert_array_equal(wb._histogram(np.array([0.5, inf], np.float32), 30, lo, hi), np.zeros(30))
+        rng = np.random.default_rng(3)
+        v = np.concatenate([rng.normal(10, 1, 500), rng.normal(50, 1, 500), rng.normal(90, 1, 100)]).astype(np.float32)
+        poked = np.concatenate([v, [inf, -inf, np.nan]]).astype(np.float32)
+        self.assertEqual(wb._otsu_threshold(poked), wb._otsu_threshold(v))
+        self.assertEqual(wb._multi_otsu_upper(poked), wb._multi_otsu_upper(v))
+        self.assertTrue(10 < wb._otsu_threshold(v) < 90)
+        # nothing finite: a cut nothing lies above, as the C++ returns
+        none = np.array([inf, -inf, np.nan], np.float32)
+        self.assertEqual(wb._otsu_threshold(none), np.inf)
+        self.assertEqual(wb._multi_otsu_upper(none), np.inf)
+
+    def test_otsu_cuts_break_ties_as_the_application(self):
+        # Symmetric about its centre, each histogram scores a split and its
+        # mirror image exactly the same; the float rounding of the between-class
+        # variance picks one, so the mirror must evaluate it in the C++ order.
+        # The same data and cuts as the "Otsu and Multi-Otsu break exact ties"
+        # case in tests/test_app_ops.cpp (the old `** 2` gave 139 and 71).
+        def symmetric(bins, ends, pairs):
+            values = [0.0] * ends + [float(bins)] * ends
+            for b, count in pairs:
+                values += [b + 0.5, bins - 1 - b + 0.5] * count
+            return np.array(values, np.float32)
+
+        self.assertEqual(wb._otsu_threshold(symmetric(256, 3, ((36, 6), (117, 17)))), 37.0)
+        self.assertEqual(wb._multi_otsu_upper(symmetric(128, 1, ((2, 2), (36, 2), (44, 6), (58, 5)))), 93.0)
+
     def test_rescale_gamma(self):
         a = np.array([[[[[-1.0, 0.0, 0.5, 1.0, 2.0]]]]], np.float32)
         out = wb._rescale_gamma(a, 0.0, 1.0, 1.0)
@@ -271,6 +306,28 @@ class TestSteps(unittest.TestCase):
         np.testing.assert_allclose(r.array[:, 0], a.mean(axis=1), rtol=1e-6)
         r = wb.run_step("einsum", {"keep": "tzyx", "reduction": "sum"}, a, {"channels": [{"label": "a"}, {"label": "b"}]})
         self.assertEqual(len(r.meta["channels"]), 1)
+
+    def test_max_and_min_keep_infinities_and_nan_only_runs(self):
+        # reduceAxes semantics (tests/test_image_ops.cpp): NaN is skipped, a
+        # real +-inf is kept, and a run with nothing but NaN stays NaN
+        a = np.array([np.inf, 1, 2, np.nan, np.nan, np.nan, -np.inf, -np.inf, 0, 5, -np.inf, np.nan],
+                     np.float32).reshape(2, 1, 1, 2, 3)
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", RuntimeWarning)   # numpy's "All-NaN slice"
+            mx = wb.run_step("einsum", {"keep": "cy", "reduction": "max"}, a).array.reshape(-1)
+            mn = wb.run_step("einsum", {"keep": "cy", "reduction": "min"}, a).array.reshape(-1)
+        np.testing.assert_array_equal(mx, [np.inf, np.nan, 0, 5])
+        np.testing.assert_array_equal(mn, [1, np.nan, -np.inf, -np.inf])
+
+    def test_otsu_threshold_step_runs_on_an_infinite_voxel(self):
+        a = np.zeros((1, 1, 1, 8, 8), np.float32)
+        a[0, 0, 0, 2:5, 2:5] = 1.0
+        a[0, 0, 0, 7, 7] = np.inf
+        a[0, 0, 0, 0, 7] = -np.inf
+        r = wb.run_step("threshold", {"method": "Otsu", "min_voxels": 0, "post": "Connected components"}, a)
+        self.assertEqual(int(r.labels.max()), 2)   # the square and the +inf voxel
+        self.assertNotEqual(int(r.labels[0, 0, 7, 7]), 0)
+        self.assertEqual(int(r.labels[0, 0, 0, 7]), 0)
 
     def test_contrast_manual_window_and_auto_window(self):
         a = np.linspace(0, 100, 2 * 1 * 2 * 8 * 8, dtype=np.float32).reshape(2, 1, 2, 8, 8)
