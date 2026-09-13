@@ -1,6 +1,7 @@
 #include "core/ops/plugin.hpp"
 
 #include <algorithm>
+#include <atomic>
 #include <cstdlib>
 #include <filesystem>
 #include <cctype>
@@ -10,6 +11,7 @@
 #include <stdexcept>
 
 #include "core/array_source.hpp"
+#include "core/executor.hpp"
 #include "core/help_pages.hpp"
 #include "core/ops/builtin.hpp"
 
@@ -25,6 +27,10 @@ namespace sirius::app {
         std::mutex& kindsMutex() {
             static std::mutex m;
             return m;
+        }
+        std::atomic<unsigned>& loadCounter() {
+            static std::atomic<unsigned> n{0};
+            return n;
         }
 
         ParamSpec specFromJson(const json& p) {
@@ -83,6 +89,9 @@ namespace sirius::app {
                 info_.remoteCapable = true;
                 info_.plugin = true;
                 info_.source = spec.value("file", "");
+                // a file that cannot be stat'ed still gets a stamp of this load
+                info_.sourceStamp = fileStamp(info_.source);
+                if (info_.sourceStamp.empty()) info_.sourceStamp = "load#" + std::to_string(++loadCounter());
                 info_.helpPage = info_.kind;
                 if (spec.contains("params") && spec["params"].is_array())
                     for (const json& p : spec["params"]) info_.params.push_back(specFromJson(p));

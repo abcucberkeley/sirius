@@ -22,6 +22,7 @@
 #include "core/executor.hpp"
 #include "core/history.hpp"
 #include "core/manifest.hpp"
+#include "core/ops/plugin.hpp"
 #include "core/pipeline.hpp"
 #include "core/tool_api.hpp"
 #include "core/workbench.hpp"
@@ -1864,6 +1865,52 @@ TEST_CASE("Files named in a list parameter are part of the fingerprint", "[app][
         f << "another size";   // rewritten under the same name
     }
     CHECK(ex.fingerprint(p, 1) != before);
+}
+
+TEST_CASE("A reloaded plugin is not served the result of the code it replaced", "[app][executor][plugin]") {
+    registerTestOps();
+    Scratch scratch;
+    const std::filesystem::path file = scratch.dir / "test_fp_plugin.py";
+    std::ofstream(file) << "def run(x): return x * 2\n";
+    const json spec = {{"kind", "test_fp_plugin"},
+                       {"name", "Mine"},
+                       {"file", file.string()},
+                       {"params", json::array({{{"key", "gain"}, {"type", "double"}, {"default", 1.0}}})}};
+    registerOperation(makePluginOperation(spec));
+    Pipeline p;
+    p.add("test_fp_plugin");
+    Executor ex(scratch.dir / "cache");
+    const std::string loaded = ex.fingerprint(p, 1);
+    CHECK(ex.fingerprint(p, 1) == loaded);
+    std::ofstream(file) << "def run(x): return x * 3   # edited\n";
+    const std::string edited = ex.fingerprint(p, 1);
+    CHECK(edited != loaded);   // the file changed: a worker that starts afresh imports the edit
+    registerOperation(makePluginOperation(spec));   // what Reload plugins does
+    const std::string reloaded = ex.fingerprint(p, 1);
+    CHECK(reloaded != loaded);   // was the same: the old code's output was served as fresh
+    CHECK(reloaded != edited);   // a run between the edit and the reload still ran the old code
+}
+
+TEST_CASE("A cache policy changed after an eviction does not serve the empty shell", "[app][workbench][executor]") {
+    registerTestOps();
+    Scratch scratch;
+    Workbench wb(scratch.dir);
+    wb.setDataset(syntheticSource(1, 1, 2, 8, 8));
+    wb.setBackend(Backend::Cpu);
+    wb.replacePipeline(Pipeline(), "clear");
+    for (int i = 0; i < 4; ++i) wb.addStep("test_scale");
+    wb.setStepCache(1, CachePolicy::Recompute);
+    wb.setStepCache(2, CachePolicy::Recompute);
+    REQUIRE(runSync(wb)->succeeded());   // step 02's store evicted step 01's array, step 03's step 02's
+    wb.setStepCache(1, CachePolicy::Memory);
+    wb.setStepParam(4, "factor", 3.0);
+    REQUIRE(runSync(wb, 4)->succeeded());   // a store: the entries take the pipeline's policies
+    CHECK_FALSE(wb.outputFresh(1));         // no array left to serve, whatever the policy says now
+    wb.setStepParam(2, "factor", 5.0);
+    const std::shared_ptr<RunJob> job = runSync(wb, 2);
+    CHECK(job->succeeded());   // was "step input has neither an array nor a source"
+    REQUIRE(wb.output(2));
+    CHECK(wb.output(2)->array);
 }
 
 TEST_CASE("Label statistics follow the viewed time point", "[app][workbench][labels]") {

@@ -74,6 +74,10 @@ namespace sirius::app {
         bool livePreview = false;
         bool plugin = false;              // a user operation served by the Python worker
         std::string source;               // plugin file
+        // The plugin file as it was loaded (its size and modification time):
+        // part of the step's fingerprint, so a reloaded edit is not served
+        // the result of the code it replaced. Empty for built-ins.
+        std::string sourceStamp;
         std::string helpPage;             // markdown file stem under app/help (defaults to kind)
         // Starting points offered by the panel and the apply_preset tool.
         std::vector<ParamPreset> presets;

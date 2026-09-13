@@ -82,38 +82,38 @@ namespace sirius::app {
         bool labelsFit(const LabelVolume& labels, const Dims5& dims) noexcept {
             return labels.t() == dims.t && labels.z() == dims.z && labels.y() == dims.y && labels.x() == dims.x;
         }
-
-        // What a parameter's path points at, not the path itself. An OTF, a
-        // PSF, a flat-field image or the dataset can all be rewritten in place
-        // while the pipeline still names the same file, and the step's output
-        // would otherwise be served from the cache as though nothing had
-        // changed. Size and modification time are enough to notice that, and
-        // cost one stat.
-        std::string fileStamp(const std::string& path) {
-            if (path.empty()) return {};
-            std::error_code ec;
-            const std::filesystem::path file(path);
-            const std::filesystem::file_status status = std::filesystem::status(file, ec);
-            if (ec) return {};
-            if (std::filesystem::is_regular_file(status)) {
-                const std::uintmax_t size = std::filesystem::file_size(file, ec);
-                if (ec) return {};
-                const std::filesystem::file_time_type when = std::filesystem::last_write_time(file, ec);
-                if (ec) return {};
-                return std::to_string(size) + ":" + std::to_string(when.time_since_epoch().count());
-            }
-            if (std::filesystem::is_directory(status)) {
-                // a zarr / N5 store or a folder dataset. The directory's own
-                // stamp catches a file added, removed or renamed, but not a
-                // chunk rewritten in place: walking a whole store on every
-                // cache lookup would cost more than the run it protects.
-                const std::filesystem::file_time_type when = std::filesystem::last_write_time(file, ec);
-                if (ec) return {};
-                return "dir:" + std::to_string(when.time_since_epoch().count());
-            }
-            return {};
-        }
     } // namespace
+
+    // What a parameter's path points at, not the path itself. An OTF, a
+    // PSF, a flat-field image or the dataset can all be rewritten in place
+    // while the pipeline still names the same file, and the step's output
+    // would otherwise be served from the cache as though nothing had
+    // changed. Size and modification time are enough to notice that, and
+    // cost one stat.
+    std::string fileStamp(const std::string& path) {
+        if (path.empty()) return {};
+        std::error_code ec;
+        const std::filesystem::path file(path);
+        const std::filesystem::file_status status = std::filesystem::status(file, ec);
+        if (ec) return {};
+        if (std::filesystem::is_regular_file(status)) {
+            const std::uintmax_t size = std::filesystem::file_size(file, ec);
+            if (ec) return {};
+            const std::filesystem::file_time_type when = std::filesystem::last_write_time(file, ec);
+            if (ec) return {};
+            return std::to_string(size) + ":" + std::to_string(when.time_since_epoch().count());
+        }
+        if (std::filesystem::is_directory(status)) {
+            // a zarr / N5 store or a folder dataset. The directory's own
+            // stamp catches a file added, removed or renamed, but not a
+            // chunk rewritten in place: walking a whole store on every
+            // cache lookup would cost more than the run it protects.
+            const std::filesystem::file_time_type when = std::filesystem::last_write_time(file, ec);
+            if (ec) return {};
+            return "dir:" + std::to_string(when.time_since_epoch().count());
+        }
+        return {};
+    }
 
     std::string Executor::fingerprint(const Pipeline& p, int index) const {
         std::string upstream;
@@ -122,7 +122,12 @@ namespace sirius::app {
             if (i > 0 && !s.enabled) continue;   // a skipped step is transparent
             std::string own = s.kind + "|" + s.params.toJson().dump() + "|" + upstream;
             // every file the step reads, by identity rather than by name
-            if (const Operation* op = findOperation(s.kind))
+            if (const Operation* op = findOperation(s.kind)) {
+                // A plugin's code is part of what it computes: the file as it
+                // was loaded (an edited file reloaded runs other code) and as
+                // it is now (a worker that restarts imports it afresh).
+                if (!op->info().sourceStamp.empty())
+                    own += "|code@" + op->info().sourceStamp + "|now@" + fileStamp(op->info().source);
                 for (const ParamSpec& spec : op->info().params) {
                     if (spec.type == ParamType::Path) {
                         const std::string stamp = fileStamp(s.params.getString(spec.key));
@@ -136,6 +141,7 @@ namespace sirius::app {
                         }
                     }
                 }
+            }
             upstream = stableHash(own);
         }
         return upstream;
@@ -201,7 +207,11 @@ namespace sirius::app {
             if (it == entries_.end() || !it->second || it->second->fingerprint != fp) return nullptr;
             Entry& e = *it->second;
             if (!e.output) return nullptr;
-            if (e.policy == CachePolicy::Recompute && !e.output->array && !e.output->source) return nullptr;
+            // Only an output that still holds its data is served, whatever the
+            // policy says now: a Recompute eviction leaves a shell with neither
+            // array nor source, and a policy changed to Memory or Disk after
+            // it does not bring the array back.
+            if (!e.output->array && !e.output->source && !e.arrayOnDisk) return nullptr;
             if (auto out = load(e, pending)) return out;
         }
         return restore(pending);
