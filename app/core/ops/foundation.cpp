@@ -247,7 +247,7 @@ namespace sirius::app {
                 char note[240];
                 std::snprintf(note, sizeof note, "%.1f s · %s · %s", seconds, diag.summary.c_str(),
                               ctx.remote->capabilities().device.empty() ? "worker"
-                                                                       : ctx.remote->capabilities().device.c_str());
+                                                                        : ctx.remote->capabilities().device.c_str());
                 out.note = note;
                 ctx.report(1.0, "");
                 return out;
