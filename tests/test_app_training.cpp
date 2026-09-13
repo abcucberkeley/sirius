@@ -292,4 +292,92 @@ TEST_CASE("An export says what is wrong before writing anything", "[app][trainin
     o.image = o.instances = o.semantic = o.boxes = o.slices = false;
     CHECK(validateTrainingExport(o, labels) == "nothing selected to write");
     CHECK_THROWS_AS(exportTrainingData(Array5{}, meta(), labels, o), std::runtime_error);
+
+    SECTION("an image on another grid than the labels") {
+        // two frames of labels over a one-frame image: the slices of t = 1
+        // used to take the image of t = 0, and a z / y / x mismatch skipped
+        // the slice images while image.tif was written all the same
+        LabelVolume two = twoCubes(2);
+        o.slices = true;
+        o.sample = "mismatch";
+        const Array5 one = image(twoCubes(1));
+        CHECK(validateTrainingExport(o, two, one.dims()).find("not on the same grid") != std::string::npos);
+        CHECK(validateTrainingExport(o, two, image(two).dims()).empty());
+        CHECK_THROWS_AS(exportTrainingData(one, meta(), two, o), std::runtime_error);
+        CHECK_FALSE(std::filesystem::exists(tmp.dir / "mismatch"));
+        o.slices = false;
+        o.boxes = true;   // no image written: the grid of an image is nobody's business
+        CHECK(validateTrainingExport(o, two, one.dims()).empty());
+    }
+}
+
+TEST_CASE("Every sample's class ids are positions in the dataset's class table", "[app][training]") {
+    TempDir tmp;
+    TrainingExportOptions o;
+    o.directory = tmp.dir.string();
+    o.image = false;
+    o.instances = false;
+    o.slices = true;
+
+    LabelVolume a = twoCubes();
+    for (LabelStats& s : a.stats()) s.cls = "nucleus";
+    o.sample = "a";
+    exportTrainingData(Array5{}, meta(), a, o);
+
+    LabelVolume b = twoCubes();
+    for (LabelStats& s : b.stats()) s.cls = s.id == 1 ? "cell" : "nucleus";
+    o.sample = "b";
+    const TrainingExportResult r = exportTrainingData(Array5{}, meta(), b, o);
+    CHECK(r.classes == 2);
+
+    std::vector<std::string> names;
+    {
+        std::ifstream in(tmp.dir / "classes.txt");
+        for (std::string line; std::getline(in, line);)
+            if (!line.empty()) names.push_back(line);
+    }
+    REQUIRE(names == std::vector<std::string>{"nucleus", "cell"});
+
+    // b's own sorted table would say cell = 1, nucleus = 2; the dataset says
+    // nucleus = 1, cell = 2, and that is what b has to write
+    std::ifstream yolo(r.directory / "slices" / "t0_z1.txt");   // the plane of cube 1, the cell
+    std::string line;
+    REQUIRE(std::getline(yolo, line));
+    CHECK(line.rfind("1 ", 0) == 0);   // YOLO counts from 0: cell is 1
+
+    std::ifstream in(r.directory / "boxes.json");
+    const nlohmann::json j = nlohmann::json::parse(in);
+    CHECK(j.at("classes") == nlohmann::json::array({"nucleus", "cell"}));
+    for (const nlohmann::json& object : j.at("frames")[0].at("objects")) {
+        INFO(object.dump());
+        CHECK(object.at("class_id") == (object.at("class") == "cell" ? 2 : 1));
+    }
+
+    const ImageStack<std::uint8_t> semantic = readTiffStack<std::uint8_t>((r.directory / "semantic.tif").string());
+    CHECK(semantic(1, 1, 1) == 2);   // inside the cell
+    CHECK(semantic(3, 5, 6) == 1);   // inside the nucleus
+}
+
+TEST_CASE("Classes are read from each object's own frame", "[app][training]") {
+    // object 2 exists only in frame 1; the statistics table is on frame 0
+    LabelVolume labels(2, 1, 16, 16);
+    labels.paint(0, 0, 3, 3, 1.0, 0, 1);
+    labels.paint(1, 0, 3, 3, 1.0, 0, 1);
+    labels.paint(1, 0, 10, 10, 1.0, 0, 2);
+    for (Index t = 0; t < 2; ++t) {
+        labels.recomputeStats(t);
+        for (LabelStats& s : labels.stats()) s.cls = "nucleus";   // as a segmentation step names them
+    }
+    labels.recomputeStats(0);   // the viewer is on frame 0
+    const ClassTable classes = classTable(labels);
+    REQUIRE(classes.names == std::vector<std::string>{"nucleus"});
+    const Buffer<std::uint8_t> semantic = semanticVolume(labels, 1, classes);
+    CHECK(semantic.data()[10 * 16 + 10] == 1);   // was 0: background
+    CHECK(semantic.data()[3 * 16 + 3] == 1);
+    const std::vector<LabelBox> boxes = boundingBoxes(labels, 1, classes, 1);
+    REQUIRE(boxes.size() == 2);
+    CHECK(boxes[1].label == 2);
+    CHECK(boxes[1].className == "nucleus");
+    CHECK(boxes[1].classId == 1);
+    for (const SliceBox& s : sliceBoxes(labels, 1, classes, 1)) CHECK(s.classId == 1);
 }
