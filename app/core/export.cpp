@@ -30,8 +30,9 @@ namespace sirius::app {
         struct ResolvedRange {
             Index t0 = 0, t1 = 0, z0 = 0, z1 = 0;
             std::vector<Index> channels;
-            Index nt() const noexcept { return t1 - t0; }
-            Index nz() const noexcept { return z1 - z0; }
+            // an inverted range is empty, not negative (the size estimate is unsigned)
+            Index nt() const noexcept { return std::max<Index>(0, t1 - t0); }
+            Index nz() const noexcept { return std::max<Index>(0, z1 - z0); }
             Index nc() const noexcept { return static_cast<Index>(channels.size()); }
             Index planes() const noexcept { return nt() * nz() * nc(); }
         };
@@ -332,6 +333,12 @@ namespace sirius::app {
         return total;
     }
 
+    std::vector<Index> zarrChunkShape(const ZarrExportOptions& o) {
+        // given (c, t, z, y, x), written (t, c, z, y, x): assigned verbatim, the
+        // t and c extents of the chunks were swapped
+        return {o.chunk[1], o.chunk[0], o.chunk[2], o.chunk[3], o.chunk[4]};
+    }
+
     std::string exportExtension(const ExportOptions& o) {
         switch (o.format) {
             case ExportFormat::Tiff: return o.tiff.omeXml ? ".ome.tif" : ".tif";
@@ -508,7 +515,7 @@ namespace sirius::app {
             const std::vector<Index> shape{outDims.t, outDims.c, outDims.z, outDims.y, outDims.x};
             ZarrWriteOptions w;
             w.zarrVersion = o.format == ExportFormat::N5 ? 0 : o.zarr.zarrVersion;
-            w.chunks.assign(o.zarr.chunk.begin(), o.zarr.chunk.end());
+            w.chunks = zarrChunkShape(o.zarr);
             w.codec = o.zarr.codec;
             w.level = o.zarr.level;
             w.shard = o.zarr.shard;
@@ -540,7 +547,7 @@ namespace sirius::app {
                 ZarrWriteOptions lw = w;
                 lw.axes = {"t", "z", "y", "x"};
                 lw.scale = {w.scale[0], w.scale[2], w.scale[3], w.scale[4]};
-                lw.chunks = {1, o.zarr.chunk[2], o.zarr.chunk[3], o.zarr.chunk[4]};
+                lw.chunks = {o.zarr.chunk[1], o.zarr.chunk[2], o.zarr.chunk[3], o.zarr.chunk[4]};   // (t, z, y, x)
                 lw.channelNames.clear();
                 lw.channelColors.clear();
                 lw.pyramidLevels = 1;

@@ -52,7 +52,7 @@ namespace sirius::app {
 
     struct ZarrExportOptions {
         int zarrVersion = 3;                // 2 or 3 (ignored for N5)
-        std::array<Index, 5> chunk{1, 1, 16, 512, 512};
+        std::array<Index, 5> chunk{1, 1, 16, 512, 512};   // (c, t, z, y, x), as the export dialog lists it
         std::string codec = "blosc-zstd";   // "blosc-zstd", "blosc-lz4", "zstd", "gzip", "none"
         int level = 3;
         bool shard = false;                 // zarr 3 sharding (one shard = shardChunks^3 chunks)
@@ -84,6 +84,9 @@ namespace sirius::app {
     bool exportFormatAvailable(ExportFormat f) noexcept;
     // Empty when the options are consistent, otherwise the problem.
     std::string validateExport(const ExportOptions& o, const Dims5& dims);
+    // The chunk shape in the order a zarr / N5 export writes its axes,
+    // (t, c, z, y, x) as OME-NGFF has them, from ZarrExportOptions::chunk.
+    std::vector<Index> zarrChunkShape(const ZarrExportOptions& o);
 
     void exportArray(const Array5& array, const DatasetMeta& meta, const LabelVolume* labels,
                      const ExportOptions& options, const std::function<void(double, const std::string&)>& progress = {},
