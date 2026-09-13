@@ -607,9 +607,15 @@ namespace sirius::app {
         const Snapshot before = snapshot();
         const StepId id = pipeline_.duplicate(index);
         selected_ = pipeline_.indexOf(id);
+        // the copy goes in right below the original: a viewed step further
+        // down moved one place, and the view stays on it rather than on
+        // whatever step took its old index (a Delete would go there)
+        const bool viewedMoved = viewed_ > index;
+        if (viewedMoved) ++viewed_;
         pushEdit("Duplicate " + pipeline_.at(index).name, before);
         notify(&Observer::pipelineChanged);
         notify(&Observer::selectionChanged);
+        if (viewedMoved) notify(&Observer::viewedStepChanged);
         return id;
     }
 
@@ -1337,8 +1343,13 @@ namespace sirius::app {
             return;
         }
         current->apply(diff, forward);
-        current->updateStats(diff);
+        // The statistics describe one frame. A diff of another one -- an
+        // undo after the view moved on from the edit's frame -- leaves them
+        // where they are (that frame is measured again when it is shown);
+        // updating from it used to move the table to the edit's frame.
+        if (current->statsT() == diff.t || current->statsT() < 0) current->updateStats(diff);
         staleBelow(id);
+        syncLabelStats();   // the table on the viewed frame, whatever it was on
         notifyLabels(id);
         notify(&Observer::outputsChanged);
     }
@@ -1367,7 +1378,10 @@ namespace sirius::app {
         std::size_t voxels = 0;
         for (const LabelDiff& d : diffs) voxels += d.indices.size();
         session_.record("label_edit", {{"what", label}, {"voxels", voxels}, {"frames", diffs.size()}});
-        for (const LabelDiff& d : diffs) labels->updateStats(d);
+        // only the frame the table is on needs its statistics brought up to
+        // date; measuring every other frame on the way costs a full scan each
+        for (const LabelDiff& d : diffs)
+            if (labels->statsT() == d.t || labels->statsT() < 0) labels->updateStats(d);
         auto shared = std::make_shared<std::vector<LabelDiff>>(std::move(diffs));
         std::weak_ptr<LabelVolume> target = labels;
         Command c;
@@ -1380,7 +1394,7 @@ namespace sirius::app {
         };
         pushCommand(std::move(c));
         staleBelow(id);
-        syncLabelStats();   // the statistics ended on the last frame touched
+        syncLabelStats();   // the table on the viewed frame
         notifyLabels(id);
         notify(&Observer::outputsChanged);
     }

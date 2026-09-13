@@ -1938,6 +1938,70 @@ TEST_CASE("Label statistics follow the viewed time point", "[app][workbench][lab
     CHECK(labels->statsT() == 0);
 }
 
+TEST_CASE("Undoing a label edit made on another frame leaves the table on the viewed one", "[app][workbench][labels]") {
+    registerTestOps();
+    Scratch scratch;
+    Workbench wb(scratch.dir);
+    wb.setDataset(syntheticSource(1, 2, 4, 16, 16));
+    wb.setBackend(Backend::Cpu);
+    while (wb.pipeline().size() > 1) wb.removeStep(1);
+    wb.addStep("test_labels");   // a ball of id 1 in frame 0, frame 1 empty
+    REQUIRE(runSync(wb)->succeeded());
+    wb.view(1);
+    std::shared_ptr<LabelVolume> labels = wb.viewedLabels();
+    REQUIRE(labels);
+    wb.setT(0);
+    REQUIRE(labels->statsOf(1));
+    wb.setLabelReviewed(1, true);
+    wb.deleteLabel(1);
+    CHECK(labels->statsOf(1) == nullptr);
+    wb.setT(1);
+    REQUIRE(labels->statsT() == 1);
+    wb.undo();   // the delete of frame 0, with frame 1 on screen
+    CHECK(labels->statsT() == 1);   // was 0: the review table showed frame 0 under frame 1's image
+    CHECK(labels->stats().empty());
+    CHECK(countLabel(*labels, 0, 1) > 0);
+    wb.setT(0);
+    REQUIRE(labels->statsOf(1));   // measured again when its frame is shown
+    CHECK(labels->statsOf(1)->voxels == countLabel(*labels, 0, 1));
+    CHECK(labels->statsOf(1)->reviewed);   // and the review mark came back with it
+    wb.setT(1);
+    wb.redo();
+    CHECK(labels->statsT() == 1);
+    CHECK(countLabel(*labels, 0, 1) == 0);
+}
+
+TEST_CASE("Duplicating a step above the viewed one keeps the view on it", "[app][workbench]") {
+    registerTestOps();
+    Scratch scratch;
+    Workbench wb(scratch.dir);
+    wb.setDataset(syntheticSource(1, 1, 4, 16, 16));
+    wb.setBackend(Backend::Cpu);
+    while (wb.pipeline().size() > 1) wb.removeStep(1);
+    wb.addStep("test_scale");    // 1
+    wb.addStep("test_labels");   // 2
+    REQUIRE(runSync(wb)->succeeded());
+    wb.view(2);
+    wb.select(1);
+    Counter counter;
+    wb.addObserver(&counter);
+    wb.duplicateStep(1);
+    wb.removeObserver(&counter);
+    REQUIRE(wb.pipeline().size() == 4);
+    CHECK(wb.pipeline().at(2).kind == "test_scale");   // the copy, right below its original
+    CHECK(wb.viewedIndex() == 3);                      // was 2: the view silently moved onto the copy
+    CHECK(wb.pipeline().at(wb.viewedIndex()).kind == "test_labels");
+    CHECK(counter.viewed == 1);
+    wb.undo();
+    CHECK(wb.viewedIndex() == 2);
+    CHECK(wb.pipeline().at(wb.viewedIndex()).kind == "test_labels");
+
+    SECTION("duplicating the viewed step or one below it leaves the index alone") {
+        wb.duplicateStep(2);
+        CHECK(wb.viewedIndex() == 2);
+    }
+}
+
 TEST_CASE("Load parameters left at zero keep the file's own axes and voxel sizes", "[app][workbench][load]") {
     registerTestOps();
     const Operation* load = findOperation("load");
