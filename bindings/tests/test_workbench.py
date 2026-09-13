@@ -415,6 +415,22 @@ class TestSteps(unittest.TestCase):
         r2 = wb.run_step("label_cleanup", {"min_voxels": 2}, a, labels=labels)
         self.assertEqual(r2.info["labels"], 2)
 
+    @unittest.skipUnless(_HAVE_SCIPY, "label post-processing needs scipy")
+    def test_cleanup_numbers_every_frame_with_one_map(self):
+        # track 4 in every frame, track 2 from t = 1, a speck of 3 in t = 0
+        a = np.zeros((1, 3, 1, 16, 16), np.float32)
+        labels = np.zeros((3, 1, 16, 16), np.uint32)
+        labels[:, 0, 10:13, 10:13] = 4
+        labels[1:, 0, 2:5, 2:5] = 2
+        labels[0, 0, 0, 15] = 3
+        r = wb.run_step("cleanup", {"min_voxels": 2, "relabel": True}, a, labels=labels)
+        # one id per object in every frame, as cleanup.cpp: a numbering per
+        # frame made the track 1 at t = 0 and 2 afterwards
+        self.assertEqual(r.labels[:, 0, 11, 11].tolist(), [2, 2, 2])
+        self.assertEqual(r.labels[1:, 0, 3, 3].tolist(), [1, 1])
+        self.assertEqual(int(r.labels[0, 0, 0, 15]), 0)
+        self.assertEqual(r.info["labels"], 2)
+
     def test_resample_keeps_the_physical_field(self):
         a = np.ones((1, 2, 4, 8, 8), np.float32)
         meta = {"voxel_um": [0.1, 0.1, 0.4]}

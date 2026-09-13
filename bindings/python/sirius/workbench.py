@@ -2546,9 +2546,9 @@ _CLEANUP = StepSpec(
 def step_cleanup(a: np.ndarray, params: Dict[str, Any], meta: Dict[str, Any],
                  labels: Optional[np.ndarray] = None) -> StepResult:
     """Label cleanup (cleanup.cpp) on the labels of the segmentation step
-    upstream: remove_border, min_voxels, relabel (densely); low_conf and
-    size_outlier_factor only set review flags (reported in info["flags"]).
-    The intensities pass through."""
+    upstream: remove_border, min_voxels, relabel (densely, one numbering for
+    every frame); low_conf and size_outlier_factor only set review flags
+    (reported in info["flags"]). The intensities pass through."""
     if labels is None or not labels.size:
         raise ValueError("Label cleanup needs labels: add a segmentation step before it")
     min_voxels = _int(params, "min_voxels", 50)
@@ -2567,10 +2567,16 @@ def step_cleanup(a: np.ndarray, params: Dict[str, Any], meta: Dict[str, Any],
             drop = _border_labels(vol)
             if drop.size:
                 vol[np.isin(vol, drop)] = 0
-        if min_voxels > 0 or relabel:
-            vol = _remove_small(vol, min_voxels, relabel)
+        # small objects are judged frame by frame, but the ids stay
+        if min_voxels > 0:
+            vol = _remove_small(vol, min_voxels, False)
         out[t] = vol
-        for key, ids in _label_flags(vol, low_conf, outlier).items():
+    if relabel:
+        # one numbering for every frame, as LabelVolume::relabelDensely: a
+        # track keeps one id, and a late object never takes an earlier one's
+        out = _remove_small(out, 0, True)
+    for t in range(out.shape[0]):
+        for key, ids in _label_flags(out[t], low_conf, outlier).items():
             have = flags.setdefault(key, [])
             have.extend(i for i in ids if i not in have)
     kept = int(np.count_nonzero(np.unique(out)))

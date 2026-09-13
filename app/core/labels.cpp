@@ -1149,6 +1149,53 @@ namespace sirius::app {
         return next;
     }
 
+    std::uint32_t LabelVolume::relabelDensely() {
+        if (data_->empty()) return 0;
+        detach();
+        std::uint32_t* v = data_->data();
+        const Index total = data_->size();
+        // one map over the ids of every frame, ascending
+        const IdCounts counts = countIds(v, total);
+        std::unordered_map<std::uint32_t, std::uint32_t> remap;
+        std::uint32_t next = 0;
+        counts.forEachId([&](std::uint32_t id, Index) { remap[id] = ++next; });
+        auto mapped = [&remap](std::uint32_t id) {
+            const auto it = remap.find(id);
+            return it == remap.end() ? 0u : it->second;
+        };
+        std::uint32_t lastId = 0, lastNew = 0;
+        for (Index i = 0; i < total; ++i) {
+            if (!v[i]) continue;
+            if (v[i] != lastId) {
+                lastId = v[i];
+                lastNew = mapped(lastId);
+            }
+            v[i] = lastNew;
+        }
+        // What was said about an object goes with it to its new number; an
+        // id no frame has any more takes nothing to a number another object
+        // now wears.
+        std::vector<LabelStats> rows;
+        rows.reserve(stats_.size());
+        for (LabelStats& s : stats_)
+            if (const std::uint32_t id = mapped(s.id)) {
+                s.id = id;
+                rows.push_back(std::move(s));
+            }
+        stats_ = std::move(rows);   // still in id order: the map is monotonic
+        auto renumbered = [&](const std::shared_ptr<const AnnotationTable>& table) -> std::shared_ptr<const AnnotationTable> {
+            if (!table) return nullptr;
+            auto out = std::make_shared<AnnotationTable>();
+            for (const auto& [id, a] : *table)
+                if (const std::uint32_t to = mapped(id)) out->emplace(to, a);
+            return out;
+        };
+        for (auto& frame : frameAnnotations_) frame = renumbered(frame);
+        trackAnnotations_ = renumbered(trackAnnotations_);
+        maxLabel_ = next;
+        return next;
+    }
+
     std::uint32_t dropSmall(std::uint32_t* labels, Index n, Index minVoxels) {
         const IdCounts counts = countIds(labels, n);
         std::uint32_t kept = 0;

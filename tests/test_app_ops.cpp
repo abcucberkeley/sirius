@@ -1697,6 +1697,11 @@ TEST_CASE("Label cleanup keeps ids and confidences when asked", "[app][ops][clea
         CHECK(five->confidence == 1.0);
     }
     SECTION("relabel on numbers what is left densely") {
+        for (LabelStats& s : labels->stats())
+            if (s.id == 7) {
+                s.cls = "debris";   // the speck that goes, and whose number object 9 had better not inherit its mark with
+                s.reviewed = true;
+            }
         ParamSet cp = cleanup.defaults();
         cp.set("min_voxels", std::int64_t{2});
         cp.set("relabel", true);
@@ -1705,11 +1710,83 @@ TEST_CASE("Label cleanup keeps ids and confidences when asked", "[app][ops][clea
         CHECK(out.labels->at(0, 0, 2, 2) == 1);
         CHECK(out.labels->at(0, 0, 5, 5) == 2);
         CHECK(out.labels->maxLabel() == 2);
+        // the statistics follow the objects to their new numbers, not the numbers
+        const LabelStats* was9 = out.labels->statsOf(2);
+        REQUIRE(was9);
+        CHECK(was9->confidence == 0.3);
+        CHECK(was9->cls == "object");
+        CHECK_FALSE(was9->reviewed);
+        REQUIRE(out.labels->statsOf(1));
+        CHECK(out.labels->statsOf(1)->confidence == 1.0);
     }
     SECTION("recomputeStats without probabilities keeps a known confidence") {
         labels->recomputeStats(0);
         REQUIRE(labels->statsOf(9));
         CHECK(labels->statsOf(9)->confidence == 0.3);
+    }
+}
+
+TEST_CASE("Label cleanup numbers every frame with one map", "[app][ops][cleanup][track]") {
+    // tracked labels: track 4 in every frame, track 2 only from t = 1, and a
+    // speck of id 3 in t = 0 that the size filter drops
+    const Dims5 dims{1, 3, 1, 16, 16};
+    const DatasetMeta meta = metaFor(dims);
+    auto data = std::make_shared<Array5>(Array5::zeros(dims));
+    auto labels = std::make_shared<LabelVolume>(3, 1, 16, 16);
+    auto square = [&](Index t, Index y0, Index x0, std::uint32_t id) {
+        for (Index y = y0; y < y0 + 3; ++y)
+            for (Index x = x0; x < x0 + 3; ++x) labels->volume(t)[y * 16 + x] = id;
+    };
+    for (Index t = 0; t < 3; ++t) {
+        square(t, 10, 10, 4);
+        if (t >= 1) square(t, 2, 2, 2);
+    }
+    labels->volume(0)[15] = 3;
+    for (Index t = 0; t < 3; ++t) {
+        labels->recomputeStats(t);
+        for (LabelStats& s : labels->stats()) s.cls = "track";
+    }
+    labels->setTracked(true);
+    labels->recomputeStats(1);
+    for (LabelStats& s : labels->stats())
+        if (s.id == 4) s.reviewed = true;
+    const Operation& cleanup = requireOperation("cleanup");
+    ParamSet cp = cleanup.defaults();
+    cp.set("min_voxels", std::int64_t{2});
+    Progress prog;
+    StepInput in = inputOf(data, meta);
+    in.labels = labels;
+    const StepOutput out = cleanup.run(in, cp, prog.ctx);
+    REQUIRE(out.labels);
+    const LabelVolume& c = *out.labels;
+    CHECK(c.tracked());
+    const std::uint32_t big = c.at(0, 0, 11, 11), late = c.at(1, 0, 3, 3);
+    CHECK(big == 2);    // ids 2 and 4 are left: numbered 1 and 2 in every frame
+    CHECK(late == 1);
+    for (Index t = 0; t < 3; ++t) {
+        INFO("frame " << t);
+        CHECK(c.at(t, 0, 11, 11) == big);   // was 1 in t = 0 and 2 afterwards
+        if (t >= 1) CHECK(c.at(t, 0, 3, 3) == late);
+        CHECK(c.annotationOf(t, big).reviewed);   // the mark went with the track
+        CHECK(c.annotationOf(t, big).cls == "track");
+    }
+    CHECK(c.at(0, 0, 0, 15) == 0);
+    CHECK(c.maxLabel() == 2);
+
+    SECTION("deleting a track afterwards takes that track and nothing else") {
+        auto edited = out.labels->clone();
+        for (Index t = 0; t < 3; ++t) edited->remove(t, late);   // what Workbench::deleteLabel does on tracked labels
+        for (Index t = 0; t < 3; ++t) {
+            INFO("frame " << t);
+            CHECK(edited->at(t, 0, 11, 11) == big);
+            CHECK(edited->at(t, 0, 3, 3) == 0);
+        }
+    }
+    SECTION("without relabel the ids stay as they were") {
+        cp.set("relabel", false);
+        const StepOutput kept = cleanup.run(in, cp, prog.ctx);
+        for (Index t = 0; t < 3; ++t) CHECK(kept.labels->at(t, 0, 11, 11) == 4);
+        CHECK(kept.labels->at(2, 0, 3, 3) == 2);
     }
 }
 

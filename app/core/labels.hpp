@@ -111,6 +111,12 @@ namespace sirius::app {
         // (cleanup) call resetMaxLabel() to make it the highest id present.
         std::uint32_t maxLabel() const noexcept;
         void resetMaxLabel() noexcept;
+        // Numbers the ids present in any frame 1..n in the order of the old
+        // ids, with one map for every frame -- a track keeps one id, and an
+        // object that starts late does not take the number of one that ended
+        // -- and renumbers the statistics and the annotations of every frame
+        // along with the voxels. maxLabel() becomes n. Returns n.
+        std::uint32_t relabelDensely();
 
         // --- statistics ---------------------------------------------------
         // Recomputed from the voxels; `probabilities` (same (z, y, x) as one

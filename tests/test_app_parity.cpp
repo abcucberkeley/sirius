@@ -24,6 +24,7 @@
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
+#include <map>
 #include <string>
 #include <vector>
 
@@ -101,9 +102,14 @@ namespace {
         const char* name;
         const char* kind;
         json params;
+        // For a step that works on labels: the earlier case whose output
+        // labels are its input. The sidecar names it, and the Python side
+        // reads that case's C++ labels, so the step is compared on its own.
+        const char* labelsFrom = nullptr;
     };
 
-    // One case per behaviour the two implementations are meant to share.
+    // One case per behaviour the two implementations are meant to share,
+    // in order: a case that takes labels comes after the one that makes them.
     // Steps left out on purpose: merge (its output is a display RGB blend
     // whose channel colours come from the metadata, not from the array),
     // flatfield and load (both read files), and every worker-backed kind.
@@ -180,6 +186,13 @@ namespace {
         // where Python's round would say 2) -- the radius the presets use
         {"classic_rolling_ball_25", "classic", {{"channel", 0}, {"background", "Rolling ball"}, {"tophat", 25}, {"method", "Otsu"}, {"sigma", 0.0}, {"opening", 0}, {"fill_holes", false}, {"post", "Connected components"}, {"min_voxels", 2}}},
         {"classic_skeleton", "classic", {{"channel", 0}, {"method", "Otsu"}, {"sigma", 0.0}, {"opening", 0}, {"fill_holes", false}, {"post", "Connected components"}, {"min_voxels", 2}, {"skeleton", true}}},
+        // Label cleanup on the three frames of a threshold, each numbered on
+        // its own: small objects go frame by frame, and the relabel gives the
+        // ids that are left one numbering over all of them (frame 0 loses its
+        // id 2, so a numbering per frame would move id 3 there). No
+        // remove_border case: every object of a 4-plane volume touches z.
+        {"cleanup_relabel", "cleanup", {{"min_voxels", 3}, {"relabel", true}}, "threshold_percentile"},
+        {"cleanup_keep_ids", "cleanup", {{"min_voxels", 2}, {"relabel", false}}, "threshold_percentile"},
         // No "Anisotropic diffusion" case: every step of it evaluates exp(),
         // and the C++ standard library and NumPy do not agree in the last bit.
         // Five iterations later a voxel can land on the other side of the
@@ -219,6 +232,7 @@ TEST_CASE("parity fixtures for the Python mirror of the operations", "[.parity][
     StepContext ctx;
     ctx.backend = Backend::Cpu;
     json index = json::array();
+    std::map<std::string, std::shared_ptr<LabelVolume>> labelsOf;   // by case name, for the steps that take labels
     for (const Case& c : kCases) {
         INFO("case " << c.name);
         const Operation* op = findOperation(c.kind);
@@ -231,10 +245,16 @@ TEST_CASE("parity fixtures for the Python mirror of the operations", "[.parity][
         StepInput in;
         in.meta = meta;
         in.array = array;
+        if (c.labelsFrom) {
+            REQUIRE(labelsOf.count(c.labelsFrom) == 1);
+            in.labels = labelsOf[c.labelsFrom];
+        }
         const StepOutput out = op->run(in, params, ctx);
         REQUIRE(out.array);
+        if (out.labels) labelsOf[c.name] = out.labels;
 
         json entry{{"name", c.name}, {"kind", c.kind}, {"params", params.toJson()}, {"dims", dimsJson(out.meta.dims)}, {"voxel_um", json::array({out.meta.voxelUm[0], out.meta.voxelUm[1], out.meta.voxelUm[2]})}, {"labels", false}};
+        if (c.labelsFrom) entry["labels_in"] = c.labelsFrom;
         writeFloats(dir / (std::string(c.name) + ".f32"), out.array->data(),
                     static_cast<std::size_t>(out.array->numel()));
         if (out.labels && !out.labels->empty()) {

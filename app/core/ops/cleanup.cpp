@@ -62,7 +62,7 @@ namespace sirius::app {
                 const Index n = labels->volumeSize();
                 for (Index t = 0; t < labels->t(); ++t) {
                     ctx.throwIfCancelled();
-                    ctx.report(static_cast<double>(t) / labels->t(), "t " + std::to_string(t));
+                    ctx.report(0.8 * static_cast<double>(t) / labels->t(), "t " + std::to_string(t));
                     std::uint32_t* vol = labels->volume(t);
                     if (removeBorder) {
                         labels->recomputeStats(t);
@@ -74,15 +74,21 @@ namespace sirius::app {
                                 if (vol[i] && drop.count(vol[i])) vol[i] = 0;
                     }
                     ctx.throwIfCancelled();
-                    // removeSmall renumbers densely as it drops; without
-                    // relabel the ids must survive, so only the drop is done.
-                    if (relabel) removeSmall(vol, n, minVoxels);
-                    else if (minVoxels > 0) dropSmall(vol, n, minVoxels);
+                    // Small objects are judged frame by frame, but the ids
+                    // stay: a renumbering per frame gave one track a
+                    // different id in the frames where another object had
+                    // started or ended, and an object the number of another.
+                    if (minVoxels > 0) dropSmall(vol, n, minVoxels);
+                }
+                ctx.throwIfCancelled();
+                // one map for every frame, the statistics and annotations along
+                if (relabel) labels->relabelDensely();
+                for (Index t = 0; t < labels->t(); ++t) {
                     ctx.throwIfCancelled();
+                    ctx.report(0.8 + 0.2 * static_cast<double>(t) / labels->t(), "statistics");
                     labels->recomputeStats(t);
                     labels->applyFlags(rules);
                 }
-                if (relabel) labels->resetMaxLabel();   // ids are dense again
                 out.labels = labels;
                 out.ranOn = Backend::Cpu;
                 out.note = std::to_string(labels->stats().size()) + " labels kept · CPU";
