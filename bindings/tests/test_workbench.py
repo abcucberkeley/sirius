@@ -246,6 +246,38 @@ class TestModelCache(unittest.TestCase):
         self.assertIn((os.path.abspath(paths[-1]), "cpu"), wb._model_cache)
 
 
+@unittest.skipIf(torch is None, "torch not installed")
+class TestTiledInference(unittest.TestCase):
+    def test_a_constant_model_stays_constant_up_to_the_volume_corners(self):
+        # the blend window tapered the tile faces on the volume's border too,
+        # so a 3-D corner covered by one tile had a weight of ~4e-8, divided
+        # by a floor of 1e-6: with the application's overlap (z 4, y / x 32)
+        # 0.9 came out as 0.034 there
+        class Constant(torch.nn.Module):
+            def forward(self, x):
+                return torch.ones_like(x) * 0.9
+
+        model = torch.jit.script(Constant())
+        volume = np.random.default_rng(0).random((10, 100, 100), dtype=np.float32)
+        prob = wb.tiled_inference(volume, model, (8, 64, 64), (4, 32, 32), "cpu")
+        self.assertEqual(prob.shape, (1, 10, 100, 100))
+        np.testing.assert_allclose(prob, 0.9, atol=1e-5)
+        # one tile bigger than the volume on every axis: no neighbour anywhere
+        small = wb.tiled_inference(volume[:4, :20, :20], model, (8, 64, 64), (4, 32, 32), "cpu")
+        np.testing.assert_allclose(small, 0.9, atol=1e-5)
+
+    def test_overlapping_tiles_still_cross_fade(self):
+        # an identity model through overlapping tiles reproduces the input
+        class Identity(torch.nn.Module):
+            def forward(self, x):
+                return x
+
+        model = torch.jit.script(Identity())
+        volume = np.random.default_rng(1).random((12, 50, 50), dtype=np.float32)
+        prob = wb.tiled_inference(volume, model, (6, 24, 24), (2, 6, 6), "cpu", normalize=False)
+        np.testing.assert_allclose(prob[0], volume, atol=1e-5)
+
+
 @unittest.skipIf(_sirius_extension() is None, "sirius extension not importable")
 class TestSimStep(unittest.TestCase):
     DATA = Path(__file__).resolve().parents[2] / "tests" / "data"

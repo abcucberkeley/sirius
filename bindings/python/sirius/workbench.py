@@ -3033,17 +3033,22 @@ def model_info(path: str, device: str = "cpu") -> Dict[str, Any]:
     return info
 
 
-def _blend_window(shape: Sequence[int], overlap: Sequence[int]) -> np.ndarray:
+def _blend_window(shape: Sequence[int], overlap: Sequence[int], taper_low: Sequence[bool] = (True, True, True),
+                  taper_high: Sequence[bool] = (True, True, True)) -> np.ndarray:
     """Separable raised-cosine window: 1 in the tile core, tapering over each
-    overlap band, so overlapping predictions cross-fade without seams."""
+    overlap band, so overlapping predictions cross-fade without seams. A face
+    with no neighbouring tile (taper_low / taper_high false: it lies on the
+    volume's border) is not tapered -- nothing else covers those voxels."""
     w = np.ones(tuple(shape), dtype=np.float32)
     for ax, (n, o) in enumerate(zip(shape, overlap)):
         o = int(min(max(o, 0), n // 2))
         prof = np.ones(n, dtype=np.float32)
         if o > 0:
             ramp = (0.5 - 0.5 * np.cos(np.pi * (np.arange(o) + 0.5) / o)).astype(np.float32)
-            prof[:o] = ramp
-            prof[n - o:] = ramp[::-1]
+            if taper_low[ax]:
+                prof[:o] = ramp
+            if taper_high[ax]:
+                prof[n - o:] = ramp[::-1]
         prof = np.maximum(prof, 1e-3)
         view = [1] * len(shape)
         view[ax] = n
@@ -3091,7 +3096,7 @@ def tiled_inference(volume: np.ndarray, model, tile: Sequence[int] = (32, 256, 2
         pos = list(range(0, n - t, step)) + [n - t]
         starts.append(sorted(set(pos)))
     tiles = [(z0, y0, x0) for z0 in starts[0] for y0 in starts[1] for x0 in starts[2]]
-    window = _blend_window(tile, overlap)
+    windows: Dict[Tuple[Tuple[bool, ...], Tuple[bool, ...]], np.ndarray] = {}
     is_onnx = isinstance(model, _OnnxModel)
     torch = None if is_onnx else _torch()
     dev = resolve_device(device)
@@ -3122,12 +3127,21 @@ def tiled_inference(volume: np.ndarray, model, tile: Sequence[int] = (32, 256, 2
         y = y[0][:, : patch.shape[0], : patch.shape[1], : patch.shape[2]]
         if acc is None:
             acc = np.zeros((y.shape[0],) + shape, dtype=np.float32)
+        # Taper only the faces another tile overlaps. A face on the volume's
+        # border used to taper too, and at a 3-D corner the weight fell to
+        # ~(1e-3)^3, below the old division floor: a constant 0.9 model came
+        # out as 0.03 in the corner voxels.
+        low = tuple(o > 0 for o in (z0, y0, x0))
+        high = tuple(o + t < n for o, t, n in zip((z0, y0, x0), tile, shape))
+        window = windows.get((low, high))
+        if window is None:
+            window = windows[(low, high)] = _blend_window(tile, overlap, low, high)
         w = window[: patch.shape[0], : patch.shape[1], : patch.shape[2]]
         sl = (slice(z0, z0 + patch.shape[0]), slice(y0, y0 + patch.shape[1]), slice(x0, x0 + patch.shape[2]))
         acc[(slice(None),) + sl] += y * w
         weight[sl] += w
     assert acc is not None
-    acc /= np.maximum(weight, 1e-6)
+    np.divide(acc, weight, out=acc, where=weight > 0)   # every voxel lies in some tile: weight > 0
     _progress(progress, 1.0, "tiles done")
     return _activation(acc, activation).astype(np.float32, copy=False)
 
