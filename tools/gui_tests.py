@@ -151,14 +151,19 @@ LOCAL_ONLY = {"http_proxy": "", "HTTP_PROXY": "", "no_proxy": "127.0.0.1,localho
 class FakeModelServer:
     """An OpenAI-compatible model server on 127.0.0.1, for the assistant scenarios.
 
-    It lists one model ("foo"), answers every chat with "hello" (plain JSON,
-    which the client takes even when it asked for a stream) and keeps the
-    method, path and Authorization header of every request it saw.
+    It lists one model ("foo") and answers the chats in turn with the messages
+    in `chats` (the last one from then on; "hello" by default), as plain JSON,
+    which the client takes even when it asked for a stream. It keeps the
+    method, path and Authorization header of every request it saw, and the
+    body of every chat request.
     """
 
-    def __init__(self) -> None:
+    def __init__(self, chats: Optional[List[Dict[str, Any]]] = None) -> None:
         seen: List[Tuple[str, str, Optional[str]]] = []
+        bodies: List[Dict[str, Any]] = []
+        replies = chats or [{"role": "assistant", "content": "hello"}]
         self.requests = seen
+        self.bodies = bodies
 
         class Handler(http.server.BaseHTTPRequestHandler):
             def log_message(self, *args: Any) -> None:
@@ -177,8 +182,10 @@ class FakeModelServer:
                 self.answer({"data": [{"id": "foo"}], "models": [{"name": "foo"}]})
 
             def do_POST(self) -> None:  # noqa: N802 - the name http.server calls
-                self.rfile.read(int(self.headers.get("Content-Length", "0")))
-                self.answer({"choices": [{"message": {"role": "assistant", "content": "hello"}}]})
+                body = json.loads(self.rfile.read(int(self.headers.get("Content-Length", "0"))) or b"{}")
+                bodies.append(body)
+                message = replies[min(len(bodies), len(replies)) - 1]
+                self.answer({"choices": [{"message": message, "finish_reason": "stop"}]})
 
         self.server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Handler)
         self.url = f"http://127.0.0.1:{self.server.server_address[1]}/v1"
@@ -581,6 +588,30 @@ def test_an_api_key_from_the_environment_is_not_stored(app: Path, tmp: Path) -> 
     check(not store.exists() or "assistant/apiKey" not in store.read_text(), f"the environment's key was written to {store}")
 
 
+def test_a_cut_off_tool_call_is_answered_not_run(app: Path, tmp: Path) -> None:
+    # A reply cut off at the token limit leaves a tool call with arguments that
+    # are not JSON. They ran as {} -- a cut-off `run` ran every step -- and the
+    # model heard the result as if its call had worked.
+    if not sys.platform.startswith("linux"):
+        raise Skip("the settings are seeded as an INI file under XDG_CONFIG_HOME, which only Linux reads")
+    env = isolated_settings(tmp, "cut-off")
+    env.update(LOCAL_ONLY)
+    env.update({"OPENROUTER_API_KEY": "", "SIRIUS_LLM_API_KEY": ""})
+    call = {"id": "call_1", "type": "function", "function": {"name": "set_view", "arguments": '{"mode": "3'}}
+    cut = {"role": "assistant", "content": "", "tool_calls": [call]}
+    with FakeModelServer(chats=[cut, {"role": "assistant", "content": "done"}]) as server:
+        conf = settings_file(env)
+        conf.parent.mkdir(parents=True, exist_ok=True)
+        conf.write_text(f"[assistant]\nprovider=custom\nbaseUrl={server.url}\nmodel=foo\naskBeforeActing=false\n")
+        run(app, ["--dataset", str(RAW), "--ask", "show it in 3D", "--quit-after", "8000"], env=env)
+    answers = [m for body in server.bodies for m in body.get("messages", []) if m.get("role") == "tool"]
+    check(bool(answers), f"the cut-off call was never answered ({len(server.bodies)} chat requests)")
+    check(
+        "not a valid JSON object" in answers[0]["content"],
+        f"the cut-off call ran with no arguments: {answers[0]['content'][:200]}",
+    )
+
+
 SCENARIOS = [
     test_ortho_view_shows_the_dataset,
     test_every_view_mode_renders,
@@ -595,6 +626,7 @@ SCENARIOS = [
     test_space_in_a_read_only_view_leaves_the_step_alone,
     test_ollama_never_gets_the_api_key,
     test_an_api_key_from_the_environment_is_not_stored,
+    test_a_cut_off_tool_call_is_answered_not_run,
 ]
 
 

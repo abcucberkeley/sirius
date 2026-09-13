@@ -484,7 +484,19 @@ namespace sirius::app {
             h->addWidget(skip);
             static_cast<QVBoxLayout*>(streamingBlock->layout())->addWidget(row);
             scrollToBottom();
-            auto finish = [this, row, call](bool doIt) {
+            // Answered once. Apply can start a run, which the run hook waits
+            // for in a nested event loop; deleteLater() is not processed
+            // there, so the chips stayed on screen and live, and a second
+            // click popped the next pending call without running or
+            // answering it, answered this call twice and sent a chat request
+            // in the middle of the run.
+            auto answered = std::make_shared<bool>(false);
+            auto finish = [this, row, apply, skip, call, answered](bool doIt) {
+                if (*answered) return;
+                *answered = true;
+                apply->setEnabled(false);
+                skip->setEnabled(false);
+                row->hide();
                 row->deleteLater();
                 if (!pending.empty()) pending.pop_front();
                 if (doIt) {
@@ -505,13 +517,21 @@ namespace sirius::app {
 
         void executeCall(const PendingCall& call) {
             setBusy(true, QStringLiteral("Running %1…").arg(call.name));
-            nlohmann::json args = nlohmann::json::parse(toStd(call.arguments), nullptr, false);
-            if (args.is_discarded() || !args.is_object()) args = nlohmann::json::object();
+            // Arguments that are not a JSON object -- typically a reply cut
+            // off at the token limit -- go back to the model as an error.
+            // They used to run as {}: a `run` cut short ran every step, a
+            // set_step_param with its value missing reset to defaults.
+            nlohmann::json args = call.arguments.trimmed().isEmpty() ? nlohmann::json::object()
+                                                                     : nlohmann::json::parse(toStd(call.arguments), nullptr, false);
             nlohmann::json result;
-            try {
-                result = api.call(toStd(call.name), args);
-            } catch (const std::exception& e) {
-                result = {{"error", e.what()}};
+            if (args.is_discarded() || !args.is_object()) {
+                result = {{"error", "the arguments of this call are not a valid JSON object (was the reply cut off?); nothing was done"}};
+            } else {
+                try {
+                    result = api.call(toStd(call.name), args);
+                } catch (const std::exception& e) {
+                    result = {{"error", e.what()}};
+                }
             }
             const std::vector<ActionRecord> actions = api.takeActions();
             if (!actions.empty()) addCards(streamingBlock, actions);
