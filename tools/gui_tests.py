@@ -27,6 +27,7 @@ import subprocess
 import sys
 import tempfile
 import threading
+import zipfile
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -518,6 +519,60 @@ def test_menu_actions_reach_the_view(app: Path, tmp: Path) -> None:
     check(view.get("physical_z") is False, "Physical z scaling did not turn off")
 
 
+def test_the_bundle_registry_opens_on_its_tab(app: Path, tmp: Path) -> None:
+    """Segment > Download model... with a foundation step selected.
+
+    The registry is listed by the worker, so a machine without one still has to
+    get a dialog that says so rather than no dialog: what is checked here is
+    that it opens and draws, not what it found. What it finds is checked in
+    app/python/tests/test_bundle_registry.py, without a GUI.
+    """
+    registry = tmp / "registry"
+    registry.mkdir()
+    manifest = {
+        "name": "nuclei-5d",
+        "task": "track",
+        "patch": [4, 16, 16],
+        "crop": [8, 64, 64],
+        "voxel_size": [0.75, 0.15, 0.15],
+        "peak_threshold": 0.42,
+        "min_separation_um": 1.5,
+        "channels": ["dapi"],
+        "notes": "a bundle that is not real",
+    }
+    for name in ("nuclei-5d.ltb", "membranes.ltb"):
+        with zipfile.ZipFile(registry / name, "w") as z:
+            z.writestr("manifest.json", json.dumps(manifest))
+            z.writestr("weights.bin", b"\0" * 64)
+
+    shot = tmp / "registry.png"
+    out = run(
+        app,
+        [
+            "--dataset",
+            str(RAW),
+            "--tool",
+            '{"name":"add_step","args":{"kind":"foundation"}}',
+            "--tool",
+            '{"name":"get_state","args":{}}',
+            "--action",
+            "Download model\u2026",
+            "--screenshot",
+            str(shot),
+            "--settle",
+            "4000",
+            "--quit-after",
+            "30000",
+        ],
+        env={"SIRIUS_BUNDLE_REGISTRY": str(registry)},
+    )
+    state = only(tool_results(out), "get_state")
+    check(any(s["kind"] == "foundation" for s in state["steps"]), "the foundation step was not added")
+    dialog = shot.with_name(shot.stem + "-dialog.png")
+    check(dialog.is_file(), "the model dialog did not open (no -dialog.png beside the screenshot)")
+    image_is_not_blank(dialog)
+
+
 def test_a_preset_fills_the_fields(app: Path, tmp: Path) -> None:
     # a preset is values, not a mode: the step holds what it wrote and the
     # change is undoable like any other
@@ -738,6 +793,7 @@ SCENARIOS = [
     test_ollama_never_gets_the_api_key,
     test_an_api_key_from_the_environment_is_not_stored,
     test_a_cut_off_tool_call_is_answered_not_run,
+    test_the_bundle_registry_opens_on_its_tab,
 ]
 
 
