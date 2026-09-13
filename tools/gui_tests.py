@@ -417,6 +417,36 @@ def test_a_dropped_file_opens(app: Path, tmp: Path) -> None:
     check(state["dataset"]["name"].startswith("raw"), f"opened {state['dataset']['name']}")
 
 
+def test_an_invalid_step_says_so_in_the_error_colour(app: Path, tmp: Path) -> None:
+    # A step whose parameters do not validate shows why in its row, in the
+    # error colour. A universal "* { color }" rule in the style sheet used to
+    # repaint every palette colour in body text, so the line was there but read
+    # like any other summary. The same pipeline with and without a missing OTF
+    # differs only by that line, so the red it adds is the line's text.
+    try:
+        from PIL import Image  # noqa: PLC0415 - optional, as in image_is_not_blank
+    except ImportError:
+        raise Skip("needs Pillow to read the screenshot") from None
+    text = PIPELINE.read_text()
+    check("../tests/data/otf.tif" in text, f"{PIPELINE} no longer names ../tests/data/otf.tif")
+    data = (ROOT / "tests" / "data").as_posix()
+    valid = tmp / "valid.sirius.toml"
+    valid.write_text(text.replace("../tests/data/", data + "/"))
+    invalid = tmp / "invalid.sirius.toml"
+    missing = (tmp / "missing-otf.tif").as_posix()
+    invalid.write_text(text.replace("../tests/data/otf.tif", missing).replace("../tests/data/", data + "/"))
+
+    def red_pixels(pipeline: Path) -> int:
+        shot = tmp / f"{pipeline.stem}.png"
+        run(app, ["--pipeline", str(pipeline), "--screenshot", str(shot), "--settle", "900", "--quit-after", "6000"])
+        image_is_not_blank(shot)
+        with Image.open(shot) as im:
+            return sum(1 for r, g, b in im.convert("RGB").getdata() if r > 140 and g < 100 and b < 80 and r - g > 90)
+
+    added = red_pixels(invalid) - red_pixels(valid)
+    check(added > 60, f"the invalid step added {added} red pixels: its error line is not in the error colour")
+
+
 def test_menu_actions_reach_the_view(app: Path, tmp: Path) -> None:
     out = run(
         app,
@@ -649,6 +679,7 @@ SCENARIOS = [
     test_the_wheel_zooms,
     test_the_wheel_zooms_about_the_cursor_in_compare,
     test_a_dropped_file_opens,
+    test_an_invalid_step_says_so_in_the_error_colour,
     test_menu_actions_reach_the_view,
     test_a_preset_fills_the_fields,
     test_a_token_the_secret_store_refuses_stays_in_the_settings,
