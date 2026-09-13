@@ -17,6 +17,7 @@ Runs offscreen; no display needed.
 from __future__ import annotations
 
 import argparse
+import http.server
 import json
 import os
 import re
@@ -24,8 +25,9 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import threading
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 ROOT = Path(__file__).resolve().parent.parent
 RAW = ROOT / "tests" / "data" / "raw.tif"
@@ -139,6 +141,54 @@ def isolated_settings(tmp: Path, name: str) -> Dict[str, str]:
 def settings_file(env: Dict[str, str]) -> Path:
     """Where QSettings("sirius", "sirius-app") lives under an isolated_settings() environment."""
     return Path(env["XDG_CONFIG_HOME"]) / "sirius" / "sirius-app.conf"
+
+
+# No proxy between the application and a FakeModelServer.
+LOCAL_ONLY = {"http_proxy": "", "HTTP_PROXY": "", "no_proxy": "127.0.0.1,localhost", "NO_PROXY": "127.0.0.1,localhost"}
+
+
+class FakeModelServer:
+    """An OpenAI-compatible model server on 127.0.0.1, for the assistant scenarios.
+
+    It lists one model ("foo"), answers every chat with "hello" (plain JSON,
+    which the client takes even when it asked for a stream) and keeps the
+    method, path and Authorization header of every request it saw.
+    """
+
+    def __init__(self) -> None:
+        seen: List[Tuple[str, str, Optional[str]]] = []
+        self.requests = seen
+
+        class Handler(http.server.BaseHTTPRequestHandler):
+            def log_message(self, *args: Any) -> None:
+                pass
+
+            def answer(self, body: Dict[str, Any]) -> None:
+                seen.append((self.command, self.path, self.headers.get("Authorization")))
+                data = json.dumps(body).encode()
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(data)))
+                self.end_headers()
+                self.wfile.write(data)
+
+            def do_GET(self) -> None:  # noqa: N802 - the name http.server calls
+                self.answer({"data": [{"id": "foo"}], "models": [{"name": "foo"}]})
+
+            def do_POST(self) -> None:  # noqa: N802 - the name http.server calls
+                self.rfile.read(int(self.headers.get("Content-Length", "0")))
+                self.answer({"choices": [{"message": {"role": "assistant", "content": "hello"}}]})
+
+        self.server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        self.url = f"http://127.0.0.1:{self.server.server_address[1]}/v1"
+        threading.Thread(target=self.server.serve_forever, daemon=True).start()
+
+    def __enter__(self) -> FakeModelServer:
+        return self
+
+    def __exit__(self, *exc: Any) -> None:
+        self.server.shutdown()
+        self.server.server_close()
 
 
 def tool_results(output: str) -> Dict[str, List[Any]]:
@@ -412,6 +462,48 @@ def test_a_token_the_secret_store_refuses_stays_in_the_settings(app: Path, tmp: 
     check("tok_LEGACY" in conf.read_text(), "the plaintext token went although the store could not take it")
 
 
+def test_ollama_never_gets_the_api_key(app: Path, tmp: Path) -> None:
+    # One stored key serves OpenRouter and custom servers. With the provider
+    # switched to Ollama (whose key field is disabled) every request still
+    # carried it -- to a local server, or a remote one over plain http.
+    if not sys.platform.startswith("linux"):
+        raise Skip("the settings are seeded as an INI file under XDG_CONFIG_HOME, which only Linux reads")
+    env = isolated_settings(tmp, "ollama-key")
+    env.update(LOCAL_ONLY)
+    env.update({"OPENROUTER_API_KEY": "", "SIRIUS_LLM_API_KEY": ""})
+    with FakeModelServer() as server:
+        conf = settings_file(env)
+        conf.parent.mkdir(parents=True, exist_ok=True)
+        # a plaintext key from before the secret store: read, and migrated, at start-up
+        conf.write_text(f"[assistant]\nprovider=ollama\nbaseUrl={server.url}\napiKey=sk-or-STORED\n")
+        run(app, ["--ask", "hello", "--quit-after", "6000"], env=env)
+        asked = any(method == "POST" for method, _, _ in server.requests)
+        check(asked, f"the question never reached the server: {server.requests}")
+        sent = [(method, path) for method, path, auth in server.requests if auth]
+        check(not sent, f"requests to Ollama carried the API key: {sent}")
+
+
+def test_an_api_key_from_the_environment_is_not_stored(app: Path, tmp: Path) -> None:
+    # OPENROUTER_API_KEY is used when no key is stored, and it was written
+    # into ~/.sirius/secrets.json by the first save of any assistant
+    # setting -- which start-up does as soon as the server lists its models.
+    if not sys.platform.startswith("linux"):
+        raise Skip("the settings are seeded as an INI file under XDG_CONFIG_HOME, which only Linux reads")
+    env = isolated_settings(tmp, "env-key")
+    env.update(LOCAL_ONLY)
+    env.update({"OPENROUTER_API_KEY": "sk-or-FROMENV"})
+    with FakeModelServer() as server:
+        conf = settings_file(env)
+        conf.parent.mkdir(parents=True, exist_ok=True)
+        conf.write_text(f"[assistant]\nprovider=openrouter\nbaseUrl={server.url}\n")
+        run(app, ["--ask", "hello", "--quit-after", "6000"], env=env)
+        used = ("POST", "/v1/chat/completions", "Bearer sk-or-FROMENV") in server.requests
+        check(used, f"the environment's key was not used: {server.requests}")
+    check("model=foo" in conf.read_text(), "the model the server listed was not saved (the save this is about never ran)")
+    store = Path(env["HOME"]) / ".sirius" / "secrets.json"
+    check(not store.exists() or "assistant/apiKey" not in store.read_text(), f"the environment's key was written to {store}")
+
+
 SCENARIOS = [
     test_ortho_view_shows_the_dataset,
     test_every_view_mode_renders,
@@ -422,6 +514,8 @@ SCENARIOS = [
     test_menu_actions_reach_the_view,
     test_a_preset_fills_the_fields,
     test_a_token_the_secret_store_refuses_stays_in_the_settings,
+    test_ollama_never_gets_the_api_key,
+    test_an_api_key_from_the_environment_is_not_stored,
 ]
 
 
