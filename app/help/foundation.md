@@ -54,11 +54,12 @@ label id naming the same object at every time point, with the *tracked* flag
 set, so the viewer, the review table and the label editor all work on the
 result without knowing a model produced it.
 
-Divisions are reported as a count in the diagnostics rather than as a lineage
-tree, because a label volume has no parent/child structure to hold one. Treat
-that count as approximate: a detector that splits one bright object into two
-peaks produces the same local geometry as a division, and only part of that
-confusion can be removed after the fact.
+The lineage the model reports is kept beside the labels: the step's Tracks
+tab lists each track's parent and children, and the diagnostics give the
+model's own division count. Treat both as approximate: a detector that splits
+one bright object into two peaks produces the same local geometry as a
+division, and only part of that confusion can be removed after the fact. See
+the Track objects help for reviewing tracks.
 
 ## When it is not the right tool
 

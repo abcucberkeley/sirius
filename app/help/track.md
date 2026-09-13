@@ -21,8 +21,18 @@ $$
 | **Min. track length** <br> frames | Tracks seen in fewer frames than this are dropped; the usual way to remove detections that appear once. |
 | **Relabel by track** <br> on · off | Give every object of a track the track's id, so one object keeps one colour and one row for its whole life. With it off the labels are left as the segmentation numbered them. |
 
+## Reviewing the tracks
+
+Once the step has run, its diagnostics open on a **Tracks** tab: one row per track with the frames it spans, the frames it is present in, its **gaps** (frames missing between its first and last, where identity is most likely to have been lost, so they are marked), its speed in µm per frame, the distance from its first centroid to its last, and its parent and children when the tracker reported a division. Every column sorts. Choosing a row takes the time point to the nearest frame the track exists in and puts the crosshair on it.
+
+In the viewer, **Tracks** (beside Labels and Solo) draws each track's path over the slices in the colour of its mask: solid up to the time point on screen, faint after it, dotted across a frame the track is missing from, with a dot where it is now. A track that breaks and restarts under a new id shows as a change of colour along one path. The selected track is drawn heavier; with Solo on, only its path is drawn. **Follow selected track** keeps the crosshair on it while the time point changes (and pans when zoomed in); in a frame the track is missing from, the view stays where it was.
+
+Deleting, merging, splitting or painting a track updates the table and the paths at once, and undo brings them back. The parent and child columns list only tracks that still exist: delete a daughter and her mother is left with one child, not a division.
+
+Division counts are the tracker's estimate. btrack's lineage optimisation and the foundation model's geometric rule can both miss divisions, and the built-in tracker detects none, so a count here is a lower bound to check, not a measurement.
+
 ## Note
 
-The diagnostics table lists each track with its span, the distance it covered and its mean speed; the facts above it say how many objects became how many tracks. A mean length near the frame count means objects were followed; a mean near one means the gate is too tight or the segmentation is unstable.
+The *Cleanup* tab lists the labels of the frame on screen; the facts in the step's summary say how many objects became how many tracks. A mean length near the frame count means objects were followed; a mean near one means the gate is too tight or the segmentation is unstable.
 
 Two objects that pass close together can exchange identities under the built-in tracker: distance and overlap alone cannot tell which is which at the moment they touch, and nothing there models velocity. Divisions are not detected either, so a daughter starts a new track. Switch the tracker to btrack for both: it predicts where each object should be and reconstructs the lineage. btrack ships its tracking core as a compiled library and solves the lineage step with an integer program, so the whole of it installs from a wheel and none of it is built here.
