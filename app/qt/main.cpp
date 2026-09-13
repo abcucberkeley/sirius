@@ -27,6 +27,7 @@
 #include <QJsonObject>
 #include <QKeyEvent>
 #include <QKeySequence>
+#include <QSettings>
 #include <QStandardPaths>
 #include <QTimer>
 
@@ -98,14 +99,42 @@ int main(int argc, char** argv) {
     const QCommandLineOption keyOpt(QStringLiteral("key"), QStringLiteral("Focus a widget by its accessible or object name and press a key: \"Z plane=Right\" (repeatable)"),
                                     QStringLiteral("name=key"));
     const QCommandLineOption askOpt(QStringLiteral("ask"), QStringLiteral("Send a message to the assistant"), QStringLiteral("text"));
+    // A settings file of this run's own. Without it every headless run reads
+    // and writes the settings of whoever is logged in: their dock widths,
+    // backend, cache policy and assistant settings. That makes a screenshot
+    // say as much about the developer's window as about the code, and a
+    // scripted run saves its own layout back over theirs.
+    const QCommandLineOption settingsOpt(QStringLiteral("settings"),
+                                         QStringLiteral("Keep settings in <dir> instead of the user's own; "
+                                                        "'scratch' uses a new one, removed when the run ends"),
+                                         QStringLiteral("dir"));
     const QCommandLineOption settleOpt(QStringLiteral("settle"), QStringLiteral("Milliseconds to wait before the screenshot (default 600)"),
                                        QStringLiteral("ms"));
-    parser.addOptions({datasetOpt, pipelineOpt, runOpt, screenshotOpt, quitAfterOpt, toolOpt, actionOpt, keyOpt, askOpt, settleOpt, strokeOpt, wheelOpt, dropOpt, recordOpt});
+    parser.addOptions({datasetOpt, pipelineOpt, runOpt, screenshotOpt, quitAfterOpt, toolOpt, actionOpt, keyOpt, askOpt,
+                       settleOpt, strokeOpt, wheelOpt, dropOpt, recordOpt, settingsOpt});
     parser.addPositionalArgument(QStringLiteral("files"), QStringLiteral("Datasets or pipeline files to open, as though dropped on the window"),
                                  QStringLiteral("[files...]"));
     parser.process(app);
     const QStringList files = parser.positionalArguments();
     const bool filesHavePipeline = std::any_of(files.begin(), files.end(), [](const QString& f) { return f.endsWith(QStringLiteral(".toml"), Qt::CaseInsensitive); });
+
+    // Before anything reads a setting: PreferencesDialog::applyStored below and
+    // the window's saved layout both use a default-constructed QSettings, so
+    // pointing the default format and path at a directory of our own moves the
+    // whole store, secrets included.
+    if (parser.isSet(settingsOpt)) {
+        QString dir = parser.value(settingsOpt);
+        if (dir == QLatin1String("scratch"))
+            dir = QDir(QStandardPaths::writableLocation(QStandardPaths::TempLocation))
+                      .filePath(QStringLiteral("sirius-settings-%1").arg(QCoreApplication::applicationPid()));
+        if (!QDir().mkpath(dir)) {
+            qCritical("cannot create the settings directory %s", qPrintable(dir));
+            return 2;
+        }
+        QSettings::setDefaultFormat(QSettings::IniFormat);
+        QSettings::setPath(QSettings::IniFormat, QSettings::UserScope, dir);
+        qInfo("settings: %s", qPrintable(QSettings().fileName()));
+    }
 
     sirius::app::registerBuiltinOperations();
 

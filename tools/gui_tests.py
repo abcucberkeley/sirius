@@ -89,7 +89,11 @@ def kill_tree(process: subprocess.Popen[bytes]) -> None:
 
 def run(app: Path, args: List[str], timeout: int = 300, env: Optional[Dict[str, str]] = None) -> str:
     """Run the application once, offscreen, and return everything it printed."""
-    full = [str(app), "-platform", "offscreen", *args]
+    # Settings of this run's own. Otherwise every scenario reads the settings of
+    # whoever is logged in -- dock widths, backend, cache policy -- and saves its
+    # own layout back over them when it exits. A scenario that passes here and
+    # fails on another machine, or the other way round, is the usual sign.
+    full = [str(app), "-platform", "offscreen", "--settings", "scratch", *args]
     # The scenarios read the application's own qInfo lines. sirius-app is a
     # WIN32 (no console) binary, and Qt's default handler then sends those to
     # OutputDebugString rather than the pipe, so every run comes back empty
