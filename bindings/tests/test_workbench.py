@@ -152,6 +152,33 @@ class TestRunPipeline(unittest.TestCase):
         out2, _ = wb.run_pipeline(self.path, legacy)
         np.testing.assert_array_equal(out2, out)
 
+    @unittest.skipUnless(_HAVE_SCIPY, "labelling needs scipy")
+    def test_labels_do_not_outlive_a_step_that_changes_the_grid(self):
+        # threshold -> resample: the labels cover the old grid, so the
+        # application drops them (executor.cpp, labelsFit); a crop after the
+        # resample used to cut the stale 64 x 64 labels as though they fitted
+        img = np.zeros((4, 64, 64), np.float32)
+        img[:, 10:20, 10:20] = 100.0
+        img[:, 40:50, 40:55] = 100.0
+        path = os.path.join(self.tmp.name, "grid.tif")
+        tifffile.imwrite(path, img)
+        steps = [{"kind": "load", "params": {}},
+                 {"kind": "threshold", "params": {"method": "Manual", "value": 50.0, "min_voxels": 1}},
+                 {"kind": "contrast", "params": {}}]
+        _, meta = wb.run_pipeline(path, {"steps": steps})
+        self.assertEqual(meta["labels"].shape, (1, 4, 64, 64))   # the grid is unchanged: carried through
+        steps[2] = {"kind": "resample", "params": {"voxel_x": 0.2, "voxel_y": 0.2}}
+        out, meta = wb.run_pipeline(path, {"steps": steps})
+        self.assertEqual(out.shape, (1, 1, 4, 32, 32))
+        self.assertNotIn("labels", meta)
+        steps.append({"kind": "croppad", "params": {"x0": 2}})
+        out, meta = wb.run_pipeline(path, {"steps": steps})
+        self.assertEqual(out.shape, (1, 1, 4, 32, 30))
+        self.assertNotIn("labels", meta)
+        steps[2] = {"kind": "maxproj", "params": {"axis": "z"}}
+        _, meta = wb.run_pipeline(path, {"steps": steps[:3]})
+        self.assertNotIn("labels", meta)
+
     def test_load_step_voxel_overrides(self):
         pipeline = [{"kind": "load", "params": {"voxel_x": 0.05, "voxel_y": 0.0, "voxel_z": 0.5}}]
         _, meta = wb.run_pipeline(self.path, pipeline)

@@ -3230,7 +3230,10 @@ def run_step(kind: str, params: Dict[str, Any], array: np.ndarray, meta: Optiona
     if spec.needs_labels:
         kwargs["labels"] = labels
     res = fn(a, p, meta, **kwargs)
-    if res.labels is None and labels is not None and res.array.shape[1:] == a.shape[1:]:
+    # Labels a step does not make or move are carried through only while they
+    # still cover its output voxel for voxel (labelsFit in executor.cpp): a
+    # step that changes the grid (resample, projection) drops them.
+    if res.labels is None and labels is not None and tuple(labels.shape) == tuple(res.array.shape[1:]):
         res.labels = labels
     res.meta["dims"] = _dims(res.array)
     return res
@@ -3282,8 +3285,7 @@ def run_pipeline(dataset_path: str, pipeline: Any, progress: ProgressFn = None, 
             skipped.append(kind)
             continue
         array, meta = res.array, res.meta
-        if res.labels is not None:
-            labels = res.labels
+        labels = res.labels   # None when the step moved the grid under them
     if labels is not None:
         meta["labels"] = labels
     if skipped:
