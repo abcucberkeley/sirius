@@ -156,8 +156,14 @@ void bind_buffer(nb::module_& m) {
             return os.str();
         });
 
-    m.def("to_device", [](nb::ndarray<nb::c_contig, nb::device::cpu> array, Device device) {
+    // nb::ro: only read, so a read-only array (a memory map, a broadcast) is as good as any.
+    m.def("to_device", [](nb::ndarray<nb::ro, nb::c_contig, nb::device::cpu> array, Device device) {
               // Host array -> owning buffer on `device` (a copy). Supports every element type.
+              // A Shape of rank 0 is the empty shape (numel() == 0), not a scalar: a 0-d
+              // array would come back as a 0-d array over no memory at all.
+              if (array.ndim() == 0)
+                  throw std::invalid_argument("to_device: a 0-d array has no shape a Buffer can hold; "
+                                              "reshape it to (1,) first");
               std::vector<Index> shape(array.ndim());
               for (std::size_t i = 0; i < array.ndim(); ++i) shape[i] = static_cast<Index>(array.shape(i));
               const Shape s(shape.begin(), shape.end());
