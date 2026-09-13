@@ -136,6 +136,14 @@ namespace sirius::app {
     }
 
     std::uint32_t* LabelVolume::volume(Index t) {
+        // A write here is not seen by the track index: rather than show
+        // trajectories of voxels that may have moved, there is none until
+        // indexTracks() is called again.
+        tracks_.reset();
+        return writable(t);
+    }
+
+    std::uint32_t* LabelVolume::writable(Index t) {
         detach();
         return data_->data() + t * volumeSize();
     }
@@ -346,7 +354,7 @@ namespace sirius::app {
         diff.t = t;
         if (t < 0 || t >= t_) throw std::out_of_range("LabelVolume::paint: t out of range");
         edited_ = true;
-        std::uint32_t* v = volume(t);
+        std::uint32_t* v = writable(t);
         const double r = std::max(radius, 0.0);
         const Index ri = static_cast<Index>(std::ceil(r));
         zRadius = std::max<Index>(zRadius, 0);
@@ -381,7 +389,7 @@ namespace sirius::app {
         if (z < 0 || z >= z_ || y < 0 || y >= y_ || x < 0 || x >= x_)
             throw std::out_of_range("LabelVolume::fill: seed outside the volume");
         edited_ = true;
-        std::uint32_t* v = volume(t);
+        std::uint32_t* v = writable(t);
         const Index seed = (z * y_ + y) * x_ + x;
         const std::uint32_t from = v[seed];
         if (from == label) return indexed(std::move(diff));
@@ -422,7 +430,7 @@ namespace sirius::app {
         sources.erase(std::unique(sources.begin(), sources.end()), sources.end());
         const std::uint32_t target = sources.front();
         edited_ = true;
-        std::uint32_t* v = volume(t);
+        std::uint32_t* v = writable(t);
         const Index n = volumeSize();
         for (Index i = 0; i < n; ++i) {
             const std::uint32_t cur = v[i];
@@ -442,7 +450,7 @@ namespace sirius::app {
         if (t < 0 || t >= t_) throw std::out_of_range("LabelVolume::remove: t out of range");
         if (!id) return indexed(std::move(diff));
         edited_ = true;
-        std::uint32_t* v = volume(t);
+        std::uint32_t* v = writable(t);
         const Index n = volumeSize();
         for (Index i = 0; i < n; ++i) {
             if (v[i] != id) continue;
@@ -461,7 +469,7 @@ namespace sirius::app {
         if (t < 0 || t >= t_) throw std::out_of_range("LabelVolume::split: t out of range");
         if (!id) throw std::invalid_argument("LabelVolume::split: cannot split the background");
         edited_ = true;
-        std::uint32_t* v = volume(t);
+        std::uint32_t* v = writable(t);
         auto inside = [&](const std::array<Index, 3>& s) {
             return s[0] >= 0 && s[0] < z_ && s[1] >= 0 && s[1] < y_ && s[2] >= 0 && s[2] < x_ &&
                    v[(s[0] * y_ + s[1]) * x_ + s[2]] == id;
@@ -528,7 +536,7 @@ namespace sirius::app {
         if (diff.before.size() != diff.indices.size() || diff.after.size() != diff.indices.size())
             throw std::invalid_argument("LabelVolume::apply: malformed diff");
         edited_ = true;
-        std::uint32_t* v = volume(diff.t);
+        std::uint32_t* v = writable(diff.t);
         const std::vector<std::uint32_t>& values = forward ? diff.after : diff.before;
         const Index n = volumeSize();
         // A stroke's diff is the concatenation of every mouse move, so one

@@ -102,11 +102,13 @@ namespace sirius::app {
         // indexTracks() builds it -- one pass over the voxels, what a tracking
         // step does once its labels are written -- and from then on kept
         // current by every edit and apply(), at the cost of the voxels they
-        // change. Writes through volume() / plane() bypass it: rebuild after.
+        // change. A write through volume() / plane() drops it (null again).
         void indexTracks();
         std::shared_ptr<const TrackIndex> tracks() const noexcept { return tracks_; }
 
-        // The mutable accessors detach a shared copy first (see the header note).
+        // The mutable accessors detach a shared copy first (see the header note),
+        // and drop the track index: the edits below keep it current, a raw
+        // write cannot (call indexTracks() again when the ids still name tracks).
         std::uint32_t* volume(Index t);                          // (z, y, x)
         const std::uint32_t* volume(Index t) const noexcept;
         std::uint32_t* plane(Index t, Index z);
@@ -172,6 +174,7 @@ namespace sirius::app {
 
     private:
         void detach();                       // own the voxels before writing
+        std::uint32_t* writable(Index t);    // volume(t) for the edits, which keep the track index themselves
         LabelDiff indexed(LabelDiff diff);   // an edit's diff, after bringing the track index up to date
         LabelStats* mutableStatsOf(std::uint32_t id) noexcept;
 

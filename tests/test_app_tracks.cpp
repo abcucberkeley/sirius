@@ -22,6 +22,7 @@
 #include <nlohmann/json.hpp>
 
 #include "core/array_source.hpp"
+#include "core/ops/builtin.hpp"
 #include "core/labels.hpp"
 #include "core/tool_api.hpp"
 #include "core/tracks.hpp"
@@ -461,4 +462,92 @@ TEST_CASE("lineageFromJson keeps the entries that name two ids", "[app][tracks]"
     CHECK(got == Lineage{{3, 1}, {4, 1}, {10, 2}});
     CHECK(lineageFromJson(nlohmann::json::array()).empty());
     CHECK(lineageFromJson(nlohmann::json()).empty());
+}
+
+TEST_CASE("A raw write drops the track index; the edits keep it", "[app][tracks]") {
+    LabelVolume labels(2, 2, 8, 8);
+    cube(labels, 0, 1, 0, 0, 0, 2);
+    cube(labels, 1, 1, 0, 0, 2, 2);
+    labels.setTracked(true);
+    labels.indexTracks();
+    REQUIRE(labels.tracks());
+
+    labels.apply(labels.paint(0, 1, 5, 5, 1.0, 0, 2), false);   // edits and apply keep it
+    REQUIRE(labels.tracks());
+    requireSame(*labels.tracks(), TrackIndex(labels));
+
+    labels.volume(1)[0] = 7;   // a write the index cannot see
+    CHECK_FALSE(labels.tracks());
+    labels.indexTracks();
+    CHECK(labels.tracks()->pointAt(7, 1).has_value());
+    labels.plane(0, 1)[3] = 9;
+    CHECK_FALSE(labels.tracks());
+
+    SECTION("a shared volume's raw write leaves the other volume's index alone") {
+        labels.indexTracks();
+        const std::shared_ptr<LabelVolume> other = labels.share();
+        other->volume(0)[1] = 3;
+        CHECK_FALSE(other->tracks());
+        REQUIRE(labels.tracks());
+        CHECK_FALSE(labels.tracks()->pointAt(3, 0).has_value());
+    }
+}
+
+TEST_CASE("Operations that rewrite tracked labels leave no stale tracks", "[app][tracks][ops]") {
+    registerBuiltinOperations();
+    const Operation* cleanup = findOperation("cleanup");
+    const Operation* croppad = findOperation("croppad");
+    REQUIRE(cleanup);
+    REQUIRE(croppad);
+
+    // two tracks over three frames, and a speck in frame 1 that cleanup removes
+    auto labels = std::make_shared<LabelVolume>(3, 4, 16, 16);
+    for (Index t = 0; t < 3; ++t) {
+        cube(*labels, t, 5, 1, 2, 2 + t, 3);
+        cube(*labels, t, 9, 1, 10, 10, 3);
+    }
+    labels->volume(1)[4 * 16 * 16 - 1] = 12;
+    labels->setTracked(true);
+    labels->setLineage({{9, 5}});
+    labels->indexTracks();
+
+    StepInput in;
+    in.meta = clip(3, 4, 16, 16)->meta();
+    in.array = std::make_shared<Array5>(in.meta.dims);
+    in.labels = labels;
+    const StepContext ctx;
+
+    SECTION("cleanup with relabel renumbers each frame: no longer tracks") {
+        ParamSet p = cleanup->defaults();
+        p.set("min_voxels", Index{2});
+        p.set("relabel", true);
+        const StepOutput out = cleanup->run(in, p, ctx);
+        REQUIRE(out.labels);
+        CHECK_FALSE(out.labels->tracked());
+        CHECK_FALSE(out.labels->tracks());
+        CHECK(out.labels->lineage().empty());
+        REQUIRE(labels->tracks());   // the input is untouched
+        CHECK(labels->tracks()->pointAt(12, 1).has_value());
+    }
+    SECTION("cleanup without relabel keeps the ids, and the tracks are re-indexed") {
+        ParamSet p = cleanup->defaults();
+        p.set("min_voxels", Index{2});
+        p.set("relabel", false);
+        const StepOutput out = cleanup->run(in, p, ctx);
+        REQUIRE(out.labels);
+        CHECK(out.labels->tracked());
+        REQUIRE(out.labels->tracks());
+        requireSame(*out.labels->tracks(), TrackIndex(*out.labels));
+        CHECK_FALSE(out.labels->tracks()->pointAt(12, 1).has_value());
+        CHECK(out.labels->lineage() == Lineage{{9, 5}});
+    }
+    SECTION("crop keeps tracks as tracks") {
+        ParamSet p = croppad->defaults();
+        const StepOutput out = croppad->run(in, p, ctx);
+        REQUIRE(out.labels);
+        CHECK(out.labels->tracked());
+        REQUIRE(out.labels->tracks());
+        requireSame(*out.labels->tracks(), TrackIndex(*out.labels));
+        CHECK(out.labels->lineage() == Lineage{{9, 5}});
+    }
 }

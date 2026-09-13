@@ -102,6 +102,13 @@ namespace sirius::app {
                                 }
                         labels->recomputeStats(t);
                     }
+                    // cropping keeps the ids, so tracks stay tracks (a track
+                    // wholly outside the box is simply gone from the index)
+                    if (input.labels->tracked()) {
+                        labels->setTracked(true);
+                        labels->setLineage(input.labels->lineage());
+                        labels->indexTracks();
+                    }
                     out.labels = labels;
                 }
                 out.ranOn = Backend::Cpu;

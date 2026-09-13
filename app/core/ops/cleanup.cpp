@@ -83,6 +83,16 @@ namespace sirius::app {
                     labels->applyFlags(rules);
                 }
                 if (relabel) labels->resetMaxLabel();   // ids are dense again
+                if (labels->tracked()) {
+                    if (relabel) {
+                        // renumbered frame by frame: an id no longer names one
+                        // object through time, so these are not tracks any more
+                        labels->setTracked(false);
+                        labels->setLineage({});
+                    } else {
+                        labels->indexTracks();   // same ids, fewer objects
+                    }
+                }
                 out.labels = labels;
                 out.ranOn = Backend::Cpu;
                 out.note = std::to_string(labels->stats().size()) + " labels kept · CPU";
