@@ -394,6 +394,14 @@ TEST_CASE("predictedK0 follows the reconstruction's initial guess", "[app][volum
     const auto k = predictedK0(p, 1);
     CHECK_THAT(std::atan2(k[1][1], k[1][0]), WithinAbs(0.25 + kPi / 3.0, 1e-12));
     CHECK_THAT(otfSupportRadius(p), WithinRel(2.0 * p.na / (p.wavelength_nm * 1e-3), 1e-12));
+
+    // the overlay draws parameters the form has not validated: one phase
+    // (no side order to divide the spacing by) stays finite
+    p.nphases = 1;
+    for (const auto& v : predictedK0(p, 9)) {
+        CHECK(std::isfinite(v[0]));
+        CHECK(std::isfinite(v[1]));
+    }
 }
 
 TEST_CASE("SpectrumGeometry maps frequencies to centered pixels", "[app][volume][overlay]") {

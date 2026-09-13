@@ -116,7 +116,7 @@ namespace sirius {
             backend = dev.isCuda() ? simdetail::makeCudaSimBackend(dev, stream)
                                    : simdetail::makeCpuSimBackend();
 
-            norders = p.norders > 0 ? p.norders : p.nphases / 2 + 1;
+            norders = p.resolvedOrders();
             nbands = 2 * norders - 1;
             if (p.nphases < nbands)
                 throw std::invalid_argument("SimReconstructor: " + std::to_string(p.nphases) +

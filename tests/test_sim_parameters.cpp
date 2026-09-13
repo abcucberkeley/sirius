@@ -101,6 +101,45 @@ TEST_CASE("validate rejects out-of-range fields", "[params]") {
     }
 }
 
+TEST_CASE("validate resolves the order count and needs 2 orders the phases can separate", "[params][orders]") {
+    using Catch::Matchers::ContainsSubstring;
+    SECTION("norders 0 derives nphases / 2 + 1, the default") {
+        SIMParameters p;
+        CHECK(p.norders == 0);
+        CHECK(p.resolvedOrders() == 3);
+        p.nphases = 3;   // 2D SIM: no norders needed
+        CHECK(p.resolvedOrders() == 2);
+        REQUIRE_NOTHROW(p.validate());
+        p.norders = 2;
+        p.nphases = 4;   // an explicit count below the derived one
+        CHECK(p.resolvedOrders() == 2);
+        REQUIRE_NOTHROW(p.validate());
+    }
+    SECTION("a single order (explicit, or derived from 1 phase) is rejected") {
+        SIMParameters p;
+        p.norders = 1;
+        REQUIRE_THROWS_WITH(p.validate(), ContainsSubstring("at least 2 orders"));
+        p.norders = 0;
+        p.nphases = 1;
+        REQUIRE_THROWS_WITH(p.validate(), ContainsSubstring("at least 2 orders"));
+    }
+    SECTION("too few phases for the bands") {
+        SIMParameters p;
+        p.nphases = 4;   // derives 3 orders = 5 bands
+        REQUIRE_THROWS_WITH(p.validate(), ContainsSubstring("4 phases cannot separate 3 orders"));
+        p.nphases = 2;   // derives 2 orders = 3 bands
+        REQUIRE_THROWS_WITH(p.validate(), ContainsSubstring("2 phases cannot separate 2 orders"));
+        p.nphases = 5;
+        p.norders = 4;
+        REQUIRE_THROWS_WITH(p.validate(), ContainsSubstring("5 phases cannot separate 4 orders"));
+    }
+    SECTION("negative norders") {
+        SIMParameters p;
+        p.norders = -1;
+        REQUIRE_THROWS_AS(p.validate(), std::runtime_error);
+    }
+}
+
 TEST_CASE("validate enforces k0_angles size == ndirs", "[params]") {
     SIMParameters p;
     p.ndirs = 3;
@@ -119,6 +158,7 @@ TEST_CASE("TOML round-trip preserves every serialized field", "[params][toml]") 
     SIMParameters in;
     in.ndirs = 2;
     in.nphases = 7;
+    in.norders = 2;   // default 0 (derive: 4 orders here)
     in.linespacing_um = 0.2035;
     in.k0_start_angle = 1.234;
     in.na = 1.42;
@@ -152,6 +192,7 @@ TEST_CASE("TOML round-trip preserves every serialized field", "[params][toml]") 
 
     REQUIRE(out.ndirs == in.ndirs);
     REQUIRE(out.nphases == in.nphases);
+    REQUIRE(out.norders == in.norders);
     REQUIRE(out.linespacing_um == Approx(in.linespacing_um));
     REQUIRE(out.k0_start_angle == Approx(in.k0_start_angle));
     REQUIRE(out.na == Approx(in.na));
@@ -194,6 +235,33 @@ TEST_CASE("loadParameters keeps defaults for absent keys", "[params][toml]") {
     REQUIRE(out.nphases == def.nphases);
     REQUIRE(out.linespacing_um == Approx(def.linespacing_um));
     REQUIRE(out.zoomfact == Approx(def.zoomfact));
+}
+
+TEST_CASE("TOML norders: written, read, and derived when absent", "[params][toml][orders]") {
+    SECTION("a default (derived) count round-trips as derived") {
+        SIMParameters in;
+        in.nphases = 3;
+        TempFile tf(".toml");
+        saveParameters(tf.str(), in);
+        const SIMParameters out = loadParameters(tf.str());
+        CHECK(out.norders == 0);
+        CHECK(out.resolvedOrders() == 2);
+    }
+    SECTION("a hand-written norders is honoured") {
+        TempFile tf(".toml", "[optics]\nnphases = 5\nnorders = 2\n");
+        const SIMParameters out = loadParameters(tf.str());
+        CHECK(out.norders == 2);
+        CHECK(out.resolvedOrders() == 2);
+    }
+    SECTION("a 3-phase file without norders loads") {
+        TempFile tf(".toml", "[optics]\nnphases = 3\n");
+        const SIMParameters out = loadParameters(tf.str());
+        CHECK(out.resolvedOrders() == 2);
+    }
+    SECTION("an order count the phases cannot separate is refused on load") {
+        TempFile tf(".toml", "[optics]\nnphases = 3\nnorders = 3\n");
+        REQUIRE_THROWS_AS(loadParameters(tf.str()), std::runtime_error);
+    }
 }
 
 TEST_CASE("loadParameters throws on malformed TOML", "[params][toml]") {
@@ -308,6 +376,29 @@ TEST_CASE("fromLegacy maps the example config into SIMParameters", "[legacy][con
     REQUIRE(p.fast_si == false);
     REQUIRE(p.k0_angles.has_value());
     REQUIRE(p.k0_angles->size() == 3);
+}
+
+TEST_CASE("fromLegacy carries the order count of the config", "[legacy][convert][orders]") {
+    SECTION("no orders key derives them, so a 3-phase config converts") {
+        TempFile tf(".cfg", "nphases=3\n");
+        const SIMParameters p = fromLegacy(loadLegacyConfig(tf.str()));
+        CHECK(p.norders == 0);
+        CHECK(p.resolvedOrders() == 2);
+    }
+    SECTION("nordersout, what cudasirecon configs use") {
+        TempFile tf(".cfg", "nphases=5\nnordersout=2\n");
+        const SIMParameters p = fromLegacy(loadLegacyConfig(tf.str()));
+        CHECK(p.norders == 2);
+    }
+    SECTION("an explicit norders wins over nordersout") {
+        TempFile tf(".cfg", "nphases=5\nnordersout=2\nnorders=3\n");
+        const SIMParameters p = fromLegacy(loadLegacyConfig(tf.str()));
+        CHECK(p.norders == 3);
+    }
+    SECTION("an order count the phases cannot separate fails validation") {
+        TempFile tf(".cfg", "nphases=3\nnorders=3\n");
+        REQUIRE_THROWS_AS(fromLegacy(loadLegacyConfig(tf.str())), std::runtime_error);
+    }
 }
 
 TEST_CASE("fromLegacy converts apodizeoutput int to enum", "[legacy][convert]") {

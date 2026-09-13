@@ -28,6 +28,16 @@ namespace sirius {
     void SIMParameters::validate() const {
         if (ndirs < 1) throw std::runtime_error("ndirs must be >= 1");
         if (nphases < 1) throw std::runtime_error("nphases must be >= 1");
+        if (norders < 0) throw std::runtime_error("norders must be >= 0 (0 derives nphases / 2 + 1)");
+        // The widefield order alone is no SIM (and the k0 fit would divide by
+        // its order 0), and 2 * orders - 1 bands need as many phases.
+        const int orders = resolvedOrders();
+        if (orders < 2)
+            throw std::runtime_error("at least 2 orders are needed, got " + std::to_string(orders) +
+                                     (norders > 0 ? " (norders)" : " (nphases / 2 + 1)"));
+        if (nphases < 2 * orders - 1)
+            throw std::runtime_error(std::to_string(nphases) + " phases cannot separate " + std::to_string(orders) +
+                                     " orders (that needs " + std::to_string(2 * orders - 1) + " phases)");
         if (linespacing_um <= 0.0) throw std::runtime_error("linespacing_um must be > 0");
         if (k0_angles && static_cast<int>(k0_angles->size()) != ndirs)
             throw std::runtime_error("k0_angles size must equal ndirs");
@@ -52,6 +62,7 @@ namespace sirius {
         toml::table optics;
         optics.insert("ndirs", p.ndirs);
         optics.insert("nphases", p.nphases);
+        optics.insert("norders", p.norders);
         optics.insert("linespacing_um", p.linespacing_um);
         optics.insert("k0_start_angle", p.k0_start_angle);
         optics.insert("na", p.na);
@@ -113,6 +124,7 @@ namespace sirius {
         auto optics = tbl["optics"];
         p.ndirs = optics["ndirs"].value_or(p.ndirs);
         p.nphases = optics["nphases"].value_or(p.nphases);
+        p.norders = optics["norders"].value_or(p.norders);
         p.linespacing_um = optics["linespacing_um"].value_or(p.linespacing_um);
         p.k0_start_angle = optics["k0_start_angle"].value_or(p.k0_start_angle);
         p.na = optics["na"].value_or(p.na);

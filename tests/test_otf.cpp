@@ -255,6 +255,15 @@ TEST_CASE("idealOTF 3D has a missing cone, a symmetric kz axis and a shifted ord
     CHECK(peak != 0);
 }
 
+TEST_CASE("idealOTF tabulates the derived order count", "[otf][ideal][orders]") {
+    SIMParameters p = lowNaParams();
+    p.norders = 0;
+    p.nphases = 3;
+    CHECK(idealOTF(p, false).data().dimension(0) == 2);
+    p.nphases = 5;
+    CHECK(idealOTF(p, false).data().dimension(0) == 3);
+}
+
 TEST_CASE("idealOTF rejects unphysical inputs", "[otf][ideal]") {
     SIMParameters p = lowNaParams();
     p.na = 1.5;

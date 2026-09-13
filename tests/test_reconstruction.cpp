@@ -105,6 +105,19 @@ TEST_CASE("CPU reconstruction reproduces the cudasirecon reference output", "[re
     CHECK(rel < 1e-4);
 }
 
+TEST_CASE("The reconstructor refuses an order count it cannot fit", "[reconstruction][orders]") {
+    // One order used to reach the k0 fit (a division by order 0, then a read
+    // through the absent sine band: a segfault); one phase divided the 3D
+    // pattern guess by zero. Both are now parameter errors.
+    TestData t = loadTestData();
+    SIMParameters p = t.params;
+    p.norders = 1;
+    CHECK_THROWS_AS(SimReconstructor(p, t.otf, Device::cpu(), PlanRigor::Estimate), std::runtime_error);
+    p.norders = 0;
+    p.nphases = 1;
+    CHECK_THROWS_AS(SimReconstructor(p, t.otf, Device::cpu(), PlanRigor::Estimate), std::runtime_error);
+}
+
 TEST_CASE("Repeated CPU reconstructions of the same input are bit-identical",
           "[reconstruction]") {
     // The k0 bracket search maximizes |modamp|^2, so a reduction whose

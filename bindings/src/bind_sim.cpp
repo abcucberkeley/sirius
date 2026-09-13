@@ -79,7 +79,7 @@ void bind_sim(nb::module_& m) {
         .def_rw("linespacing_um", &SIMParameters::linespacing_um)
         .def_rw("ndirs", &SIMParameters::ndirs)
         .def_rw("nphases", &SIMParameters::nphases)
-        .def_rw("norders", &SIMParameters::norders)
+        .def_rw("norders", &SIMParameters::norders, "Orders to separate; 0 (the default) derives nphases // 2 + 1.")
         .def_rw("na", &SIMParameters::na)
         .def_rw("nimm", &SIMParameters::nimm)
         .def_rw("wavelength_nm", &SIMParameters::wavelength_nm)

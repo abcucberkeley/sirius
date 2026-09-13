@@ -68,7 +68,7 @@ namespace sirius {
         const int nzotf = threeD ? opts.axialSamples : 1;
         if (nzotf < 1) throw std::invalid_argument("idealOTF: axialSamples must be at least 1");
         const double dzPsf = opts.dzPsf > 0.0 ? opts.dzPsf : p.dz_psf;
-        const int norders = p.norders > 0 ? p.norders : p.nphases / 2 + 1;
+        const int norders = p.resolvedOrders();
 
         const double lambda = p.wavelength_nm * 1e-3;   // um, in vacuum
         const double kn = p.nimm / lambda;              // wavenumber in the medium [1/um]

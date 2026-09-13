@@ -197,6 +197,9 @@ namespace sirius {
 
         p.ndirs = c.ndirs;
         p.nphases = c.nphases;
+        // cudasirecon configs carry nordersout (0: nphases / 2 + 1); a
+        // SIRIUS-written norders wins over it. 0 stays "derive".
+        p.norders = c.norders > 0 ? c.norders : c.norders_output;
         p.linespacing_um = c.linespacing;
         p.k0_start_angle = c.k0startangle;
         p.na = c.na;

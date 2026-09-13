@@ -23,7 +23,7 @@ namespace sirius {
         double linespacing_um = 0.24;   // illumination line spacing (um)
         int ndirs = 3;      // number of directions (theta)
         int nphases = 5;      // number of phases (phi)
-        int norders = 3;      // nphases / 2 + 1;
+        int norders = 0;      // orders to separate; 0 derives nphases / 2 + 1 (resolvedOrders)
         double na = 1.0;    // detection numerical aperture
         double nimm = 1.33;   // immersion refractive index
         double wavelength_nm = 510.;   // emission wavelength (nm)
@@ -53,6 +53,12 @@ namespace sirius {
         bool equalizez = false; // ref = equalizez ? S[sidx(0, 0, 0)] : S[sidx(0, 0, z)]; where S(d, p, z) is plane sums over (ny, nx)
         bool no_kz0 = true;
         bool filter_overlaps = true;
+
+        // The orders the reconstruction separates and assembles: norders, or
+        // nphases / 2 + 1 when norders is 0. Everything that consumes the
+        // order count goes through this, so a file that leaves norders out
+        // means the same thing everywhere.
+        int resolvedOrders() const noexcept { return norders > 0 ? norders : nphases / 2 + 1; }
 
         // Throws std::runtime_error on invalid parameters
         void validate() const;
