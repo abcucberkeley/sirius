@@ -172,6 +172,16 @@ class WorkerServer:
     def resolved_device(self) -> str:
         return workbench().resolve_device(self.device)
 
+    def request_device(self, requested: Any = None) -> str:
+        """Where one request runs: the device it names ("cpu", "cuda",
+        "cuda:1"), or this worker's own (--device, resolved) for "auto" or
+        none. The application sends "cpu" when the step's backend is the CPU,
+        and reports the step as having run there."""
+        text = str(requested or "").strip().lower()
+        if not text or text == "auto":
+            return self.resolved_device()
+        return workbench().resolve_device(text)
+
     def capabilities(self) -> Dict[str, Any]:
         wb = workbench()
         methods = ["hello", "ping", "model_info", "run", "cancel", "shutdown", "list_plugins", "reload_plugins",
@@ -536,7 +546,13 @@ class WorkerServer:
         wb = workbench()
         kind = str(params.get("kind", ""))
         p = params.get("params") or {}
-        device = self.resolved_device()
+        if kind != "plugin" and isinstance(p, dict) and "device" in p:
+            # the request's own device (seg.cpp sends "cpu" for the CPU
+            # backend); a plugin's parameters are its own, device included
+            p = dict(p)
+            device = self.request_device(p.pop("device"))
+        else:
+            device = self.resolved_device()
 
         def cancelled() -> bool:
             return cancel.is_set()
@@ -711,7 +727,8 @@ def _jsonable(obj: Any) -> Any:
     if isinstance(obj, (list, tuple)):
         return [_jsonable(v) for v in obj]
     if isinstance(obj, np.generic):
-        return obj.item()
+        # .item() of a float64 NaN is a float NaN: scrubbed below like any other
+        return _jsonable(obj.item())
     if isinstance(obj, np.ndarray):
         # tolist() gives Python floats: scrubbed like any other (encode_frame
         # refuses NaN, and one inside a diagnostics table lost whole replies)

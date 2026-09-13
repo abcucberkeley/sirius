@@ -17,6 +17,7 @@ import tempfile
 import threading
 import time
 import unittest
+import warnings
 
 import numpy as np
 
@@ -483,6 +484,53 @@ class TestTorchOverSocket(ServerTestCase):
             c.close()
 
 
+class TestRequestDevice(unittest.TestCase):
+    """A run goes where its request says: seg.cpp sends "device": "cpu" for
+    the CPU backend and "auto" otherwise, and the step reports where it ran
+    from the request, so a worker started on CUDA must honour "cpu"."""
+
+    def test_the_request_names_the_device_and_auto_is_the_workers_own(self):
+        server = WorkerServer("127.0.0.1", 0, "t", "cuda")
+        self.assertEqual(server.request_device("cpu"), "cpu")
+        self.assertEqual(server.request_device("CPU"), "cpu")
+        self.assertEqual(server.request_device("auto"), "cuda")
+        self.assertEqual(server.request_device(None), "cuda")
+        self.assertEqual(server.request_device("cuda:1"), "cuda:1")
+
+    @unittest.skipUnless(HAVE_TORCH, "torch not importable")
+    def test_a_cpu_request_runs_on_the_cpu_of_a_cuda_worker(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        path = os.path.join(tmp.name, "where.pt")
+
+        class Where(torch.nn.Module):
+            """1 where the input tensor is on CUDA, 0 on the CPU."""
+
+            def forward(self, x):
+                return torch.ones_like(x) * float(x.is_cuda)
+
+        torch.jit.script(Where()).save(path)
+        # started for CUDA: without a GPU a run that ignored the request's
+        # device fails, with one it computes on the GPU; either way not "cpu"
+        server = WorkerServer("127.0.0.1", 0, "t", "cuda")
+        port = server.bind()
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        try:
+            c = _Client(port, "t")
+            c.hello()
+            vol = np.random.default_rng(0).random((4, 16, 16), dtype=np.float32)
+            _, header, tensors = c.call("run", {"kind": "torch_segment", "params": {
+                "model": path, "tile": [4, 16, 16], "overlap": 0, "device": "cpu"}}, {"input": vol})
+            c.close()
+            self.assertEqual(header["type"], "result", header)
+            self.assertEqual(header["result"]["device"], "cpu")
+            self.assertEqual(float(tensors["prob"].max()), 0.0)
+        finally:
+            server.stop()
+            thread.join(timeout=5)
+
+
 class TestStepLibraryLocation(unittest.TestCase):
     def test_workbench_is_found(self):
         wb = workbench()
@@ -587,6 +635,17 @@ class TestJsonScrubbing(unittest.TestCase):
         out = _jsonable(table)
         self.assertEqual(out, {"rows": [[None, 1.5], [None, 2]], "n": 3})
         json.dumps(out, allow_nan=False)   # what encode_frame does
+
+    def test_a_numpy_nan_scalar_is_scrubbed(self):
+        # a plugin's np.nanmean of an all-NaN column is a numpy float64 NaN;
+        # it made encode_frame raise and the whole reply was lost
+        from sirius_worker.server import _jsonable
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", RuntimeWarning)
+            mean = np.nanmean(np.array([np.nan, np.nan]))
+        out = _jsonable({"mean": mean, "peak": np.float32(np.inf), "count": np.int32(2)})
+        self.assertEqual(out, {"mean": None, "peak": None, "count": 2})
+        protocol.encode_frame({"id": 1, "type": "result", "result": out})
 
 
 class TestDescriptorNumbers(unittest.TestCase):
