@@ -813,3 +813,50 @@ TEST_CASE("a plugin file deleted and reloaded leaves the add menu", "[app][rpc][
     std::filesystem::remove_all(pdir);
 }
 #endif
+
+// --- a worker that dies ------------------------------------------------------------
+
+#ifndef _WIN32
+#include <arpa/inet.h>
+#include <netinet/in.h>
+#include <sys/socket.h>
+
+TEST_CASE("A worker that dies while a request is sent is an error, not SIGPIPE", "[app][rpc]") {
+    const int listener = ::socket(AF_INET, SOCK_STREAM, 0);
+    REQUIRE(listener >= 0);
+    sockaddr_in addr{};
+    addr.sin_family = AF_INET;
+    addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    addr.sin_port = 0;
+    REQUIRE(::bind(listener, reinterpret_cast<sockaddr*>(&addr), sizeof addr) == 0);
+    REQUIRE(::listen(listener, 1) == 0);
+    socklen_t len = sizeof addr;
+    REQUIRE(::getsockname(listener, reinterpret_cast<sockaddr*>(&addr), &len) == 0);
+    // answers hello, then its process is gone (out of memory, a wall-time limit)
+    std::thread server([listener] {
+        const int s = ::accept(listener, nullptr, nullptr);
+        if (s < 0) return;
+        std::vector<std::byte> in;
+        std::vector<char> buf(1 << 16);
+        std::optional<rpc::Message> hello;
+        while (!(hello = rpc::decodeFrame(in))) {
+            const auto n = ::recv(s, buf.data(), buf.size(), 0);
+            if (n <= 0) break;
+            in.insert(in.end(), reinterpret_cast<const std::byte*>(buf.data()), reinterpret_cast<const std::byte*>(buf.data()) + n);
+        }
+        if (hello) {
+            const std::vector<std::byte> reply = rpc::encodeFrame(
+                {{"id", hello->header["id"]}, {"type", "result"}, {"result", {{"protocol_version", rpc::kProtocolVersion}}}}, {});
+            (void)::send(s, reply.data(), reply.size(), 0);
+        }
+        ::close(s);
+    });
+    std::unique_ptr<RemoteWorker> worker = RemoteWorker::connect("127.0.0.1", ntohs(addr.sin_port), "");
+    server.join();
+    ::close(listener);
+    std::vector<float> volume(16 << 20);   // 64 MB: more than the socket buffers take without a reader
+    const rpc::TensorRef ref{"volume", "float32", {static_cast<Index>(volume.size())}, volume.data(), volume.size() * sizeof(float)};
+    // before: the application ended here with SIGPIPE (exit status 141)
+    CHECK_THROWS_AS(worker->call("run", {{"kind", "x"}}, {ref}), ProtocolError);
+}
+#endif
