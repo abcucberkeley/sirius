@@ -29,6 +29,8 @@
 
 #include <nlohmann/json.hpp>
 
+#include <sirius/tiff_io.hpp>
+
 #include "core/operation.hpp"
 #include "core/ops/builtin.hpp"
 
@@ -205,6 +207,54 @@ namespace {
         {"classic_local_mean_16bit", "classic", {{"channel", 0}, {"method", "Local mean"}, {"window", 11}, {"local_ratio", 1.0005}, {"local_offset", 2.0}, {"sigma", 0.0}, {"opening", 0}, {"fill_holes", false}, {"post", "Connected components"}, {"min_voxels", 2}}},
     };
 
+    // The Load step on TIFFs, for the Python loader: each case is a file the
+    // fixture writes (pages, ImageDescription, pixel size in the resolution
+    // tags, 0 = none) and the Load parameters it is opened with.
+    struct LoadCase {
+        const char* name;
+        const char* description;
+        Index pages;
+        double pixelUm;
+        json params;
+    };
+
+    const char* const kOmeZcyx =
+        "<?xml version=\"1.0\" encoding=\"UTF-8\"?><OME xmlns=\"http://www.openmicroscopy.org/Schemas/OME/2016-06\">"
+        "<Image ID=\"Image:0\"><Pixels ID=\"Pixels:0\" DimensionOrder=\"XYZCT\" Type=\"uint16\" SizeX=\"5\" SizeY=\"6\" "
+        "SizeC=\"2\" SizeT=\"1\" SizeZ=\"3\" PhysicalSizeX=\"65\" PhysicalSizeXUnit=\"nm\" PhysicalSizeY=\"70\" "
+        "PhysicalSizeYUnit=\"nm\" PhysicalSizeZ=\"0.25\" PhysicalSizeZUnit=\"\xc2\xb5m\">"
+        "<Channel ID=\"Channel:0:0\" Name=\"DAPI\" EmissionWavelength=\"461\"/>"
+        "<Channel ID=\"Channel:0:1\" Name=\"G&amp;FP\" EmissionWavelength=\"0.51\" EmissionWavelengthUnit=\"\xc2\xb5m\" "
+        "Color=\"-16711681\"/></Pixels></Image></OME>";
+    const char* const kOmeTime =
+        "<OME xmlns=\"http://www.openmicroscopy.org/Schemas/OME/2016-06\"><Image ID=\"Image:0\">"
+        "<Pixels ID=\"Pixels:0\" DimensionOrder=\"XYCTZ\" Type=\"uint16\" SizeX=\"5\" SizeY=\"6\" SizeC=\"1\" SizeT=\"4\" "
+        "SizeZ=\"1\" PhysicalSizeX=\"0.2\" TimeIncrement=\"500\" TimeIncrementUnit=\"ms\"><Channel ID=\"Channel:0:0\"/>"
+        "</Pixels></Image></OME>";
+    const char* const kImageJHyperstack =
+        "ImageJ=1.54f\nimages=12\nchannels=2\nslices=3\nframes=2\nhyperstack=true\nunit=nm\nspacing=300\nfinterval=2\nloop=false\n";
+
+    const std::vector<LoadCase> kLoadCases = {
+        // ImageJ and OME files with three axes or fewer: the metadata's
+        // channels / frames, not pages as z
+        {"ij_cyx", "ImageJ=1.54f\nimages=2\nchannels=2\nmode=composite\nloop=false\n", 2, 0.0, json::object()},
+        {"ij_tyx", "ImageJ=1.54f\nimages=3\nframes=3\nfinterval=1.5\nloop=false\n", 3, 0.0, json::object()},
+        // units: nm spacing, the resolution tag in cm winning over the ImageJ unit
+        {"ij_hyperstack", kImageJHyperstack, 12, 0.065, json::object()},
+        {"ij_hyperstack_c3", kImageJHyperstack, 12, 0.065, {{"c", 3}}},
+        {"ij_pixel_unit", "ImageJ=1.54f\nimages=4\nslices=4\nunit=pixel\nspacing=2\n", 4, 0.05, json::object()},
+        // OME: physical sizes in nm / µm, z-fastest pages, channel names,
+        // wavelengths in two units, an explicit colour, milliseconds
+        {"ome_zcyx", kOmeZcyx, 6, 0.0, json::object()},
+        {"ome_zcyx_tzc", kOmeZcyx, 6, 0.0, {{"z", 3}, {"page_order", "tzc"}}},
+        {"ome_time", kOmeTime, 4, 0.12, json::object()},
+        // plain pages: counts that do not divide them fall back to z
+        {"plain_z4", "", 12, 0.08, {{"z", 4}}},
+        {"plain_c3", "", 12, 0.0, {{"c", 3}}},
+        {"plain_zct_c2", "", 12, 0.0, {{"c", 2}, {"page_order", "zct"}}},
+        {"plain_voxel", "", 6, 0.08, {{"voxel_z", 0.5}}},
+    };
+
     ParamSet paramsOf(const json& j) {
         ParamSet p;
         for (auto it = j.begin(); it != j.end(); ++it) {
@@ -281,4 +331,51 @@ TEST_CASE("parity fixtures for the Python mirror of the operations", "[.parity][
         index.push_back(entry);
     }
     writeJson(dir / "cases.json", json{{"version", 1}, {"cases", index}});
+}
+
+TEST_CASE("parity fixtures for the Python TIFF loader", "[.parity][app]") {
+    const char* outDir = std::getenv("SIRIUS_PARITY_OUT");
+    if (!outDir || !*outDir) SKIP("set SIRIUS_PARITY_OUT to a directory to write the parity fixtures");
+    const std::filesystem::path dir(outDir);
+    std::filesystem::create_directories(dir);
+
+    registerBuiltinOperations();
+    const Operation* load = findOperation("load");
+    REQUIRE(load != nullptr);
+    constexpr Index kRows = 6, kCols = 5;
+    json index = json::array();
+    for (const LoadCase& c : kLoadCases) {
+        INFO("case " << c.name);
+        const std::filesystem::path file = dir / (std::string("load_") + c.name + ".tif");
+        Buffer<std::uint16_t> pages(Shape{c.pages, kRows, kCols});
+        for (Index p = 0; p < c.pages; ++p)
+            for (Index y = 0; y < kRows; ++y)
+                for (Index x = 0; x < kCols; ++x) pages.data()[(p * kRows + y) * kCols + x] = static_cast<std::uint16_t>(p * 31 + y * 7 + x);
+        TiffWriteOptions o;
+        o.description = c.description;
+        o.xPixelUm = o.yPixelUm = c.pixelUm;
+        writeTiffStack<std::uint16_t>(file.string(), pages.view(), o);
+
+        ParamSet params = paramsOf(c.params);
+        params.set("path", file.string());
+        params.set("read_as", std::string("Full load to RAM"));
+        params.applyDefaults(load->info().params);
+        StepContext ctx;
+        const StepOutput out = load->run(StepInput{}, params, ctx);
+        REQUIRE(out.array);
+        // only cases where the metadata describes the array that was read
+        REQUIRE(out.meta.dims == out.array->dims());
+        writeFloats(dir / (std::string("load_") + c.name + ".f32"), out.array->data(), static_cast<std::size_t>(out.array->numel()));
+        json channels = json::array();
+        for (const ChannelInfo& ch : out.meta.channels) channels.push_back({{"label", ch.label}, {"wavelength_nm", ch.wavelengthNm}, {"color", ch.hexColor()}});
+        index.push_back({{"name", c.name},
+                         {"file", file.filename().string()},
+                         {"params", c.params},
+                         {"dims", dimsJson(out.meta.dims)},
+                         {"voxel_um", json::array({out.meta.voxelUm[0], out.meta.voxelUm[1], out.meta.voxelUm[2]})},
+                         {"frame_interval_s", out.meta.frameIntervalS},
+                         {"format", out.meta.format},
+                         {"channels", channels}});
+    }
+    writeJson(dir / "loader.json", json{{"version", 1}, {"cases", index}});
 }

@@ -237,5 +237,40 @@ class TestParity(unittest.TestCase):
                          "TOLERANCES and the fixture kinds have drifted apart")
 
 
+@unittest.skipIf(wb is None, f"sirius.workbench did not import: {_LOAD_ERROR}")
+@unittest.skipIf(FIXTURES is None or not (FIXTURES / "loader.json").is_file(),
+                 "no loader fixtures: run SIRIUS_PARITY_OUT=<dir> sirius_tests \"[parity]\" first")
+class TestLoaderParity(unittest.TestCase):
+    """The TIFFs the fixture writer made, opened by the application's Load
+    step and by run_pipeline's loader: the same array, dimensions, voxel size,
+    frame interval and channels, exactly. The dimensions are where the two
+    used to part: ImageJ / OME files with three axes or fewer, counts that do
+    not divide the pages, length units."""
+
+    def test_every_file(self):
+        with open(FIXTURES / "loader.json", encoding="utf-8") as f:
+            cases = json.load(f)["cases"]
+        self.assertTrue(cases)
+        for case in cases:
+            with self.subTest(case=case["name"]):
+                pipeline = [{"kind": "load", "params": dict(case["params"])}]
+                try:
+                    with warnings.catch_warnings():
+                        warnings.simplefilter("error", wb.UnknownParameterWarning)
+                        got, meta = wb.run_pipeline(str(FIXTURES / case["file"]), pipeline)
+                except wb.NotAvailable as e:   # neither tifffile nor the extension
+                    self.skipTest(str(e))
+                name = case["name"]
+                self.assertEqual(list(got.shape), case["dims"], f"load[{name}]: dimensions")
+                expected = _read_f32(FIXTURES / f"load_{name}.f32", tuple(case["dims"]))
+                self.assertTrue(np.array_equal(got, expected), f"load[{name}]: the planes differ")
+                self.assertEqual(meta["voxel_um"], case["voxel_um"], f"load[{name}]: voxel size")
+                self.assertEqual(meta["frame_interval_s"], case["frame_interval_s"], f"load[{name}]: frame interval")
+                self.assertEqual(meta["format"], case["format"])
+                self.assertEqual([[ch["label"], ch["wavelength_nm"], ch["color"]] for ch in meta["channels"]],
+                                 [[ch["label"], ch["wavelength_nm"], ch["color"]] for ch in case["channels"]],
+                                 f"load[{name}]: channels")
+
+
 if __name__ == "__main__":
     unittest.main()

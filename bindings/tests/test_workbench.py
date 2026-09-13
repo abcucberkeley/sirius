@@ -161,7 +161,7 @@ class TestRunPipeline(unittest.TestCase):
         img[:, 10:20, 10:20] = 100.0
         img[:, 40:50, 40:55] = 100.0
         path = os.path.join(self.tmp.name, "grid.tif")
-        tifffile.imwrite(path, img)
+        tifffile.imwrite(path, img, photometric="minisblack")   # 4 leading planes are not RGBA
         steps = [{"kind": "load", "params": {}},
                  {"kind": "threshold", "params": {"method": "Manual", "value": 50.0, "min_voxels": 1}},
                  {"kind": "contrast", "params": {}}]
@@ -192,6 +192,96 @@ def _sirius_extension():
         return sirius if hasattr(sirius, "SimReconstructor") else None
     except Exception:  # noqa: BLE001
         return None
+
+
+@unittest.skipIf(tifffile is None, "tifffile not installed")
+class TestTiffLoader(unittest.TestCase):
+    """Files as ImageJ and tifffile's OME writer make them, loaded as the
+    application loads them. The expected values were read with the
+    application's Load step (bindings/tests/test_parity.py compares the files
+    the C++ fixture writer makes; these cover what that writer cannot
+    produce: ImageJ's "none" resolution unit, tifffile's OME-XML)."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.tmp = tempfile.TemporaryDirectory()
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.tmp.cleanup()
+
+    def _write(self, name, data, **kw):
+        path = os.path.join(self.tmp.name, name)
+        tifffile.imwrite(path, data, **kw)
+        return path
+
+    def test_imagej_files_with_three_axes_or_fewer_keep_their_axes(self):
+        cyx = np.arange(2 * 16 * 12, dtype=np.uint16).reshape(2, 16, 12)
+        a, meta = wb.load_dataset(self._write("cyx.tif", cyx, imagej=True, metadata={"axes": "CYX"}))
+        self.assertEqual(a.shape, (2, 1, 1, 16, 12))   # was (1, 1, 2, ...): every page a z plane
+        np.testing.assert_array_equal(a[1, 0, 0], cyx[1])
+        self.assertTrue(meta["dims_from_metadata"])
+        self.assertEqual([ch["color"] for ch in meta["channels"]], ["#63e08a", "#e871d9"])   # the palette, not white
+        a, _ = wb.load_dataset(self._write("tyx.tif", cyx[:, :, :].repeat(2, axis=0)[:3], imagej=True,
+                                           metadata={"axes": "TYX", "finterval": 2.0}))
+        self.assertEqual(a.shape, (1, 3, 1, 16, 12))
+
+    def test_imagej_length_units(self):
+        zyx = np.zeros((5, 16, 12), np.uint16)
+        # ImageJ writes the resolution unit "none" and the unit in its description
+        _, meta = wb.load_dataset(self._write("nm.tif", zyx, imagej=True, resolution=(1 / 65, 1 / 65),
+                                              metadata={"axes": "ZYX", "spacing": 300, "unit": "nm"}))
+        self.assertEqual(meta["voxel_um"], [0.06499999993946404, 0.06499999993946404, 0.3])   # was 65 x 65 x 300
+        _, meta = wb.load_dataset(self._write("mm.tif", zyx[:4], imagej=True, resolution=(5000.0, 5000.0),
+                                              metadata={"axes": "ZYX", "spacing": 0.001, "unit": "mm"}))
+        self.assertEqual(meta["voxel_um"], [0.2, 0.2, 1.0])
+        # a resolution tag in centimetres wins over the description's unit;
+        # without a spacing, z is twice x
+        _, meta = wb.load_dataset(self._write("cm.tif", zyx[:4].astype(np.float32), imagej=True,
+                                              resolution=(1e4 / 0.2, 1e4 / 0.2), resolutionunit="CENTIMETER",
+                                              metadata={"axes": "ZYX", "unit": "nm"}))
+        self.assertEqual(meta["voxel_um"], [0.2, 0.2, 0.4])
+
+    def test_ome_units_order_and_channels(self):
+        data = np.arange(2 * 3 * 4 * 16 * 12, dtype=np.uint16).reshape(2, 3, 4, 16, 12)   # t, c, z, y, x
+        path = self._write("tczyx.ome.tif", data, metadata={
+            "axes": "TCZYX", "PhysicalSizeX": 0.1, "PhysicalSizeY": 0.12, "TimeIncrement": 1500, "TimeIncrementUnit": "ms",
+            "Channel": {"Name": ["DAPI", "GFP", "RFP"], "Color": [-16776961, 16711935, -1]}})
+        a, meta = wb.load_dataset(path)
+        self.assertEqual(a.shape, (3, 2, 4, 16, 12))
+        np.testing.assert_array_equal(a[2, 1, 3], data[1, 2, 3])
+        self.assertEqual(meta["name"], "tczyx")
+        self.assertEqual(meta["voxel_um"], [0.1, 0.12, 0.2])
+        self.assertEqual(meta["frame_interval_s"], 1.5)
+        self.assertEqual([(ch["label"], ch["color"]) for ch in meta["channels"]],
+                         [("DAPI", "#ff0000"), ("GFP", "#00ff00"), ("RFP", "#7c9cff")])   # white -> the palette
+        path = self._write("czyx.ome.tif", data[0, :, :2], metadata={
+            "axes": "CZYX", "PhysicalSizeX": 65, "PhysicalSizeXUnit": "nm", "PhysicalSizeY": 65, "PhysicalSizeYUnit": "nm",
+            "Channel": {"EmissionWavelength": [450.0, 0.52, 640.0], "EmissionWavelengthUnit": ["nm", "\u00b5m", "nm"]}})
+        _, meta = wb.load_dataset(path)
+        self.assertEqual(meta["voxel_um"], [0.065, 0.065, 0.13])
+        self.assertEqual([(ch["wavelength_nm"], ch["color"]) for ch in meta["channels"]],
+                         [(450.0, "#6ec1c0"), (520.0, "#9dafad"), (640.0, "#ff7a5c")])
+
+    def test_explicit_counts_follow_the_application(self):
+        pages = np.arange(12 * 4 * 3, dtype=np.float32).reshape(12, 4, 3)
+        path = self._write("plain.tif", pages, photometric="minisblack", metadata=None)
+        self.assertEqual(wb.load_dataset(path, c=3)[0].shape, (3, 1, 4, 4, 3))
+        # 4 planes do not divide 12 pages without a channel count: pages as z
+        # (this read c3 z4 before)
+        self.assertEqual(wb.load_dataset(path, z=4)[0].shape, (1, 1, 12, 4, 3))
+        a, _ = wb.load_dataset(path, "zct", c=2)
+        self.assertEqual(a.shape, (2, 1, 6, 4, 3))
+        np.testing.assert_array_equal(a[1, 0, 0], pages[6])   # z fastest: channel 1 starts at page 6
+        # an ImageJ file with an explicit count keeps the file's other axes
+        ij = self._write("ij.tif", pages.reshape(2, 3, 2, 4, 3), imagej=True, metadata={"axes": "TZCYX"})
+        self.assertEqual(wb.load_dataset(ij, c=3)[0].shape, (3, 2, 2, 4, 3))
+
+    def test_colour_tiffs_are_refused_like_the_application(self):
+        path = self._write("rgb.tif", np.zeros((8, 8, 3), np.uint8), photometric="rgb")
+        with self.assertRaises(Exception) as cm:
+            wb.load_dataset(path)
+        self.assertIn("single-channel", str(cm.exception))
 
 
 try:

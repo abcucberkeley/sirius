@@ -34,6 +34,7 @@ from __future__ import annotations
 import json
 import math
 import os
+import re
 import threading
 import warnings
 from collections import OrderedDict
@@ -298,10 +299,76 @@ def _default_meta(a: np.ndarray, source: str = "", fmt: str = "memory") -> Dict[
         "dims": _dims(a),
         "voxel_um": [0.1, 0.1, 0.2],  # x, y, z
         "frame_interval_s": 0.0,
-        "channels": [{"label": f"ch {i}", "wavelength_nm": 0.0, "color": "#ffffff"} for i in range(c)],
+        "channels": _normalize_channels([], c),
         "rgb": False,
         "sim": {"present": False, "ndirs": 3, "nphases": 5, "fast_si": False},
     }
+
+
+# The channel palette of dataset.cpp (colorForWavelength): 405, 488, 561 and
+# 640 nm, and the wavelengths a multi-channel file without any are given.
+_PALETTE = ((405.0, (0x7C, 0x9C, 0xFF)), (488.0, (0x63, 0xE0, 0x8A)), (561.0, (0xE8, 0x71, 0xD9)),
+            (640.0, (0xFF, 0x7A, 0x5C)))
+_PALETTE_FALLBACK_NM = (488.0, 561.0, 405.0, 640.0)
+
+
+def _color_for_wavelength(nm: float) -> Tuple[float, float, float]:
+    """``colorForWavelength``: the palette colour within 25 nm of a line, else
+    interpolated between its neighbours (float32 arithmetic, as there)."""
+    f32 = np.float32
+    stops = [(s, [f32(v) / f32(255.0) for v in rgb]) for s, rgb in _PALETTE]
+    if not nm > 0.0:
+        return 1.0, 1.0, 1.0
+    for s, c in stops:
+        if abs(s - nm) < 25.0:
+            return tuple(float(v) for v in c)  # type: ignore[return-value]
+    if nm <= stops[0][0]:
+        return tuple(float(v) for v in stops[0][1])  # type: ignore[return-value]
+    if nm >= stops[3][0]:
+        return tuple(float(v) for v in stops[3][1])  # type: ignore[return-value]
+    for i in range(3):
+        (s0, c0), (s1, c1) = stops[i], stops[i + 1]
+        if s0 <= nm <= s1:
+            f = f32((nm - s0) / (s1 - s0))
+            return tuple(float(c0[k] * (f32(1.0) - f) + c1[k] * f) for k in range(3))  # type: ignore[return-value]
+    return 1.0, 1.0, 1.0
+
+
+def _hex_color(rgb: Sequence[float]) -> str:
+    """``ChannelInfo::hexColor``: lround(clamp(v, 0, 1) * 255) per component."""
+    def byte(v: float) -> int:
+        return int(math.floor(float(np.float32(min(max(float(v), 0.0), 1.0)) * np.float32(255.0)) + 0.5))
+    return "#{:02x}{:02x}{:02x}".format(*(byte(v) for v in rgb))
+
+
+def _normalize_channels(channels: Sequence[Dict[str, Any]], c: int, rgb: bool = False) -> List[Dict[str, Any]]:
+    """``DatasetMeta::normalizeChannels``: one entry per channel; a missing
+    label is "ch <i>", and a white (default) colour becomes the colour of the
+    channel's wavelength -- or, in a multi-channel dataset without
+    wavelengths, the palette's 488 / 561 / 405 / 640 nm colours in turn."""
+    if rgb:
+        return [{"label": n, "wavelength_nm": 0.0, "color": col}
+                for n, col in (("R", "#ff0000"), ("G", "#00ff00"), ("B", "#0000ff"))]
+    n = max(int(c), 1)
+    out = []
+    for i in range(n):
+        ch = dict(channels[i]) if i < len(channels) and isinstance(channels[i], dict) else {}
+        label = str(ch.get("label") or "") or f"ch {i}"
+        try:
+            nm = float(ch.get("wavelength_nm") or 0.0)
+        except (TypeError, ValueError):
+            nm = 0.0
+        color = ch.get("color")
+        if not color or _hex_to_rgb(color) == (1.0, 1.0, 1.0):
+            if nm > 0.0:
+                color = _hex_color(_color_for_wavelength(nm))
+            elif n > 1:
+                color = _hex_color(_color_for_wavelength(_PALETTE_FALLBACK_NM[i % 4]))
+            else:
+                color = "#ffffff"
+        ch.update({"label": label, "wavelength_nm": nm, "color": str(color)})
+        out.append(ch)
+    return out
 
 
 def _reorder_to_ctzyx(a: np.ndarray, axes: str) -> np.ndarray:
@@ -324,88 +391,290 @@ def _reorder_to_ctzyx(a: np.ndarray, axes: str) -> np.ndarray:
     return out.reshape(shape)
 
 
-def _tiff_metadata(path: str) -> Tuple[Optional[str], Dict[str, Any]]:
-    """(axes string of the stored series, metadata dict) via tifffile, or (None, {})."""
+# --- TIFF metadata: a port of the application's parser (array_source.cpp) ---
+# The Python loader has to read a file exactly as the application does --
+# the same dimensions, page order and voxel size -- or an exported pipeline
+# runs on a different array. So this is the C++ code transcribed, not
+# tifffile's own interpretation of the metadata.
+
+_XML_SPACE = " \t\n\v\f\r"
+_STOD = re.compile(r"[ \t\n\v\f\r]*[+-]?(?:(?:[0-9]+\.?[0-9]*|\.[0-9]+)(?:[eE][+-]?[0-9]+)?|inf(?:inity)?|nan)",
+                   re.IGNORECASE)
+
+
+def _stod(text: Any, default: float) -> float:
+    """``std::stod``: the number at the start of `text`, else `default`."""
+    m = _STOD.match(str(text))
+    if not m:
+        return default
+    v = float(m.group(0))
+    if math.isinf(v) and "inf" not in m.group(0).lower():
+        return default   # out of range: stod throws
+    return v
+
+
+def _to_index(v: float) -> int:
+    """static_cast<Index> of a parsed count (truncation; nonsense is 0)."""
+    return int(v) if math.isfinite(v) else 0
+
+
+def _unit_to_um(unit: Any) -> float:
+    """``unitToUm``: a length unit in micrometres. Empty and unknown units are
+    micrometres; "pixel" means the size is not physical (0)."""
+    u = str(unit or "").strip(" \t\r\n").lower()
+    if u in ("", "\u00b5m", "\u03bcm", "um", "micron", "microns", "micrometer", "micrometre"):
+        return 1.0
+    return {"nm": 1e-3, "nanometer": 1e-3, "mm": 1e3, "millimeter": 1e3, "cm": 1e4, "centimeter": 1e4,
+            "m": 1e6, "meter": 1e6, "inch": 2.54e4, "in": 2.54e4, "pixel": 0.0, "pixels": 0.0}.get(u, 1.0)
+
+
+def _time_unit_to_s(unit: Any) -> float:
+    """``timeUnitToS``."""
+    u = str(unit or "").strip(" \t\r\n").lower()
+    return {"ms": 1e-3, "us": 1e-6, "\u00b5s": 1e-6, "min": 60.0, "h": 3600.0}.get(u, 1.0)
+
+
+def _xml_unescape(s: str) -> str:
+    """``xmlUnescape``: the five named entities, then numeric references."""
+    for entity, char in (("&amp;", "&"), ("&lt;", "<"), ("&gt;", ">"), ("&quot;", '"'), ("&apos;", "'")):
+        s = s.replace(entity, char)
+    pos = 0
+    while True:
+        pos = s.find("&#", pos)
+        if pos < 0:
+            break
+        end = s.find(";", pos)
+        if end < 0:
+            break
+        num = s[pos + 2:end]
+        m = (re.match(r"[ \t\n\v\f\r]*\+?([0-9a-fA-F]+)", num[1:]) if len(num) > 1 and num[0] in "xX"
+             else re.match(r"[ \t\n\v\f\r]*\+?([0-9]+)", num))
+        if not m:
+            pos = end + 1
+            continue
+        code = int(m.group(1), 16 if len(num) > 1 and num[0] in "xX" else 10)
+        char = chr(code) if code < 0x110000 else ""
+        s = s[:pos] + char + s[end + 1:]
+        pos += len(char)
+    return s
+
+
+def _parse_attrs(tag: str) -> Dict[str, str]:
+    """``parseAttrs``: the attributes of one start tag's text."""
+    out: Dict[str, str] = {}
+    i, n = 0, len(tag)
+    while i < n:
+        while i < n and (tag[i] in _XML_SPACE or tag[i] == "/"):
+            i += 1
+        start = i
+        while i < n and tag[i] != "=" and tag[i] not in _XML_SPACE:
+            i += 1
+        if i >= n:
+            break
+        name = tag[start:i]
+        while i < n and (tag[i] in _XML_SPACE or tag[i] == "="):
+            i += 1
+        if i >= n:
+            break
+        quote = tag[i]
+        if quote not in "\"'":
+            i += 1
+            continue
+        i += 1
+        end = tag.find(quote, i)
+        if end < 0:
+            break
+        out[name] = _xml_unescape(tag[i:end])
+        i = end + 1
+    return out
+
+
+def _find_tags(xml: str, name: str) -> List[Dict[str, str]]:
+    """``findTags``: every start tag `name` (any namespace prefix) in order."""
+    out = []
+    pos, n = 0, len(xml)
+    while True:
+        pos = xml.find("<", pos)
+        if pos < 0:
+            break
+        i = pos + 1
+        if i < n and xml[i] in "/?!":
+            pos += 1
+            continue
+        name_end = i
+        while name_end < n and xml[name_end] not in _XML_SPACE and xml[name_end] not in ">/":
+            name_end += 1
+        tag_name = xml[i:name_end]
+        tag_name = tag_name[tag_name.find(":") + 1:]
+        close = xml.find(">", name_end)
+        if close < 0:
+            break
+        if tag_name == name:
+            out.append(_parse_attrs(xml[name_end:close]))
+        pos = close + 1
+    return out
+
+
+def _ome_color(text: str) -> Optional[Tuple[float, float, float]]:
+    """``omeColor``: a signed 32-bit RGBA, or None when absent or unreadable."""
+    m = re.match(r"[ \t\n\v\f\r]*([+-]?[0-9]+)", text or "")
+    if not m:
+        return None
+    u = int(m.group(1)) & 0xFFFFFFFF
+    f32 = np.float32
+    return tuple(float(f32((u >> shift) & 0xFF) / f32(255.0)) for shift in (24, 16, 8))  # type: ignore[return-value]
+
+
+def _parse_tiff_description(description: str) -> Dict[str, Any]:
+    """``parseTiffDescription``: dimensions, page order, voxel size (µm; for
+    ImageJ the x / y entries are minus the unit, which the resolution tags
+    are then divided into), frame interval and channels of an OME-XML or
+    ImageJ ImageDescription."""
+    md: Dict[str, Any] = {"ome": False, "imagej": False, "c": 0, "t": 0, "z": 0, "dimension_order": "",
+                          "voxel_um": [0.0, 0.0, 0.0], "frame_interval_s": 0.0, "channels": []}
+    text = description or ""
+    if "<OME" in text or "<ome" in text:
+        md["ome"] = True
+        pixels = _find_tags(text, "Pixels")
+        if pixels:
+            p = pixels[0]
+            md["c"] = _to_index(_stod(p["SizeC"], 0.0)) if "SizeC" in p else 0
+            md["t"] = _to_index(_stod(p["SizeT"], 0.0)) if "SizeT" in p else 0
+            md["z"] = _to_index(_stod(p["SizeZ"], 0.0)) if "SizeZ" in p else 0
+            md["dimension_order"] = p.get("DimensionOrder", "")
+            md["voxel_um"] = [_stod(p.get(f"PhysicalSize{ax}", ""), 0.0) * _unit_to_um(p.get(f"PhysicalSize{ax}Unit", ""))
+                              for ax in "XYZ"]
+            md["frame_interval_s"] = _stod(p.get("TimeIncrement", ""), 0.0) * _time_unit_to_s(p.get("TimeIncrementUnit", ""))
+        for ch in _find_tags(text, "Channel"):
+            em = _stod(ch.get("EmissionWavelength", ""), 0.0)
+            unit = ch.get("EmissionWavelengthUnit", "")
+            entry: Dict[str, Any] = {"label": ch.get("Name", ""),
+                                     "wavelength_nm": em * _unit_to_um(unit or "nm") * 1e3 if em > 0 else 0.0}
+            color = _ome_color(ch.get("Color", ""))
+            if color is not None and color != (1.0, 1.0, 1.0):
+                entry["color"] = _hex_color(color)
+            md["channels"].append(entry)
+    elif text.startswith("ImageJ=") or "\nImageJ=" in text:
+        md["imagej"] = True
+        kv: Dict[str, str] = {}
+        for line in text.split("\n"):
+            eq = line.find("=")
+            if eq >= 0:
+                kv[line[:eq].strip(" \t\r\n")] = line[eq + 1:].strip(" \t\r\n")
+
+        def num(key: str, default: float) -> float:
+            return _stod(kv[key], default) if key in kv else default
+
+        md["c"] = _to_index(num("channels", 0.0))
+        md["z"] = _to_index(num("slices", 0.0))
+        md["t"] = _to_index(num("frames", 0.0))
+        md["dimension_order"] = "XYCZT"   # hyperstacks: channel fastest, then slice, then frame
+        unit = _unit_to_um(kv.get("unit", ""))
+        spacing = num("spacing", 0.0)
+        if spacing > 0 and unit > 0:
+            md["voxel_um"][2] = spacing * unit
+        md["frame_interval_s"] = num("finterval", 0.0)
+        if unit > 0:
+            md["voxel_um"][0] = md["voxel_um"][1] = -unit   # the resolution tags hold pixels per unit
+    return md
+
+
+def _normalize_order(order: str) -> str:
+    """``normalizeOrder``: c, t, z once each, fastest first; the rest dropped."""
+    out = ""
+    for ch in str(order).lower():
+        if ch in "ctz" and ch not in out:
+            out += ch
+    return out + "".join(ch for ch in "czt" if ch not in out)
+
+
+def _pixel_from_resolution(xres: float, yres: float, unit_tag: int, imagej_unit_um: float) -> List[float]:
+    """``pixelFromResolution``: x / y pixel size from the resolution tags; the
+    ResolutionUnit tag wins when it names a real unit (ImageJ writes "none"
+    and puts its unit in the description); only 1 nm .. 100 µm is believed."""
+    if not (xres > 0.0 and yres > 0.0):
+        return [0.0, 0.0]
+    unit = 1e4 if unit_tag == 3 else 2.54e4 if unit_tag == 2 else imagej_unit_um if imagej_unit_um > 0 else 0.0
+    if unit <= 0.0:
+        return [0.0, 0.0]
+    return [v if 1e-3 < v < 100.0 else 0.0 for v in (unit / xres, unit / yres)]
+
+
+def _resolution(tags, name: str) -> float:
+    """A resolution tag as libtiff hands it over: float32 of num / den."""
+    tag = tags.get(name)
+    if tag is None:
+        return 0.0
+    value = tag.value
+    try:
+        num, den = (value[0], value[1]) if isinstance(value, (tuple, list)) else (float(value), 1)
+    except (TypeError, IndexError, ValueError):
+        return 0.0
+    return float(np.float32(num / den)) if den else 0.0
+
+
+def _tiff_probe(path: str) -> Dict[str, Any]:
+    """What ``probeTiff`` reads before deciding anything: the number of
+    full-resolution pages, the first page's ImageDescription and resolution
+    tags, and its pixel type. tifffile reads the tags; the page count comes
+    from the sirius extension when it is there (the application's own
+    reader), else from tifffile skipping reduced-resolution pages."""
     try:
         import tifffile  # type: ignore
     except ImportError:
-        return None, {}
-    info: Dict[str, Any] = {}
+        tifffile = None
+    info: Dict[str, Any] = {"description": "", "xres": 0.0, "yres": 0.0, "res_unit": 2, "pages": None,
+                            "dtype": None, "reader": None}
+    ext = _sirius_tiff()
+    if ext is not None:
+        t = ext.inspect_tiff(path)
+        if not t.uniform_pages:
+            raise ValueError(f"TIFF pages differ in size or pixel type: {path}")
+        info.update(pages=int(t.page_count), dtype=str(np.dtype(t.dtype)), reader="sirius")
+    if tifffile is None:
+        if ext is None:
+            raise NotAvailable("loading TIFF needs the 'sirius' extension or 'tifffile'")
+        return info
     with tifffile.TiffFile(path) as tf:
-        series = tf.series[0] if tf.series else None
-        axes = series.axes if series is not None else None
-        if tf.is_ome:
-            info["format"] = "ome-tiff"
-            try:
-                info.update(_parse_ome_xml(tf.ome_metadata or ""))
-            except Exception:  # noqa: BLE001 - metadata is best effort
-                pass
-        elif tf.is_imagej:
-            info["format"] = "tiff"
-            ij = tf.imagej_metadata or {}
-            voxel = [0.0, 0.0, 0.0]
-            if "spacing" in ij:
-                voxel[2] = float(ij["spacing"])
-            if "finterval" in ij:
-                info["frame_interval_s"] = float(ij["finterval"])
-            page = tf.pages[0]
-            xres = page.tags.get("XResolution")
-            yres = page.tags.get("YResolution")
-            unit = str(ij.get("unit") or "").lower()
-            if xres is not None and yres is not None and unit in ("micron", "um", "µm", "μm"):
-                if xres.value[0] and yres.value[0]:
-                    voxel[0] = xres.value[1] / xres.value[0]
-                    voxel[1] = yres.value[1] / yres.value[0]
-            if any(voxel):
-                info["voxel_um"] = voxel
-        else:
-            info["format"] = "tiff"
-        info["dtype"] = str(tf.pages[0].dtype)
-        info["bytes_on_disk"] = os.path.getsize(path)
-    return axes, info
+        first = tf.pages[0]
+        info["description"] = first.description or ""
+        info["xres"] = _resolution(first.tags, "XResolution")
+        info["yres"] = _resolution(first.tags, "YResolution")
+        unit = first.tags.get("ResolutionUnit")
+        info["res_unit"] = int(unit.value) if unit is not None else 2
+        if ext is None:
+            full = [i for i, page in enumerate(tf.pages) if not int(getattr(page, "subfiletype", 0)) & 1]
+            shapes = {(tuple(tf.pages[i].shape), str(tf.pages[i].dtype)) for i in full}
+            if int(getattr(first, "samplesperpixel", 1)) != 1:
+                raise ValueError("Only single-channel (grayscale) TIFFs are supported.")
+            if len(shapes) != 1:
+                raise ValueError(f"TIFF pages differ in size or pixel type: {path}")
+            info.update(pages=len(full), dtype=str(first.dtype), reader="tifffile", full_pages=full)
+    return info
 
 
-def _parse_ome_xml(xml: str) -> Dict[str, Any]:
-    import xml.etree.ElementTree as ET
+def _sirius_tiff():
+    """The sirius extension when it imports (its TIFF reader is the
+    application's), else None."""
+    try:
+        import sirius  # type: ignore
 
-    out: Dict[str, Any] = {}
-    if not xml.strip():
-        return out
-    root = ET.fromstring(xml)
-    ns = root.tag[: root.tag.index("}") + 1] if root.tag.startswith("{") else ""
-    pixels = root.find(f".//{ns}Pixels")
-    if pixels is None:
-        return out
-    g = pixels.get
-    voxel = [float(g("PhysicalSizeX") or 0), float(g("PhysicalSizeY") or 0), float(g("PhysicalSizeZ") or 0)]
-    if any(voxel):
-        out["voxel_um"] = voxel
-    if g("TimeIncrement"):
-        out["frame_interval_s"] = float(g("TimeIncrement"))
-    channels = []
-    for ch in pixels.findall(f"{ns}Channel"):
-        nm = ch.get("EmissionWavelength") or ch.get("ExcitationWavelength") or 0
-        entry: Dict[str, Any] = {"label": ch.get("Name") or "", "wavelength_nm": float(nm)}
-        color = ch.get("Color")
-        if color:
-            try:
-                rgba = int(color) & 0xFFFFFFFF
-                entry["color"] = f"#{(rgba >> 24) & 255:02x}{(rgba >> 16) & 255:02x}{(rgba >> 8) & 255:02x}"
-            except ValueError:
-                pass
-        channels.append(entry)
-    if channels:
-        out["channels"] = channels
-    return out
+        sirius.inspect_tiff  # noqa: B018 - the extension, not a namespace package
+        return sirius
+    except Exception:  # noqa: BLE001 - fall back to tifffile
+        return None
 
 
 def load_dataset(path: str, page_order: str = "czt", c: Optional[int] = None, t: Optional[int] = None,
                  z: Optional[int] = None, progress: ProgressFn = None) -> Tuple[np.ndarray, Dict[str, Any]]:
     """Load a TIFF / OME-TIFF or a zarr / N5 store as (c, t, z, y, x) float32.
 
-    Plain multi-page TIFFs without dimension metadata are reshaped with
-    `page_order` (fastest axis first, ImageJ's "czt") and the explicit
-    counts; an unspecified count is derived from the page count.
+    A TIFF is read as the application's Load step reads it: the pages are
+    shaped by the explicit counts and `page_order` (fastest axis first,
+    ImageJ's "czt") when given, else by the OME / ImageJ metadata, else they
+    are z planes; a count left unset keeps what the file says, the plane count
+    is derived from the pages, and counts that do not multiply to the page
+    count fall back to pages as z. Voxel sizes honour the metadata's units.
     """
     path = str(path)
     if not os.path.exists(path):
@@ -472,71 +741,82 @@ def _load_zarr(path: str) -> Tuple[np.ndarray, Dict[str, Any]]:
             elif ax[0] == "z":
                 v[2] = s
     if channels:
-        meta["channels"] = (channels + meta["channels"])[: a.shape[0]]
+        meta["channels"] = _normalize_channels(channels, a.shape[0])
     meta["dtype"] = str(data.dtype)
     meta["dims_from_metadata"] = True
     return a, meta
 
 
-def _read_tiff_pages(path: str) -> Tuple[np.ndarray, Optional[str]]:
-    """(array, axes) -- the sirius extension for plain stacks, tifffile otherwise."""
-    axes, _ = _tiff_metadata(path)
-    if axes is None or len(axes) <= 3:
-        try:
-            import sirius  # type: ignore
-
-            return np.asarray(sirius.read_tiff(path, dtype=np.float32)), None
-        except Exception:  # noqa: BLE001 - fall back to tifffile
-            pass
-    try:
-        import tifffile  # type: ignore
-    except ImportError as e:
-        raise NotAvailable("loading TIFF needs the 'sirius' extension or 'tifffile'") from e
-    return np.asarray(tifffile.imread(path)), axes
-
-
 def _load_tiff(path: str, page_order: str, c: Optional[int], t: Optional[int], z: Optional[int]):
-    _, info = _tiff_metadata(path)
-    data, axes = _read_tiff_pages(path)
-    dims_from_meta = False
-    if axes is not None and len(axes) == data.ndim and data.ndim > 3:
-        norm = axes.upper().replace("Q", "T").replace("S", "C").replace("I", "T")
-        a = _as5(_reorder_to_ctzyx(data, norm))
-        dims_from_meta = True
+    """``probeTiff`` + ``TiffArraySource``: see load_dataset."""
+    probe = _tiff_probe(path)
+    md = _parse_tiff_description(probe["description"])
+    pages = int(probe["pages"])
+    # dimensions: explicit page order > OME / ImageJ metadata > pages as z.
+    # The Load step passes a page order as soon as a count is set or the
+    # order is not "czt" (load.cpp); an axis left at 0 keeps the file's.
+    pc, pt, pz = (max(int(v or 0), 0) for v in (c, t, z))
+    order_text = "czt" if page_order is None else str(page_order)
+    given = pc > 0 or pt > 0 or pz > 0 or order_text != "czt"
+    described = (md["ome"] or md["imagej"]) and (md["c"] > 0 or md["t"] > 0 or md["z"] > 0)
+    nc, nt, nz, order, from_meta = 1, 1, pages, "czt", False
+    if given:
+        po_order = order_text or "czt"
+        nc = pc if pc > 0 else (md["c"] if described and md["c"] > 0 else 1)
+        nt = pt if pt > 0 else (md["t"] if described and md["t"] > 0 else 1)
+        nz = pz if pz > 0 else max(pages // max(nc * nt, 1), 1)
+        order = (_normalize_order(md["dimension_order"]) if described and po_order == "czt" and md["dimension_order"]
+                 else _normalize_order(po_order))
+        from_meta = described and pc <= 0 and pt <= 0 and pz <= 0
+    elif described:
+        nc, nt = max(md["c"], 1), max(md["t"], 1)
+        nz = md["z"] if md["z"] > 0 else max(pages // (nc * nt), 1)
+        order = _normalize_order(md["dimension_order"])
+        from_meta = True
+    if nc * nt * nz != pages:
+        nc, nt, nz, order, from_meta = 1, 1, pages, "czt", False
+
+    if probe["reader"] == "sirius":
+        stack = np.asarray(_sirius_tiff().read_tiff(path, dtype=np.float32))
     else:
-        pages = data.reshape((-1,) + data.shape[-2:])
-        n = pages.shape[0]
-        counts = {"c": int(c or 0), "t": int(t or 0), "z": int(z or 0)}
-        unknown = [k for k, v in counts.items() if v <= 0]
-        known = 1
-        for v in counts.values():
-            if v > 0:
-                known *= v
-        if len(unknown) > 1:
-            for k in unknown:
-                counts[k] = 1
-            counts["z" if "z" in unknown else unknown[0]] = max(1, n // known)
-        elif unknown:
-            counts[unknown[0]] = max(1, n // known)
-        if counts["c"] * counts["t"] * counts["z"] != n:
-            raise ValueError(f"{n} pages do not factor into c{counts['c']} t{counts['t']} z{counts['z']}")
-        order = page_order.lower()
-        slowest_first = "".join(reversed(order))
-        shape = tuple(counts[ax] for ax in slowest_first)
-        a = _as5(_reorder_to_ctzyx(pages.reshape(shape + pages.shape[1:]), slowest_first + "yx"))
-    meta = _default_meta(a, path, info.get("format", "tiff"))
-    if info.get("voxel_um") and any(info["voxel_um"]):
-        v = meta["voxel_um"]
-        for i in range(3):
-            if info["voxel_um"][i]:
-                v[i] = float(info["voxel_um"][i])
-    if info.get("frame_interval_s"):
-        meta["frame_interval_s"] = float(info["frame_interval_s"])
-    for i, ch in enumerate(info.get("channels", [])[: a.shape[0]]):
-        meta["channels"][i].update({k: v for k, v in ch.items() if v not in ("", None)})
-    meta["dtype"] = info.get("dtype", str(data.dtype))
-    meta["bytes_on_disk"] = info.get("bytes_on_disk", os.path.getsize(path))
-    meta["dims_from_metadata"] = dims_from_meta
+        import tifffile  # type: ignore
+
+        with tifffile.TiffFile(path) as tf:
+            stack = np.stack([tf.pages[i].asarray() for i in probe["full_pages"]]).astype(np.float32, copy=False)
+    stack = stack.reshape((pages,) + stack.shape[-2:])
+    counts = {"c": nc, "t": nt, "z": nz}
+    slowest_first = order[::-1]
+    shape = tuple(counts[ax] for ax in slowest_first)
+    a = _as5(_reorder_to_ctzyx(stack.reshape(shape + stack.shape[1:]), slowest_first + "yx"))
+
+    fmt = "ome-tiff" if md["ome"] else "tiff"
+    meta = _default_meta(a, path, fmt)
+    if meta["name"].endswith(".ome"):   # stem of the stem, as probeTiff names it
+        meta["name"] = meta["name"][:-4]
+    # voxel size: OME physical sizes, else the resolution tags (in the
+    # ImageJ unit when the tag says "none"), ImageJ spacing for z; a missing
+    # x / y is 0.1 µm and a missing z twice x
+    voxel = list(md["voxel_um"]) if md["ome"] else [0.0, 0.0, 0.0]
+    imagej_unit = -md["voxel_um"][0] if md["imagej"] and md["voxel_um"][0] < 0 else 0.0
+    if voxel[0] <= 0.0 or voxel[1] <= 0.0:
+        xy = _pixel_from_resolution(probe["xres"], probe["yres"], probe["res_unit"], imagej_unit)
+        if xy[0] > 0.0:
+            voxel[0] = xy[0]
+        if xy[1] > 0.0:
+            voxel[1] = xy[1]
+    if voxel[2] <= 0.0 and md["imagej"]:
+        voxel[2] = md["voxel_um"][2]
+    known_xy = voxel[0] > 0.0 and voxel[1] > 0.0
+    if not known_xy:
+        voxel[0] = voxel[1] = 0.1
+    if voxel[2] <= 0.0:
+        voxel[2] = voxel[0] * 2.0 if known_xy else 0.2
+    meta["voxel_um"] = [float(v) for v in voxel]
+    meta["frame_interval_s"] = float(md["frame_interval_s"])
+    meta["channels"] = _normalize_channels(md["channels"] if md["ome"] else [], nc)
+    meta["dtype"] = probe["dtype"] or str(stack.dtype)
+    meta["bytes_on_disk"] = os.path.getsize(path)
+    meta["dims_from_metadata"] = bool(from_meta)
     return a, meta
 
 
@@ -3315,7 +3595,7 @@ def run_pipeline(dataset_path: str, pipeline: Any, progress: ProgressFn = None, 
             load_params = s.get("params", {}) or {}
             break
     lp = _prepare_params(_LOAD, load_params, None)
-    order = _str(lp, "page_order", "czt") or "czt"
+    order = _str(lp, "page_order", "czt")   # "" is not "czt" to load.cpp either: it still passes a page order
     counts = [_int(lp, k, 0) or None for k in ("c", "t", "z")]
     array, meta = load_dataset(dataset_path, order, counts[0], counts[1], counts[2],
                                progress=lambda f, m: _progress(progress, 0.0, m))
