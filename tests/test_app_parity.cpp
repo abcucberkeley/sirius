@@ -7,8 +7,8 @@
 // failure that would corrupt someone's results without saying anything.
 //
 // This case runs a fixed list of (kind, params) through the real Operation on
-// one deterministic synthetic array and writes every result as raw float32
-// with a JSON sidecar. bindings/tests/test_parity.py replays the same list
+// one deterministic synthetic array (and a few on the same array as 16-bit
+// camera counts) and writes every result as raw float32 with a JSON sidecar. bindings/tests/test_parity.py replays the same list
 // through sirius.workbench.run_step on the same input and compares.
 //
 //     SIRIUS_PARITY_OUT=<dir> sirius_tests "[parity]"
@@ -69,6 +69,16 @@ namespace {
                             a->at(c, t, z, y, x) = static_cast<float>(v);
                         }
         return a;
+    }
+
+    // The same array as 16-bit camera counts: whole numbers, a few tens of
+    // counts of signal on an offset of 12000. A step that differences large
+    // sums there (the local variance of Local contrast) needs float64 to
+    // agree with itself, which values of 0..3 never show.
+    std::shared_ptr<Array5> cameraCounts(const Array5& a) {
+        auto out = std::make_shared<Array5>(a.dims());
+        for (Index i = 0; i < a.numel(); ++i) out->data()[i] = static_cast<float>(std::round(a.data()[i] * 40.0 + 12000.0));
+        return out;
     }
 
     DatasetMeta syntheticMeta(Dims5 d) {
@@ -188,6 +198,13 @@ namespace {
         // tests/test_app_labels.cpp.
     };
 
+    // Cases run on cameraCounts() of the same input ("input16").
+    const std::vector<Case> kCameraCases = {
+        {"classic_local_contrast_16bit", "classic", {{"channel", 0}, {"method", "Local contrast"}, {"window", 11}, {"contrast_k", 1.2}, {"sigma", 0.0}, {"opening", 0}, {"fill_holes", false}, {"post", "Connected components"}, {"min_voxels", 2}}},
+        {"classic_local_contrast_hysteresis_16bit", "classic", {{"channel", 1}, {"method", "Local contrast"}, {"window", 7}, {"contrast_k", 0.8}, {"hysteresis", true}, {"hysteresis_ratio", 0.5}, {"sigma", 0.0}, {"opening", 0}, {"fill_holes", false}, {"post", "Connected components"}, {"min_voxels", 1}}},
+        {"classic_local_mean_16bit", "classic", {{"channel", 0}, {"method", "Local mean"}, {"window", 11}, {"local_ratio", 1.0005}, {"local_offset", 2.0}, {"sigma", 0.0}, {"opening", 0}, {"fill_holes", false}, {"post", "Connected components"}, {"min_voxels", 2}}},
+    };
+
     ParamSet paramsOf(const json& j) {
         ParamSet p;
         for (auto it = j.begin(); it != j.end(); ++it) {
@@ -212,14 +229,22 @@ TEST_CASE("parity fixtures for the Python mirror of the operations", "[.parity][
     const DatasetMeta meta = syntheticMeta(dims);
     const std::shared_ptr<Array5> array = syntheticArray(dims);
 
+    const std::shared_ptr<Array5> camera = cameraCounts(*array);
+
     writeFloats(dir / "input.f32", array->data(), static_cast<std::size_t>(array->numel()));
+    writeFloats(dir / "input16.f32", camera->data(), static_cast<std::size_t>(camera->numel()));
     writeJson(dir / "input.json", json{{"dims", dimsJson(dims)},
                                        {"voxel_um", json::array({meta.voxelUm[0], meta.voxelUm[1], meta.voxelUm[2]})}});
 
     StepContext ctx;
     ctx.backend = Backend::Cpu;
     json index = json::array();
-    for (const Case& c : kCases) {
+    std::vector<std::pair<const Case*, const char*>> runs;
+    for (const Case& c : kCases) runs.emplace_back(&c, "input");
+    for (const Case& c : kCameraCases) runs.emplace_back(&c, "input16");
+    for (const auto& [cp, inputName] : runs) {
+        const Case& c = *cp;
+        const std::shared_ptr<Array5>& source = std::string(inputName) == "input" ? array : camera;
         INFO("case " << c.name);
         const Operation* op = findOperation(c.kind);
         REQUIRE(op != nullptr);
@@ -230,11 +255,11 @@ TEST_CASE("parity fixtures for the Python mirror of the operations", "[.parity][
         params.applyDefaults(op->info().params);
         StepInput in;
         in.meta = meta;
-        in.array = array;
+        in.array = source;
         const StepOutput out = op->run(in, params, ctx);
         REQUIRE(out.array);
 
-        json entry{{"name", c.name}, {"kind", c.kind}, {"params", params.toJson()}, {"dims", dimsJson(out.meta.dims)}, {"voxel_um", json::array({out.meta.voxelUm[0], out.meta.voxelUm[1], out.meta.voxelUm[2]})}, {"labels", false}};
+        json entry{{"name", c.name}, {"kind", c.kind}, {"params", params.toJson()}, {"dims", dimsJson(out.meta.dims)}, {"voxel_um", json::array({out.meta.voxelUm[0], out.meta.voxelUm[1], out.meta.voxelUm[2]})}, {"labels", false}, {"input", inputName}};
         writeFloats(dir / (std::string(c.name) + ".f32"), out.array->data(),
                     static_cast<std::size_t>(out.array->numel()));
         if (out.labels && !out.labels->empty()) {

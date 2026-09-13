@@ -171,6 +171,10 @@ class TestParity(unittest.TestCase):
         with open(FIXTURES / "input.json", encoding="utf-8") as f:
             spec = json.load(f)
         cls.input = _read_f32(FIXTURES / "input.f32", tuple(spec["dims"]))
+        # the same array as 16-bit camera counts, for the cases that name it
+        cls.inputs = {"input": cls.input}
+        if (FIXTURES / "input16.f32").is_file():
+            cls.inputs["input16"] = _read_f32(FIXTURES / "input16.f32", tuple(spec["dims"]))
         cls.meta = {"voxel_um": list(spec["voxel_um"]), "dims": {}}
         with open(FIXTURES / "cases.json", encoding="utf-8") as f:
             cls.cases = json.load(f)["cases"]
@@ -181,7 +185,7 @@ class TestParity(unittest.TestCase):
         with warnings.catch_warnings():
             warnings.simplefilter("error", wb.UnknownParameterWarning)
             try:
-                return wb.run_step(kind, dict(case["params"]), self.input, meta)
+                return wb.run_step(kind, dict(case["params"]), self.inputs[case.get("input", "input")], meta)
             except wb.NotAvailable as e:   # scipy / scikit-image missing
                 self.skipTest(f"{kind}: {e}")
 

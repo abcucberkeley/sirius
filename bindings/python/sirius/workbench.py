@@ -1364,26 +1364,37 @@ def step_threshold(a: np.ndarray, params: Dict[str, Any], meta: Dict[str, Any]) 
                             "class_name": _str(params, "class_name", "object")})
 
 
-def _local_mean_plane(pl: np.ndarray, r: int) -> np.ndarray:
-    """Mean over a (2r+1)² window clamped to the plane (integral image)."""
-    y, x = pl.shape
+def _local_box_mean(v: np.ndarray, r: int) -> np.ndarray:
+    """Float64 mean over a (2r+1)² window clamped to the plane, from an
+    integral image summed as classic.cpp sums it (along each row, then down
+    the rows), so the two agree to the last bit."""
+    y, x = v.shape
     integral = np.zeros((y + 1, x + 1), dtype=np.float64)
-    integral[1:, 1:] = pl.astype(np.float64).cumsum(axis=0).cumsum(axis=1)
+    integral[1:, 1:] = np.asarray(v, dtype=np.float64).cumsum(axis=1).cumsum(axis=0)
     yy, xx = np.arange(y), np.arange(x)
     y0, y1 = np.maximum(yy - r, 0), np.minimum(yy + r + 1, y)
     x0, x1 = np.maximum(xx - r, 0), np.minimum(xx + r + 1, x)
     s = (integral[y1[:, None], x1[None, :]] - integral[y0[:, None], x1[None, :]]
          - integral[y1[:, None], x0[None, :]] + integral[y0[:, None], x0[None, :]])
     count = (y1 - y0)[:, None] * (x1 - x0)[None, :]
-    return (s / count).astype(np.float32)
+    return s / count
+
+
+def _local_mean_plane(pl: np.ndarray, r: int) -> np.ndarray:
+    """Mean over a (2r+1)² window clamped to the plane -- ``localMeanPlane``
+    (float32, as the application stores it)."""
+    return _local_box_mean(pl, r).astype(np.float32)
 
 
 def _local_stats_plane(pl: np.ndarray, r: int) -> Tuple[np.ndarray, np.ndarray]:
     """Local mean and standard deviation over a (2r+1)² window clamped to the
-    plane -- ``localStatsPlane`` in classic.cpp."""
-    mean = _local_mean_plane(pl, r)
-    mean_sq = _local_mean_plane(np.asarray(pl, dtype=np.float64) ** 2, r)
-    return mean, np.sqrt(np.maximum(0.0, mean_sq - mean ** 2))
+    plane -- ``localStatsPlane`` in classic.cpp. The variance is a small
+    difference of two large numbers (camera data sits on an offset of
+    thousands), so it is taken in float64 and only the results are float32."""
+    v = np.asarray(pl, dtype=np.float64)
+    mean = _local_box_mean(v, r)
+    var = np.maximum(0.0, _local_box_mean(v * v, r) - mean * mean)
+    return mean.astype(np.float32), np.sqrt(var).astype(np.float32)
 
 
 def _dog_plane(pl: np.ndarray, sigma: float, ratio: float = 1.6) -> np.ndarray:
@@ -2296,12 +2307,16 @@ def step_classic(a: np.ndarray, params: Dict[str, Any], meta: Dict[str, Any]) ->
             by_contrast = method == "Local contrast"
             rows, low_rows = [], []
             for pl in work:
+                # the cut in float64, as classic.cpp takes it: in float32 it
+                # rounds by whole counts on 16-bit data
                 if by_contrast:
                     mean, sd = _local_stats_plane(pl, window)
-                    cut_plane = mean + contrast_k * sd + offset
+                    mean = mean.astype(np.float64)
+                    cut_plane = mean + contrast_k * sd.astype(np.float64) + offset
                 else:
-                    mean = _local_mean_plane(pl, window)
+                    mean = _local_mean_plane(pl, window).astype(np.float64)
                     cut_plane = ratio * mean + offset
+                pl = pl.astype(np.float64)
                 rows.append(pl > cut_plane)
                 if hysteresis:
                     low_rows.append(pl > mean + hysteresis_ratio * (cut_plane - mean))
