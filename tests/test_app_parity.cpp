@@ -144,6 +144,9 @@ namespace {
         {"resample_linear", "resample", {{"voxel_x", 0.16}, {"voxel_y", 0.16}, {"voxel_z", 0.2}, {"interpolation", "linear"}}},
         {"resample_up_linear", "resample", {{"voxel_x", 0.06}, {"voxel_y", 0.08}, {"voxel_z", 0.0}, {"interpolation", "linear"}}},
         {"resample_cubic", "resample", {{"voxel_x", 0.16}, {"voxel_y", 0.16}, {"voxel_z", 0.2}, {"interpolation", "cubic"}}},
+        // the last x column and z plane of these grids used to read as fill
+        // on one side or both (a running sum / product a few ulps past the edge)
+        {"resample_edges", "resample", {{"voxel_x", 0.04}, {"voxel_y", 0.04}, {"voxel_z", 0.1}, {"interpolation", "linear"}}},
         {"resample_nearest", "resample", {{"voxel_x", 0.16}, {"voxel_y", 0.16}, {"voxel_z", 0.2}, {"interpolation", "nearest"}}},
         {"threshold_otsu", "threshold", {{"channel", 0}, {"method", "Otsu"}, {"post", "Connected components"}, {"min_voxels", 0}}},
         {"threshold_manual", "threshold", {{"channel", 1}, {"method", "Manual"}, {"value", 0.6}, {"post", "Connected components"}, {"min_voxels", 4}}},

@@ -669,6 +669,14 @@ class TestSteps(unittest.TestCase):
         np.testing.assert_allclose(r5.array[0, 0, :, 0, 0], [0, 1, 1, 2, 2, 3, 3], atol=1e-6)
         r6 = wb.run_step("resample", {"voxel_z": 0.2, "interpolation": "cubic"}, ramp, meta)
         self.assertEqual(r6.array.shape, (1, 1, 7, 3, 3))
+        # the last plane / column the extent promises is sampled: 189 * (0.1 / 0.3)
+        # rounds past plane 63, and was read as fill
+        ones = np.ones((1, 1, 64, 2, 64), np.float32)
+        for interp in ("linear", "cubic", "nearest"):
+            r7 = wb.run_step("resample", {"voxel_z": 0.1, "voxel_x": 0.1, "interpolation": interp}, ones,
+                             {"voxel_um": [0.5, 0.5, 0.3]})
+            self.assertEqual(r7.array.shape, (1, 1, 190, 2, 316))
+            self.assertAlmostEqual(float(r7.array.min()), 1.0, places=6, msg=interp)   # not 0: filled
 
     def test_bleach_mode_and_over(self):
         a = np.ones((1, 2, 4, 8, 8), np.float32)

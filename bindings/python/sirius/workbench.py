@@ -1246,10 +1246,33 @@ def _resample_extent(n: int, d: float, t: float) -> int:
     return 1 if n == 1 else int(math.floor((n - 1) * d / t + 1e-9)) + 1
 
 
-def _axis_taps(n_in: int, n_out: int, ratio: float, interp: str) -> List[Tuple[np.ndarray, np.ndarray]]:
+def _fitted_step(step: float, samples: int, n_in: int) -> float:
+    """``fittedStep`` of resample.cpp: the ratio pulled down by the rounding
+    error that would put the last output centre past the last input centre,
+    for both ways resampleAffine reaches it (a product along z / y, a running
+    sum along x). Without it the last plane or column read as fill."""
+    if samples <= 1 or n_in <= 1:
+        return step
+    last = float(n_in - 1)
+    for _ in range(64):
+        reach = max(float(np.add.accumulate(np.full(samples - 1, step))[-1]), float(samples - 1) * step)
+        over = reach - last
+        if over <= 0.0 or over > 1e-6:
+            break
+        step = math.nextafter(step - over / (samples - 1), 0.0)
+    return step
+
+
+def _axis_taps(n_in: int, n_out: int, ratio: float, interp: str,
+               accumulated: bool = False) -> List[Tuple[np.ndarray, np.ndarray]]:
     """``axisTaps`` of image_ops.cpp for every output index of one axis:
-    (indices, weights) pairs; positions outside the input weigh 0 (fill)."""
-    p = np.arange(n_out, dtype=np.float64) * ratio
+    (indices, weights) pairs; positions outside the input weigh 0 (fill).
+    The positions are those resampleAffine evaluates: index * ratio, or along
+    x (`accumulated`) the ratio added once per index."""
+    if accumulated and n_out > 1:
+        p = np.concatenate(([0.0], np.add.accumulate(np.full(n_out - 1, ratio, dtype=np.float64))))
+    else:
+        p = np.arange(n_out, dtype=np.float64) * ratio
     if n_in == 1:
         ok = (p >= -0.5) & (p <= 0.5)
         return [(np.zeros(n_out, dtype=np.int64), ok.astype(np.float64))]
@@ -1277,7 +1300,8 @@ def _resample_volume(v: np.ndarray, extents: Sequence[int], ratios: Sequence[flo
         if n_in == n_out and abs(ratios[axis] - 1.0) < 1e-12:
             continue
         acc = None
-        for idx, w in _axis_taps(n_in, n_out, ratios[axis], interp):
+        ratio = _fitted_step(ratios[axis], n_out, n_in)
+        for idx, w in _axis_taps(n_in, n_out, ratio, interp, accumulated=axis == 2):
             shape = [1, 1, 1]
             shape[axis] = n_out
             term = np.take(out, idx, axis=axis) * w.astype(np.float32).reshape(shape)
