@@ -52,6 +52,25 @@ namespace sirius::app {
                 }
                 watershed(landscape.data(), mask.data(), z, y, x, out);
                 count = seeds;
+                // The flood only reaches what is connected to a seed. A
+                // component no seed landed in -- a thin bar the h-maxima
+                // flattened, a nucleus closer to another than the seed
+                // distance -- is still an object, not background: numbered
+                // after the seeds, in raster order of its first voxel.
+                std::vector<std::uint8_t> unseeded(static_cast<std::size_t>(n), 0);
+                bool any = false;
+                for (Index i = 0; i < n; ++i) {
+                    if (!mask[static_cast<std::size_t>(i)] || out[i] != 0) continue;
+                    unseeded[static_cast<std::size_t>(i)] = 1;
+                    any = true;
+                }
+                if (any) {
+                    std::vector<std::uint32_t> extra(static_cast<std::size_t>(n));
+                    const std::uint32_t more = connectedComponents(unseeded.data(), z, y, x, extra.data());
+                    for (Index i = 0; i < n; ++i)
+                        if (extra[static_cast<std::size_t>(i)]) out[i] = seeds + extra[static_cast<std::size_t>(i)];
+                    count = seeds + more;
+                }
             }
         } else {
             count = connectedComponents(mask.data(), z, y, x, out);

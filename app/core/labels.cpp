@@ -1768,12 +1768,19 @@ namespace sirius::app {
         // Dijkstra from every labelled voxel at once. A voxel reached from two
         // labels at the same distance stays background: growing it either way
         // would join two objects that the segmentation kept apart.
+        // Equal distances leave the queue in the order they entered it (the
+        // labelled voxels in raster order first): a tied voxel still passes
+        // on the label that reached it first, and that must not depend on
+        // how a heap happens to order equal keys -- the Python mirror keys
+        // its heap the same way and has to agree voxel for voxel.
         struct Node {
             double d;
+            std::uint64_t seq;
             Index i;
-            bool operator>(const Node& o) const { return d > o.d; }
+            bool operator>(const Node& o) const { return d != o.d ? d > o.d : seq > o.seq; }
         };
         std::priority_queue<Node, std::vector<Node>, std::greater<Node>> queue;
+        std::uint64_t seq = 0;
         std::vector<double> best(static_cast<std::size_t>(n), std::numeric_limits<double>::infinity());
         std::vector<std::uint32_t> from(static_cast<std::size_t>(n), 0u);
         std::vector<std::uint8_t> tied(static_cast<std::size_t>(n), 0);
@@ -1781,7 +1788,7 @@ namespace sirius::app {
             if (labels[i] != 0) {
                 best[static_cast<std::size_t>(i)] = 0.0;
                 from[static_cast<std::size_t>(i)] = labels[i];
-                queue.push({0.0, i});
+                queue.push({0.0, seq++, i});
             }
         const double stepZ = zAspect;   // the planes are that much further apart than the pixels
         while (!queue.empty()) {
@@ -1805,7 +1812,7 @@ namespace sirius::app {
                     bj = d;
                     from[static_cast<std::size_t>(j)] = from[static_cast<std::size_t>(cur.i)];
                     tied[static_cast<std::size_t>(j)] = 0;
-                    queue.push({d, j});
+                    queue.push({d, seq++, j});
                 } else if (std::fabs(d - bj) <= 1e-9 && from[static_cast<std::size_t>(cur.i)] != from[static_cast<std::size_t>(j)]) {
                     tied[static_cast<std::size_t>(j)] = 1;
                 }

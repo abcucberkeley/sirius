@@ -141,14 +141,16 @@ namespace {
         // classical segmentation: one case per branch that has its own maths,
         // so the Python mirror cannot drift from the C++ on any of them
         {"classic_otsu_hmax", "classic", {{"channel", 0}, {"method", "Otsu"}, {"sigma", 1.0}, {"opening", 1}, {"post", "Watershed (distance)"}, {"seeds", "H-maxima"}, {"seed_depth", 1.5}, {"min_voxels", 4}}},
-        // No "Distance maxima" case: with those seeds this fixture puts two
-        // seeds equidistant from the ridge between them, and the two floods
-        // break that tie differently -- the application's priority queue and
-        // scikit-image's give 22 voxels of one shared boundary to different
-        // neighbours. The foreground and the object count agree; only the
-        // border moves. Matching it would mean reimplementing the C++ queue
-        // order in the mirror. The h-maxima case below covers the same
-        // watershed code with seeds that are not tied.
+        // With distance-maxima seeds this fixture puts two seeds equidistant
+        // from the ridge between them. scikit-image's flood broke that tie
+        // differently from the application's queue and moved 22 voxels of
+        // the shared boundary (h-maxima seeds were not spared either on other
+        // inputs); the mirror now floods in the C++ queue order, voxel for
+        // voxel, and this case is what holds it there.
+        {"classic_otsu_distance_maxima", "classic", {{"channel", 0}, {"method", "Otsu"}, {"sigma", 1.0}, {"opening", 1}, {"post", "Watershed (distance)"}, {"seeds", "Distance maxima"}, {"seed_distance", 3.0}, {"min_voxels", 4}}},
+        // Seeds further apart than the objects: a component no seed landed in
+        // is numbered after the seeds instead of being dropped.
+        {"threshold_watershed_far_seeds", "threshold", {{"channel", 0}, {"method", "Percentile"}, {"percentile", 85.0}, {"post", "Watershed (distance)"}, {"seed_distance", 12.0}, {"min_voxels", 0}}},
         {"classic_multi_otsu", "classic", {{"channel", 1}, {"method", "Multi-Otsu"}, {"sigma", 0.0}, {"opening", 0}, {"fill_holes", false}, {"post", "Connected components"}, {"min_voxels", 2}}},
         {"classic_local_contrast", "classic", {{"channel", 0}, {"method", "Local contrast"}, {"window", 11}, {"contrast_k", 1.2}, {"sigma", 0.0}, {"opening", 0}, {"fill_holes", false}, {"post", "Connected components"}, {"min_voxels", 2}}},
         {"classic_local_mean", "classic", {{"channel", 0}, {"method", "Local mean"}, {"window", 11}, {"local_ratio", 1.15}, {"sigma", 0.0}, {"opening", 0}, {"fill_holes", false}, {"post", "Connected components"}, {"min_voxels", 2}}},

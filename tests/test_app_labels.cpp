@@ -1154,6 +1154,69 @@ TEST_CASE("On a tracked volume the class and review mark follow the id", "[app][
     CHECK(l.statsOf(6)->cls == "track");
 }
 
+TEST_CASE("watershed hands out tied voxels in the order they entered the queue", "[app][labels]") {
+    // Equal heights leave the queue first in, first out (seeds in raster
+    // order, neighbours -z, +z, -y, +y, -x, +x): seed 2 enters first and takes
+    // the low row before seed 1 gets to the tied voxels below it. The Python
+    // mirror's flood is pinned to the same answer (test_workbench.py).
+    const std::vector<float> land{1, 0, 0, 1, 1, 1};
+    const std::vector<std::uint8_t> mask(6, 1);
+    std::vector<std::uint32_t> labels{2, 0, 0, 1, 0, 0};
+    watershed(land.data(), mask.data(), 1, 2, 3, labels.data());
+    CHECK(labels == std::vector<std::uint32_t>{2, 2, 2, 1, 2, 2});
+}
+
+TEST_CASE("Expanding labels passes ties on in the order voxels were reached", "[app][labels][classic]") {
+    // (1, 1) is as far from 1 as from 2 and stays background, but it was
+    // reached from 1 first, and what it passes on to (1, 0) was down to how
+    // the heap ordered equal distances -- which the Python mirror's heap did
+    // differently. Both now take equal distances first in, first out, and
+    // test_workbench.py pins the mirror to this same answer.
+    std::vector<std::uint32_t> labels{0, 1, 0, 0, 0, 2, 0, 0, 0, 0, 0, 0};
+    expandLabels(labels.data(), 1, 4, 3, 4.0, 3.0);
+    CHECK(labels == std::vector<std::uint32_t>{1, 1, 0, 1, 0, 2, 1, 0, 2, 1, 0, 2});
+}
+
+TEST_CASE("A seeded watershed keeps the objects no seed landed in", "[app][labels]") {
+    // two 7 x 7 squares two pixels apart: their seeds are closer than the
+    // seed distance, so only the first gets one, and the flood cannot cross
+    // the gap -- the second used to vanish from the labels
+    const Index y = 12, x = 20;
+    std::vector<float> fg(static_cast<std::size_t>(y * x), 0.0f);
+    for (Index r = 2; r < 9; ++r)
+        for (Index c = 2; c < 9; ++c) {
+            fg[static_cast<std::size_t>(r * x + c)] = 1.0f;
+            fg[static_cast<std::size_t>(r * x + c + 9)] = 1.0f;
+        }
+    LabelPostOptions post;
+    post.post = "Watershed (distance)";
+    post.seeds = "Distance maxima";
+    post.seedMinDistance = 10.0;
+    post.minVoxels = 0;
+    LabelVolume labels(1, 1, y, x);
+    CHECK(labelsFromProbabilities(fg.data(), nullptr, 1, y, x, post, labels, 0) == 2);
+    Index voxels = 0;
+    for (Index i = 0; i < y * x; ++i) voxels += labels.volume(0)[i] != 0 ? 1 : 0;
+    CHECK(voxels == 98);
+    CHECK(labels.at(0, 0, 5, 5) != labels.at(0, 0, 5, 14));
+    CHECK(labels.at(0, 0, 5, 14) != 0);
+
+    SECTION("h-maxima: a thin bar beside a round object") {
+        // the bar's distance map is too shallow to stand seed_depth above
+        // anything, which left it without a seed once the disc had one
+        std::fill(fg.begin(), fg.end(), 0.0f);
+        for (Index r = 1; r < 10; ++r)
+            for (Index c = 1; c < 10; ++c) fg[static_cast<std::size_t>(r * x + c)] = 1.0f;
+        for (Index r = 4; r < 7; ++r)
+            for (Index c = 12; c < 19; ++c) fg[static_cast<std::size_t>(r * x + c)] = 1.0f;
+        post.seeds = "H-maxima";
+        post.seedDepth = 2.0;
+        LabelVolume bar(1, 1, y, x);
+        CHECK(labelsFromProbabilities(fg.data(), nullptr, 1, y, x, post, bar, 0) == 2);
+        CHECK(bar.at(0, 0, 5, 15) != 0);
+    }
+}
+
 TEST_CASE("distanceSeeds can be cancelled", "[app][labels]") {
     Mask m(5, 40, 40);
     for (int k = 0; k < 4; ++k) m.sphere(2, 6 + 9 * k, 20, 4.0);
