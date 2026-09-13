@@ -74,6 +74,15 @@ namespace sirius::app {
         bool livePreview = false;
         bool plugin = false;              // a user operation served by the Python worker
         std::string source;               // plugin file
+        // The plugin file as it was loaded (its size and modification time):
+        // part of the step's fingerprint, so a reloaded edit is not served
+        // the result of the code it replaced. Empty for built-ins.
+        std::string sourceStamp;
+        // A stand-in for a kind nothing loaded provides (registerMissingOperation):
+        // it keeps a pipeline's step resolvable, fails validation with the
+        // reason, and is left out of allOperations() and so of the add menu,
+        // the assistant's tools and the schema.
+        bool missing = false;
         std::string helpPage;             // markdown file stem under app/help (defaults to kind)
         // Starting points offered by the panel and the apply_preset tool.
         std::vector<ParamPreset> presets;
@@ -163,10 +172,19 @@ namespace sirius::app {
     };
 
     // --- registry ----------------------------------------------------------
-    void registerOperation(std::unique_ptr<Operation> op);   // replaces an existing kind
+    // Replaces an existing kind. The replaced operation is kept alive: a
+    // reference taken before a plugin reload must not dangle.
+    void registerOperation(std::unique_ptr<Operation> op);
     const Operation* findOperation(const std::string& kind) noexcept;
     const Operation& requireOperation(const std::string& kind);   // throws std::out_of_range
-    std::vector<const Operation*> allOperations();              // in registration order
+    // A stand-in for `kind` (OpInfo::missing): a plugin that is not loaded, a
+    // kind from a newer SIRIUS. Its validation and run fail with the reason.
+    std::unique_ptr<Operation> makeMissingOperation(const std::string& kind);
+    // The operation registered for `kind`, registering a stand-in first when
+    // there is none, so a pipeline step naming it keeps its place.
+    const Operation* registerMissingOperation(const std::string& kind);
+    // Every registered operation but the stand-ins, in registration order.
+    std::vector<const Operation*> allOperations();
     // Groups in menu order with their operations (Reconstruct, Reduce, ...).
     std::vector<std::pair<std::string, std::vector<const Operation*>>> operationGroups();
     // Registers every built-in operation (idempotent).

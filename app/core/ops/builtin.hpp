@@ -16,6 +16,7 @@
 
 #include <sirius/sim_parameters.hpp>
 
+#include "core/array_source.hpp"
 #include "core/operation.hpp"
 #include "core/rpc.hpp"
 
@@ -25,6 +26,10 @@ namespace sirius::app {
     std::vector<OperationFactory> builtinOperationFactories();
 
     std::unique_ptr<Operation> makeLoadOperation();
+    // The Load step's parameters as the options it opens the dataset with
+    // (page order, voxel size, SIM layout, tile, full read); 0 keeps what the
+    // file says for that axis or size.
+    OpenOptions loadOpenOptions(const ParamSet& loadParams);
     std::unique_ptr<Operation> makeSimOperation();
     std::unique_ptr<Operation> makeDeconvolveOperation();
     std::unique_ptr<Operation> makeVolumeOperation();

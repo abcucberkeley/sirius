@@ -24,4 +24,6 @@ $$
 
 Stitching a dataset's tiles holds every tile of one (channel, t) plus the canvas in memory, so it suits mosaics whose one-channel volume fits in RAM.
 
+A dataset's tiles are read from its files, one tile after another, so Stitch in that mode goes directly after Load: a step between them that changes the pixels (a contrast, a flat field, a registration) could only be applied to the one tile Load passes on, and Stitch refuses to run rather than leave it out of the mosaic. Put those steps after Stitch, where they apply to the whole mosaic. Steps that only change the labels (label cleanup, tracking) and a Load that reads its tile into memory are fine.
+
 The alignment panel shows a checkerboard of fixed and moving tile in their overlap, the tile map with the selected pair and the pairwise shift statistics (mean and maximum displacement, normalised cross-correlation).

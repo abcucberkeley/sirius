@@ -597,3 +597,266 @@ TEST_CASE("rpc tensor descriptors must hold non-negative integers", "[app][rpc]"
     std::vector<rpc::TensorRef> wrapped{{"a", "float32", {std::numeric_limits<Index>::max(), 4}, one.data(), 4}};
     CHECK_THROWS(rpc::encodeFrame({{"id", 1}}, wrapped));
 }
+
+// --- plugin reloads --------------------------------------------------------------
+
+#include <filesystem>
+#include <fstream>
+#include <mutex>
+
+#include "core/array_source.hpp"
+#include "core/help_pages.hpp"
+#include "core/ops/builtin.hpp"
+#include "core/ops/plugin.hpp"
+#include "core/pipeline.hpp"
+#include "core/workbench.hpp"
+
+#include "temp_path.hpp"
+
+namespace {
+
+    // A worker whose plugin list the test sets: it answers hello and
+    // list_plugins / reload_plugins, one loopback connection per launch.
+    struct PluginCatalog {
+        struct Connection {
+            std::unique_ptr<rpc::Transport> t;
+            std::thread thread;
+            Connection(std::unique_ptr<rpc::Transport> transport, PluginCatalog& catalog) : t(std::move(transport)) {
+                thread = std::thread([this, &catalog] { serve(catalog); });
+            }
+            ~Connection() {
+                t->close();
+                thread.join();
+            }
+            void serve(PluginCatalog& catalog) {
+                std::vector<std::byte> buf;
+                try {
+                    for (;;) {
+                        auto m = rpc::decodeFrame(buf);
+                        if (!m) {
+                            t->receive(buf, std::chrono::milliseconds(50));
+                            continue;
+                        }
+                        const std::uint64_t id = m->header.value("id", 0ull);
+                        const std::string method = m->header.value("method", "");
+                        json result;
+                        if (method == "hello")
+                            result = {{"version", "test"}, {"methods", json::array()}, {"protocol_version", rpc::kProtocolVersion}, {"device", "cpu"}, {"hostname", "loop"}};
+                        else if (method == "list_plugins" || method == "reload_plugins")
+                            result = {{"plugins", catalog.plugins()}, {"dirs", {"/plugins"}}};
+                        if (result.is_null()) t->send(rpc::encodeFrame({{"id", id}, {"type", "error"}, {"message", "unknown method " + method}}, {}));
+                        else t->send(rpc::encodeFrame({{"id", id}, {"type", "result"}, {"result", result}}, {}));
+                    }
+                } catch (const std::exception&) {
+                    // the client closed: done
+                }
+            }
+        };
+
+        std::mutex mutex;
+        json list = json::array();
+        std::vector<std::unique_ptr<Connection>> connections;
+
+        json plugins() {
+            std::lock_guard<std::mutex> g(mutex);
+            return list;
+        }
+        void set(json l) {
+            std::lock_guard<std::mutex> g(mutex);
+            list = std::move(l);
+        }
+        std::unique_ptr<RemoteWorker> connect() {
+            auto [client, server] = rpc::loopbackPair();
+            connections.push_back(std::make_unique<Connection>(std::move(server), *this));
+            return std::make_unique<RemoteWorker>(std::move(client));
+        }
+    };
+
+    json pluginSpec(const std::string& kind, double offset) {
+        return {{"kind", kind},
+                {"name", kind},
+                {"file", "/plugins/" + kind + ".py"},
+                {"params", json::array({{{"key", "gain"}, {"type", "double"}, {"default", 1.0}},
+                                        {{"key", "offset"}, {"type", "double"}, {"default", offset}}})},
+                {"help", "# " + kind + "\n\nA test plugin.\n"}};
+    }
+
+    bool inAddMenu(const std::string& kind) {
+        for (const auto& group : operationGroups())
+            for (const Operation* op : group.second)
+                if (op->kind() == kind) return true;
+        return false;
+    }
+
+    bool inPluginKinds(const std::string& kind) {
+        const std::vector<std::string> kinds = pluginKinds();
+        return std::find(kinds.begin(), kinds.end(), kind) != kinds.end();
+    }
+
+} // namespace
+
+TEST_CASE("A plugin whose file is gone stays in the pipeline as not loaded", "[app][rpc][plugin]") {
+    registerBuiltinOperations();
+    const std::filesystem::path scratch = test::uniqueTempPath("plugin_catalog", "");
+    PluginCatalog catalog;
+    {
+        Workbench wb(scratch);
+        wb.setLocalWorkerLauncher([&catalog] { return catalog.connect(); });
+        auto array = std::make_shared<Array5>(Array5::filled(Dims5{1, 1, 2, 4, 4}, 1.0f));
+        DatasetMeta meta;
+        meta.name = "synthetic";
+        meta.sourcePath = "memory://synthetic";
+        meta.dims = array->dims();
+        wb.setDataset(std::make_shared<MemorySource>(array, meta));
+
+        // a pipeline opened before its plugin is loaded
+        wb.replacePipeline(Pipeline::fromJson({{"steps", json::array({{{"kind", "load"}}, {{"kind", "zz_late"}, {"params", {{"gain", 3.0}}}}})}}),
+                           "Load pipeline");
+        REQUIRE(wb.pipeline().at(1).op().info().missing);
+        catalog.set(json::array({pluginSpec("zz_late", 5.0), pluginSpec("zz_gone", 0.0), pluginSpec("zz_broken", 0.0)}));
+        CHECK(wb.loadPlugins(false) == 3);
+        CHECK_FALSE(wb.pipeline().at(1).op().info().missing);
+        CHECK(wb.pipeline().at(1).params.getDouble("gain") == 3.0);     // as the pipeline said
+        CHECK(wb.pipeline().at(1).params.getDouble("offset") == 5.0);   // declared by the plugin
+        CHECK(inAddMenu("zz_gone"));
+        CHECK(inPluginKinds("zz_gone"));
+        wb.addStep("zz_gone");
+        wb.setStepParam(2, "gain", 2.0);
+
+        // zz_gone.py is deleted; zz_broken.py now fails to import (and is listed by its file name)
+        catalog.set(json::array({pluginSpec("zz_late", 5.0),
+                                 {{"kind", "zz_broken"}, {"name", "zz_broken"}, {"file", "/plugins/zz_broken.py"}, {"error", "SyntaxError: invalid syntax"}}}));
+        CHECK(wb.loadPlugins(true) == 1);
+        const Operation* gone = findOperation("zz_gone");
+        REQUIRE(gone);
+        CHECK(gone->info().missing);
+        CHECK_FALSE(inAddMenu("zz_gone"));       // was still offered by the add menu
+        CHECK_FALSE(inPluginKinds("zz_gone"));
+        CHECK(loadHelpPage("zz_gone").intro.find("A test plugin") == std::string::npos);
+        const Operation* broken = findOperation("zz_broken");
+        REQUIRE(broken);
+        CHECK_FALSE(broken->info().missing);   // a file still there keeps its last good registration
+        CHECK(inAddMenu("zz_broken"));
+        // the step keeps its place, its parameters and a reason
+        REQUIRE(wb.pipeline().size() == 3);
+        CHECK(wb.pipeline().at(2).kind == "zz_gone");
+        CHECK(wb.pipeline().at(2).params.getDouble("gain") == 2.0);
+        CHECK_THAT(wb.stepValidation(2).firstError(), Catch::Matchers::ContainsSubstring("not loaded"));
+        CHECK_THROWS_AS(wb.addStep("zz_gone"), std::out_of_range);
+        wb.undo();
+        wb.undo();
+        CHECK(wb.pipeline().size() == 2);
+        wb.redo();   // a snapshot naming the kind restores
+        REQUIRE(wb.pipeline().size() == 3);
+        CHECK(wb.pipeline().at(2).kind == "zz_gone");
+
+        // the file comes back
+        catalog.set(json::array({pluginSpec("zz_late", 5.0), pluginSpec("zz_gone", 0.0), pluginSpec("zz_broken", 0.0)}));
+        CHECK(wb.loadPlugins(true) == 3);
+        CHECK_FALSE(findOperation("zz_gone")->info().missing);
+        CHECK(inAddMenu("zz_gone"));
+        CHECK(wb.stepValidation(2).ok());
+    }
+    std::error_code ec;
+    std::filesystem::remove_all(scratch, ec);
+}
+
+#ifndef _WIN32
+TEST_CASE("a plugin file deleted and reloaded leaves the add menu", "[app][rpc][worker][plugin]") {
+    const char* python = std::getenv("SIRIUS_PYTHON");
+    if (!python || !*python) SKIP("SIRIUS_PYTHON is not set");
+    const std::string dir = workerScriptPath();
+    if (dir.empty()) SKIP("sirius_worker not found");
+    registerBuiltinOperations();
+    const std::filesystem::path pdir = test::uniqueTempPath("plugins_reload", "");
+    std::filesystem::create_directories(pdir);
+    for (const char* kind : {"zz_worker_gone", "zz_worker_kept"})
+        std::ofstream(pdir / (std::string(kind) + ".py")) << "STEP = {'kind': '" << kind << "', 'name': 'Test'}\n"
+                                                          << "def run(data, params, meta, ctx):\n    return data\n";
+    const std::string cmd = std::string("cd '") + dir + "' && SIRIUS_PLUGIN_DIRS='" + pdir.string() + "' exec '" + python +
+                            "' -m sirius_worker --host 127.0.0.1 --port 0 --token reload --device cpu 2>/dev/null";
+    FILE* pipe = ::popen(cmd.c_str(), "r");
+    REQUIRE(pipe);
+    char line[512] = {0};
+    REQUIRE(std::fgets(line, sizeof line, pipe));
+    const int port = json::parse(line).value("port", 0);
+    REQUIRE(port > 0);
+    auto worker = RemoteWorker::connect("127.0.0.1", port, "reload");
+
+    PluginLoadResult r = registerPluginOperations(*worker, false);
+    CHECK(inAddMenu("zz_worker_gone"));
+    CHECK(inAddMenu("zz_worker_kept"));
+    Pipeline p;
+    p.add("zz_worker_gone");
+    const json snapshot = p.toJson();
+
+    std::filesystem::remove(pdir / "zz_worker_gone.py");   // Plugin Manager ▸ Delete
+    r = registerPluginOperations(*worker, true);
+    CHECK(r.removed == std::vector<std::string>{"zz_worker_gone"});
+    REQUIRE(findOperation("zz_worker_gone"));
+    CHECK(findOperation("zz_worker_gone")->info().missing);
+    CHECK_FALSE(inAddMenu("zz_worker_gone"));
+    CHECK_FALSE(inPluginKinds("zz_worker_gone"));
+    CHECK(inAddMenu("zz_worker_kept"));
+    CHECK_NOTHROW(Pipeline::fromJson(snapshot));
+
+    // a file that breaks is not a removal
+    std::ofstream(pdir / "zz_worker_kept.py") << "this is not python (\n";
+    r = registerPluginOperations(*worker, true);
+    CHECK(r.removed.empty());
+    CHECK_FALSE(findOperation("zz_worker_kept")->info().missing);
+    CHECK(inAddMenu("zz_worker_kept"));
+
+    (void)worker->call("shutdown", json::object());
+    worker->close();
+    ::pclose(pipe);
+    std::filesystem::remove_all(pdir);
+}
+#endif
+
+// --- a worker that dies ------------------------------------------------------------
+
+#ifndef _WIN32
+#include <arpa/inet.h>
+#include <netinet/in.h>
+#include <sys/socket.h>
+
+TEST_CASE("A worker that dies while a request is sent is an error, not SIGPIPE", "[app][rpc]") {
+    const int listener = ::socket(AF_INET, SOCK_STREAM, 0);
+    REQUIRE(listener >= 0);
+    sockaddr_in addr{};
+    addr.sin_family = AF_INET;
+    addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    addr.sin_port = 0;
+    REQUIRE(::bind(listener, reinterpret_cast<sockaddr*>(&addr), sizeof addr) == 0);
+    REQUIRE(::listen(listener, 1) == 0);
+    socklen_t len = sizeof addr;
+    REQUIRE(::getsockname(listener, reinterpret_cast<sockaddr*>(&addr), &len) == 0);
+    // answers hello, then its process is gone (out of memory, a wall-time limit)
+    std::thread server([listener] {
+        const int s = ::accept(listener, nullptr, nullptr);
+        if (s < 0) return;
+        std::vector<std::byte> in;
+        std::vector<char> buf(1 << 16);
+        std::optional<rpc::Message> hello;
+        while (!(hello = rpc::decodeFrame(in))) {
+            const auto n = ::recv(s, buf.data(), buf.size(), 0);
+            if (n <= 0) break;
+            in.insert(in.end(), reinterpret_cast<const std::byte*>(buf.data()), reinterpret_cast<const std::byte*>(buf.data()) + n);
+        }
+        if (hello) {
+            const std::vector<std::byte> reply = rpc::encodeFrame(
+                {{"id", hello->header["id"]}, {"type", "result"}, {"result", {{"protocol_version", rpc::kProtocolVersion}}}}, {});
+            (void)::send(s, reply.data(), reply.size(), 0);
+        }
+        ::close(s);
+    });
+    std::unique_ptr<RemoteWorker> worker = RemoteWorker::connect("127.0.0.1", ntohs(addr.sin_port), "");
+    server.join();
+    ::close(listener);
+    std::vector<float> volume(16 << 20);   // 64 MB: more than the socket buffers take without a reader
+    const rpc::TensorRef ref{"volume", "float32", {static_cast<Index>(volume.size())}, volume.data(), volume.size() * sizeof(float)};
+    // before: the application ended here with SIGPIPE (exit status 141)
+    CHECK_THROWS_AS(worker->call("run", {{"kind", "x"}}, {ref}), ProtocolError);
+}
+#endif

@@ -94,6 +94,9 @@ namespace sirius::app {
     // Probe a path without reading pixels: dims (as far as the metadata goes),
     // dtype, size, channels. Throws std::runtime_error when unreadable.
     DatasetMeta probeDataset(const std::string& path);
+    // The meta openDataset(path, options) would give, still without reading
+    // pixels (`readAll` is ignored). Throws like openDataset.
+    DatasetMeta probeDataset(const std::string& path, const OpenOptions& options);
     OpenResult openDataset(const std::string& path, const OpenOptions& options = {});
 
     // Formats the build can open, as file-dialog filters and extensions.

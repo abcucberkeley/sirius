@@ -379,9 +379,12 @@ namespace sirius::app {
     // --- dataset -------------------------------------------------------------------
 
     namespace {
+        // `params` holds what the options do not say (the defaults for a
+        // dataset opened afresh, a pipeline's own Load step when it names it).
         void applyOpenOptions(ParamSet& params, const std::string& path, const OpenOptions& o, const DatasetMeta& meta) {
             params.set("path", path);
             params.set("read_as", std::string(o.readAll ? "Full load to RAM" : "Lazy (chunk on demand)"));
+            params.set("tile", static_cast<std::int64_t>(o.tile));
             if (o.pageOrder) {
                 params.set("page_order", o.pageOrder->order);
                 params.set("c", static_cast<std::int64_t>(o.pageOrder->c));
@@ -396,6 +399,7 @@ namespace sirius::app {
             if (o.sim) {
                 params.set("sim_ndirs", static_cast<std::int64_t>(o.sim->present ? o.sim->ndirs : 0));
                 params.set("sim_nphases", static_cast<std::int64_t>(o.sim->present ? o.sim->nphases : 0));
+                params.set("sim_fast", o.sim->present && o.sim->fastSi);
             } else if (meta.sim.present) {
                 params.set("sim_ndirs", static_cast<std::int64_t>(meta.sim.ndirs));
                 params.set("sim_nphases", static_cast<std::int64_t>(meta.sim.nphases));
@@ -404,33 +408,7 @@ namespace sirius::app {
         }
     } // namespace
 
-    OpenOptions Workbench::openOptionsFromLoadParams(const ParamSet& p) {
-        OpenOptions o;
-        o.readAll = p.getString("read_as").rfind("Full", 0) == 0;
-        const std::string order = p.getString("page_order");
-        const Index c = p.getInt("c", 0), t = p.getInt("t", 0), z = p.getInt("z", 0);
-        if (c > 0 || t > 0 || z > 0 || (!order.empty() && order != "czt")) {
-            PageOrder po;
-            po.order = order.empty() ? "czt" : order;
-            po.c = std::max<Index>(c, 0);   // 0: the file's own (probeTiff)
-            po.t = std::max<Index>(t, 0);
-            po.z = std::max<Index>(z, 0);
-            o.pageOrder = po;
-        }
-        // any one of them overrides that axis; 0 keeps the file's (as the Load step's run does)
-        const double vx = p.getDouble("voxel_x", 0.0), vy = p.getDouble("voxel_y", 0.0), vz = p.getDouble("voxel_z", 0.0);
-        if (vx > 0.0 || vy > 0.0 || vz > 0.0) o.voxelUm = std::array<double, 3>{std::max(vx, 0.0), std::max(vy, 0.0), std::max(vz, 0.0)};
-        const int ndirs = static_cast<int>(p.getInt("sim_ndirs", 0)), nphases = static_cast<int>(p.getInt("sim_nphases", 0));
-        if (ndirs > 0 && nphases > 0) {
-            SimLayout sim;
-            sim.present = true;
-            sim.ndirs = ndirs;
-            sim.nphases = nphases;
-            sim.fastSi = p.getBool("sim_fast", false);
-            o.sim = sim;
-        }
-        return o;
-    }
+    OpenOptions Workbench::openOptionsFromLoadParams(const ParamSet& p) { return loadOpenOptions(p); }
 
     void Workbench::startRecording(const std::string& path) {
         nlohmann::json header{{"application", "sirius"}};
@@ -456,14 +434,23 @@ namespace sirius::app {
     void Workbench::recordEvent(const std::string& event, const nlohmann::json& fields) { session_.record(event, fields); }
 
     void Workbench::openDataset(const std::string& path, const OpenOptions& options) {
+        // A dataset opened afresh (the Open dialog, a recent file, a drop)
+        // starts from the Load step's defaults: the previous dataset's page
+        // order, axes, voxel size or tile describe that dataset, and would be
+        // applied to this one the next time the Load step runs.
+        const Operation* op = findOperation("load");
+        openDatasetAs(path, options, op ? op->defaults() : ParamSet{});
+    }
+
+    void Workbench::openDatasetAs(const std::string& path, const OpenOptions& options, ParamSet loadParams) {
         if (refuseIfRunning("open a dataset")) throw std::runtime_error("A run is in progress: cancel it or wait before opening a dataset.");
         OpenResult opened = sirius::app::openDataset(path, options);   // throws with a message
-        Step& load = pipeline_.at(0);
-        applyOpenOptions(load.params, path, options, opened.meta);
+        applyOpenOptions(loadParams, path, options, opened.meta);
         if (const Operation* op = findOperation("load")) {
-            load.params.applyDefaults(op->info().params);
-            load.params.coerce(op->info().params);
+            loadParams.applyDefaults(op->info().params);
+            loadParams.coerce(op->info().params);
         }
+        pipeline_.at(0).params = std::move(loadParams);
         installDataset(opened.source, opened.meta, "opened " + opened.meta.format);
         logLine("Opened " + path + " · " + datasetMeta_.shapeString() + " · " + opened.metadataSummary);
         session_.record("dataset", {{"path", path},
@@ -511,12 +498,22 @@ namespace sirius::app {
         if (source_->inMemory()) out->array = source_->readAll();
         out->note = std::move(note);
         loadOutput_ = out;
-        executor_.seed(pipeline_, 0, out);
+        loadOutputParams_ = pipeline_.at(0).params;
+        seedLoadOutput();
         view_.channelVisible.assign(static_cast<std::size_t>(std::max<Index>(datasetMeta_.dims.c, 1)), true);
         view_.cx = datasetMeta_.dims.x / 2;
         view_.cy = datasetMeta_.dims.y / 2;
         view_.z = datasetMeta_.dims.z / 2;
         view_.t = 0;
+    }
+
+    void Workbench::seedLoadOutput() {
+        // The opened dataset is the Load step's output only for the parameters
+        // it was opened with: after an edit (a tile, a page order, a voxel
+        // size) the step has to run again, and storing the old source under
+        // the edited parameters served the old data as their fresh result.
+        if (source_ && loadOutput_ && pipeline_.at(0).params.toJson() == loadOutputParams_.toJson())
+            executor_.seed(pipeline_, 0, loadOutput_);
     }
 
     void Workbench::closeDataset() {
@@ -650,8 +647,12 @@ namespace sirius::app {
         if (refuseIfRunning("edit parameters")) return;
         const Snapshot before = snapshot();
         pipeline_.setParams(index, params);
-        if (pipeline_.at(index).params == ParamSet::fromJson(before.pipeline["steps"][static_cast<std::size_t>(index)]["params"]))
-            return;   // nothing changed after coercion
+        // Nothing changed after coercion: compared as values. A set read back
+        // from the snapshot's JSON lists its keys sorted, the step's in spec
+        // order, so every step with two parameters or more looked edited, and
+        // the undo entry of a no-op commit (a field losing focus) wiped the redo.
+        if (pipeline_.at(index).params.toJson() == before.pipeline["steps"][static_cast<std::size_t>(index)]["params"])
+            return;
         pushEdit(label.empty() ? "Edit " + pipeline_.at(index).name : label, before, mergeKey);
         // the values themselves, not just the label: a reader wants what was
         // set, on which kind of step, not a sentence about it
@@ -708,7 +709,7 @@ namespace sirius::app {
         // The old steps' outputs go: the incoming steps may reuse their ids,
         // and output(index) serves a step's last output fresh or not.
         executor_.clear();
-        if (source_) executor_.seed(pipeline_, 0, loadOutput_);
+        seedLoadOutput();
         selected_ = std::min(1, pipeline_.size() - 1);
         viewed_ = pipeline_.size() - 1;
         clampSelection();
@@ -748,10 +749,17 @@ namespace sirius::app {
         replacePipeline(p, "Load pipeline " + std::filesystem::path(path).filename().string());
         pipelinePath_ = path;
         logLine("Loaded pipeline " + path);
+        for (int i = 1; i < pipeline_.size(); ++i)
+            if (pipeline_.at(i).op().info().missing)
+                logLine("Step " + Step::number(i) + " '" + pipeline_.at(i).kind + "' is not loaded: reload plugins once its plugin is installed");
         // A pipeline that names its dataset opens it (relative paths resolve
         // against the pipeline file, then the working directory).
         const std::string dataset = pipeline_.at(0).params.getString("path");
-        if (dataset.empty() || (source_ && datasetMeta_.sourcePath == dataset)) return;
+        if (dataset.empty()) return;
+        // The open dataset is the pipeline's when it is the same file opened
+        // the same way; the same file with another tile, page order or voxel
+        // size is opened again, the way the pipeline says.
+        if (source_ && datasetMeta_.sourcePath == dataset && pipeline_.at(0).params.toJson() == loadOutputParams_.toJson()) return;
         std::filesystem::path resolved = dataset;
         if (resolved.is_relative()) {
             const std::filesystem::path beside = std::filesystem::path(path).parent_path() / resolved;
@@ -759,7 +767,10 @@ namespace sirius::app {
             if (std::filesystem::exists(beside, ec)) resolved = beside;
         }
         try {
-            openDataset(resolved.string(), openOptionsFromLoadParams(pipeline_.at(0).params));
+            // the pipeline's own Load parameters, not the defaults: its light-sheet
+            // angle is not an open option, and must not be lost to the open
+            const ParamSet wanted = pipeline_.at(0).params;
+            openDatasetAs(resolved.string(), openOptionsFromLoadParams(wanted), wanted);
         } catch (const std::exception& e) {
             logLine("The pipeline's dataset could not be opened: " + std::string(e.what()));
             // The data on screen is still the previous dataset: the Load
@@ -767,7 +778,7 @@ namespace sirius::app {
             // while its output (the previous data) is served as fresh.
             if (source_) {
                 pipeline_.at(0).params = loadBefore;
-                executor_.seed(pipeline_, 0, loadOutput_);
+                seedLoadOutput();
                 notifyStep(0);
                 notify(&Observer::outputsChanged);
             }
@@ -1134,7 +1145,7 @@ namespace sirius::app {
         if (refuseIfRunning("clear the caches")) return;
         endPaintStroke();
         executor_.clear();
-        if (source_) executor_.seed(pipeline_, 0, loadOutput_);
+        seedLoadOutput();
         logLine("Cleared all caches");
         notify(&Observer::outputsChanged);
     }
@@ -1180,7 +1191,25 @@ namespace sirius::app {
             for (const std::string& k : r.kinds) kinds += (kinds.empty() ? "" : ", ") + k;
             logLine(r.kinds.empty() ? "Plugins: none found" + (r.dirs.empty() ? std::string() : " in " + r.dirs.back())
                                     : "Plugins: " + kinds);
+            for (const std::string& k : r.removed) logLine("Plugins: no file provides '" + k + "' any more");
+            // A step of a kind that is loaded now (a pipeline opened before its
+            // plugin was) takes the parameters the operation declares; a step
+            // whose plugin went is shown as not loaded.
+            bool stepsChanged = false;
+            for (int i = 1; i < pipeline_.size(); ++i) {
+                const std::string& kind = pipeline_.at(i).kind;
+                if (std::find(r.kinds.begin(), r.kinds.end(), kind) != r.kinds.end()) {
+                    pipeline_.setParams(i, pipeline_.at(i).params);
+                    stepsChanged = true;
+                } else if (std::find(r.removed.begin(), r.removed.end(), kind) != r.removed.end()) {
+                    stepsChanged = true;
+                }
+            }
             notify(&Observer::operationsChanged);
+            if (stepsChanged) {
+                notify(&Observer::pipelineChanged);
+                notify(&Observer::outputsChanged);
+            }
             return static_cast<int>(r.kinds.size());
         } catch (const std::exception& e) {
             logLine(std::string("Plugins unavailable: ") + e.what());
@@ -1283,6 +1312,22 @@ namespace sirius::app {
             logLine("Run " + (job->wasCancelled() ? std::string("cancelled") : "failed: " + job->error()));
         }
         job->ownedRemote_.reset();
+        // A run that re-ran the Load step (its tile, page order or voxel size
+        // was edited) opened the data anew: that is the dataset from now on,
+        // the output step 01 shows and the one the caches are seeded with
+        // when they are cleared.
+        bool reopened = false;
+        if (source_) {
+            std::shared_ptr<const StepOutput> load = executor_.cached(pipeline_, 0);
+            if (load && load->source && load->source != source_) {
+                loadOutput_ = load;
+                loadOutputParams_ = pipeline_.at(0).params;
+                source_ = load->source;
+                datasetMeta_ = load->meta;
+                reopened = true;
+            }
+        }
+        if (reopened) notify(&Observer::datasetChanged);
         const DatasetMeta meta = outputMetaOf(viewed_);
         view_.channelVisible.resize(static_cast<std::size_t>(std::max<Index>(meta.dims.c, 1)), true);
         view_.z = std::clamp<Index>(view_.z, 0, std::max<Index>(meta.dims.z - 1, 0));

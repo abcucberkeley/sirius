@@ -21,6 +21,8 @@
 #include "core/cancel.hpp"
 #include "core/executor.hpp"
 #include "core/history.hpp"
+#include "core/manifest.hpp"
+#include "core/ops/plugin.hpp"
 #include "core/pipeline.hpp"
 #include "core/tool_api.hpp"
 #include "core/workbench.hpp"
@@ -393,6 +395,60 @@ TEST_CASE("Pipeline round-trips through JSON and TOML with ids", "[app][pipeline
     const std::string py = p.toPythonScript("/data/x.tif");
     CHECK(py.find("run_pipeline") != std::string::npos);
     CHECK(py.find("test_maxz") != std::string::npos);
+}
+
+TEST_CASE("A step whose operation is not loaded keeps its place and its parameters", "[app][pipeline][plugin]") {
+    registerTestOps();
+    const json written = {{"sigma", 2.5}, {"mode", "fast"}, {"sizes", {1, 2, 3}}};
+    const json j = {{"version", 1},
+                    {"steps", json::array({{{"kind", "load"}},
+                                           {{"kind", "test_scale"}, {"params", {{"factor", 3.0}}}},
+                                           {{"kind", "test_not_loaded"}, {"name", "My plugin"}, {"cache", "memory"}, {"params", written}}})}};
+    const Pipeline p = Pipeline::fromJson(j);   // was: "pipeline: unknown operation 'test_not_loaded'"
+    REQUIRE(p.size() == 3);
+    const Step& s = p.at(2);
+    CHECK(s.kind == "test_not_loaded");
+    CHECK(s.name == "My plugin");
+    CHECK(s.cache == CachePolicy::Memory);
+    REQUIRE(s.op().info().missing);
+    CHECK(p.toJson()["steps"][2]["params"] == written);   // saved back as written, no defaults of a guess
+    const Validation v = s.op().validate(s.params, DatasetMeta{});
+    CHECK_FALSE(v.ok());
+    CHECK_THAT(v.firstError(), Catch::Matchers::ContainsSubstring("not loaded"));
+    // a stand-in is not something to add, list or look up help for
+    Pipeline copy = p;
+    CHECK_THROWS_AS(copy.add("test_not_loaded"), std::out_of_range);
+    for (const Operation* op : allOperations()) CHECK(op->kind() != "test_not_loaded");
+    for (const auto& group : operationGroups())
+        for (const Operation* op : group.second) CHECK(op->kind() != "test_not_loaded");
+    for (const json& op : operationSchemas()["operations"]) CHECK(op["kind"] != "test_not_loaded");
+    CHECK_THROWS_WITH(Pipeline::fromJson({{"steps", json::array({{{"kind", "load"}}, json::object()})}}),
+                      Catch::Matchers::ContainsSubstring("without a kind"));
+
+    test::TempFile file("pipeline", ".sirius.toml");
+    p.save(file.str);
+    CHECK(Pipeline::load(file.str).toJson()["steps"][2]["params"] == written);
+
+    Scratch scratch;
+    Workbench wb(scratch.dir);
+    wb.setDataset(syntheticSource());
+    wb.setBackend(Backend::Cpu);
+    wb.replacePipeline(p, "Load pipeline");
+    CHECK(wb.stepSummary(2) == "not loaded");
+    CHECK_FALSE(wb.createRun());   // refused with the reason, not thrown
+    CHECK(logContains(wb, "not loaded"));
+    CHECK(runSync(wb, 1)->succeeded());   // the steps above it still run
+    wb.removeStep(2);
+    CHECK(wb.pipeline().size() == 2);
+    wb.undo();   // the snapshot names the kind: restoring it does not throw
+    REQUIRE(wb.pipeline().size() == 3);
+    CHECK(wb.pipeline().at(2).kind == "test_not_loaded");
+    CHECK(wb.pipeline().at(2).params.toJson() == written);
+    wb.redo();
+    CHECK(wb.pipeline().size() == 2);
+    ToolApi api(wb);
+    CHECK(api.call("add_step", {{"kind", "test_not_loaded"}}).contains("error"));
+    for (const json& op : api.call("list_operations", json::object())) CHECK(op["kind"] != "test_not_loaded");
 }
 
 // --- Executor -------------------------------------------------------------------
@@ -1865,6 +1921,52 @@ TEST_CASE("Files named in a list parameter are part of the fingerprint", "[app][
     CHECK(ex.fingerprint(p, 1) != before);
 }
 
+TEST_CASE("A reloaded plugin is not served the result of the code it replaced", "[app][executor][plugin]") {
+    registerTestOps();
+    Scratch scratch;
+    const std::filesystem::path file = scratch.dir / "test_fp_plugin.py";
+    std::ofstream(file) << "def run(x): return x * 2\n";
+    const json spec = {{"kind", "test_fp_plugin"},
+                       {"name", "Mine"},
+                       {"file", file.string()},
+                       {"params", json::array({{{"key", "gain"}, {"type", "double"}, {"default", 1.0}}})}};
+    registerOperation(makePluginOperation(spec));
+    Pipeline p;
+    p.add("test_fp_plugin");
+    Executor ex(scratch.dir / "cache");
+    const std::string loaded = ex.fingerprint(p, 1);
+    CHECK(ex.fingerprint(p, 1) == loaded);
+    std::ofstream(file) << "def run(x): return x * 3   # edited\n";
+    const std::string edited = ex.fingerprint(p, 1);
+    CHECK(edited != loaded);   // the file changed: a worker that starts afresh imports the edit
+    registerOperation(makePluginOperation(spec));   // what Reload plugins does
+    const std::string reloaded = ex.fingerprint(p, 1);
+    CHECK(reloaded != loaded);   // was the same: the old code's output was served as fresh
+    CHECK(reloaded != edited);   // a run between the edit and the reload still ran the old code
+}
+
+TEST_CASE("A cache policy changed after an eviction does not serve the empty shell", "[app][workbench][executor]") {
+    registerTestOps();
+    Scratch scratch;
+    Workbench wb(scratch.dir);
+    wb.setDataset(syntheticSource(1, 1, 2, 8, 8));
+    wb.setBackend(Backend::Cpu);
+    wb.replacePipeline(Pipeline(), "clear");
+    for (int i = 0; i < 4; ++i) wb.addStep("test_scale");
+    wb.setStepCache(1, CachePolicy::Recompute);
+    wb.setStepCache(2, CachePolicy::Recompute);
+    REQUIRE(runSync(wb)->succeeded());   // step 02's store evicted step 01's array, step 03's step 02's
+    wb.setStepCache(1, CachePolicy::Memory);
+    wb.setStepParam(4, "factor", 3.0);
+    REQUIRE(runSync(wb, 4)->succeeded());   // a store: the entries take the pipeline's policies
+    CHECK_FALSE(wb.outputFresh(1));         // no array left to serve, whatever the policy says now
+    wb.setStepParam(2, "factor", 5.0);
+    const std::shared_ptr<RunJob> job = runSync(wb, 2);
+    CHECK(job->succeeded());   // was "step input has neither an array nor a source"
+    REQUIRE(wb.output(2));
+    CHECK(wb.output(2)->array);
+}
+
 TEST_CASE("Label statistics follow the viewed time point", "[app][workbench][labels]") {
     registerTestOps();
     Scratch scratch;
@@ -1926,6 +2028,187 @@ TEST_CASE("Load parameters left at zero keep the file's own axes and voxel sizes
     const OpenResult voxel = sirius::app::openDataset(path.string(), oneVoxel);
     CHECK(voxel.meta.voxelUm[2] == 0.7);
     CHECK(voxel.meta.voxelUm[0] == plain.meta.voxelUm[0]);   // the file's, not 0
+}
+
+namespace {
+    // A plain float32 TIFF of `pages` 4 x 4 pages, each page's value its index.
+    std::string writePages(const std::filesystem::path& path, Index pages, const std::string& description = {}) {
+        Buffer<float> b(Shape{pages, 4, 4});
+        for (Index i = 0; i < b.size(); ++i) b.data()[i] = static_cast<float>(i / 16);
+        TiffWriteOptions w;
+        w.description = description;
+        writeTiffStack<float>(path.string(), b.view(), w);
+        return path.string();
+    }
+} // namespace
+
+TEST_CASE("The Load step's dims are the source's, whatever the axes asked for", "[app][workbench][load]") {
+    registerTestOps();
+    Scratch scratch;
+    const Operation* loadOp = findOperation("load");
+    REQUIRE(loadOp);
+    const Operation& load = *loadOp;
+    Executor ex(scratch.dir / "cache");
+    StepContext ctx;
+
+    // an ImageJ hyperstack of 2 channels x 10 planes: 20 pages, which 2
+    // channels x 4 time points do not divide
+    const std::string path = writePages(scratch.dir / "hyper.tif", 20, "ImageJ=1.53t\nimages=20\nchannels=2\nslices=10\nhyperstack=true\n");
+    Pipeline p;
+    ParamSet lp = p.at(0).params;
+    lp.set("path", path);
+    lp.set("t", std::int64_t{4});
+    p.setParams(0, lp);
+    std::shared_ptr<const StepOutput> out = ex.run(p, 0, ctx);
+    REQUIRE(out->source);
+    // was c1 t4 z5 over a source serving c1 t1 z20: a reader of one volume
+    // allocated 5 planes and the source wrote 20 into them
+    REQUIRE(out->meta.dims == out->source->dims());
+    CHECK(out->meta.dims == Dims5{1, 1, 20, 4, 4});
+    const Buffer<float> volume = out->asInput().readVolume(0, 0);
+    CHECK(volume.shape()[0] == 20);
+    // what the step predicts is what it produces, and it says why
+    CHECK(load.outputMeta(p.at(0).params, DatasetMeta{}).dims == out->meta.dims);
+    const Validation v = load.validate(p.at(0).params, DatasetMeta{});
+    CHECK(v.ok());
+    REQUIRE(v.warnings.size() == 1);
+    CHECK_THAT(v.warnings.front(), Catch::Matchers::ContainsSubstring("do not fit"));
+
+    SECTION("a layout that fits is applied, by the prediction and the run alike") {
+        lp.set("t", std::int64_t{0});
+        lp.set("c", std::int64_t{4});   // 20 = 4 x 5
+        p.setParams(0, lp);
+        const std::shared_ptr<const StepOutput> four = ex.run(p, 0, ctx);
+        CHECK(four->meta.dims == Dims5{4, 1, 5, 4, 4});
+        CHECK(four->source->dims() == four->meta.dims);
+        CHECK(load.outputMeta(p.at(0).params, DatasetMeta{}).dims == four->meta.dims);
+        CHECK(load.validate(p.at(0).params, DatasetMeta{}).warnings.empty());
+    }
+
+    SECTION("a folder takes its axes from its manifest, and says so") {
+        const std::filesystem::path folder = scratch.dir / "frames";
+        std::filesystem::create_directories(folder);
+        writePages(folder / "f0.tif", 3);
+        writePages(folder / "f1.tif", 3);
+        manifestOfOneStack(folder).save(folder);
+        ParamSet fp = load.defaults();
+        fp.set("path", folder.string());
+        fp.set("t", std::int64_t{6});
+        const Validation fv = load.validate(fp, DatasetMeta{});
+        CHECK_FALSE(fv.ok());
+        CHECK_THAT(fv.firstError(), Catch::Matchers::ContainsSubstring("manifest"));
+        Pipeline q;
+        q.setParams(0, fp);
+        CHECK_THROWS_WITH(ex.run(q, 0, ctx), Catch::Matchers::ContainsSubstring("manifest"));
+        fp.set("t", std::int64_t{0});
+        q.setParams(0, fp);
+        CHECK(ex.run(q, 0, ctx)->meta.dims == Dims5{1, 2, 3, 4, 4});
+    }
+}
+
+TEST_CASE("Opening another dataset starts from the Load step's defaults", "[app][workbench][load]") {
+    registerTestOps();
+    Scratch scratch;
+    const std::string a = writePages(scratch.dir / "a.tif", 12), b = writePages(scratch.dir / "b.tif", 8);
+    Workbench wb(scratch.dir / "wb");
+    wb.setBackend(Backend::Cpu);
+    OpenOptions oa;
+    oa.voxelUm = std::array<double, 3>{0.05, 0.05, 0.3};
+    oa.pageOrder = PageOrder{"czt", 3, 1, 4};
+    wb.openDataset(a, oa);
+    CHECK(wb.dataset().dims == Dims5{3, 1, 4, 4, 4});
+    CHECK(wb.pipeline().at(0).params.getDouble("voxel_x") == 0.05);
+
+    wb.openDataset(b);   // a recent file, a drop, --dataset: no options
+    const ParamSet& lp = wb.pipeline().at(0).params;
+    CHECK(lp.getString("path") == b);
+    CHECK(lp.getInt("c") == 0);   // was A's 3
+    CHECK(lp.getInt("z") == 0);   // was A's 4
+    CHECK(lp.getDouble("voxel_x") == 0.0);   // was A's 0.05
+    CHECK(wb.dataset().dims == Dims5{1, 1, 8, 4, 4});
+    // the next time the Load step runs it opens B as B
+    wb.setStepParam(0, "read_as", std::string("Full load to RAM"));
+    REQUIRE(runSync(wb, 0)->succeeded());
+    const std::shared_ptr<const StepOutput> reloaded = wb.executor().cached(wb.pipeline(), 0);
+    REQUIRE(reloaded);
+    CHECK(reloaded->meta.dims == Dims5{1, 1, 8, 4, 4});
+    CHECK(reloaded->meta.voxelUm[0] == wb.dataset().voxelUm[0]);
+    CHECK(reloaded->meta.voxelUm[0] != 0.05);
+}
+
+TEST_CASE("A voxel size given for one axis keeps the dataset's for the others", "[app][workbench][load]") {
+    registerTestOps();
+    Scratch scratch;
+    const std::filesystem::path folder = scratch.dir / "frames";
+    std::filesystem::create_directories(folder);
+    writePages(folder / "f0.tif", 3);
+    writePages(folder / "f1.tif", 3);
+    DatasetManifest m = manifestOfOneStack(folder);
+    m.voxelUm = {0.2, 0.2, 0.5};
+    m.save(folder);
+    ParamSet p = requireOperation("load").defaults();
+    p.set("path", folder.string());
+    p.set("voxel_z", 0.7);
+    const OpenResult r = sirius::app::openDataset(folder.string(), Workbench::openOptionsFromLoadParams(p));
+    CHECK(r.meta.voxelUm[0] == 0.2);   // was 0: the whole vector replaced the manifest's
+    CHECK(r.meta.voxelUm[1] == 0.2);
+    CHECK(r.meta.voxelUm[2] == 0.7);
+    CHECK(requireOperation("load").outputMeta(p, DatasetMeta{}).voxelUm == r.meta.voxelUm);
+}
+
+TEST_CASE("An edited Load step is not re-seeded with the data it replaced", "[app][workbench][load][executor]") {
+    registerTestOps();
+    Scratch scratch;
+    const std::string path = writePages(scratch.dir / "stack.tif", 12);
+    Workbench wb(scratch.dir / "wb");
+    wb.setBackend(Backend::Cpu);
+    wb.openDataset(path);
+    wb.replacePipeline(Pipeline(), "clear");
+    wb.addStep("test_scale");
+    REQUIRE(runSync(wb)->succeeded());
+    CHECK(wb.output(1)->meta.dims == Dims5{1, 1, 12, 4, 4});
+
+    wb.setStepParam(0, "c", std::int64_t{3});
+    CHECK_FALSE(wb.outputFresh(0));
+    REQUIRE(runSync(wb)->succeeded());
+    CHECK(wb.output(1)->meta.dims == Dims5{3, 1, 4, 4, 4});
+    CHECK(wb.output(0)->meta.dims == Dims5{3, 1, 4, 4, 4});   // step 01 shows what it ran, not what was opened
+    CHECK(wb.dataset().dims == Dims5{3, 1, 4, 4, 4});
+    wb.clearAllCaches();
+    CHECK(wb.outputFresh(0));
+    REQUIRE(runSync(wb)->succeeded());
+    CHECK(wb.output(1)->meta.dims == Dims5{3, 1, 4, 4, 4});   // was c1 z12: the opened source re-seeded under c = 3
+
+    SECTION("an edit that has not run is not seeded either") {
+        wb.setStepParam(0, "c", std::int64_t{4});
+        wb.clearAllCaches();
+        CHECK_FALSE(wb.outputFresh(0));
+        REQUIRE(runSync(wb)->succeeded());
+        CHECK(wb.output(1)->meta.dims == Dims5{4, 1, 3, 4, 4});
+    }
+    SECTION("undoing the edit runs the step with the old parameters again") {
+        wb.undo();
+        CHECK(wb.pipeline().at(0).params.getInt("c") == 0);
+        CHECK_FALSE(wb.outputFresh(0));
+        REQUIRE(runSync(wb)->succeeded());
+        CHECK(wb.output(1)->meta.dims == Dims5{1, 1, 12, 4, 4});
+        CHECK(wb.dataset().dims == Dims5{1, 1, 12, 4, 4});
+    }
+    SECTION("a pipeline naming the same file with other Load parameters opens it that way") {
+        Pipeline q;
+        ParamSet ql = wb.pipeline().at(0).params;
+        ql.set("c", std::int64_t{4});
+        ql.set("sheet_angle", 30.0);
+        q.setParams(0, ql);
+        q.add("test_scale");
+        test::TempFile file("wb", ".sirius.toml");
+        q.save(file.str);
+        wb.loadPipeline(file.str);
+        CHECK(wb.dataset().dims == Dims5{4, 1, 3, 4, 4});   // was still c3 z4: the path matched, so nothing was opened
+        CHECK(wb.outputFresh(0));
+        CHECK(wb.pipeline().at(0).params.getInt("c") == 4);
+        CHECK(wb.pipeline().at(0).params.getDouble("sheet_angle") == 30.0);   // not an open option, and kept
+    }
 }
 
 TEST_CASE("A recorded session marks the strokes and the review decisions", "[app][workbench][session]") {
@@ -2052,6 +2335,57 @@ TEST_CASE("A choice has to be named in full", "[app][pipeline][params]") {
     q.set("interpolation", std::string("c"));       // a prefix is a typo: the default it is
     p.setParams(1, q);
     CHECK(p.at(1).params.getString("interpolation") != "cubic");
+}
+
+TEST_CASE("A pipeline file with a value its parameter cannot take is refused, naming it", "[app][pipeline][params]") {
+    registerBuiltinOperations();
+    const auto write = [](const test::TempFile& file, const std::string& method, const std::string& minVoxels) {
+        std::ofstream(file.path) << "version = 1\n"
+                                    "[[steps]]\nkind = \"load\"\n"
+                                    "[[steps]]\nkind = \"threshold\"\n[steps.params]\nmethod = \""
+                                 << method << "\"\n"
+                                 << "min_voxels = " << minVoxels << "\n";
+    };
+    test::TempFile file("pipeline", ".sirius.toml");
+    write(file, "Triangel", "4");
+    // was loaded with Otsu in place of the misspelt method, silently
+    CHECK_THROWS_WITH(Pipeline::load(file.str), Catch::Matchers::ContainsSubstring("step 02 (threshold)") &&
+                                                    Catch::Matchers::ContainsSubstring("'Triangel' is not one of"));
+    write(file, "otsu", "\"many\"");
+    CHECK_THROWS_WITH(Pipeline::load(file.str), Catch::Matchers::ContainsSubstring("min_voxels"));
+    write(file, "otsu", "4");   // case is still forgiven
+    CHECK(Pipeline::load(file.str).at(1).params.getString("method") == "Otsu");
+    // an undo snapshot is read leniently: it is always well formed
+    const json snapshot = {{"steps", json::array({{{"kind", "load"}}, {{"kind", "threshold"}, {"params", {{"method", "Triangel"}}}}})}};
+    CHECK(Pipeline::fromJson(snapshot).at(1).params.getString("method") == "Otsu");
+    // the pipeline the repository ships loads
+    CHECK_NOTHROW(Pipeline::load(SIRIUS_TEST_DATA_DIR "/../../examples/sim_bundled.sirius.toml"));
+}
+
+TEST_CASE("An edit that changes no value is not an undo entry", "[app][workbench][history][params]") {
+    registerTestOps();
+    Scratch scratch;
+    Workbench wb(scratch.dir);
+    wb.setDataset(syntheticSource(1, 1, 2, 8, 8));
+    for (const char* kind : {"test_labels", "test_scale", "contrast"}) {
+        INFO(kind);
+        wb.addStep(kind);
+        const int i = wb.pipeline().size() - 1;
+        const ParamSet p = wb.pipeline().at(i).params;
+        REQUIRE(p.size() >= 1);
+        const std::size_t before = wb.history().size();
+        wb.setStepParam(i, p.items().front().first, p.items().front().second);
+        CHECK(wb.history().size() == before);   // was one more for every step with two parameters or more
+        wb.setStepParams(i, p, "unchanged");
+        CHECK(wb.history().size() == before);
+    }
+    // a field losing focus commits its unchanged value: the redo survives it
+    wb.undo();
+    REQUIRE(wb.history().canRedo());
+    const int last = wb.pipeline().size() - 1;
+    const auto first = wb.pipeline().at(last).params.items().front();
+    wb.setStepParam(last, first.first, first.second);
+    CHECK(wb.history().canRedo());
 }
 
 TEST_CASE("On tracked labels a split travels along the track", "[app][workbench][labels][track]") {
