@@ -22,8 +22,14 @@
 
 namespace sirius::app {
 
-    enum class ExportFormat { Tiff, Zarr, N5, Raw };
-    enum class ExportScaling { Cast, MinMax, FixedRange, Percentile };
+    enum class ExportFormat { Tiff,
+                              Zarr,
+                              N5,
+                              Raw };
+    enum class ExportScaling { Cast,
+                               MinMax,
+                               FixedRange,
+                               Percentile };
 
     struct ExportRange {
         Index t0 = 0, t1 = -1;              // half open; -1 = to the end

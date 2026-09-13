@@ -315,8 +315,13 @@ namespace sirius::app {
         std::uint64_t total = static_cast<std::uint64_t>(r.planes()) * plane;
         int levels = 1;
         double f = 2.0;
-        if (o.format == ExportFormat::Tiff) { levels = std::max(o.tiff.pyramidLevels, 1); f = std::max(o.tiff.downsample, 2); }
-        else if (o.format == ExportFormat::Zarr || o.format == ExportFormat::N5) { levels = std::max(o.zarr.pyramidLevels, 1); f = std::max(o.zarr.downsample, 2); }
+        if (o.format == ExportFormat::Tiff) {
+            levels = std::max(o.tiff.pyramidLevels, 1);
+            f = std::max(o.tiff.downsample, 2);
+        } else if (o.format == ExportFormat::Zarr || o.format == ExportFormat::N5) {
+            levels = std::max(o.zarr.pyramidLevels, 1);
+            f = std::max(o.zarr.downsample, 2);
+        }
         double factor = 1.0, level = 1.0;
         for (int k = 1; k < levels; ++k) {
             level /= f * f;
