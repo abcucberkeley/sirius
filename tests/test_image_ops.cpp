@@ -64,7 +64,8 @@ TEST_CASE("reduceAxes matches a direct evaluation for every op and axis subset",
             reduceAxes(a.v.data(), e, reduce, op, out.data());
             // direct: for every output voxel, fold the input voxels that map to it
             Array expected(oe);
-            std::vector<double> acc(expected.v.size(), op == ReduceOp::Max ? -1e300 : op == ReduceOp::Min ? 1e300 : 0.0);
+            std::vector<double> acc(expected.v.size(), op == ReduceOp::Max ? -1e300 : op == ReduceOp::Min ? 1e300
+                                                                                                          : 0.0);
             double count = 1;
             for (int i = 0; i < 5; ++i)
                 if (reduce[static_cast<std::size_t>(i)]) count *= static_cast<double>(e[static_cast<std::size_t>(i)]);
@@ -188,8 +189,10 @@ TEST_CASE("deskewGeometry shears each plane by the stage travel along x", "[imag
             const double k = (corner & 1) ? iz - 1 : 0, x = (corner & 2) ? ix - 1 : 0;
             const double X = (x + k * shear) * dx, Zp = k * dzOut;
             const double xr = X * std::cos(th) + Zp * std::sin(th), zr = -X * std::sin(th) + Zp * std::cos(th);
-            zmin = std::min(zmin, zr); zmax = std::max(zmax, zr);
-            xmin = std::min(xmin, xr); xmax = std::max(xmax, xr);
+            zmin = std::min(zmin, zr);
+            zmax = std::max(zmax, zr);
+            xmin = std::min(xmin, xr);
+            xmax = std::max(xmax, xr);
         }
         CHECK(r.ox == static_cast<Index>(std::ceil((xmax - xmin) / dx - 1e-9)) + 1);
         CHECK(r.oz == static_cast<Index>(std::ceil((zmax - zmin) / dx - 1e-9)) + 1);
@@ -353,7 +356,7 @@ namespace {
         detail::downsampleBoxMean<T>(in.data(), shape, factors, out.data());
         return out;
     }
-}
+} // namespace
 
 TEST_CASE("shared box-mean matches the writers' previous behaviour", "[image_ops][downsample]") {
     SECTION("uint16 rounds the mean to nearest, halves away from zero") {

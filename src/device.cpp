@@ -78,7 +78,8 @@ namespace sirius {
         if (d.isCpu()) return;
         if (!builtWithCuda())
             throw std::runtime_error("SIRIUS was built without CUDA support (SIRIUS_ENABLE_CUDA=OFF); "
-                                     "cannot use " + toString(d));
+                                     "cannot use " +
+                                     toString(d));
         if (d.index < 0 || d.index >= cudaDeviceCount())
             throw std::runtime_error("CUDA device " + toString(d) + " does not exist (" +
                                      std::to_string(cudaDeviceCount()) + " device(s) visible)");

@@ -134,10 +134,10 @@ namespace sirius {
             if (reduce[i]) count *= static_cast<double>(extent[i]);
         const double init = initialAccumulator(op);
 
-        #pragma omp parallel
+#pragma omp parallel
         {
             std::vector<double> acc(static_cast<std::size_t>(outPlane));
-            #pragma omp for schedule(dynamic)
+#pragma omp for schedule(dynamic)
             for (Index op_ = 0; op_ < outPlanes; ++op_) {
                 const Index ocI = op_ / (ot * oz), otI = (op_ / oz) % ot, ozI = op_ % oz;
                 std::fill(acc.begin(), acc.end(), init);
@@ -184,7 +184,7 @@ namespace sirius {
         requirePositive(iz, iy, ix, "resampleAffine input");
         requirePositive(oz, oy, ox, "resampleAffine output");
         const Index inPlane = iy * ix;
-        #pragma omp parallel for collapse(2) schedule(dynamic, 4)
+#pragma omp parallel for collapse(2) schedule(dynamic, 4)
         for (Index z = 0; z < oz; ++z)
             for (Index y = 0; y < oy; ++y) {
                 float* row = out + (z * oy + y) * ox;
@@ -320,7 +320,7 @@ namespace sirius {
         requirePositive(oz, oy, ox, "cropPad output");
         // columns of the output that map inside the input
         const Index xa = std::clamp<Index>(-x0, 0, ox), xb = std::clamp<Index>(ix - x0, 0, ox);
-        #pragma omp parallel for collapse(2) schedule(static)
+#pragma omp parallel for collapse(2) schedule(static)
         for (Index z = 0; z < oz; ++z)
             for (Index y = 0; y < oy; ++y) {
                 float* row = out + (z * oy + y) * ox;
@@ -376,11 +376,11 @@ namespace sirius {
         const double span = static_cast<double>(hi) - static_cast<double>(lo);
         const double invGamma = gamma > 0.0f ? 1.0 / static_cast<double>(gamma) : 1.0;
         if (!(span > 0.0)) {
-            #pragma omp parallel for schedule(static)
+#pragma omp parallel for schedule(static)
             for (Index i = 0; i < n; ++i) values[i] = std::isnan(values[i]) ? values[i] : (values[i] > hi ? 1.0f : 0.0f);
             return;
         }
-        #pragma omp parallel for schedule(static)
+#pragma omp parallel for schedule(static)
         for (Index i = 0; i < n; ++i) {
             const double t = std::clamp((static_cast<double>(values[i]) - lo) / span, 0.0, 1.0);
             values[i] = static_cast<float>(invGamma == 1.0 ? t : std::pow(t, invGamma));
@@ -399,10 +399,10 @@ namespace sirius {
         if (n <= 0 || !(hi > lo)) return counts;
         const double scale = bins / (static_cast<double>(hi) - static_cast<double>(lo));
         // per-thread histograms merged at the end: no atomics on the hot loop
-        #pragma omp parallel
+#pragma omp parallel
         {
             std::vector<double> local(counts.size(), 0.0);
-            #pragma omp for schedule(static) nowait
+#pragma omp for schedule(static) nowait
             for (Index i = 0; i < n; ++i) {
                 const float v = values[i];
                 if (!(v >= lo) || v > hi) continue;   // NaN and out-of-range values are not counted
@@ -410,7 +410,7 @@ namespace sirius {
                 if (b >= bins) b = bins - 1;   // v == hi lands in the last bin
                 local[static_cast<std::size_t>(b)] += 1.0;
             }
-            #pragma omp critical
+#pragma omp critical
             for (std::size_t b = 0; b < counts.size(); ++b) counts[b] += local[b];
         }
         return counts;
@@ -419,7 +419,7 @@ namespace sirius {
     void equalizeFrames(float* stack, Index frames, Index planeSize, bool toMean) {
         if (frames <= 0 || planeSize <= 0) return;
         std::vector<double> sums(static_cast<std::size_t>(frames), 0.0);
-        #pragma omp parallel for schedule(static)
+#pragma omp parallel for schedule(static)
         for (Index f = 0; f < frames; ++f) {
             const float* p = stack + f * planeSize;
             double s = 0.0;
@@ -432,7 +432,7 @@ namespace sirius {
             for (double s : sums) target += s;
             target /= static_cast<double>(frames);
         }
-        #pragma omp parallel for schedule(static)
+#pragma omp parallel for schedule(static)
         for (Index f = 0; f < frames; ++f) {
             const double s = sums[static_cast<std::size_t>(f)];
             if (s == 0.0 || !std::isfinite(s)) continue;   // an empty frame cannot be scaled
@@ -457,7 +457,7 @@ namespace sirius {
         // pixels with no gain (dead, vignetted to black) would explode; floor them
         const float floor_ = static_cast<float>(1e-6 * mean);
         for (float& g : gain) g = static_cast<float>(mean / std::max(g, floor_));
-        #pragma omp parallel for schedule(static)
+#pragma omp parallel for schedule(static)
         for (Index p = 0; p < planes; ++p) {
             float* v = values + p * planeSize;
             for (Index i = 0; i < planeSize; ++i)
