@@ -381,7 +381,7 @@ namespace sirius::app {
         QAction* savePipeline = nullptr;
         QAction* savePipelineAs = nullptr;
         QAction* closeDataset = nullptr;
-        std::vector<QAction*> labelEdits;   // label mutations, refused during a run
+        std::vector<QAction*> labelEdits;   // label mutations (and Load Torch model), refused during a run
         QByteArray defaultState;
         QString lastDir;
 
@@ -598,7 +598,9 @@ namespace sirius::app {
 
             // Segment
             QMenu* segment = bar->addMenu(QStringLiteral("Segment"));
-            action(segment, QStringLiteral("Load Torch model…"), QKeySequence(Qt::CTRL | Qt::Key_M), [this] { loadTorchModel(); });
+            // an edit (it adds or changes a step): refused during a run like the label edits
+            labelEdits.push_back(
+                action(segment, QStringLiteral("Load Torch model…"), QKeySequence(Qt::CTRL | Qt::Key_M), [this] { loadTorchModel(); }));
             action(segment, QStringLiteral("Download model…"), QKeySequence(), [this] { modelHub(); });
             action(segment, QStringLiteral("Run segmentation"), QKeySequence(), [this] {
                 const int i = segmentationStep();
@@ -922,6 +924,7 @@ namespace sirius::app {
             const Pipeline& p = wb().pipeline();
             if (index <= 0 || index >= p.size() || !wb().canEdit()) return;
             const Step& step = p.at(index);
+            const StepId id = step.id;
             const QString name = QStringLiteral("%1 %2").arg(fromStd(Step::number(index)), fromStd(step.name));
             const std::size_t cached = wb().executor().cachedBytesOf(step.id);
             if (cached > 64ull * 1024 * 1024) {
@@ -932,6 +935,10 @@ namespace sirius::app {
                         .arg(name, widgets::bytesText(cached)),
                     QMessageBox::Cancel | QMessageBox::Yes, QMessageBox::Cancel);
                 if (answer != QMessageBox::Yes) return;
+                // The question's event loop may have let the assistant move or
+                // remove steps: the step asked about is found again by id.
+                index = wb().pipeline().indexOf(id);
+                if (index <= 0) return;
             }
             wb().removeStep(index);   // logs "Removed step …" itself
             wb().logLine("Edit ▸ Undo (" + toStd(shortcutText(keys::undo())) + ") brings step " + toStd(name) + " back.");
@@ -1165,23 +1172,27 @@ namespace sirius::app {
         }
 
         void loadTorchModel() {
-            int i = segmentationStep();
-            if (i < 0 || wb().pipeline().at(i).kind != "seg") {
-                if (!findOperation("seg")) return;
-                i = wb().pipeline().indexOf(wb().addStep("seg"));
-            }
+            // segmentationStepOrNew() is -1 when no step could be added -- the
+            // workbench refuses every edit during a run, and the index of the
+            // step it did not add was taken as a step (a crash on Ctrl+M).
+            const int i = segmentationStepOrNew();
+            if (i < 0) return;
             const Step& s = wb().pipeline().at(i);
+            const StepId id = s.id;
             std::string pathKey;
             for (const ParamSpec& spec : s.op().info().params)
                 if (spec.type == ParamType::Path) {
                     pathKey = spec.key;
                     break;
                 }
+            if (pathKey.empty()) return;
             const QString path = QFileDialog::getOpenFileName(self, QStringLiteral("Load Torch model"), lastDir,
                                                               QStringLiteral("TorchScript / ONNX (*.pt *.pth *.ts *.onnx);;All files (*)"));
-            if (path.isEmpty() || pathKey.empty()) return;
-            wb().setStepParam(i, pathKey, toStd(path));
-            wb().select(i);
+            // the dialog's event loop may have seen the step move or go
+            const int now = wb().pipeline().indexOf(id);
+            if (path.isEmpty() || now < 0) return;
+            wb().setStepParam(now, pathKey, toStd(path));
+            wb().select(now);
         }
 
         void mergeLabelsDialog() {
