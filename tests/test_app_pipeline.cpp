@@ -1409,6 +1409,57 @@ TEST_CASE("History merges by key and clears redo on push", "[app][history]") {
     }
 }
 
+TEST_CASE("History revision names the state, not the number of entries", "[app][history]") {
+    // What File > Quit compares with the revision of the last save: the entry
+    // count missed a merged drag, an undo followed by a new edit and a clear.
+    auto cmd = [](std::string key = {}) {
+        Command c;
+        c.label = "edit";
+        c.undo = [] {};
+        c.redo = [] {};
+        c.mergeKey = std::move(key);
+        return c;
+    };
+    History h;
+    const auto start = h.revision();
+    h.push(cmd("drag"));
+    const auto saved = h.revision();
+    CHECK(saved != start);
+    h.push(cmd("drag"));   // merges: one entry still, but another state
+    CHECK(h.size() == 1);
+    CHECK(h.revision() != saved);
+    h.undo();
+    CHECK(h.revision() == start);
+    h.redo();
+    const auto dragged = h.revision();
+    CHECK(dragged != saved);
+    h.undo();
+    h.push(cmd());   // an undo and a new edit: as many entries as at the save
+    CHECK(h.size() == 1);
+    CHECK(h.revision() != saved);
+    CHECK(h.revision() != dragged);
+    h.undo();
+    h.redo();   // back and forth returns to the same state
+    const auto edited = h.revision();
+    h.clear();   // forgetting the history changes nothing
+    CHECK(h.revision() == edited);
+    h.push(cmd());
+    CHECK(h.revision() != edited);
+
+    SECTION("the size cap keeps the revision of what undo can still reach") {
+        History g;
+        g.setLimit(2);
+        g.push(cmd());
+        const auto first = g.revision();
+        g.push(cmd());
+        g.push(cmd());   // the first entry falls off
+        g.undo();
+        g.undo();
+        CHECK_FALSE(g.canUndo());
+        CHECK(g.revision() == first);
+    }
+}
+
 TEST_CASE("A drag interrupted by a label edit starts a new undo group", "[app][workbench][history]") {
     registerTestOps();
     Scratch scratch;

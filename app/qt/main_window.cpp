@@ -317,10 +317,13 @@ namespace sirius::app {
         MainWindow* self;
         WorkbenchBridge& bridge;
         bool unattended = false;   // see MainWindow::setUnattended
-        // The history's size when the pipeline was last saved or loaded:
-        // anything beyond it is unsaved (label edits are never saved by
-        // File > Save; they leave through an export).
-        std::size_t savedHistory = 0;
+        // The history's revision when the pipeline was last saved or loaded:
+        // any other one is unsaved work (label edits are never saved by
+        // File > Save; they leave through an export). The entry count used
+        // here missed a merged slider drag after a save, an undo followed by
+        // a new edit, the edits before a dataset open cleared the history,
+        // and every edit past the 200-entry cap.
+        std::uint64_t savedRevision = 0;
 
         ViewerWidget* viewer = nullptr;
         OpsPanel* ops = nullptr;
@@ -1014,14 +1017,14 @@ namespace sirius::app {
             try {
                 wb().savePipeline(toStd(path));
                 lastDir = QFileInfo(path).absolutePath();
-                savedHistory = wb().history().size();
+                savedRevision = wb().history().revision();
             } catch (const std::exception& e) {
                 QMessageBox::warning(self, QStringLiteral("Save pipeline"), QString::fromUtf8(e.what()));
             }
             refreshTitle();
         }
 
-        bool unsavedWork() { return wb().history().size() != savedHistory; }
+        bool unsavedWork() { return wb().history().revision() != savedRevision; }
 
         void loadPipeline() {
             const QString path = QFileDialog::getOpenFileName(self, QStringLiteral("Load pipeline"), lastDir,
@@ -1459,7 +1462,7 @@ namespace sirius::app {
     void MainWindow::openPipelinePath(const QString& path) {
         try {
             impl_->wb().loadPipeline(toStd(path));
-            impl_->savedHistory = impl_->wb().history().size();   // a loaded pipeline is a saved one
+            impl_->savedRevision = impl_->wb().history().revision();   // a loaded pipeline is a saved one
             impl_->lastDir = QFileInfo(path).absolutePath();
         } catch (const std::exception& e) {
             impl_->wb().logLine(std::string("Load pipeline failed: ") + e.what());
