@@ -79,7 +79,7 @@ from .steps import workbench
 log = logging.getLogger("sirius_worker")
 
 # kinds served through run_step plus the two with their own tensor contracts
-_SPECIAL_KINDS = ("torch_segment", "sim", "btrack", "skimage_seg")
+_SPECIAL_KINDS = ("torch_segment", "foundation", "sim", "btrack", "skimage_seg")
 
 
 class _Cancelled(Exception):
@@ -474,6 +474,13 @@ class WorkerServer:
         """Facts about a model spec. Family specs report availability; an hf:
         file not in the cache yet is described without downloading it (the
         first run, or hub_download, fetches it)."""
+        if spec.lower().endswith(".ltb"):
+            # A latents bundle describes itself: the application reads the
+            # thresholds and the voxel size it was calibrated at out of this
+            # and uses them as the step's defaults.
+            from . import foundation as foundation_model
+
+            return foundation_model.model_info(spec)
         ms = model_hub.parse_spec(spec)
         if ms.family in ("cellpose", "microsam"):
             return model_hub.family_info(spec)
@@ -590,6 +597,29 @@ class WorkerServer:
                                       progress=progress, cancelled=cancelled)
             check()
             return {"channels": int(prob.shape[0]), "device": device}, {"prob": prob}
+
+        if kind == "foundation":
+            # The latents foundation model. Unlike every other kind here it
+            # takes the whole (c, t, z, y, x) array in one call, because the
+            # colour and time axes are what the model is for; splitting them
+            # off would leave it doing the same job as torch_segment.
+            from . import foundation as foundation_model
+
+            arr = tensors.get("input")
+            if arr is None:
+                raise ValueError("run foundation: missing tensor 'input'")
+            voxel = p.get("voxel_um") or (params.get("meta") or {}).get("voxel_um")
+            if voxel:
+                p = {**p, "voxel_um": voxel}
+            labels, info, extras = foundation_model.run(arr, p, device, progress=progress, cancelled=cancelled)
+            check()
+            out_t = {"labels": np.ascontiguousarray(labels, dtype=np.uint32)}
+            if extras.get("confidence") is not None:
+                out_t["confidence"] = np.ascontiguousarray(extras["confidence"], dtype=np.float32)
+            result = {**_jsonable(info), "device": device}
+            if extras.get("lineage"):
+                result["lineage"] = {str(k): int(v) for k, v in extras["lineage"].items()}
+            return result, out_t
 
         if kind == "skimage_seg":
             # the scikit-image methods the application does not implement

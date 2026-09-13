@@ -1137,7 +1137,7 @@
           "key": "sheet_angle",
           "label": "Sheet angle",
           "max": 89.0,
-          "min": 1.0,
+          "min": 0.0,
           "read_only": false,
           "type": "double",
           "unit": "°"
@@ -1547,7 +1547,16 @@
           "key": "moving_channel",
           "label": "Moving channel",
           "read_only": false,
-          "type": "channel"
+          "type": "channel",
+          "visible_when": [
+            {
+              "key": "mode",
+              "negate": false,
+              "values": [
+                "Align channels"
+              ]
+            }
+          ]
         },
         {
           "advanced": false,
@@ -1557,7 +1566,16 @@
           "max": 1000000.0,
           "min": 0.0,
           "read_only": false,
-          "type": "int"
+          "type": "int",
+          "visible_when": [
+            {
+              "key": "mode",
+              "negate": false,
+              "values": [
+                "Align time points to reference"
+              ]
+            }
+          ]
         },
         {
           "advanced": false,
@@ -1595,6 +1613,136 @@
       "plugin": false,
       "produces_labels": false,
       "remote_capable": false
+    },
+    {
+      "group": "Segment",
+      "kind": "foundation",
+      "name": "Foundation model",
+      "needs_labels": false,
+      "params": [
+        {
+          "advanced": false,
+          "default": "",
+          "help": "A .ltb bundle: the encoder, the task head and the thresholds it was validated with. One bundle serves planes, volumes, multi-channel stacks and clips",
+          "key": "model",
+          "label": "Model",
+          "read_only": false,
+          "type": "path"
+        },
+        {
+          "advanced": false,
+          "choices": [
+            "Segment objects",
+            "Detect centroids",
+            "Track over time"
+          ],
+          "default": "Segment objects",
+          "help": "Segment gives objects with extents; Detect gives one voxel per object, which is faster and is what the model predicts directly; Track follows objects across time and needs more than one time point",
+          "key": "task",
+          "label": "Task",
+          "read_only": false,
+          "type": "choice"
+        },
+        {
+          "advanced": false,
+          "choices": [
+            "Selected channel",
+            "All channels"
+          ],
+          "default": "Selected channel",
+          "help": "The model accepts several channels at once. Send all of them only when the bundle was trained with channel identities, otherwise pick one",
+          "key": "channels",
+          "label": "Channels",
+          "read_only": false,
+          "type": "choice"
+        },
+        {
+          "advanced": false,
+          "default": 0,
+          "key": "input_channel",
+          "label": "Input channel",
+          "read_only": false,
+          "type": "channel",
+          "visible_when": [
+            {
+              "key": "channels",
+              "negate": false,
+              "values": [
+                "Selected channel"
+              ]
+            }
+          ]
+        },
+        {
+          "advanced": false,
+          "default": 0.0,
+          "help": "Peak probability cut. 0 uses the value the bundle was validated at",
+          "key": "threshold",
+          "label": "Threshold",
+          "max": 1.0,
+          "min": 0.0,
+          "read_only": false,
+          "type": "double"
+        },
+        {
+          "advanced": false,
+          "default": 0.0,
+          "help": "Two peaks closer than this are one object. In microns, so it means the same thing on anisotropic data. 0 uses the bundle's value",
+          "key": "min_separation",
+          "label": "Min. separation",
+          "max": 100.0,
+          "min": 0.0,
+          "read_only": false,
+          "type": "double",
+          "unit": "um"
+        },
+        {
+          "advanced": false,
+          "default": 0,
+          "help": "Drop smaller objects (0 = keep all)",
+          "key": "min_voxels",
+          "label": "Min. voxels",
+          "max": 1000000000.0,
+          "min": 0.0,
+          "read_only": false,
+          "type": "int"
+        },
+        {
+          "advanced": true,
+          "default": [
+            0.0,
+            0.0,
+            0.0
+          ],
+          "help": "Inference tile (z, y, x); all zero uses the bundle's own crop size",
+          "key": "tile",
+          "label": "Tile",
+          "read_only": false,
+          "type": "double_list",
+          "unit": "px"
+        },
+        {
+          "advanced": false,
+          "default": 0.45,
+          "key": "label_opacity",
+          "label": "Label opacity",
+          "max": 1.0,
+          "min": 0.0,
+          "read_only": false,
+          "type": "double"
+        },
+        {
+          "advanced": true,
+          "default": "object",
+          "key": "class_name",
+          "label": "Class",
+          "read_only": false,
+          "type": "string"
+        }
+      ],
+      "plugin": false,
+      "produces_labels": true,
+      "remote_capable": true
     },
     {
       "group": "Segment",
