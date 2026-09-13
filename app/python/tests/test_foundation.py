@@ -16,6 +16,7 @@ whose heatmap the test decides, which needs no latents, torch or weights.
 
 from __future__ import annotations
 
+import importlib.util
 import os
 import socket
 import sys
@@ -84,6 +85,26 @@ def blobs(c=1, t=1, z=8, y=64, x=64):
     for cz, cy, cx in ((4, 16, 16), (4, 44, 20), (4, 24, 46)):
         v += np.exp(-((zz - cz) ** 2 * 4.0 + (yy - cy) ** 2 + (xx - cx) ** 2) / 18.0)
     return v + 0.01 * np.random.default_rng(0).random(v.shape).astype(np.float32)
+
+
+def load_workbench_under_test():
+    """This checkout's bindings/python/sirius/workbench.py, whatever `sirius`
+    the interpreter has installed (as bindings/tests/test_workbench_schema.py)."""
+    here = Path(__file__).resolve().parents[3] / "bindings" / "python" / "sirius" / "workbench.py"
+    try:
+        import sirius.workbench as wb  # type: ignore
+
+        if Path(wb.__file__).resolve() == here:
+            return wb
+    except Exception:  # noqa: BLE001
+        pass
+    name = "sirius_workbench_under_test"
+    if name not in sys.modules:
+        spec = importlib.util.spec_from_file_location(name, here)
+        module = importlib.util.module_from_spec(spec)
+        sys.modules[name] = module
+        spec.loader.exec_module(module)  # type: ignore[union-attr]
+    return sys.modules[name]
 
 
 @unittest.skipUnless(HAVE, f"latents not importable: {WHY}")
@@ -545,6 +566,20 @@ class WithScriptedHeatmap(unittest.TestCase):
             sock.close()
             server.stop()
             thread.join(timeout=5)
+
+    def test_run_step_hands_the_step_its_device_progress_and_cancel(self):
+        wb = load_workbench_under_test()
+        Script.heatmaps = blob((self.Z, self.Y, self.X), (8, 24, 24), (1.5, 3, 3), 0.9)[None]
+        seen = []
+        res = wb.run_step("foundation", {"model": self.path, "task": "Detect centroids"},
+                          clip(1, self.Z, self.Y, self.X), {"voxel_um": [0.15, 0.15, 0.75]},
+                          progress=lambda f, m: seen.append(f), device="cuda:3")
+        self.assertEqual(Script.loads, ["cuda:3"])
+        self.assertTrue(seen)
+        self.assertEqual(res.info["voxel_um"], [0.15, 0.15, 0.75])
+        with self.assertRaises(wb.Cancelled):
+            wb.run_step("foundation", {"model": self.path, "task": "Detect centroids"},
+                        clip(1, self.Z, self.Y, self.X), None, cancelled=lambda: True)
 
 
 if __name__ == "__main__":

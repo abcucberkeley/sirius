@@ -40,12 +40,12 @@ checkout.
 | Parameter | Explanation |
 |---|---|
 | **Model** <br> `.ltb` bundle | Encoder, task head and the thresholds the model was validated with. Its manifest also supplies this step's defaults. |
-| **Task** <br> segment · detect · track | *Segment* returns objects with extents, by growing each detected centre out to where the model's confidence falls away. *Detect* returns one voxel per object, which is what the model predicts directly and is the fastest. *Track* follows objects across time and needs more than one time point. |
+| **Task** <br> segment · detect · track | *Segment* returns objects with extents, by growing each detected centre out to where the model's confidence falls away. *Detect* returns one voxel per object, which is what the model predicts directly and is the fastest. *Track* follows objects across time and needs more than one time point. A bundle whose head predicts three classes (background, interior, boundary) has no centres to detect or link, and runs *Segment* only. |
 | **Channels** <br> one · all | The model accepts several channels together. Send all of them only when the bundle was trained with channel identities; otherwise pick the one channel the structure is in. |
 | **Threshold** <br> 0 = bundle's | Peak probability cut. Lower recovers dim objects, higher separates touching ones. |
 | **Min. separation** <br> µm, 0 = bundle's | Two peaks closer together than this are treated as one object. In **microns**, not voxels, so it means the same thing along z as in plane. On anisotropic data a voxel-based gate is a different physical distance on every axis, which splits single objects in plane while merging distinct ones in depth. |
-| **Min. voxels** | Drop smaller objects. Ignored for a tracking run, where the label id is a track id and renumbering would destroy the identity that makes it one. |
-| **Tile** <br> 0 = bundle's | Inference tile. The bundle's own crop size is usually right; reduce it if the GPU runs out of memory. |
+| **Min. voxels** <br> Segment only | Drop smaller objects. *Detect* returns one voxel per object, so there is no size to filter. A tracking run keeps every object: there the label id is a track id, and dropping an object in the one frame where it looks small would leave a hole in its track. |
+| **Tile** <br> 0 = bundle's | Inference tile (z, y, x); a zero extent uses the bundle's own crop size on that axis. The bundle's size is usually right; reduce it if the GPU runs out of memory. |
 
 ## Tracking
 
@@ -56,9 +56,11 @@ result without knowing a model produced it.
 
 Divisions are reported as a count in the diagnostics rather than as a lineage
 tree, because a label volume has no parent/child structure to hold one. Treat
-that count as approximate: a detector that splits one bright object into two
-peaks produces the same local geometry as a division, and only part of that
-confusion can be removed after the fact.
+that count as approximate. The linker matches one object to one object, so a
+division is recovered afterwards by a geometric rule, and that rule still
+misses divisions on real detections; and a detector that splits one bright
+object into two peaks produces the same local geometry as a division, which
+only part of that rule can tell apart.
 
 ## When it is not the right tool
 

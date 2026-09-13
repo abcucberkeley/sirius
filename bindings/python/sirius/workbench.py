@@ -3154,8 +3154,8 @@ _FOUNDATION = StepSpec(
              "channels": ("Selected channel", "All channels")},
     aliases={"bundle": "model", "model_path": "model", "channel": "input_channel",
              "min_sep": "min_separation", "minVoxels": "min_voxels", "tile_size": "tile"},
-    # Python-only: the voxel size to calibrate distances with, when the caller
-    # knows better than the dataset metadata does
+    # Python-only: the voxel size to calibrate distances with, [x, y, z] like the
+    # metadata's, when the caller knows better than the dataset metadata does
     extra=("voxel_um", "device"))
 
 
@@ -3164,8 +3164,9 @@ def step_foundation(a: np.ndarray, params: Dict[str, Any], meta: Dict[str, Any],
                     cancelled: CancelFn = None, device: str = "auto") -> StepResult:
     """The latents foundation model: model (a .ltb bundle), task (Segment
     objects | Detect centroids | Track over time), channels, input_channel,
-    threshold, min_separation (um), min_voxels, tile [z, y, x], class_name;
-    label_opacity is display-only.
+    threshold, min_separation (um), min_voxels (Segment only), tile [z, y, x]
+    (a zero extent uses the bundle's), class_name; label_opacity is
+    display-only.
 
     Unlike step_seg this passes the whole (c, t, z, y, x) array to the model in
     one call: the time and channel axes are inputs the model reasons over, not
@@ -3176,7 +3177,7 @@ def step_foundation(a: np.ndarray, params: Dict[str, Any], meta: Dict[str, Any],
         from sirius_worker import foundation as fm  # type: ignore
     except ImportError as e:
         raise NotAvailable(
-            f"the foundation model needs the sirius_worker package (app/python) on the Python path") from e
+            "the foundation model needs the sirius_worker package (app/python) on the Python path") from e
     path = _str(params, "model")
     if not path:
         raise ValueError("foundation: no model bundle given")
@@ -3190,9 +3191,12 @@ def step_foundation(a: np.ndarray, params: Dict[str, Any], meta: Dict[str, Any],
             "min_separation": _float(params, "min_separation", 0.0),
             "min_voxels": _int(params, "min_voxels", 0),
             "voxel_um": params.get("voxel_um") or (meta or {}).get("voxel_um")}
-    if all(v > 0 for v in tile):
+    if any(v > 0 for v in tile):
         call["tile"] = tile
-    labels, info, extras = fm.run(sub, call, device, progress=progress, cancelled=cancelled)
+    try:
+        labels, info, extras = fm.run(sub, call, device, progress=progress, cancelled=cancelled)
+    except fm.Cancelled as e:
+        raise Cancelled("cancelled") from e
     return StepResult(a, dict(meta), labels=np.asarray(labels, dtype=np.uint32),
                       prob=extras.get("confidence"), info=info)
 
@@ -3262,7 +3266,7 @@ def run_step(kind: str, params: Dict[str, Any], array: np.ndarray, meta: Optiona
     spec = _SPECS[k]
     p = _prepare_params(spec, params, meta)
     kwargs: Dict[str, Any] = {}
-    if k in ("sim", "seg"):
+    if k in ("sim", "seg", "foundation"):
         kwargs.update(progress=progress, cancelled=cancelled, device=device)
     if spec.needs_labels:
         kwargs["labels"] = labels
