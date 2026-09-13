@@ -148,10 +148,12 @@ def _worst(actual: np.ndarray, expected: np.ndarray, atol: float, rtol: float):
     tolerance by the most, or None when every voxel is inside it."""
     a = np.asarray(actual, dtype=np.float64)
     b = np.asarray(expected, dtype=np.float64)
-    both_nan = np.isnan(a) & np.isnan(b)
-    err = np.abs(a - b)
-    allowed = atol + rtol * np.abs(b)
-    over = np.where(both_nan, -1.0, err - allowed)
+    same = (a == b) | (np.isnan(a) & np.isnan(b))   # equal infinities too, whose difference is NaN
+    with np.errstate(invalid="ignore"):
+        err = np.abs(a - b)
+        allowed = atol + rtol * np.abs(b)
+        over = np.where(same, -1.0, err - allowed)
+    over = np.where(np.isnan(over), np.inf, over)   # an infinity against a number misses by everything
     k = int(np.argmax(over))
     if over.flat[k] <= 0.0:
         return None
@@ -178,10 +180,12 @@ class TestParity(unittest.TestCase):
     def _run(self, case):
         kind = case["kind"]
         meta = dict(self.meta)
+        # a case may run on its own copy of the input (the +-inf voxel cases)
+        data = _read_f32(FIXTURES / case["input"], self.input.shape) if case.get("input") else self.input
         with warnings.catch_warnings():
             warnings.simplefilter("error", wb.UnknownParameterWarning)
             try:
-                return wb.run_step(kind, dict(case["params"]), self.input, meta)
+                return wb.run_step(kind, dict(case["params"]), data, meta)
             except wb.NotAvailable as e:   # scipy / scikit-image missing
                 self.skipTest(f"{kind}: {e}")
 

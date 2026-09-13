@@ -21,7 +21,10 @@ namespace sirius {
         // Stop early when the relative change ||o_k+1 - o_k|| / ||o_k|| drops
         // below this (0 = never).
         double stopRelativeChange = 0.0;
-        Device device = Device::cpu();         // CUDA runs the FFTs on the device (falls back to CPU when unavailable)
+        // Not used yet: the deconvolution runs on the host whatever the device.
+        // A CUDA device is served by the CPU path (DeconvolutionResult::ranOnGpu
+        // stays false); the image and PSF views must be host memory either way.
+        Device device = Device::cpu();
         // Called after every iteration; return false to stop. A stop this
         // way is a normal, successful finish: the estimate is written back
         // and DeconvolutionResult::stoppedEarly is set.

@@ -6,8 +6,10 @@
 #include <catch2/generators/catch_generators.hpp>
 #include <catch2/matchers/catch_matchers_exception.hpp>
 
+#include <algorithm>
 #include <complex>
 #include <cstdint>
+#include <limits>
 #include <numeric>
 #include <stdexcept>
 #include <string>
@@ -397,10 +399,34 @@ TEST_CASE("Device buffers round-trip through the GPU", "[buffer][cuda]") {
         auto back = toEigen<3>(devF);
         for (Index i = 0; i < host.size(); ++i) REQUIRE(back.data()[i] == hostF.data()[i]);
 
+        // Float -> int8 saturates on both backends (detail::convertScalar):
+        // 0..12287 lands mostly on 127. The device result is compared with the
+        // host conversion element by element, not with a wrapping cast.
         Buffer<std::int8_t> devI8(host.shape(), gpu);
         convert(devF, devI8);
+        Buffer<std::int8_t> hostI8(host.shape());
+        convert(hostF, hostI8);
         auto backI8 = toEigen<3>(devI8);
-        REQUIRE(backI8.data()[300] == static_cast<std::int8_t>(300));
+        for (Index i = 0; i < host.size(); ++i) REQUIRE(backI8.data()[i] == hostI8.data()[i]);
+        REQUIRE(backI8.data()[100] == 100);
+        REQUIRE(backI8.data()[300] == 127);
+
+        // and the values a uint16 source cannot produce: negative, NaN, infinite
+        const double inf = std::numeric_limits<double>::infinity();
+        const std::vector<double> edge{3.9, -2.5, 127.5, 128.0, -128.5, -129.0, -300.0, 1e300,
+                                       std::numeric_limits<double>::quiet_NaN(), inf, -inf};
+        Buffer<double> hostD(Shape{static_cast<Index>(edge.size())});
+        std::copy(edge.begin(), edge.end(), hostD.data());
+        Buffer<std::int8_t> edgeHost(hostD.shape()), edgeDev(hostD.shape(), gpu);
+        convert(hostD, edgeHost);
+        convert(toDevice(hostD, gpu), edgeDev);
+        auto edgeBack = toEigen<1>(edgeDev);
+        for (Index i = 0; i < hostD.size(); ++i) {
+            INFO("value " << edge[static_cast<std::size_t>(i)]);
+            REQUIRE(edgeBack(i) == edgeHost.data()[i]);
+        }
+        REQUIRE(edgeHost.data()[6] == -128);
+        REQUIRE(edgeHost.data()[8] == 0);
     }
 
     SECTION("views of device memory cannot be mapped as Eigen tensors") {

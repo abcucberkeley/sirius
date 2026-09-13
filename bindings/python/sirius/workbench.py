@@ -606,25 +606,28 @@ def _percentiles(values: np.ndarray, lo_pct: float, hi_pct: float, max_samples: 
 
 
 def _histogram(values: np.ndarray, bins: int, lo: float, hi: float) -> np.ndarray:
-    """``sirius::histogram``: counts of `bins` equal bins over [lo, hi]; NaN and
-    values outside the range are not counted, hi lands in the last bin."""
-    counts = np.zeros(max(bins, 1), dtype=np.float64)
+    """``sirius::histogram``: counts of `bins` equal bins over [lo, hi]; NaN,
+    +-inf and values outside the range are not counted, hi lands in the last
+    bin, and an infinite bound counts nothing."""
+    bins = max(int(bins), 1)
+    counts = np.zeros(bins, dtype=np.float64)
     x = np.asarray(values, dtype=np.float64).reshape(-1)
-    if x.size == 0 or not hi > lo:
+    if x.size == 0 or not hi > lo or not (math.isfinite(lo) and math.isfinite(hi)):
         return counts
     scale = bins / (float(hi) - float(lo))
+    if not (scale > 0.0 and math.isfinite(scale)):
+        return counts
     x = x[(x >= lo) & (x <= hi)]
-    b = ((x - lo) * scale).astype(np.int64)
-    b[b >= bins] = bins - 1
+    b = np.clip(((x - lo) * scale).astype(np.int64), 0, bins - 1)
     return np.bincount(b, minlength=bins).astype(np.float64)
 
 
 def _otsu_threshold(values: np.ndarray) -> float:
     """``sirius::app::otsuThreshold`` (threshold.cpp): Otsu's cut on a 256-bin
     histogram between the data's min and max, returned as the upper edge of
-    the best bin."""
+    the best bin. NaN and +-inf are left out, as there."""
     v = np.asarray(values, dtype=np.float32).reshape(-1)
-    v = v[~np.isnan(v)]
+    v = v[np.isfinite(v)]
     if v.size == 0:
         return float("inf")
     mn, mx = float(v.min()), float(v.max())
@@ -642,10 +645,20 @@ def _otsu_threshold(values: np.ndarray) -> float:
     with np.errstate(divide="ignore", invalid="ignore"):
         m_b = sum_b / w_b
         m_f = (sum_all - sum_b) / w_f
-        between = w_b * w_f * (m_b - m_f) ** 2
+        # the C++ product order, ((wB wF) d) d: another order rounds a tie
+        # between two bins differently and picks the other one
+        between = w_b * w_f * (m_b - m_f) * (m_b - m_f)
     between[~valid] = -np.inf
     best = int(np.argmax(between))   # the first maximum, as the C++ strict '>' keeps
-    return mn + (mx - mn) * float(best + 1) / bins
+    return _bin_edge32(mn, mx, best + 1, bins)
+
+
+def _bin_edge32(lo: float, hi: float, k: int, bins: int) -> float:
+    """``lo + (hi - lo) * k / bins`` in float32 arithmetic, as the C++ cuts are
+    computed: the float64 result rounds to a neighbouring float32 about half
+    the time, and a voxel equal to the cut then lands on the other side."""
+    f32 = np.float32
+    return float(f32(lo) + (f32(hi) - f32(lo)) * f32(k) / f32(bins))
 
 
 def _rescale_gamma(a: np.ndarray, lo: float, hi: float, gamma: float) -> np.ndarray:
@@ -1283,18 +1296,19 @@ _THRESHOLD = StepSpec(
 
 def _multi_otsu_upper(values: np.ndarray) -> float:
     """``multiOtsuThresholds`` (classic.cpp): the upper of two Otsu cuts over a
-    128-bin histogram, which keeps only the brightest of three classes."""
+    128-bin histogram, which keeps only the brightest of three classes. NaN
+    and +-inf are left out, as there."""
     v = np.asarray(values, dtype=np.float32).reshape(-1)
-    v = v[~np.isnan(v)]
+    v = v[np.isfinite(v)]
     if v.size == 0:
-        return 0.0
+        return float("inf")
     lo, hi = float(v.min()), float(v.max())
     if not hi > lo:
         return lo
     bins = 128
-    counts, _ = np.histogram(v, bins=bins, range=(lo, hi))
-    w = np.concatenate([[0.0], np.cumsum(counts.astype(np.float64))])
-    m = np.concatenate([[0.0], np.cumsum(np.arange(bins) * counts.astype(np.float64))])
+    counts = _histogram(v, bins, lo, hi)   # sirius::histogram's binning, not np.histogram's
+    w = np.concatenate([[0.0], np.cumsum(counts)])
+    m = np.concatenate([[0.0], np.cumsum(np.arange(bins) * counts)])
     total, mean = w[bins], m[bins]
     if not total > 0.0:
         return hi
@@ -1312,12 +1326,14 @@ def _multi_otsu_upper(values: np.ndarray) -> float:
             continue
         m1 = np.where(ok, (m[a_ + 1:bins] - m[a_]) / np.where(ok, w1, 1.0), 0.0)
         m2 = np.where(ok, (mean - m[a_ + 1:bins]) / np.where(ok, w2, 1.0), 0.0)
-        between = w0 * (m0 - grand) ** 2 + w1 * (m1 - grand) ** 2 + w2 * (m2 - grand) ** 2
+        # the C++ product order, (w d) d: w d**2 rounds exact ties differently
+        between = (w0 * (m0 - grand) * (m0 - grand) + w1 * (m1 - grand) * (m1 - grand)
+                   + w2 * (m2 - grand) * (m2 - grand))
         between = np.where(ok, between, -1.0)
         k = int(np.argmax(between))
         if between[k] > best:
             best, best_b = float(between[k]), a_ + 1 + k
-    return lo + (hi - lo) * (best_b + 1) / bins
+    return _bin_edge32(lo, hi, best_b + 1, bins)
 
 
 def _global_cut(v: np.ndarray, method: str, params: Dict[str, Any]) -> float:
