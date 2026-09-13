@@ -264,8 +264,9 @@ namespace sirius::simdetail {
                  t += (IndexT)gridDim.x * blockDim.x) {
                 const IndexT ix = t % xdim;
                 const IndexT iy = (t / xdim) % ydim;
-                const double angle = angleX * static_cast<double>(ix - xdim / 2) +
-                                     angleY * static_cast<double>(iy - ydim / 2);
+                // real-valued centres, as the CPU backend's carrierTable
+                const double angle = angleX * (static_cast<double>(ix) - 0.5 * static_cast<double>(xdim)) +
+                                     angleY * (static_cast<double>(iy) - 0.5 * static_cast<double>(ydim));
                 out[t] += accumulateValue(big, t, order, angle);
             }
         }

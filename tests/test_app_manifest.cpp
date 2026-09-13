@@ -26,8 +26,10 @@
 #include <sirius/tiff_io.hpp>
 
 #include "core/array_source.hpp"
+#include "core/executor.hpp"
 #include "core/manifest.hpp"
 #include "core/ops/builtin.hpp"
+#include "core/pipeline.hpp"
 
 #include "temp_path.hpp"
 
@@ -603,12 +605,23 @@ TEST_CASE("Stitch fuses the tiles of a folder dataset back into the scene", "[ap
     CHECK(r.note.find("4 tiles") != std::string::npos);
     CHECK(prog.fractions.back() == 1.0);
 
-    SECTION("a materialized input reopens the folder for the other tiles") {
+    SECTION("a tile read into memory reopens the folder for the other tiles") {
+        // what the Load step's "Full load to RAM" hands on: the array and a
+        // memory source of the one tile
         StepInput full;
         full.meta = opened.meta;
         full.array = opened.source->readAll();
+        full.source = std::make_shared<MemorySource>(full.array, opened.meta);
         const StepOutput r2 = op.run(full, p, prog.ctx);
         checkMosaic(r2);
+    }
+    SECTION("an input a step computed is refused, not replaced by the files") {
+        // a contrast or a flat field between Load and Stitch: the folder
+        // reopened for it gave the raw tiles back, the step silently gone
+        StepInput computed;
+        computed.meta = opened.meta;
+        computed.array = opened.source->readAll();
+        CHECK_THROWS_WITH(op.run(computed, p, prog.ctx), Catch::Matchers::ContainsSubstring("directly after Load"));
     }
     SECTION("validation") {
         p.set("channel", std::int64_t{2});
@@ -621,6 +634,49 @@ TEST_CASE("Stitch fuses the tiles of a folder dataset back into the scene", "[ap
         single.tiles.resize(1);
         CHECK_FALSE(op.validate(p, single).ok());   // one tile is nothing to stitch
     }
+}
+
+TEST_CASE("Stitch of a dataset's tiles runs on Load's tiles, not on what a step made of them", "[app][ops][stitch][manifest]") {
+    const TempFolder folder, cache;
+    writeTileFolder(folder.path);
+    manifestFromFolder(folder.path, tileRule()).save(folder.path);
+    StepContext ctx;
+    ctx.backend = Backend::Cpu;
+    ctx.scratchDir = cache.path;
+    auto pipeline = [&](bool contrast, bool fullLoad) {
+        Pipeline p;
+        ParamSet lp = p.at(0).params;
+        lp.set("path", folder.str);
+        if (fullLoad) lp.set("read_as", std::string("Full load to RAM"));
+        p.setParams(0, lp);
+        if (contrast) {
+            p.add("contrast");
+            ParamSet cp = p.at(1).params;
+            cp.set("min", 0.0);
+            cp.set("max", 100.0);
+            cp.set("gamma", 1.0);
+            p.setParams(1, cp);
+        }
+        p.add("stitch");
+        const int s = p.size() - 1;
+        ParamSet sp = p.at(s).params;
+        sp.set("search_radius", std::vector<double>{0, 4, 4});
+        sp.set("mask_background", false);
+        p.setParams(s, sp);
+        return p;
+    };
+    Executor direct(cache.path / "direct");
+    const std::shared_ptr<const StepOutput> lazy = direct.runAll(pipeline(false, false), ctx);
+    REQUIRE(lazy->array);
+    CHECK(lazy->array->dims().c == 2);
+    Executor full(cache.path / "full");
+    const std::shared_ptr<const StepOutput> inMemory = full.runAll(pipeline(false, true), ctx);
+    REQUIRE(inMemory->array);
+    CHECK(inMemory->array->dims() == lazy->array->dims());
+    // Load -> Contrast -> Stitch used to give exactly Load -> Stitch: the
+    // folder was reopened and the contrast silently left out
+    Executor windowed(cache.path / "contrast");
+    CHECK_THROWS_WITH(windowed.runAll(pipeline(true, false), ctx), Catch::Matchers::ContainsSubstring("directly after Load"));
 }
 
 TEST_CASE("A folder of TIFFs reads as one stack without a pattern", "[app][manifest]") {

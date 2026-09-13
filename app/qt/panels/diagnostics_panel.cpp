@@ -270,10 +270,15 @@ namespace sirius::app {
                 const int x = static_cast<int>(me->position().x()) - option.rect.x() - 6;
                 const int wMerge = fm.horizontalAdvance(QStringLiteral("merge")), wSep = fm.horizontalAdvance(QStringLiteral(" · ")),
                           wSplit = fm.horizontalAdvance(QStringLiteral("split"));
+                // The bin is the 11 px icon paint() draws after the text. The
+                // column stretches to the table's edge, and the delete area used
+                // to run to it: a click anywhere in the blank right of a row
+                // deleted that row's label.
+                const int bin = fm.horizontalAdvance(text());
                 QString link;
                 if (x >= 0 && x <= wMerge) link = QStringLiteral("merge");
                 else if (x >= wMerge + wSep && x <= wMerge + wSep + wSplit) link = QStringLiteral("split");
-                else if (x > wMerge + 2 * wSep + wSplit - 2) link = QStringLiteral("delete");
+                else if (x >= bin - 2 && x <= bin + 11 + 2) link = QStringLiteral("delete");
                 if (link.isEmpty()) return false;
                 onAction(link, model->data(index, Qt::UserRole).toUInt());
                 return true;

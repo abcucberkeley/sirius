@@ -9,8 +9,8 @@ namespace sirius {
     // Integer values (0/1/2) to match the legacy cudasirecon
     // so they survive round tripping
     enum class ApodizationType {
-        None     = 0,
-        Cosine   = 1,
+        None = 0,
+        Cosine = 1,
         Triangle = 2
     };
 
@@ -21,22 +21,22 @@ namespace sirius {
         // Geometry and optics
         double k0_start_angle = 0.;     // starting illumination angle (rad)
         double linespacing_um = 0.24;   // illumination line spacing (um)
-        int ndirs             = 3;      // number of directions (theta)
-        int nphases           = 5;      // number of phases (phi)
-        int norders           = 3;      // nphases / 2 + 1;
-        double na             = 1.0;    // detection numerical aperture
-        double nimm           = 1.33;   // immersion refractive index
-        double wavelength_nm  = 510.;   // emission wavelength (nm)
+        int ndirs = 3;      // number of directions (theta)
+        int nphases = 5;      // number of phases (phi)
+        int norders = 0;      // orders to separate; 0 derives nphases / 2 + 1 (resolvedOrders)
+        double na = 1.0;    // detection numerical aperture
+        double nimm = 1.33;   // immersion refractive index (>= na)
+        double wavelength_nm = 510.;   // emission wavelength (nm)
         std::optional<std::vector<double>> k0_angles; // null, derive from k0_start_angles
 
         // Pixel sizes (um) in the sample plane
-        double dx     = 0.1;  // transverse pixel size, image column direction
-        double dy     = 0.1;  // transverse pixel size, image row direction
-        double dz     = 0.2;  // axial pixel size
+        double dx = 0.1;  // transverse pixel size, image column direction
+        double dy = 0.1;  // transverse pixel size, image row direction
+        double dz = 0.2;  // axial pixel size
         double dz_psf = 0.15; // axial step size of the PSF/OTF
 
         // Output and filtering
-        double zoomfact = 2.0; // "Zoom factor" for the output grid transverse dimensions relative to the input data grid. SIM increases resolution.
+        double zoomfact = 2.0; // "Zoom factor" for the output grid transverse dimensions relative to the input data grid (>= 1). SIM increases resolution.
         int z_zoom = 1; // Zoom factor for the output grid axial dimension.
         double wiener = 0.01;
         double otfcutoff = 0.006;
@@ -54,6 +54,12 @@ namespace sirius {
         bool no_kz0 = true;
         bool filter_overlaps = true;
 
+        // The orders the reconstruction separates and assembles: norders, or
+        // nphases / 2 + 1 when norders is 0. Everything that consumes the
+        // order count goes through this, so a file that leaves norders out
+        // means the same thing everywhere.
+        int resolvedOrders() const noexcept { return norders > 0 ? norders : nphases / 2 + 1; }
+
         // Throws std::runtime_error on invalid parameters
         void validate() const;
     };
@@ -61,7 +67,7 @@ namespace sirius {
     // TOML I/O. loadParameters starts from defaults so a partial file overrides
     // only the keys present, then validate()s before returning.
     SIMParameters loadParameters(const std::string& path);
-    void          saveParameters(const std::string& path, const SIMParameters& p);
+    void saveParameters(const std::string& path, const SIMParameters& p);
 
 } // namespace sirius
 

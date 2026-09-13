@@ -16,6 +16,7 @@
 
 #include <sirius/sim_parameters.hpp>
 
+#include "core/array_source.hpp"
 #include "core/operation.hpp"
 #include "core/rpc.hpp"
 
@@ -25,6 +26,10 @@ namespace sirius::app {
     std::vector<OperationFactory> builtinOperationFactories();
 
     std::unique_ptr<Operation> makeLoadOperation();
+    // The Load step's parameters as the options it opens the dataset with
+    // (page order, voxel size, SIM layout, tile, full read); 0 keeps what the
+    // file says for that axis or size.
+    OpenOptions loadOpenOptions(const ParamSet& loadParams);
     std::unique_ptr<Operation> makeSimOperation();
     std::unique_ptr<Operation> makeDeconvolveOperation();
     std::unique_ptr<Operation> makeVolumeOperation();
@@ -60,7 +65,7 @@ namespace sirius::app {
     // "12.8 GB", "412 MB"
     std::string formatBytes(std::uint64_t bytes);
     std::string formatNumber(double v, int decimals);
-    // Otsu's threshold of `n` values (256-bin histogram); NaNs ignored.
+    // Otsu's threshold of `n` values (256-bin histogram over the finite ones; NaN and +-inf ignored).
     float otsuThreshold(const float* values, Index n);
     // "~9 s" for `bytes` at a nominal throughput.
     std::string estimatedTime(std::uint64_t bytes, double bytesPerSecond);
@@ -118,6 +123,9 @@ namespace sirius::app {
         std::uint32_t externalSeedCount = 0;
         LabelFlagRules flags;
         std::string className = "object";
+        // Called during the long loops (the distance seeds); the step sets it
+        // to throw when its run is cancelled.
+        std::function<void()> poll;
     };
     std::uint32_t labelsFromProbabilities(const float* foreground, const float* boundary, Index z, Index y, Index x,
                                           const LabelPostOptions& options, LabelVolume& labels, Index t);

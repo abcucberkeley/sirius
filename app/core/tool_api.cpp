@@ -102,7 +102,8 @@ namespace sirius::app {
                  {"kind"}),
              [this](const json& a) {
                  const std::string kind = a.value("kind", "");
-                 if (!findOperation(kind)) throw std::invalid_argument("unknown operation kind '" + kind + "'");
+                 const Operation* op = findOperation(kind);
+                 if (!op || op->info().missing) throw std::invalid_argument("unknown operation kind '" + kind + "'");
                  if (!wb_.canEdit()) throw std::runtime_error("a run is in progress: cancel it or wait before editing the pipeline");
                  int at = -1;
                  if (a.contains("at") && a["at"].is_number_integer()) at = a["at"].get<int>() - 1;

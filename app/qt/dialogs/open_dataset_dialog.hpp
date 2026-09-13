@@ -42,7 +42,11 @@ namespace sirius::app {
 
         void openAsOneStack();
 
+    public slots:
+        void accept() override;
+
     private:
+        void probe();
         void updatePageCheck();
         struct Impl;
         std::unique_ptr<Impl> impl_;

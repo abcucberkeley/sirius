@@ -19,6 +19,7 @@
 #include <cmath>
 #include <filesystem>
 #include <fstream>
+#include <limits>
 #include <numeric>
 #include <optional>
 #include <random>
@@ -35,6 +36,7 @@
 
 #include <set>
 
+#include "sim_synthetic.hpp"
 #include "temp_path.hpp"
 
 using namespace sirius;
@@ -294,6 +296,94 @@ TEST_CASE("SIM reconstructs the bundled stack from a parameter file and reports 
     }
 }
 
+TEST_CASE("SIM reconstructs a 2D stack with the step's defaults", "[app][ops][sim][2d]") {
+    // The step's defaults skip the kz = 0 plane and damp the zero order, and
+    // a 2D stack has no other plane: the result used to be all NaN. The scene
+    // is sim_synthetic.hpp's; only the optics are set, every switch keeps its
+    // default.
+    SIMParameters optics;
+    optics.ndirs = 3;
+    optics.nphases = 3;
+    optics.na = 1.2;
+    optics.nimm = 1.33;
+    optics.wavelength_nm = 530.0;
+    optics.linespacing_um = 0.30;
+    optics.k0_start_angle = 0.3;
+    optics.dx = 0.08;
+    optics.dy = 0.08;
+    const Buffer<double> raw = test::syntheticSim2d(optics, 128);
+
+    const Dims5 dims{1, 1, 9, 128, 128};
+    DatasetMeta meta = metaFor(dims, 0.08, 0.3);
+    meta.sim.present = true;
+    meta.sim.ndirs = 3;
+    meta.sim.nphases = 3;
+    auto array = std::make_shared<Array5>(dims);
+    for (Index z = 0; z < dims.z; ++z)
+        for (Index y = 0; y < dims.y; ++y)
+            for (Index x = 0; x < dims.x; ++x)
+                array->at(0, 0, z, y, x) = static_cast<float>(raw.data()[(z * dims.y + y) * dims.x + x]);
+
+    const Operation& sim = requireOperation("sim");
+    auto run = [&](const ParamSet& sp) {
+        const Validation v = sim.validate(sp, meta);
+        INFO(v.firstError());
+        REQUIRE(v.ok());
+        Progress prog;
+        StepOutput out = sim.run(inputOf(array, meta), sp, prog.ctx);
+        REQUIRE(out.array);
+        CHECK(out.array->dims() == Dims5{1, 1, 1, 256, 256});
+        Index bad = 0;
+        for (Index i = 0; i < 256 * 256; ++i) bad += std::isfinite(out.array->plane(0, 0, 0)[i]) ? 0 : 1;
+        CHECK(bad == 0);
+        return out;
+    };
+
+    SECTION("Estimate mode finds the simulated pattern") {
+        ParamSet sp = sim.defaults();
+        CHECK(sp.getBool("no_kz0", false));
+        CHECK(sp.getBool("suppress_zero_order", false));
+        sp.set("phases", std::int64_t{3});
+        sp.set("na", 1.2);
+        sp.set("nimm", 1.33);
+        sp.set("wavelength_nm", 530.0);
+        sp.set("linespacing_um", 0.30);
+        sp.set("k0_start_angle", 0.3 * 180.0 / kPi);   // degrees
+        const StepOutput out = run(sp);
+        REQUIRE(out.diagnostics.table);
+        const auto& rows = out.diagnostics.table->rows;
+        REQUIRE(rows.size() == 3);
+        CHECK(rows[0][0] == "17°");
+        CHECK(rows[1][0] == "77°");
+        CHECK(rows[2][0] == "137°");
+    }
+    SECTION("the form refuses what used to crash the run") {
+        // one order segfaulted the k0 fit; an NA above the immersion index
+        // segfaulted the filter (with a measured OTF, which is not needed to
+        // see the form refuse it)
+        ParamSet orders = sim.defaults();
+        orders.set("phases", std::int64_t{3});
+        orders.set("orders", std::int64_t{1});
+        CHECK_FALSE(sim.validate(orders, meta).ok());
+        ParamSet na = sim.defaults();
+        na.set("phases", std::int64_t{3});
+        na.set("na", 1.6);
+        const Validation v = sim.validate(na, meta);
+        REQUIRE_FALSE(v.ok());
+        CHECK(v.firstError().find("nimm") != std::string::npos);
+    }
+    SECTION("From file mode with a TOML file that leaves the orders out") {
+        // the form validated, and the run threw "3 phases cannot separate 3 orders"
+        const test::TempFile toml("sim2d", ".toml");
+        std::ofstream(toml.path) << "[optics]\nndirs = 3\nnphases = 3\nlinespacing_um = 0.30\nk0_start_angle = 0.3\n"
+                                    "na = 1.2\nnimm = 1.33\nwavelength_nm = 530.0\n";
+        ParamSet sp = sim.defaults();
+        sp.set("mode", std::string("From file"));
+        sp.set("params_file", toml.str);
+        run(sp);
+    }
+}
+
 TEST_CASE("SIM reports a cancelled run as a cancellation, not as a step failure",
           "[app][ops][sim][cancel]") {
     // A SIM reconstruction is the longest thing the application does -- minutes
@@ -477,6 +567,138 @@ TEST_CASE("Contrast rescales every channel into 0..1 and reports histograms", "[
     }
 }
 
+TEST_CASE("Infinite voxels leave the contrast window and the Otsu cuts to the finite values", "[app][ops][contrast][threshold]") {
+    // One +-inf voxel crashed the application as a dataset opened: the
+    // histograms spanned [min, inf], and (inf - lo) * (bins / inf) is a NaN
+    // bin index that was written outside the counts.
+    const float inf = std::numeric_limits<float>::infinity();
+    const Dims5 dims{1, 1, 9, 40, 20};
+    const DatasetMeta meta = metaFor(dims);
+    const auto finite = blobArray(dims, 3, 3.0);   // 0 and 1000
+    auto data = std::make_shared<Array5>(finite->clone());
+    data->at(0, 0, 4, 1, 1) = inf;
+    data->at(0, 0, 0, 39, 19) = -inf;
+    Progress prog;
+
+    SECTION("Otsu's cut is the cut of the finite values") {
+        std::vector<float> values(finite->data(), finite->data() + finite->numel());
+        const float cut = otsuThreshold(values.data(), static_cast<Index>(values.size()));
+        CHECK(cut > 0.0f);
+        CHECK(cut < 1000.0f);
+        values.push_back(inf);
+        values.push_back(-inf);
+        CHECK(otsuThreshold(values.data(), static_cast<Index>(values.size())) == cut);
+        // nothing finite: a cut nothing lies above
+        const std::vector<float> none{inf, -inf, std::numeric_limits<float>::quiet_NaN()};
+        CHECK(otsuThreshold(none.data(), 3) == inf);
+    }
+    SECTION("Threshold (Otsu) labels the blobs and the +inf voxel") {
+        const Operation& op = requireOperation("threshold");
+        ParamSet p = op.defaults();
+        p.set("method", std::string("Otsu"));
+        p.set("min_voxels", std::int64_t{0});
+        const StepOutput r = op.run(inputOf(data, meta), p, prog.ctx);
+        REQUIRE(r.labels);
+        CHECK(r.labels->stats().size() == 4);
+        CHECK(r.labels->at(0, 4, 1, 1) != 0);
+        CHECK(r.labels->at(0, 0, 39, 19) == 0);
+    }
+    SECTION("Classic Multi-Otsu still separates the core from the halo") {
+        const Dims5 d3{1, 1, 8, 48, 48};
+        auto three = std::make_shared<Array5>(Array5::zeros(d3));
+        for (Index z = 2; z < 5; ++z)
+            for (Index y = 8; y < 40; ++y)
+                for (Index x = 8; x < 40; ++x) three->at(0, 0, z, y, x) = 400.0f;   // halo
+        for (Index y = 20; y < 26; ++y)
+            for (Index x = 20; x < 26; ++x) three->at(0, 0, 3, y, x) = 4000.0f;   // core
+        three->at(0, 0, 0, 0, 0) = inf;
+        three->at(0, 0, 7, 47, 47) = -inf;
+        const Operation& op = requireOperation("classic");
+        ParamSet p = op.defaults();
+        p.set("sigma", 0.0);
+        p.set("opening", std::int64_t{0});
+        p.set("fill_holes", false);
+        p.set("min_voxels", std::int64_t{1});
+        p.set("post", std::string("Connected components"));
+        p.set("method", std::string("Multi-Otsu"));
+        const StepOutput r = op.run(inputOf(three, metaFor(d3)), p, prog.ctx);
+        REQUIRE(r.labels);
+        CHECK(r.labels->stats().size() == 2);        // the core and the +inf voxel
+        CHECK(r.labels->at(0, 3, 22, 22) != 0);
+        CHECK(r.labels->at(0, 3, 10, 10) == 0);      // the halo
+        CHECK(r.labels->at(0, 0, 0, 0) != 0);
+        CHECK(r.labels->at(0, 7, 47, 47) == 0);
+    }
+    SECTION("Contrast opens on them and maps them to the ends of the window") {
+        const Operation& op = requireOperation("contrast");
+        const StepInput in = inputOf(data, meta);
+        const ParamSet p = op.initialParams(op.defaults(), in);   // what a new step (or a dataset opening) computes
+        CHECK(p.getDouble("min", -1.0) == 0.0);
+        CHECK(p.getDouble("max", -1.0) == 1000.0);
+        const StepOutput out = op.run(in, p, prog.ctx);
+        REQUIRE(out.array);
+        CHECK(out.array->at(0, 0, 4, 1, 1) == 1.0f);
+        CHECK(out.array->at(0, 0, 0, 39, 19) == 0.0f);
+        REQUIRE(out.diagnostics.histograms.size() == 1);
+        const DiagnosticHistogram& h = out.diagnostics.histograms[0];
+        CHECK(h.binLo == 0.0f);
+        CHECK(h.binHi == 1000.0f);
+        CHECK(std::accumulate(h.bins.begin(), h.bins.end(), 0.0) == static_cast<double>(data->numel() - 2));
+        CHECK(contrastPreview(in, p).histograms.size() == 1);
+    }
+}
+
+TEST_CASE("Otsu and Multi-Otsu break exact ties the way bindings/tests/test_workbench.py expects", "[app][ops][threshold]") {
+    // A histogram symmetric about its centre scores a split and its mirror
+    // image exactly the same; which one wins is decided by the last bit of the
+    // between-class variance, so the Python mirror has to evaluate it in the
+    // order these loops do. Same data and cuts as
+    // TestIntensityHelpers.test_otsu_cuts_break_ties_as_the_application.
+    // Values sit at bin centres of [0, bins]: `pairs` holds (bin, count), each
+    // mirrored to bins - 1 - bin, and the two ends pin the range.
+    const auto symmetric = [](float bins, int ends, std::initializer_list<std::pair<int, int>> pairs) {
+        std::vector<float> values(static_cast<std::size_t>(ends), 0.0f);
+        values.insert(values.end(), static_cast<std::size_t>(ends), bins);
+        for (const auto& [bin, count] : pairs)
+            for (int i = 0; i < count; ++i) {
+                values.push_back(static_cast<float>(bin) + 0.5f);
+                values.push_back(bins - 1.0f - static_cast<float>(bin) + 0.5f);
+            }
+        return values;
+    };
+    const auto labelsAbove = [](const char* kind, ParamSet p, const std::vector<float>& values, float cut) {
+        const Dims5 dims{1, 1, 1, 1, static_cast<Index>(values.size())};
+        auto data = std::make_shared<Array5>(dims);
+        std::copy(values.begin(), values.end(), data->data());
+        const Operation& op = requireOperation(kind);
+        ParamSet params = op.defaults();
+        for (const auto& [key, value] : p.items()) params.set(key, value);
+        Progress prog;
+        const StepOutput r = op.run(inputOf(data, metaFor(dims)), params, prog.ctx);
+        REQUIRE(r.labels);
+        for (std::size_t i = 0; i < values.size(); ++i) {
+            INFO(kind << ": value " << values[i]);
+            CHECK((r.labels->at(0, 0, 0, static_cast<Index>(i)) != 0) == (values[i] > cut));
+        }
+    };
+    SECTION("Otsu: 0 + 256 * 37 / 256, not the 139 of the mirror image") {
+        ParamSet p;
+        p.set("method", std::string("Otsu"));
+        p.set("min_voxels", std::int64_t{0});
+        labelsAbove("threshold", p, symmetric(256.0f, 3, {{36, 6}, {117, 17}}), 37.0f);
+    }
+    SECTION("Multi-Otsu: 0 + 128 * 93 / 128, not the 71 of the mirror image") {
+        ParamSet p;
+        p.set("sigma", 0.0);
+        p.set("opening", std::int64_t{0});
+        p.set("fill_holes", false);
+        p.set("min_voxels", std::int64_t{1});
+        p.set("post", std::string("Connected components"));
+        p.set("method", std::string("Multi-Otsu"));
+        labelsAbove("classic", p, symmetric(128.0f, 1, {{2, 2}, {36, 2}, {44, 6}, {58, 5}}), 93.0f);
+    }
+}
+
 TEST_CASE("Flat-field divides by the flat image", "[app][ops][flatfield]") {
     const Dims5 dims{1, 1, 2, 4, 4};
     const DatasetMeta meta = metaFor(dims);
@@ -577,6 +799,53 @@ TEST_CASE("Crop / pad cuts a box and carries labels", "[app][ops][croppad]") {
     CHECK(out.labels->at(0, 0, 0, 0) == 0);
 }
 
+TEST_CASE("Crop / pad keeps what was said about the objects it carries", "[app][ops][croppad][labels]") {
+    const Dims5 dims{1, 2, 1, 12, 12};
+    const DatasetMeta meta = metaFor(dims);
+    const Operation& op = requireOperation("croppad");
+    ParamSet p = op.defaults();
+    p.set("y0", std::int64_t{2});
+    p.set("x0", std::int64_t{2});
+    p.set("y", std::int64_t{8});
+    p.set("x", std::int64_t{8});
+    StepInput in = inputOf(rampArray(dims), meta);
+    // a track of two frames, as the tracking step leaves it, with a review
+    // mark, a model confidence and flag rules of its own
+    auto labels = std::make_shared<LabelVolume>(2, 1, 12, 12);
+    for (Index t = 0; t < 2; ++t) {
+        for (Index y = 4; y < 7; ++y)
+            for (Index x = 4 + t; x < 7 + t; ++x) labels->volume(t)[y * 12 + x] = 3;
+        labels->recomputeStats(t);
+        for (LabelStats& s : labels->stats()) {
+            s.cls = "track";
+            s.confidence = t == 0 ? 0.4 : 0.9;
+        }
+    }
+    labels->setTracked(true);
+    LabelFlagRules rules;
+    rules.flagBorder = false;
+    rules.lowConfidence = 0.5;
+    labels->applyFlags(rules);
+    labels->recomputeStats(0);
+    labels->stats().front().reviewed = true;
+    in.labels = labels;
+    Progress prog;
+    const StepOutput out = op.run(in, p, prog.ctx);
+    REQUIRE(out.labels);
+    CHECK(out.labels->tracked());   // a delete on it still takes the whole track
+    CHECK(out.labels->statsT() == 0);
+    const LabelStats* s = out.labels->statsOf(3);
+    REQUIRE(s);
+    CHECK(s->cls == "track");
+    CHECK(s->reviewed);
+    CHECK(s->confidence == 0.4);
+    CHECK(s->bbox == std::array<Index, 6>{0, 1, 2, 5, 2, 5});   // measured on the new grid
+    CHECK(std::find(s->flags.begin(), s->flags.end(), "low conf") != s->flags.end());   // the rules came along
+    CHECK(out.labels->flaggedCount("touching border") == 0);
+    CHECK(out.labels->annotationOf(1, 3).confidence == 0.9);   // and the other frame's own
+    CHECK(out.labels->annotationOf(1, 3).reviewed);
+}
+
 TEST_CASE("Resample changes the voxel size", "[app][ops][resample]") {
     const Dims5 dims{1, 1, 4, 8, 8};
     const DatasetMeta meta = metaFor(dims, 0.1, 0.4);
@@ -593,6 +862,31 @@ TEST_CASE("Resample changes the voxel size", "[app][ops][resample]") {
     const StepOutput r = op.run(inputOf(rampArray(dims), meta), p, prog.ctx);
     REQUIRE(r.array);
     CHECK(r.array->dims() == out.dims);
+
+    SECTION("the last plane and column the extent promises are sampled, not filled") {
+        // 63 * 0.3 / 0.1 is 189 to within rounding, so 190 planes; the last
+        // one's centre, 189 * (0.1 / 0.3), rounds past plane 63. Along x the
+        // step is added once per column, and 63 additions of 0.2 pass 63 too.
+        const Dims5 d{1, 1, 64, 2, 64};
+        const DatasetMeta m = metaFor(d, 0.5, 0.3);
+        const auto ones = std::make_shared<Array5>(d);
+        std::fill(ones->data(), ones->data() + ones->numel(), 1.0f);
+        ParamSet q = op.defaults();
+        q.set("voxel_z", 0.1);
+        q.set("voxel_x", 0.1);
+        for (const char* interp : {"linear", "cubic", "nearest"}) {
+            INFO(interp);
+            q.set("interpolation", std::string(interp));
+            const StepOutput s = op.run(inputOf(ones, m), q, prog.ctx);
+            REQUIRE(s.array);
+            const Dims5& o = s.array->dims();
+            REQUIRE(o.z == 190);
+            REQUIRE(o.x == 316);
+            CHECK(s.array->at(0, 0, o.z - 1, 0, 0) == 1.0f);
+            CHECK(s.array->at(0, 0, 0, 0, o.x - 1) == 1.0f);
+            CHECK(s.array->at(0, 0, o.z - 1, 1, o.x - 1) == 1.0f);
+        }
+    }
 }
 
 TEST_CASE("Volume reconstruction resamples to isotropic voxels", "[app][ops][volrec]") {
@@ -772,6 +1066,37 @@ TEST_CASE("Threshold labels blobs and Label cleanup drops the small ones", "[app
         CHECK(r.labels->stats().size() == 4);   // the input labels are untouched
         StepInput none = inputOf(data, meta);
         CHECK_THROWS(cleanup.run(none, cp, prog.ctx));
+    }
+}
+
+TEST_CASE("Threshold and classical labels have an unknown confidence in every frame", "[app][ops][threshold][classic]") {
+    const Dims5 dims{1, 2, 5, 40, 20};
+    const DatasetMeta meta = metaFor(dims);
+    auto data = blobArray(Dims5{1, 1, 5, 40, 20}, 3, 3.0);
+    auto two = std::make_shared<Array5>(Array5::zeros(dims));
+    for (Index t = 0; t < 2; ++t)
+        for (Index z = 0; z < dims.z; ++z)
+            for (Index y = 0; y < dims.y; ++y)
+                for (Index x = 0; x < dims.x; ++x) two->at(0, t, z, y, x) = data->at(0, 0, z, y, x) * (t == 0 ? 0.5f : 1.0f);
+    Progress prog;
+    for (const char* kind : {"threshold", "classic"}) {
+        INFO(kind);
+        const Operation& op = requireOperation(kind);
+        ParamSet p = op.defaults();
+        p.set("method", std::string("Manual"));
+        p.set("value", 100.0);
+        p.set("min_voxels", std::int64_t{0});
+        if (std::string(kind) == "classic") {
+            p.set("sigma", 0.0);
+            p.set("opening", std::int64_t{0});
+            p.set("expand", 2.0);   // grows into voxels the mask called background
+        }
+        const StepOutput r = op.run(inputOf(two, meta), p, prog.ctx);
+        REQUIRE(r.labels);
+        r.labels->recomputeStats(0);   // the viewer on the first frame: the intensities were never probabilities there either
+        REQUIRE_FALSE(r.labels->stats().empty());
+        for (const LabelStats& s : r.labels->stats()) CHECK(s.confidence == 1.0);
+        CHECK(r.labels->flaggedCount("low conf") == 0);
     }
 }
 
@@ -1619,6 +1944,11 @@ TEST_CASE("Label cleanup keeps ids and confidences when asked", "[app][ops][clea
         CHECK(five->confidence == 1.0);
     }
     SECTION("relabel on numbers what is left densely") {
+        for (LabelStats& s : labels->stats())
+            if (s.id == 7) {
+                s.cls = "debris";   // the speck that goes, and whose number object 9 had better not inherit its mark with
+                s.reviewed = true;
+            }
         ParamSet cp = cleanup.defaults();
         cp.set("min_voxels", std::int64_t{2});
         cp.set("relabel", true);
@@ -1627,11 +1957,126 @@ TEST_CASE("Label cleanup keeps ids and confidences when asked", "[app][ops][clea
         CHECK(out.labels->at(0, 0, 2, 2) == 1);
         CHECK(out.labels->at(0, 0, 5, 5) == 2);
         CHECK(out.labels->maxLabel() == 2);
+        // the statistics follow the objects to their new numbers, not the numbers
+        const LabelStats* was9 = out.labels->statsOf(2);
+        REQUIRE(was9);
+        CHECK(was9->confidence == 0.3);
+        CHECK(was9->cls == "object");
+        CHECK_FALSE(was9->reviewed);
+        REQUIRE(out.labels->statsOf(1));
+        CHECK(out.labels->statsOf(1)->confidence == 1.0);
     }
     SECTION("recomputeStats without probabilities keeps a known confidence") {
         labels->recomputeStats(0);
         REQUIRE(labels->statsOf(9));
         CHECK(labels->statsOf(9)->confidence == 0.3);
+    }
+}
+
+TEST_CASE("Label cleanup numbers every frame with one map", "[app][ops][cleanup][track]") {
+    // tracked labels: track 4 in every frame, track 2 only from t = 1, and a
+    // speck of id 3 in t = 0 that the size filter drops
+    const Dims5 dims{1, 3, 1, 16, 16};
+    const DatasetMeta meta = metaFor(dims);
+    auto data = std::make_shared<Array5>(Array5::zeros(dims));
+    auto labels = std::make_shared<LabelVolume>(3, 1, 16, 16);
+    auto square = [&](Index t, Index y0, Index x0, std::uint32_t id) {
+        for (Index y = y0; y < y0 + 3; ++y)
+            for (Index x = x0; x < x0 + 3; ++x) labels->volume(t)[y * 16 + x] = id;
+    };
+    for (Index t = 0; t < 3; ++t) {
+        square(t, 10, 10, 4);
+        if (t >= 1) square(t, 2, 2, 2);
+    }
+    labels->volume(0)[15] = 3;
+    for (Index t = 0; t < 3; ++t) {
+        labels->recomputeStats(t);
+        for (LabelStats& s : labels->stats()) s.cls = "track";
+    }
+    labels->setTracked(true);
+    labels->recomputeStats(1);
+    for (LabelStats& s : labels->stats())
+        if (s.id == 4) s.reviewed = true;
+    const Operation& cleanup = requireOperation("cleanup");
+    ParamSet cp = cleanup.defaults();
+    cp.set("min_voxels", std::int64_t{2});
+    Progress prog;
+    StepInput in = inputOf(data, meta);
+    in.labels = labels;
+    const StepOutput out = cleanup.run(in, cp, prog.ctx);
+    REQUIRE(out.labels);
+    const LabelVolume& c = *out.labels;
+    CHECK(c.tracked());
+    const std::uint32_t big = c.at(0, 0, 11, 11), late = c.at(1, 0, 3, 3);
+    CHECK(big == 2);    // ids 2 and 4 are left: numbered 1 and 2 in every frame
+    CHECK(late == 1);
+    for (Index t = 0; t < 3; ++t) {
+        INFO("frame " << t);
+        CHECK(c.at(t, 0, 11, 11) == big);   // was 1 in t = 0 and 2 afterwards
+        if (t >= 1) CHECK(c.at(t, 0, 3, 3) == late);
+        CHECK(c.annotationOf(t, big).reviewed);   // the mark went with the track
+        CHECK(c.annotationOf(t, big).cls == "track");
+    }
+    CHECK(c.at(0, 0, 0, 15) == 0);
+    CHECK(c.maxLabel() == 2);
+
+    SECTION("deleting a track afterwards takes that track and nothing else") {
+        auto edited = out.labels->clone();
+        for (Index t = 0; t < 3; ++t) edited->remove(t, late);   // what Workbench::deleteLabel does on tracked labels
+        for (Index t = 0; t < 3; ++t) {
+            INFO("frame " << t);
+            CHECK(edited->at(t, 0, 11, 11) == big);
+            CHECK(edited->at(t, 0, 3, 3) == 0);
+        }
+    }
+    SECTION("without relabel the ids stay as they were") {
+        cp.set("relabel", false);
+        const StepOutput kept = cleanup.run(in, cp, prog.ctx);
+        for (Index t = 0; t < 3; ++t) CHECK(kept.labels->at(t, 0, 11, 11) == 4);
+        CHECK(kept.labels->at(2, 0, 3, 3) == 2);
+    }
+}
+
+TEST_CASE("Track objects marks its labels tracked only when it gives them track ids", "[app][ops][track]") {
+    // two objects that swap nothing but their numbering between the frames
+    const Dims5 dims{1, 2, 1, 16, 16};
+    const DatasetMeta meta = metaFor(dims);
+    auto data = std::make_shared<Array5>(Array5::zeros(dims));
+    auto labels = std::make_shared<LabelVolume>(2, 1, 16, 16);
+    auto square = [&](Index t, Index y0, Index x0, std::uint32_t id) {
+        for (Index y = y0; y < y0 + 3; ++y)
+            for (Index x = x0; x < x0 + 3; ++x) labels->volume(t)[y * 16 + x] = id;
+    };
+    square(0, 2, 2, 1);
+    square(0, 10, 10, 2);
+    square(1, 2, 3, 2);    // the first object, numbered 2 in this frame
+    square(1, 10, 11, 1);
+    for (Index t = 0; t < 2; ++t) labels->recomputeStats(t);
+    const Operation& op = requireOperation("track");
+    Progress prog;
+    StepInput in = inputOf(data, meta);
+    in.labels = labels;
+
+    ParamSet p = op.defaults();
+    const StepOutput relabelled = op.run(in, p, prog.ctx);
+    REQUIRE(relabelled.labels);
+    CHECK(relabelled.labels->tracked());
+    CHECK(relabelled.labels->at(1, 0, 3, 4) == relabelled.labels->at(0, 0, 3, 3));
+
+    p.set("relabel", false);
+    const StepOutput asSegmented = op.run(in, p, prog.ctx);
+    REQUIRE(asSegmented.labels);
+    // id 1 is a different object in each frame: a delete of "track 1" must not
+    // take both, which is what the tracked flag would make it do
+    CHECK_FALSE(asSegmented.labels->tracked());
+    CHECK(asSegmented.labels->at(1, 0, 3, 4) == 2);
+
+    SECTION("only btrack needs the Python worker") {
+        CHECK_FALSE(op.needsWorker(op.defaults()));
+        ParamSet bayes = op.defaults();
+        bayes.set("tracker", std::string("btrack (Bayesian)"));
+        CHECK(op.needsWorker(bayes));
+        CHECK(op.info().remoteCapable);   // the worker still implements it, for the HPC hints
     }
 }
 

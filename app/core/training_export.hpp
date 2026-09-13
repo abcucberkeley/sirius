@@ -40,8 +40,9 @@ namespace sirius::app {
         bool empty() const noexcept { return names.empty(); }
     };
 
-    // Every class named by the label statistics, sorted, "object" when a
-    // volume carries no statistics but does carry labels.
+    // Every class of every object in every frame (LabelVolume::annotationOf,
+    // so each frame's own), sorted; "object" for the labels nothing was said
+    // about. The functions below name the class of a label the same way.
     ClassTable classTable(const LabelVolume& labels);
 
     // One object of one time point.
@@ -107,13 +108,17 @@ namespace sirius::app {
         std::vector<std::string> files;     // relative to the dataset folder
         std::uint64_t objects = 0;
         std::uint64_t sliceObjects = 0;
-        std::size_t classes = 0;
+        std::size_t classes = 0;            // in this sample; the ids index the dataset's classes.txt
         Index frames = 0;
         std::uint64_t bytes = 0;
     };
 
     // Empty when the options are consistent, otherwise the problem.
     std::string validateTrainingExport(const TrainingExportOptions& o, const LabelVolume& labels);
+    // The same, and the image written beside the labels (image.tif, the
+    // slice planes) has to be of the same (t, z, y, x) as they are: an image
+    // of another grid would be a sample whose masks do not fit its image.
+    std::string validateTrainingExport(const TrainingExportOptions& o, const LabelVolume& labels, const Dims5& imageDims);
 
     TrainingExportResult exportTrainingData(const Array5& array, const DatasetMeta& meta, const LabelVolume& labels,
                                             const TrainingExportOptions& options,

@@ -154,9 +154,11 @@ namespace sirius::app {
 
     void LabelVolume::recomputeStats(Index t, const float* probabilities) {
         if (t < 0 || t >= t_) throw std::out_of_range("LabelVolume::recomputeStats: t out of range");
-        // annotations survive a recompute: keep class / reviewed of known ids
-        std::unordered_map<std::uint32_t, LabelStats> previous;
-        for (const LabelStats& s : stats_) previous.emplace(s.id, s);
+        // Annotations survive a recompute, frame by frame: the table on
+        // screen is put aside for the frame it describes, and every row below
+        // takes what was said about its id in frame t -- not what the table
+        // of another frame said about another object under the same number.
+        saveAnnotations();
 
         const std::uint32_t* v = static_cast<const LabelVolume&>(*this).volume(t);   // read only: no detach
         const Index n = volumeSize();
@@ -170,7 +172,14 @@ namespace sirius::app {
             Index z0 = std::numeric_limits<Index>::max(), z1 = -1, y0 = std::numeric_limits<Index>::max(), y1 = -1,
                   x0 = std::numeric_limits<Index>::max(), x1 = -1;
         };
-        std::vector<Acc> acc(static_cast<std::size_t>(maxId) + 1);
+        // One accumulator per id: a table indexed by id while the ids are not
+        // much sparser than the voxels, a map beyond that -- a single id near
+        // 2^32 (a plugin's, a corrupt file's) used to ask for a 200 GB table.
+        const bool dense = static_cast<Index>(maxId) <= std::max<Index>(Index{1} << 16, n / 8);
+        std::vector<Acc> table(dense ? static_cast<std::size_t>(maxId) + 1 : 0);
+        std::unordered_map<std::uint32_t, Acc> sparse;
+        std::uint32_t lastId = 0;
+        Acc* last = nullptr;   // neighbouring voxels mostly share an id: one lookup per run of them
         for (Index z = 0; z < z_; ++z)
             for (Index y = 0; y < y_; ++y) {
                 const std::uint32_t* row = v + (z * y_ + y) * x_;
@@ -178,7 +187,11 @@ namespace sirius::app {
                 for (Index x = 0; x < x_; ++x) {
                     const std::uint32_t id = row[x];
                     if (!id) continue;
-                    Acc& a = acc[id];
+                    if (!last || id != lastId) {
+                        last = dense ? &table[id] : &sparse[id];
+                        lastId = id;
+                    }
+                    Acc& a = *last;
                     ++a.voxels;
                     if (prow) a.prob += prow[x];
                     a.z0 = std::min(a.z0, z);
@@ -189,21 +202,28 @@ namespace sirius::app {
                     a.x1 = std::max(a.x1, x);
                 }
             }
+        std::vector<std::pair<std::uint32_t, const Acc*>> present;   // ascending id
+        if (dense) {
+            for (std::uint32_t id = 1; id <= maxId; ++id)
+                if (table[id].voxels) present.emplace_back(id, &table[id]);
+        } else {
+            present.reserve(sparse.size());
+            for (const auto& [id, a] : sparse) present.emplace_back(id, &a);
+            std::sort(present.begin(), present.end(), [](const auto& a, const auto& b) { return a.first < b.first; });
+        }
 
         stats_.clear();
-        for (std::uint32_t id = 1; id <= maxId; ++id) {
-            const Acc& a = acc[id];
-            if (!a.voxels) continue;
+        stats_.reserve(present.size());
+        for (const auto& [id, acc] : present) {
+            const Acc& a = *acc;
             LabelStats s;
-            auto it = previous.find(id);
-            if (it != previous.end()) {
-                s.cls = it->second.cls;
-                s.reviewed = it->second.reviewed;
-                // The mean probability came with the segmentation; a later
-                // pass without one (cleanup, crop, tracking) keeps it, as
-                // updateStats does, rather than promoting every label to 1.
-                s.confidence = it->second.confidence;
-            }
+            const LabelAnnotation known = savedAnnotation(t, id);
+            s.cls = known.cls;
+            s.reviewed = known.reviewed;
+            // The mean probability came with the segmentation; a later
+            // pass without one (cleanup, crop, tracking) keeps it, as
+            // updateStats does, rather than promoting every label to 1.
+            s.confidence = known.confidence;
             s.id = id;
             s.voxels = a.voxels;
             if (probabilities) s.confidence = a.prob / static_cast<double>(a.voxels);
@@ -247,6 +267,7 @@ namespace sirius::app {
         std::sort(touched.begin(), touched.end());
         touched.erase(std::unique(touched.begin(), touched.end()), touched.end());
         const std::uint32_t* v = static_cast<const LabelVolume&>(*this).volume(diff.t);
+        std::vector<LabelStats> gone;   // rows the edit emptied
         for (std::uint32_t id : touched) {
             LabelStats* known = mutableStatsOf(id);
             Index z0 = box[0], z1 = box[1], y0 = box[2], y1 = box[3], x0 = box[4], x1 = box[5];
@@ -275,6 +296,7 @@ namespace sirius::app {
                     }
                 }
             if (count == 0) {
+                if (known) gone.push_back(*known);
                 stats_.erase(std::remove_if(stats_.begin(), stats_.end(), [id](const LabelStats& s) { return s.id == id; }),
                              stats_.end());
                 continue;
@@ -282,6 +304,11 @@ namespace sirius::app {
             if (!known) {
                 LabelStats s;
                 s.id = id;
+                // what the frame said about this id before, an undone delete say
+                const LabelAnnotation before = savedAnnotation(diff.t, id);
+                s.cls = before.cls;
+                s.confidence = before.confidence;
+                s.reviewed = before.reviewed;
                 // keep the table ordered by id, as recomputeStats leaves it
                 auto at = std::find_if(stats_.begin(), stats_.end(), [id](const LabelStats& o) { return o.id > id; });
                 known = &*stats_.insert(at, std::move(s));
@@ -291,6 +318,13 @@ namespace sirius::app {
             known->touchesBorder = by0 == 0 || by1 == y_ - 1 || bx0 == 0 || bx1 == x_ - 1 ||
                                    (z_ > 1 && (bz0 == 0 || bz1 == z_ - 1));
         }
+        if (!gone.empty()) {
+            // kept for the frame, so the undo that brings the object back
+            // brings back its class and review mark too
+            std::vector<const LabelStats*> rows;
+            for (const LabelStats& s : gone) rows.push_back(&s);
+            saveAnnotations(diff.t, rows);
+        }
         if (flagRules_) applyFlags(*flagRules_);
     }
 
@@ -298,6 +332,99 @@ namespace sirius::app {
         for (const LabelStats& s : stats_)
             if (s.id == id) return &s;
         return nullptr;
+    }
+
+    void LabelVolume::saveAnnotations(Index t, const std::vector<const LabelStats*>& rows) {
+        if (t < 0 || t >= t_ || rows.empty()) return;
+        if (static_cast<Index>(frameAnnotations_.size()) != t_) frameAnnotations_.resize(static_cast<std::size_t>(t_));
+        std::shared_ptr<const AnnotationTable>& slot = frameAnnotations_[static_cast<std::size_t>(t)];
+        // A row that says nothing ("object", confidence 1, not reviewed) is
+        // what a lookup answers anyway, so the frame keeps no entry for it:
+        // the labels of a threshold cost nothing here, whatever their count.
+        auto plain = [](const LabelStats& s) { return s.cls == "object" && s.confidence == 1.0 && !s.reviewed; };
+        bool needed = static_cast<bool>(slot);
+        for (const LabelStats* s : rows) needed = needed || !plain(*s);
+        if (needed) {
+            // a new table rather than an edit: share() and clone() hold the old one
+            auto frame = slot ? std::make_shared<AnnotationTable>(*slot) : std::make_shared<AnnotationTable>();
+            for (const LabelStats* s : rows) {
+                if (plain(*s)) frame->erase(s->id);
+                else (*frame)[s->id] = LabelAnnotation{s->cls, s->confidence, s->reviewed};
+            }
+            slot = frame->empty() ? nullptr : std::move(frame);
+        }
+        // the track's marks are kept explicitly, plain ones too: they
+        // override what a frame put aside before the mark was taken back
+        if (!tracked_) return;
+        auto track = trackAnnotations_ ? std::make_shared<AnnotationTable>(*trackAnnotations_) : std::make_shared<AnnotationTable>();
+        for (const LabelStats* s : rows) (*track)[s->id] = LabelAnnotation{s->cls, s->confidence, s->reviewed};
+        trackAnnotations_ = std::move(track);
+    }
+
+    void LabelVolume::saveAnnotations() {
+        if (statsT_ < 0 || stats_.empty()) return;
+        std::vector<const LabelStats*> rows;
+        rows.reserve(stats_.size());
+        for (const LabelStats& s : stats_) rows.push_back(&s);
+        saveAnnotations(statsT_, rows);
+    }
+
+    LabelAnnotation LabelVolume::savedAnnotation(Index t, std::uint32_t id) const {
+        auto find = [id](const std::shared_ptr<const AnnotationTable>& table) -> const LabelAnnotation* {
+            if (!table) return nullptr;
+            const auto it = table->find(id);
+            return it == table->end() ? nullptr : &it->second;
+        };
+        auto inFrame = [&](Index f) -> const LabelAnnotation* {
+            return f >= 0 && f < static_cast<Index>(frameAnnotations_.size()) ? find(frameAnnotations_[static_cast<std::size_t>(f)])
+                                                                              : nullptr;
+        };
+        LabelAnnotation a;
+        const LabelAnnotation* own = inFrame(t);
+        if (own) a = *own;
+        if (!tracked_) return a;   // another frame's id 3 is another object
+        // One id, one object in every frame: class and review mark are the
+        // track's, whichever frame they were given in. An id no frame has
+        // described as a track yet takes the nearest frame that knows it.
+        if (const LabelAnnotation* track = find(trackAnnotations_)) {
+            if (!own) a.confidence = track->confidence;
+            a.cls = track->cls;
+            a.reviewed = track->reviewed;
+        } else if (!own && !frameAnnotations_.empty()) {
+            for (Index d = 1; d < t_; ++d) {
+                const LabelAnnotation* near = inFrame(t - d);
+                if (!near) near = inFrame(t + d);
+                if (near) {
+                    a = *near;
+                    break;
+                }
+            }
+        }
+        return a;
+    }
+
+    LabelAnnotation LabelVolume::annotationOf(Index t, std::uint32_t id) const {
+        const LabelStats* row = statsOf(id);
+        if (row && t == statsT_) return LabelAnnotation{row->cls, row->confidence, row->reviewed};
+        LabelAnnotation a = savedAnnotation(t, id);
+        // the table on screen is newer than what was put aside for its track
+        if (row && tracked_) {
+            a.cls = row->cls;
+            a.reviewed = row->reviewed;
+        }
+        return a;
+    }
+
+    void LabelVolume::copyAnnotationsFrom(const LabelVolume& other) {
+        if (&other == this) return;
+        stats_ = other.stats_;
+        statsT_ = other.statsT_ < t_ ? other.statsT_ : -1;
+        frameAnnotations_ = other.frameAnnotations_;
+        if (!frameAnnotations_.empty()) frameAnnotations_.resize(static_cast<std::size_t>(t_));
+        trackAnnotations_ = other.trackAnnotations_;
+        flagRules_ = other.flagRules_;
+        tracked_ = other.tracked_;
+        maxLabel_ = std::max(maxLabel_, other.maxLabel_);
     }
 
     LabelStats* LabelVolume::mutableStatsOf(std::uint32_t id) noexcept {
@@ -369,6 +496,7 @@ namespace sirius::app {
                 }
         }
         maxLabel_ = std::max(maxLabel_, label);
+        if (!diff.empty()) ++generation_;
         return diff;
     }
 
@@ -405,6 +533,7 @@ namespace sirius::app {
         diff.before.assign(diff.indices.size(), from);
         diff.after.assign(diff.indices.size(), label);
         maxLabel_ = std::max(maxLabel_, label);
+        ++generation_;
         return diff;
     }
 
@@ -431,6 +560,7 @@ namespace sirius::app {
             diff.after.push_back(target);
             v[i] = target;
         }
+        if (!diff.empty()) ++generation_;
         return diff;
     }
 
@@ -449,6 +579,7 @@ namespace sirius::app {
             diff.after.push_back(0);
             v[i] = 0;
         }
+        if (!diff.empty()) ++generation_;
         return diff;
     }
 
@@ -517,7 +648,10 @@ namespace sirius::app {
                     diff.after.push_back(newId);
                     v[i] = newId;
                 }
-        if (!diff.empty()) maxLabel_ = std::max(maxLabel_, newId);
+        if (!diff.empty()) {
+            maxLabel_ = std::max(maxLabel_, newId);
+            ++generation_;
+        }
         return diff;
     }
 
@@ -540,6 +674,7 @@ namespace sirius::app {
             v[i] = values[k];
             maxLabel_ = std::max(maxLabel_, values[k]);
         }
+        if (count) ++generation_;
     }
 
     std::shared_ptr<LabelVolume> LabelVolume::clone() const {
@@ -557,6 +692,8 @@ namespace sirius::app {
         c->data_ = data_;
         c->stats_ = stats_;
         c->statsT_ = statsT_;
+        c->frameAnnotations_ = frameAnnotations_;
+        c->trackAnnotations_ = trackAnnotations_;
         c->flagRules_ = flagRules_;
         c->maxLabel_ = maxLabel_;
         c->tracked_ = tracked_;
@@ -923,7 +1060,7 @@ namespace sirius::app {
     }
 
     std::uint32_t distanceSeeds(const std::uint8_t* mask, Index z, Index y, Index x, double minDistance,
-                                std::uint32_t* out) {
+                                std::uint32_t* out, const std::function<void()>& poll) {
         requireExtent(z, y, x, "distanceSeeds");
         const Index plane = y * x, n = z * plane;
         std::vector<float> dist(static_cast<std::size_t>(n));
@@ -933,7 +1070,8 @@ namespace sirius::app {
         // every 26-neighbour
         std::vector<Index> candidates;
         for (Index iz = 0; iz < z; ++iz)
-            for (Index iy = 0; iy < y; ++iy)
+            for (Index iy = 0; iy < y; ++iy) {
+                if (poll) poll();
                 for (Index ix = 0; ix < x; ++ix) {
                     const Index i = (iz * y + iy) * x + ix;
                     const float d = dist[static_cast<std::size_t>(i)];
@@ -951,13 +1089,16 @@ namespace sirius::app {
                             }
                     if (maximal) candidates.push_back(i);
                 }
+            }
         // deepest first; a candidate closer than minDistance to an accepted
         // seed is the same object's plateau, not a new one
         std::stable_sort(candidates.begin(), candidates.end(),
                          [&](Index a, Index b) { return dist[static_cast<std::size_t>(a)] > dist[static_cast<std::size_t>(b)]; });
         const double minD2 = std::max(minDistance, 1.0) * std::max(minDistance, 1.0);
         std::vector<Voxel> accepted;
-        for (Index i : candidates) {
+        for (std::size_t k = 0; k < candidates.size(); ++k) {
+            if (poll && (k & 255) == 0) poll();
+            const Index i = candidates[k];
             const Voxel c{i / plane, (i / x) % y, i % x};
             bool ok = true;
             for (const Voxel& a : accepted) {
@@ -1030,6 +1171,54 @@ namespace sirius::app {
             const auto it = remap.find(labels[i]);
             labels[i] = it == remap.end() ? 0u : it->second;
         }
+        return next;
+    }
+
+    std::uint32_t LabelVolume::relabelDensely() {
+        if (data_->empty()) return 0;
+        detach();
+        std::uint32_t* v = data_->data();
+        const Index total = data_->size();
+        // one map over the ids of every frame, ascending
+        const IdCounts counts = countIds(v, total);
+        std::unordered_map<std::uint32_t, std::uint32_t> remap;
+        std::uint32_t next = 0;
+        counts.forEachId([&](std::uint32_t id, Index) { remap[id] = ++next; });
+        auto mapped = [&remap](std::uint32_t id) {
+            const auto it = remap.find(id);
+            return it == remap.end() ? 0u : it->second;
+        };
+        std::uint32_t lastId = 0, lastNew = 0;
+        for (Index i = 0; i < total; ++i) {
+            if (!v[i]) continue;
+            if (v[i] != lastId) {
+                lastId = v[i];
+                lastNew = mapped(lastId);
+            }
+            v[i] = lastNew;
+        }
+        // What was said about an object goes with it to its new number; an
+        // id no frame has any more takes nothing to a number another object
+        // now wears.
+        std::vector<LabelStats> rows;
+        rows.reserve(stats_.size());
+        for (LabelStats& s : stats_)
+            if (const std::uint32_t id = mapped(s.id)) {
+                s.id = id;
+                rows.push_back(std::move(s));
+            }
+        stats_ = std::move(rows);   // still in id order: the map is monotonic
+        auto renumbered = [&](const std::shared_ptr<const AnnotationTable>& table) -> std::shared_ptr<const AnnotationTable> {
+            if (!table) return nullptr;
+            auto out = std::make_shared<AnnotationTable>();
+            for (const auto& [id, a] : *table)
+                if (const std::uint32_t to = mapped(id)) out->emplace(to, a);
+            return out;
+        };
+        for (auto& frame : frameAnnotations_) frame = renumbered(frame);
+        trackAnnotations_ = renumbered(trackAnnotations_);
+        maxLabel_ = next;
+        ++generation_;
         return next;
     }
 
@@ -1601,12 +1790,19 @@ namespace sirius::app {
         // Dijkstra from every labelled voxel at once. A voxel reached from two
         // labels at the same distance stays background: growing it either way
         // would join two objects that the segmentation kept apart.
+        // Equal distances leave the queue in the order they entered it (the
+        // labelled voxels in raster order first): a tied voxel still passes
+        // on the label that reached it first, and that must not depend on
+        // how a heap happens to order equal keys -- the Python mirror keys
+        // its heap the same way and has to agree voxel for voxel.
         struct Node {
             double d;
+            std::uint64_t seq;
             Index i;
-            bool operator>(const Node& o) const { return d > o.d; }
+            bool operator>(const Node& o) const { return d != o.d ? d > o.d : seq > o.seq; }
         };
         std::priority_queue<Node, std::vector<Node>, std::greater<Node>> queue;
+        std::uint64_t seq = 0;
         std::vector<double> best(static_cast<std::size_t>(n), std::numeric_limits<double>::infinity());
         std::vector<std::uint32_t> from(static_cast<std::size_t>(n), 0u);
         std::vector<std::uint8_t> tied(static_cast<std::size_t>(n), 0);
@@ -1614,7 +1810,7 @@ namespace sirius::app {
             if (labels[i] != 0) {
                 best[static_cast<std::size_t>(i)] = 0.0;
                 from[static_cast<std::size_t>(i)] = labels[i];
-                queue.push({0.0, i});
+                queue.push({0.0, seq++, i});
             }
         const double stepZ = zAspect;   // the planes are that much further apart than the pixels
         while (!queue.empty()) {
@@ -1638,7 +1834,7 @@ namespace sirius::app {
                     bj = d;
                     from[static_cast<std::size_t>(j)] = from[static_cast<std::size_t>(cur.i)];
                     tied[static_cast<std::size_t>(j)] = 0;
-                    queue.push({d, j});
+                    queue.push({d, seq++, j});
                 } else if (std::fabs(d - bj) <= 1e-9 && from[static_cast<std::size_t>(cur.i)] != from[static_cast<std::size_t>(j)]) {
                     tied[static_cast<std::size_t>(j)] = 1;
                 }

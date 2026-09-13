@@ -125,6 +125,9 @@ namespace sirius::app {
 
     // Hash helper shared with the tool API (stable across runs).
     std::string stableHash(const std::string& s);
+    // "size:mtime" of a file ("dir:mtime" of a directory), empty when there is
+    // none: what the fingerprint notices of a file rewritten under its name.
+    std::string fileStamp(const std::string& path);
 
 } // namespace sirius::app
 

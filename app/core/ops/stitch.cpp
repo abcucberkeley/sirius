@@ -334,11 +334,22 @@ namespace sirius::app {
             // --- the input dataset's tiles ----------------------------------------
 
             // A source that can serve every tile: the lazy folder source the Load
-            // step made, or the folder reopened when the input was materialized
-            // (a memory source holds one tile) or comes from a later step.
+            // step made, or the folder reopened when the Load step read its tile
+            // into memory (a memory source holds one tile).
             static std::shared_ptr<ArraySource> tileSource(const StepInput& input) {
                 const Index n = static_cast<Index>(input.meta.tiles.size());
-                if (input.source && input.source->tileCount() == n) return input.source;
+                // The other tiles come from the files, so the pixels coming in
+                // must still be the files' pixels: a step between Load and
+                // Stitch that computed an array (a contrast, a flat field, a
+                // registration) would be silently dropped from the mosaic,
+                // which is what reopening the folder for any input used to do.
+                // A step that passes its input's source on (cleanup, tracking)
+                // changes no pixels and is fine.
+                if (!input.source)
+                    throw std::runtime_error("Stitch: the dataset's tiles are read from its files, so the steps between Load and "
+                                             "Stitch would be left out of the mosaic. Put Stitch directly after Load and the "
+                                             "other steps after it, or stitch tile files (the Tiles parameter).");
+                if (input.source->tileCount() == n) return input.source;
                 if (isFolderDataset(input.meta.sourcePath)) return openDataset(input.meta.sourcePath, OpenOptions{}).source;
                 throw std::runtime_error("Stitch: the tiles of " + input.meta.name + " are not readable here (" +
                                          (input.meta.sourcePath.empty() ? std::string("no source folder") : input.meta.sourcePath) + ")");

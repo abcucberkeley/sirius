@@ -17,6 +17,7 @@ import tempfile
 import threading
 import time
 import unittest
+import warnings
 
 import numpy as np
 
@@ -483,6 +484,53 @@ class TestTorchOverSocket(ServerTestCase):
             c.close()
 
 
+class TestRequestDevice(unittest.TestCase):
+    """A run goes where its request says: seg.cpp sends "device": "cpu" for
+    the CPU backend and "auto" otherwise, and the step reports where it ran
+    from the request, so a worker started on CUDA must honour "cpu"."""
+
+    def test_the_request_names_the_device_and_auto_is_the_workers_own(self):
+        server = WorkerServer("127.0.0.1", 0, "t", "cuda")
+        self.assertEqual(server.request_device("cpu"), "cpu")
+        self.assertEqual(server.request_device("CPU"), "cpu")
+        self.assertEqual(server.request_device("auto"), "cuda")
+        self.assertEqual(server.request_device(None), "cuda")
+        self.assertEqual(server.request_device("cuda:1"), "cuda:1")
+
+    @unittest.skipUnless(HAVE_TORCH, "torch not importable")
+    def test_a_cpu_request_runs_on_the_cpu_of_a_cuda_worker(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        path = os.path.join(tmp.name, "where.pt")
+
+        class Where(torch.nn.Module):
+            """1 where the input tensor is on CUDA, 0 on the CPU."""
+
+            def forward(self, x):
+                return torch.ones_like(x) * float(x.is_cuda)
+
+        torch.jit.script(Where()).save(path)
+        # started for CUDA: without a GPU a run that ignored the request's
+        # device fails, with one it computes on the GPU; either way not "cpu"
+        server = WorkerServer("127.0.0.1", 0, "t", "cuda")
+        port = server.bind()
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        try:
+            c = _Client(port, "t")
+            c.hello()
+            vol = np.random.default_rng(0).random((4, 16, 16), dtype=np.float32)
+            _, header, tensors = c.call("run", {"kind": "torch_segment", "params": {
+                "model": path, "tile": [4, 16, 16], "overlap": 0, "device": "cpu"}}, {"input": vol})
+            c.close()
+            self.assertEqual(header["type"], "result", header)
+            self.assertEqual(header["result"]["device"], "cpu")
+            self.assertEqual(float(tensors["prob"].max()), 0.0)
+        finally:
+            server.stop()
+            thread.join(timeout=5)
+
+
 class TestStepLibraryLocation(unittest.TestCase):
     def test_workbench_is_found(self):
         wb = workbench()
@@ -562,6 +610,77 @@ class TestConnectionLifecycle(unittest.TestCase):
             server.stop()
             thread.join(timeout=5)
 
+    def test_a_partial_frame_before_hello_does_not_lock_the_next_client_out(self):
+        # one byte of a header length, then silence: the frame read used to
+        # block with no deadline, so nobody else was ever served
+        server = WorkerServer("127.0.0.1", 0, "t", "cpu")
+        server.HELLO_TIMEOUT = 1.0
+        port = server.bind()
+        thread = self._serve(server)
+        try:
+            stalled = socket.create_connection(("127.0.0.1", port), timeout=10)
+            stalled.sendall(b"\x05")
+            time.sleep(0.3)
+            client = _Client(port, "t")
+            client.sock.settimeout(10)
+            t0 = time.monotonic()
+            self.assertEqual(client.hello()["type"], "result")
+            self.assertLess(time.monotonic() - t0, 5.0)
+            self.assertEqual(stalled.recv(1), b"")   # the stalled peer was dropped
+            stalled.close()
+            client.close()
+        finally:
+            server.stop()
+            thread.join(timeout=5)
+        self.assertFalse(thread.is_alive())
+
+    def test_a_hello_dripped_a_byte_at_a_time_is_cut_off_at_the_deadline(self):
+        # every byte arrives well within the poll interval, so only a
+        # deadline on the whole frame stops it; a served hello is the failure
+        server = WorkerServer("127.0.0.1", 0, "t", "cpu")
+        server.HELLO_TIMEOUT = 0.5
+        port = server.bind()
+        thread = self._serve(server)
+        try:
+            frame = protocol.encode_frame({"id": 1, "type": "request", "method": "hello",
+                                           "params": {"token": "t", "protocol_version": protocol.PROTOCOL_VERSION}})
+            self.assertGreater(len(frame) * 0.03, 2 * server.HELLO_TIMEOUT)
+            drip = socket.create_connection(("127.0.0.1", port), timeout=10)
+            closed = False
+            for byte in frame:
+                try:
+                    drip.sendall(bytes([byte]))
+                except OSError:
+                    closed = True
+                    break
+                time.sleep(0.03)
+            if not closed:
+                drip.settimeout(10)
+                try:
+                    header, _ = protocol.read_frame(drip)
+                    closed = header.get("type") != "result"
+                except (ConnectionError, OSError):
+                    closed = True
+            self.assertTrue(closed, "a hello that took longer than HELLO_TIMEOUT was served")
+            drip.close()
+        finally:
+            server.stop()
+            thread.join(timeout=5)
+
+    def test_stop_takes_effect_while_an_authenticated_frame_is_half_sent(self):
+        server = WorkerServer("127.0.0.1", 0, "t", "cpu")
+        port = server.bind()
+        thread = self._serve(server)
+        client = _Client(port, "t")
+        self.assertEqual(client.hello()["type"], "result")
+        frame = protocol.encode_frame({"id": 2, "type": "request", "method": "ping", "params": {}})
+        client.sock.sendall(frame[:6])   # the length and two bytes of the header, then nothing
+        time.sleep(0.3)
+        server.stop()
+        thread.join(timeout=5)
+        self.assertFalse(thread.is_alive(), "stop() did not reach a reader waiting inside a frame")
+        client.close()
+
     def test_hello_params_of_the_wrong_type_are_an_error_not_a_crash(self):
         server = WorkerServer("127.0.0.1", 0, "t", "cpu")
         port = server.bind()
@@ -587,6 +706,17 @@ class TestJsonScrubbing(unittest.TestCase):
         out = _jsonable(table)
         self.assertEqual(out, {"rows": [[None, 1.5], [None, 2]], "n": 3})
         json.dumps(out, allow_nan=False)   # what encode_frame does
+
+    def test_a_numpy_nan_scalar_is_scrubbed(self):
+        # a plugin's np.nanmean of an all-NaN column is a numpy float64 NaN;
+        # it made encode_frame raise and the whole reply was lost
+        from sirius_worker.server import _jsonable
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", RuntimeWarning)
+            mean = np.nanmean(np.array([np.nan, np.nan]))
+        out = _jsonable({"mean": mean, "peak": np.float32(np.inf), "count": np.int32(2)})
+        self.assertEqual(out, {"mean": None, "peak": None, "count": 2})
+        protocol.encode_frame({"id": 1, "type": "result", "result": out})
 
 
 class TestDescriptorNumbers(unittest.TestCase):

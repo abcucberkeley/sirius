@@ -49,9 +49,10 @@ namespace sirius::app {
             const auto pct = percentiles(samples.data(), n, loPct, hiPct);
             w.lo = pct.first;
             w.hi = pct.second;
+            // the histogram spans the finite values: a +-inf voxel has no bin
             float mn = std::numeric_limits<float>::infinity(), mx = -mn;
             for (float v : samples) {
-                if (std::isnan(v)) continue;
+                if (!std::isfinite(v)) continue;
                 mn = std::min(mn, v);
                 mx = std::max(mx, v);
             }
@@ -178,7 +179,8 @@ namespace sirius::app {
                 std::snprintf(nb, sizeof nb, "%g – %g", mn, mx);
                 std::string note = nb;
                 out.array = result;
-                out.labels = input.labels ? input.labels->clone() : nullptr;
+                // out.labels stays null: the executor carries the input's
+                // labels through, and the corrections painted on this step with them
                 out.ranOn = Backend::Cpu;
                 out.note = note + " · CPU";
                 out.diagnostics = contrastDiagnostics(StepInput{meta, in, nullptr, nullptr}, params, 0,

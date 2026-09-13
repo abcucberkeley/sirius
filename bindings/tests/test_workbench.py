@@ -152,6 +152,33 @@ class TestRunPipeline(unittest.TestCase):
         out2, _ = wb.run_pipeline(self.path, legacy)
         np.testing.assert_array_equal(out2, out)
 
+    @unittest.skipUnless(_HAVE_SCIPY, "labelling needs scipy")
+    def test_labels_do_not_outlive_a_step_that_changes_the_grid(self):
+        # threshold -> resample: the labels cover the old grid, so the
+        # application drops them (executor.cpp, labelsFit); a crop after the
+        # resample used to cut the stale 64 x 64 labels as though they fitted
+        img = np.zeros((4, 64, 64), np.float32)
+        img[:, 10:20, 10:20] = 100.0
+        img[:, 40:50, 40:55] = 100.0
+        path = os.path.join(self.tmp.name, "grid.tif")
+        tifffile.imwrite(path, img, photometric="minisblack")   # 4 leading planes are not RGBA
+        steps = [{"kind": "load", "params": {}},
+                 {"kind": "threshold", "params": {"method": "Manual", "value": 50.0, "min_voxels": 1}},
+                 {"kind": "contrast", "params": {}}]
+        _, meta = wb.run_pipeline(path, {"steps": steps})
+        self.assertEqual(meta["labels"].shape, (1, 4, 64, 64))   # the grid is unchanged: carried through
+        steps[2] = {"kind": "resample", "params": {"voxel_x": 0.2, "voxel_y": 0.2}}
+        out, meta = wb.run_pipeline(path, {"steps": steps})
+        self.assertEqual(out.shape, (1, 1, 4, 32, 32))
+        self.assertNotIn("labels", meta)
+        steps.append({"kind": "croppad", "params": {"x0": 2}})
+        out, meta = wb.run_pipeline(path, {"steps": steps})
+        self.assertEqual(out.shape, (1, 1, 4, 32, 30))
+        self.assertNotIn("labels", meta)
+        steps[2] = {"kind": "maxproj", "params": {"axis": "z"}}
+        _, meta = wb.run_pipeline(path, {"steps": steps[:3]})
+        self.assertNotIn("labels", meta)
+
     def test_load_step_voxel_overrides(self):
         pipeline = [{"kind": "load", "params": {"voxel_x": 0.05, "voxel_y": 0.0, "voxel_z": 0.5}}]
         _, meta = wb.run_pipeline(self.path, pipeline)
@@ -165,6 +192,180 @@ def _sirius_extension():
         return sirius if hasattr(sirius, "SimReconstructor") else None
     except Exception:  # noqa: BLE001
         return None
+
+
+@unittest.skipIf(tifffile is None, "tifffile not installed")
+class TestTiffLoader(unittest.TestCase):
+    """Files as ImageJ and tifffile's OME writer make them, loaded as the
+    application loads them. The expected values were read with the
+    application's Load step (bindings/tests/test_parity.py compares the files
+    the C++ fixture writer makes; these cover what that writer cannot
+    produce: ImageJ's "none" resolution unit, tifffile's OME-XML)."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.tmp = tempfile.TemporaryDirectory()
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.tmp.cleanup()
+
+    def _write(self, name, data, **kw):
+        path = os.path.join(self.tmp.name, name)
+        tifffile.imwrite(path, data, **kw)
+        return path
+
+    def test_imagej_files_with_three_axes_or_fewer_keep_their_axes(self):
+        cyx = np.arange(2 * 16 * 12, dtype=np.uint16).reshape(2, 16, 12)
+        a, meta = wb.load_dataset(self._write("cyx.tif", cyx, imagej=True, metadata={"axes": "CYX"}))
+        self.assertEqual(a.shape, (2, 1, 1, 16, 12))   # was (1, 1, 2, ...): every page a z plane
+        np.testing.assert_array_equal(a[1, 0, 0], cyx[1])
+        self.assertTrue(meta["dims_from_metadata"])
+        self.assertEqual([ch["color"] for ch in meta["channels"]], ["#63e08a", "#e871d9"])   # the palette, not white
+        a, _ = wb.load_dataset(self._write("tyx.tif", cyx[:, :, :].repeat(2, axis=0)[:3], imagej=True,
+                                           metadata={"axes": "TYX", "finterval": 2.0}))
+        self.assertEqual(a.shape, (1, 3, 1, 16, 12))
+
+    def test_imagej_length_units(self):
+        zyx = np.zeros((5, 16, 12), np.uint16)
+        # ImageJ writes the resolution unit "none" and the unit in its description
+        _, meta = wb.load_dataset(self._write("nm.tif", zyx, imagej=True, resolution=(1 / 65, 1 / 65),
+                                              metadata={"axes": "ZYX", "spacing": 300, "unit": "nm"}))
+        self.assertEqual(meta["voxel_um"], [0.06499999993946404, 0.06499999993946404, 0.3])   # was 65 x 65 x 300
+        _, meta = wb.load_dataset(self._write("mm.tif", zyx[:4], imagej=True, resolution=(5000.0, 5000.0),
+                                              metadata={"axes": "ZYX", "spacing": 0.001, "unit": "mm"}))
+        self.assertEqual(meta["voxel_um"], [0.2, 0.2, 1.0])
+        # a resolution tag in centimetres wins over the description's unit;
+        # without a spacing, z is twice x
+        _, meta = wb.load_dataset(self._write("cm.tif", zyx[:4].astype(np.float32), imagej=True,
+                                              resolution=(1e4 / 0.2, 1e4 / 0.2), resolutionunit="CENTIMETER",
+                                              metadata={"axes": "ZYX", "unit": "nm"}))
+        self.assertEqual(meta["voxel_um"], [0.2, 0.2, 0.4])
+
+    def test_ome_units_order_and_channels(self):
+        data = np.arange(2 * 3 * 4 * 16 * 12, dtype=np.uint16).reshape(2, 3, 4, 16, 12)   # t, c, z, y, x
+        path = self._write("tczyx.ome.tif", data, metadata={
+            "axes": "TCZYX", "PhysicalSizeX": 0.1, "PhysicalSizeY": 0.12, "TimeIncrement": 1500, "TimeIncrementUnit": "ms",
+            "Channel": {"Name": ["DAPI", "GFP", "RFP"], "Color": [-16776961, 16711935, -1]}})
+        a, meta = wb.load_dataset(path)
+        self.assertEqual(a.shape, (3, 2, 4, 16, 12))
+        np.testing.assert_array_equal(a[2, 1, 3], data[1, 2, 3])
+        self.assertEqual(meta["name"], "tczyx")
+        self.assertEqual(meta["voxel_um"], [0.1, 0.12, 0.2])
+        self.assertEqual(meta["frame_interval_s"], 1.5)
+        self.assertEqual([(ch["label"], ch["color"]) for ch in meta["channels"]],
+                         [("DAPI", "#ff0000"), ("GFP", "#00ff00"), ("RFP", "#7c9cff")])   # white -> the palette
+        path = self._write("czyx.ome.tif", data[0, :, :2], metadata={
+            "axes": "CZYX", "PhysicalSizeX": 65, "PhysicalSizeXUnit": "nm", "PhysicalSizeY": 65, "PhysicalSizeYUnit": "nm",
+            "Channel": {"EmissionWavelength": [450.0, 0.52, 640.0], "EmissionWavelengthUnit": ["nm", "\u00b5m", "nm"]}})
+        _, meta = wb.load_dataset(path)
+        self.assertEqual(meta["voxel_um"], [0.065, 0.065, 0.13])
+        self.assertEqual([(ch["wavelength_nm"], ch["color"]) for ch in meta["channels"]],
+                         [(450.0, "#6ec1c0"), (520.0, "#9dafad"), (640.0, "#ff7a5c")])
+
+    def test_explicit_counts_follow_the_application(self):
+        pages = np.arange(12 * 4 * 3, dtype=np.float32).reshape(12, 4, 3)
+        path = self._write("plain.tif", pages, photometric="minisblack", metadata=None)
+        self.assertEqual(wb.load_dataset(path, c=3)[0].shape, (3, 1, 4, 4, 3))
+        # 4 planes do not divide 12 pages without a channel count: pages as z
+        # (this read c3 z4 before)
+        self.assertEqual(wb.load_dataset(path, z=4)[0].shape, (1, 1, 12, 4, 3))
+        a, _ = wb.load_dataset(path, "zct", c=2)
+        self.assertEqual(a.shape, (2, 1, 6, 4, 3))
+        np.testing.assert_array_equal(a[1, 0, 0], pages[6])   # z fastest: channel 1 starts at page 6
+        # an ImageJ file with an explicit count keeps the file's other axes
+        ij = self._write("ij.tif", pages.reshape(2, 3, 2, 4, 3), imagej=True, metadata={"axes": "TZCYX"})
+        self.assertEqual(wb.load_dataset(ij, c=3)[0].shape, (3, 2, 2, 4, 3))
+
+    def test_colour_tiffs_are_refused_like_the_application(self):
+        path = self._write("rgb.tif", np.zeros((8, 8, 3), np.uint8), photometric="rgb")
+        with self.assertRaises(Exception) as cm:
+            wb.load_dataset(path)
+        self.assertIn("single-channel", str(cm.exception))
+
+
+try:
+    import torch  # type: ignore
+except ImportError:  # pragma: no cover - environment dependent
+    torch = None
+
+
+@unittest.skipIf(torch is None, "torch not installed")
+class TestModelCache(unittest.TestCase):
+    """load_model serves a model from memory only while its file is the one
+    it read: a re-export under the same name is another model."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.path = os.path.join(self.tmp.name, "model.pt")
+
+    def _export(self, path, k, mtime_ns):
+        class Scale(torch.nn.Module):
+            def __init__(self, k):
+                super().__init__()
+                self.k = k
+
+            def forward(self, x):
+                return x * self.k
+
+        torch.jit.script(Scale(k)).save(path)
+        os.utime(path, ns=(mtime_ns, mtime_ns))   # distinct stamps however coarse the file system clock
+
+    def _value(self, model):
+        with torch.no_grad():
+            return float(model(torch.ones(1))[0])
+
+    def test_a_model_rewritten_in_place_is_read_again(self):
+        self._export(self.path, 1.0, 1_000_000_000)
+        first = wb.load_model(self.path, "cpu")
+        self.assertEqual(self._value(first), 1.0)
+        self.assertIs(wb.load_model(self.path, "cpu"), first)   # unchanged: served from memory
+        self._export(self.path, 2.0, 2_000_000_000)
+        second = wb.load_model(self.path, "cpu")
+        self.assertEqual(self._value(second), 2.0)
+        self.assertIsNot(second, first)
+
+    def test_the_cache_is_bounded(self):
+        paths = [os.path.join(self.tmp.name, f"m{i}.pt") for i in range(wb._MODEL_CACHE_SIZE + 2)]
+        for i, p in enumerate(paths):
+            self._export(p, float(i), 1_000_000_000 + i)
+            wb.load_model(p, "cpu")
+        self.assertLessEqual(len(wb._model_cache), wb._MODEL_CACHE_SIZE)
+        self.assertNotIn((os.path.abspath(paths[0]), "cpu"), wb._model_cache)   # the least recently used went
+        self.assertIn((os.path.abspath(paths[-1]), "cpu"), wb._model_cache)
+
+
+@unittest.skipIf(torch is None, "torch not installed")
+class TestTiledInference(unittest.TestCase):
+    def test_a_constant_model_stays_constant_up_to_the_volume_corners(self):
+        # the blend window tapered the tile faces on the volume's border too,
+        # so a 3-D corner covered by one tile had a weight of ~4e-8, divided
+        # by a floor of 1e-6: with the application's overlap (z 4, y / x 32)
+        # 0.9 came out as 0.034 there
+        class Constant(torch.nn.Module):
+            def forward(self, x):
+                return torch.ones_like(x) * 0.9
+
+        model = torch.jit.script(Constant())
+        volume = np.random.default_rng(0).random((10, 100, 100), dtype=np.float32)
+        prob = wb.tiled_inference(volume, model, (8, 64, 64), (4, 32, 32), "cpu")
+        self.assertEqual(prob.shape, (1, 10, 100, 100))
+        np.testing.assert_allclose(prob, 0.9, atol=1e-5)
+        # one tile bigger than the volume on every axis: no neighbour anywhere
+        small = wb.tiled_inference(volume[:4, :20, :20], model, (8, 64, 64), (4, 32, 32), "cpu")
+        np.testing.assert_allclose(small, 0.9, atol=1e-5)
+
+    def test_overlapping_tiles_still_cross_fade(self):
+        # an identity model through overlapping tiles reproduces the input
+        class Identity(torch.nn.Module):
+            def forward(self, x):
+                return x
+
+        model = torch.jit.script(Identity())
+        volume = np.random.default_rng(1).random((12, 50, 50), dtype=np.float32)
+        prob = wb.tiled_inference(volume, model, (6, 24, 24), (2, 6, 6), "cpu", normalize=False)
+        np.testing.assert_allclose(prob[0], volume, atol=1e-5)
 
 
 @unittest.skipIf(_sirius_extension() is None, "sirius extension not importable")
@@ -187,6 +388,27 @@ class TestSimStep(unittest.TestCase):
         # the same parameters again reuse the reconstructor
         r2 = wb.run_step("sim", params, raw, {"voxel_um": [0.08, 0.08, 0.125]}, device="cpu")
         np.testing.assert_array_equal(r2.array, r.array)
+
+    def test_sim_from_file_reports_the_toml_error(self):
+        # a TOML file that fails to load was retried as a legacy config, which
+        # hid the real error behind "Unknown legacy config key"
+        meta = {"voxel_um": [0.08, 0.08, 0.125]}
+        with tempfile.TemporaryDirectory() as d:
+            bad = Path(d) / "bad.toml"
+            bad.write_text("[optics]\nndirs = 0\n")
+            with self.assertRaises(Exception) as cm:
+                wb._sim_parameters({"mode": "From file", "params_file": str(bad)}, meta)
+            self.assertIn("ndirs", str(cm.exception))
+            self.assertNotIn("legacy", str(cm.exception))
+            # a TOML file without the extension is read as TOML, as the application does
+            plain = Path(d) / "sim2d.cfg"
+            plain.write_text("# 2D SIM\n[optics]\nndirs = 3\nnphases = 3\n")
+            p = wb._sim_parameters({"mode": "From file", "params_file": str(plain)}, meta)
+            self.assertEqual(p.nphases, 3)
+            self.assertEqual(p.norders, 0)   # derived: 2 orders for 3 phases
+        # and a legacy config still loads as one
+        p = wb._sim_parameters({"mode": "From file", "params_file": str(self.DATA / "config.txt")}, meta)
+        self.assertEqual(p.nphases, 5)
 
     def test_sim_step_needs_an_otf_file(self):
         raw = np.zeros((15, 8, 8), np.float32)
@@ -215,6 +437,17 @@ class TestParameters(unittest.TestCase):
         self.assertEqual(p["method"], "Otsu")
         self.assertEqual(p["min_voxels"], 20)
         self.assertEqual(p["post"], "Connected components")
+
+    def test_numbers_are_parsed_as_the_application_loads_them(self):
+        # coerceToSpec: integers round half away from zero (llround, where
+        # Python's round() goes to even) and every number is clamped to the
+        # parameter's range
+        self.assertEqual([wb._int({"v": v}, "v", 0) for v in (2.5, 3.5, -2.5, "0.5", 1.49)], [3, 4, -3, 1, 1])
+        p = wb._prepare_params(wb.step_spec("classic"),
+                               {"window": 1, "min_voxels": -4, "sigma": 75.0, "opening": 2.5}, None)
+        self.assertEqual((p["window"], p["min_voxels"], p["sigma"], p["opening"]), (3, 0, 50.0, 3))
+        p = wb._prepare_params(wb.step_spec("croppad"), {"z0": -1e9, "x": "12.5"}, None)
+        self.assertEqual((p["z0"], p["x"]), (-100000, 13))
 
     def test_kind_aliases_resolve_to_implemented_kinds(self):
         for alias, kind in wb._KIND_ALIASES.items():
@@ -248,6 +481,41 @@ class TestIntensityHelpers(unittest.TestCase):
         two = np.array([0.0, 1.0], np.float32)
         self.assertAlmostEqual(wb._otsu_threshold(two), 1.0 / 256, places=7)
 
+    def test_histograms_and_otsu_cuts_leave_out_infinities(self):
+        # an infinite voxel made the C++ histogram write out of bounds (the
+        # application crashed opening the dataset) and these raise ValueError;
+        # both now work on the finite values, as tests/test_app_ops.cpp checks
+        inf = np.float32(np.inf)
+        np.testing.assert_array_equal(wb._histogram(np.array([-inf, 0, 0.5, 1, inf], np.float32), 4, 0.0, 1.0),
+                                      [1, 0, 1, 1])
+        for lo, hi in ((0.0, np.inf), (-np.inf, 1.0), (-np.inf, np.inf)):
+            np.testing.assert_array_equal(wb._histogram(np.array([0.5, inf], np.float32), 30, lo, hi), np.zeros(30))
+        rng = np.random.default_rng(3)
+        v = np.concatenate([rng.normal(10, 1, 500), rng.normal(50, 1, 500), rng.normal(90, 1, 100)]).astype(np.float32)
+        poked = np.concatenate([v, [inf, -inf, np.nan]]).astype(np.float32)
+        self.assertEqual(wb._otsu_threshold(poked), wb._otsu_threshold(v))
+        self.assertEqual(wb._multi_otsu_upper(poked), wb._multi_otsu_upper(v))
+        self.assertTrue(10 < wb._otsu_threshold(v) < 90)
+        # nothing finite: a cut nothing lies above, as the C++ returns
+        none = np.array([inf, -inf, np.nan], np.float32)
+        self.assertEqual(wb._otsu_threshold(none), np.inf)
+        self.assertEqual(wb._multi_otsu_upper(none), np.inf)
+
+    def test_otsu_cuts_break_ties_as_the_application(self):
+        # Symmetric about its centre, each histogram scores a split and its
+        # mirror image exactly the same; the float rounding of the between-class
+        # variance picks one, so the mirror must evaluate it in the C++ order.
+        # The same data and cuts as the "Otsu and Multi-Otsu break exact ties"
+        # case in tests/test_app_ops.cpp (the old `** 2` gave 139 and 71).
+        def symmetric(bins, ends, pairs):
+            values = [0.0] * ends + [float(bins)] * ends
+            for b, count in pairs:
+                values += [b + 0.5, bins - 1 - b + 0.5] * count
+            return np.array(values, np.float32)
+
+        self.assertEqual(wb._otsu_threshold(symmetric(256, 3, ((36, 6), (117, 17)))), 37.0)
+        self.assertEqual(wb._multi_otsu_upper(symmetric(128, 1, ((2, 2), (36, 2), (44, 6), (58, 5)))), 93.0)
+
     def test_rescale_gamma(self):
         a = np.array([[[[[-1.0, 0.0, 0.5, 1.0, 2.0]]]]], np.float32)
         out = wb._rescale_gamma(a, 0.0, 1.0, 1.0)
@@ -271,6 +539,28 @@ class TestSteps(unittest.TestCase):
         np.testing.assert_allclose(r.array[:, 0], a.mean(axis=1), rtol=1e-6)
         r = wb.run_step("einsum", {"keep": "tzyx", "reduction": "sum"}, a, {"channels": [{"label": "a"}, {"label": "b"}]})
         self.assertEqual(len(r.meta["channels"]), 1)
+
+    def test_max_and_min_keep_infinities_and_nan_only_runs(self):
+        # reduceAxes semantics (tests/test_image_ops.cpp): NaN is skipped, a
+        # real +-inf is kept, and a run with nothing but NaN stays NaN
+        a = np.array([np.inf, 1, 2, np.nan, np.nan, np.nan, -np.inf, -np.inf, 0, 5, -np.inf, np.nan],
+                     np.float32).reshape(2, 1, 1, 2, 3)
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", RuntimeWarning)   # numpy's "All-NaN slice"
+            mx = wb.run_step("einsum", {"keep": "cy", "reduction": "max"}, a).array.reshape(-1)
+            mn = wb.run_step("einsum", {"keep": "cy", "reduction": "min"}, a).array.reshape(-1)
+        np.testing.assert_array_equal(mx, [np.inf, np.nan, 0, 5])
+        np.testing.assert_array_equal(mn, [1, np.nan, -np.inf, -np.inf])
+
+    def test_otsu_threshold_step_runs_on_an_infinite_voxel(self):
+        a = np.zeros((1, 1, 1, 8, 8), np.float32)
+        a[0, 0, 0, 2:5, 2:5] = 1.0
+        a[0, 0, 0, 7, 7] = np.inf
+        a[0, 0, 0, 0, 7] = -np.inf
+        r = wb.run_step("threshold", {"method": "Otsu", "min_voxels": 0, "post": "Connected components"}, a)
+        self.assertEqual(int(r.labels.max()), 2)   # the square and the +inf voxel
+        self.assertNotEqual(int(r.labels[0, 0, 7, 7]), 0)
+        self.assertEqual(int(r.labels[0, 0, 0, 7]), 0)
 
     def test_contrast_manual_window_and_auto_window(self):
         a = np.linspace(0, 100, 2 * 1 * 2 * 8 * 8, dtype=np.float32).reshape(2, 1, 2, 8, 8)
@@ -298,6 +588,38 @@ class TestSteps(unittest.TestCase):
         np.testing.assert_allclose(r.array[1], 1.0, atol=1e-6)
         with self.assertRaises(ValueError):
             wb.run_step("merge", {}, r.array, r.meta)
+
+    def test_merge_gives_uncoloured_channels_the_palette(self):
+        # the application colours a multi-channel dataset without colours
+        # 488 / 561 nm (green, magenta); the mirror used white for both, so an
+        # exported Merge came out grey
+        a = np.zeros((2, 1, 1, 4, 4), np.float32)
+        a[0] = 0.5
+        a[1] = 0.25
+        r = wb.run_step("merge", {}, a)
+        f32 = np.float32
+        green = [f32(v) / f32(255) for v in (0x63, 0xE0, 0x8A)]
+        magenta = [f32(v) / f32(255) for v in (0xE8, 0x71, 0xD9)]
+        expected = [min(f32(1), green[k] * f32(0.5) + magenta[k] * f32(0.25)) for k in range(3)]
+        self.assertEqual(r.array[:, 0, 0, 0, 0].tolist(), [float(v) for v in expected])
+        # a single channel stays white, as there
+        r = wb.run_step("merge", {}, a[:1])
+        self.assertEqual(r.array[:, 0, 0, 0, 0].tolist(), [0.5, 0.5, 0.5])
+
+    def test_merge_treats_nan_as_the_application_does(self):
+        a = np.full((2, 1, 1, 1, 3), 0.5, np.float32)
+        a[0, 0, 0, 0, 1] = np.nan
+        meta = {"channels": [{"color": "#ff0000"}, {"color": "#00ff00"}]}
+        # additive: std::min(1, r + NaN) is 1 -- the voxel turns white
+        r = wb.run_step("merge", {"blend": "Additive"}, a, meta)
+        self.assertEqual(r.array[:, 0, 0, 0, 1].tolist(), [1.0, 1.0, 1.0])
+        self.assertEqual(r.array[:, 0, 0, 0, 0].tolist(), [0.5, 0.5, 0.0])
+        # max: std::max(r, NaN) keeps r
+        r = wb.run_step("merge", {"blend": "Max"}, a, meta)
+        self.assertEqual(r.array[:, 0, 0, 0, 1].tolist(), [0.0, 0.5, 0.0])
+        # screen passes the NaN on
+        r = wb.run_step("merge", {"blend": "Screen"}, a, meta)
+        self.assertTrue(np.isnan(r.array[:, 0, 0, 0, 1]).all())
 
     @unittest.skipUnless(_HAVE_SCIPY, "connected components need scipy")
     def test_threshold_methods_and_min_voxels(self):
@@ -341,7 +663,7 @@ class TestSteps(unittest.TestCase):
         self.assertEqual(int(seeds.max()), 2)
         self.assertTrue(mask[seeds > 0].all())
 
-    @unittest.skipUnless(_HAVE_SCIPY and _HAVE_SKIMAGE, "watershed needs scipy and scikit-image")
+    @unittest.skipUnless(_HAVE_SCIPY, "watershed seeds need scipy")
     def test_watershed_splits_touching_blobs(self):
         # two overlapping disks: the distance transform has one maximum in each
         # and a saddle at the waist, so distanceSeeds accepts exactly two seeds
@@ -356,14 +678,42 @@ class TestSteps(unittest.TestCase):
         r = wb.run_step("threshold", dict(p, post="Connected components"), a)
         self.assertEqual(int(r.labels.max()), 1)
 
+    def test_watershed_floods_in_the_application_order(self):
+        # Equal heights leave the queue in the order they entered it (seeds in
+        # raster order, neighbours -z, +z, -y, +y, -x, +x), as in labels.cpp:
+        # seed 2 enters first and takes the low row before seed 1's turn at
+        # the tied voxels below it. test_app_labels.cpp pins the C++ to the
+        # same answer; scikit-image's flood gave the bottom row to seed 1.
+        land = np.array([[[1, 0, 0], [1, 1, 1]]], np.float32)
+        seeds = np.array([[[2, 0, 0], [1, 0, 0]]], np.uint32)
+        out = wb._watershed(land, np.ones((1, 2, 3), bool), seeds)
+        self.assertEqual(out.tolist(), [[[2, 2, 2], [1, 2, 2]]])
+        # nothing leaves the mask, and a seed outside it is no seed
+        mask = np.array([[[True, True, False], [False, True, True]]])
+        out = wb._watershed(land, mask, seeds)
+        self.assertEqual(out.tolist(), [[[2, 2, 0], [0, 2, 2]]])
+
+    def test_expand_labels_passes_ties_on_in_the_application_order(self):
+        # the case test_app_labels.cpp pins the C++ to (its heap used to give
+        # (1, 0) .. (3, 1) another answer): (1, 1) is tied and stays
+        # background, and what it passes on is the label that reached it first
+        lab = np.array([[[0, 1, 0], [0, 0, 2], [0, 0, 0], [0, 0, 0]]], np.uint32)
+        grown = wb._expand_labels(lab, 4.0, 3.0)
+        self.assertEqual(grown.tolist(), [[[1, 1, 0], [1, 0, 2], [1, 0, 2], [1, 0, 2]]])
+
     @unittest.skipUnless(_HAVE_SCIPY, "label post-processing needs scipy")
-    def test_watershed_without_skimage_is_reported(self):
-        if _HAVE_SKIMAGE:
-            self.skipTest("scikit-image is installed")
-        a = np.zeros((1, 1, 1, 8, 8), np.float32)
-        a[0, 0, 0, 2:6, 2:6] = 1.0
-        with self.assertRaises(wb.NotAvailable):
-            wb.run_step("threshold", {"method": "Manual", "value": 0.5, "post": "Watershed (distance)"}, a)
+    def test_watershed_keeps_a_component_no_seed_reached(self):
+        # two 7 x 7 squares two pixels apart: with seed_distance 10 only the
+        # first gets a seed, and the second used to vanish from the labels
+        a = np.zeros((1, 1, 1, 12, 20), np.float32)
+        a[0, 0, 0, 2:9, 2:9] = 1.0
+        a[0, 0, 0, 2:9, 11:18] = 1.0
+        p = {"method": "Manual", "value": 0.5, "post": "Watershed (distance)", "seed_distance": 10.0,
+             "min_voxels": 0}
+        r = wb.run_step("threshold", p, a)
+        self.assertEqual(int(r.labels.max()), 2)
+        self.assertEqual(int(np.count_nonzero(r.labels)), 98)
+        self.assertEqual(len(np.unique(r.labels[0, 0, 2:9, 11:18])), 1)
 
     @unittest.skipUnless(_HAVE_SCIPY, "classical segmentation needs scipy")
     def test_classic_segmentation_finds_blobs(self):
@@ -415,6 +765,22 @@ class TestSteps(unittest.TestCase):
         r2 = wb.run_step("label_cleanup", {"min_voxels": 2}, a, labels=labels)
         self.assertEqual(r2.info["labels"], 2)
 
+    @unittest.skipUnless(_HAVE_SCIPY, "label post-processing needs scipy")
+    def test_cleanup_numbers_every_frame_with_one_map(self):
+        # track 4 in every frame, track 2 from t = 1, a speck of 3 in t = 0
+        a = np.zeros((1, 3, 1, 16, 16), np.float32)
+        labels = np.zeros((3, 1, 16, 16), np.uint32)
+        labels[:, 0, 10:13, 10:13] = 4
+        labels[1:, 0, 2:5, 2:5] = 2
+        labels[0, 0, 0, 15] = 3
+        r = wb.run_step("cleanup", {"min_voxels": 2, "relabel": True}, a, labels=labels)
+        # one id per object in every frame, as cleanup.cpp: a numbering per
+        # frame made the track 1 at t = 0 and 2 afterwards
+        self.assertEqual(r.labels[:, 0, 11, 11].tolist(), [2, 2, 2])
+        self.assertEqual(r.labels[1:, 0, 3, 3].tolist(), [1, 1])
+        self.assertEqual(int(r.labels[0, 0, 0, 15]), 0)
+        self.assertEqual(r.info["labels"], 2)
+
     def test_resample_keeps_the_physical_field(self):
         a = np.ones((1, 2, 4, 8, 8), np.float32)
         meta = {"voxel_um": [0.1, 0.1, 0.4]}
@@ -436,6 +802,14 @@ class TestSteps(unittest.TestCase):
         np.testing.assert_allclose(r5.array[0, 0, :, 0, 0], [0, 1, 1, 2, 2, 3, 3], atol=1e-6)
         r6 = wb.run_step("resample", {"voxel_z": 0.2, "interpolation": "cubic"}, ramp, meta)
         self.assertEqual(r6.array.shape, (1, 1, 7, 3, 3))
+        # the last plane / column the extent promises is sampled: 189 * (0.1 / 0.3)
+        # rounds past plane 63, and was read as fill
+        ones = np.ones((1, 1, 64, 2, 64), np.float32)
+        for interp in ("linear", "cubic", "nearest"):
+            r7 = wb.run_step("resample", {"voxel_z": 0.1, "voxel_x": 0.1, "interpolation": interp}, ones,
+                             {"voxel_um": [0.5, 0.5, 0.3]})
+            self.assertEqual(r7.array.shape, (1, 1, 190, 2, 316))
+            self.assertAlmostEqual(float(r7.array.min()), 1.0, places=6, msg=interp)   # not 0: filled
 
     def test_bleach_mode_and_over(self):
         a = np.ones((1, 2, 4, 8, 8), np.float32)

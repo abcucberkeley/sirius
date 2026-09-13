@@ -14,6 +14,8 @@ $$
 | Parameter | Explanation |
 |---|---|
 | **Angles · Phases** <br> 3 × 5 (3D) | Number of pattern orientations and phase steps per orientation. 3D-SIM needs 5 phases to separate five bands ($m = -2 \ldots 2$); 2D-SIM needs 3. |
+| **Orders** <br> 0 = phases / 2 + 1 | Orders to separate and assemble, advanced. 0 derives them from the phases, which is also what a parameter file without an order count means. At least 2, and $2 \times$ orders $- 1$ bands need as many phases. |
+| **Skip kz = 0 plane** <br> on | Leaves the kz = 0 plane of the widefield band out of the pattern fit and the Wiener filter, advanced. That needs another plane with signal: a 2D stack, or a stack of a few planes whose other planes lie outside the OTF's axial support or below the OTF cutoff, keeps kz = 0 whatever the switch says. |
 | **Wiener** <br> 10⁻⁴ – 10⁻² | Regularisation constant $w$ in the generalised Wiener filter. Small values sharpen but amplify noise (honeycomb artefacts); large values blur. Start at 0.001 and inspect the result spectrum. $\tilde{S}(\mathbf{k}) = \frac{\sum_m \tilde{O}^*_m \tilde{D}_m}{\sum_m \|\tilde{O}_m\|^2 + w^2}\,A(\mathbf{k})$ |
 | **Apodization** <br> cosine · triangle · none | Window $A(\mathbf{k})$ applied to the extended support to suppress ringing at the cut-off. Cosine is the safe default. |
 | **OTF** <br> measured · theoretical | Optical transfer function per band. A measured OTF from beads is preferred; the theoretical one assumes ideal aberration-free optics with the given NA, immersion index and emission wavelength. |

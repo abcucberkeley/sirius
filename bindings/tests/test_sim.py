@@ -21,6 +21,16 @@ class TestSIMParameters(unittest.TestCase):
         self.assertEqual(params.wiener, 0.002)
         self.assertEqual(params.k0_angles, [0.1, 1.2, 2.3])
 
+    def test_orders_are_derived_by_default(self):
+        # norders used to default to 3, so 3 phases (2D SIM) failed to separate
+        params = sirius.SIMParameters()
+        self.assertEqual(params.norders, 0)
+        params.nphases = 3
+        params.validate()
+        params.norders = 1
+        with self.assertRaises(RuntimeError):
+            params.validate()
+
     def test_legacy_config_maps_reference_dataset(self):
         params = sirius.load_legacy_parameters(str(DATA / "config.txt"))
         self.assertEqual(params.ndirs, 3)

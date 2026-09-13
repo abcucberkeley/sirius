@@ -9,6 +9,7 @@
 #include <array>
 #include <cmath>
 #include <cstdint>
+#include <stdexcept>
 #include <vector>
 
 #include "core/labels.hpp"
@@ -240,4 +241,36 @@ TEST_CASE("Gap closing follows a chain of missed frames, not just the first link
         CHECK(chain.gapsClosed == 3);
         CHECK(chain.tracks[0].length() == 4);
     }
+}
+
+TEST_CASE("Linking and the gap closing stop when asked to", "[app][tracking]") {
+    // Forty objects that vanish for a frame: the gap closing is an assignment
+    // over every track end and start, O(n^3) -- what a cancel has to reach.
+    const std::array<double, 3> voxel{1.0, 1.0, 1.0};
+    std::vector<std::vector<TrackObject>> frames(3);
+    for (int i = 0; i < 40; ++i) {
+        frames[0].push_back(object(static_cast<std::uint32_t>(i + 1), 0, 4.0 * i, 0));
+        frames[2].push_back(object(static_cast<std::uint32_t>(i + 1), 0, 4.0 * i, 1));
+    }
+    TrackOptions options;
+    options.maxDistanceUm = 2.0;
+    options.overlapWeight = 0.0;
+    options.maxGap = 1;
+    const TrackResult whole = linkTracks(frames, {}, voxel, options);
+    CHECK(whole.gapsClosed == 40);
+
+    int calls = 0;
+    options.poll = [&calls] {
+        if (++calls == 10) throw std::runtime_error("cancelled");
+    };
+    CHECK_THROWS_AS(linkTracks(frames, {}, voxel, options), std::runtime_error);
+    CHECK(calls == 10);   // the frame pairs alone would have polled twice
+
+    int rows = 0;
+    std::vector<double> cost(40 * 40, 1.0);
+    const auto stop = [&rows] {
+        if (++rows == 3) throw std::runtime_error("cancelled");
+    };
+    CHECK_THROWS_AS(solveAssignment(cost, 40, 40, stop), std::runtime_error);
+    CHECK(rows == 3);
 }

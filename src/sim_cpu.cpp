@@ -399,7 +399,8 @@ namespace sirius::simdetail {
                     return;
                 }
                 // The carrier exp(i (angleX (ix - xdim/2) + angleY (iy - ydim/2)))
-                // is separable: one table per axis and a complex multiply per
+                // (real-valued centres, see carrierTable) is separable: one
+                // table per axis and a complex multiply per
                 // voxel, instead of a sincos per voxel of the big grid for
                 // every side band (a fifth of a CPU reconstruction). The
                 // value is accumulateValue's to rounding; the CUDA kernel
@@ -418,12 +419,16 @@ namespace sirius::simdetail {
                 }
             }
 
-            // exp(i angle (k - n / 2)) for k = 0..n-1 (integer n / 2, as the
-            // per-voxel form has it).
+            // exp(i angle (k - n / 2)) for k = 0..n-1. The centre is the point
+            // the modulation phase is measured from, input pixel nx / 2, which
+            // on the output grid is n / 2 as a real number: an integer n / 2
+            // put it half an output pixel off on an odd grid (zoom 1.5 of an
+            // even stack), a constant phase error in every side band.
             static std::vector<Cd> carrierTable(double angle, IndexT n) {
                 std::vector<Cd> table(static_cast<std::size_t>(n));
+                const double centre = 0.5 * static_cast<double>(n);
                 for (IndexT k = 0; k < n; ++k) {
-                    const double a = angle * static_cast<double>(k - n / 2);
+                    const double a = angle * (static_cast<double>(k) - centre);
                     table[static_cast<std::size_t>(k)] = cd(std::cos(a), std::sin(a));
                 }
                 return table;

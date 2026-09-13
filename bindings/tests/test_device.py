@@ -78,6 +78,22 @@ class TestBuffer(unittest.TestCase):
             np.testing.assert_array_equal(d.numpy(), a)
             np.testing.assert_array_equal(np.from_dlpack(d.to("cpu")) if hasattr(np, "from_dlpack") else d.numpy(), a)
 
+    def test_to_device_rejects_a_0d_array(self):
+        # a rank-0 Shape is the empty shape: np.array(3.0) came back as a 0-d
+        # array over no memory (reading 5e-324 or anything else)
+        with self.assertRaisesRegex(ValueError, "0-d"):
+            sirius.to_device(np.array(3.0), "cpu")
+        np.testing.assert_array_equal(sirius.to_device(np.array(3.0).reshape(1), "cpu"), [3.0])
+
+    def test_to_device_takes_read_only_arrays(self):
+        a = np.broadcast_to(np.float32(2.0), (3, 4))   # read-only, and not C-contiguous
+        b = sirius.to_device(a, "cpu")
+        self.assertEqual(b.dtype, np.float32)
+        np.testing.assert_array_equal(b, a)
+        ro = np.arange(6, dtype=np.int16).reshape(2, 3)
+        ro.flags.writeable = False
+        np.testing.assert_array_equal(sirius.to_device(ro, "cpu"), ro)
+
     def test_to_device_cpu_returns_numpy_copy(self):
         a = np.arange(12, dtype=np.uint16).reshape(3, 4)
         b = sirius.to_device(a, "cpu")

@@ -5,6 +5,7 @@
 #include "core/ops/builtin.hpp"
 
 #include <algorithm>
+#include <cstdio>
 #include <filesystem>
 #include <map>
 #include <mutex>
@@ -20,7 +21,7 @@ namespace sirius::app {
         constexpr const char* kFull = "Full load to RAM";
 
         // probeDataset is called from the UI for every repaint of the ops
-        // row; cache it per (path, mtime, size).
+        // row; cache it per (path, mtime, size) and the options it was probed with.
         struct ProbeCache {
             std::mutex mutex;
             struct Entry {
@@ -36,8 +37,22 @@ namespace sirius::app {
             return c;
         }
 
-        // Empty error when the probe succeeded.
-        std::string cachedProbe(const std::string& path, DatasetMeta& meta) {
+        // The options as part of a cache key ("" for none).
+        std::string optionsKey(const OpenOptions* o) {
+            if (!o) return {};
+            const PageOrder po = o->pageOrder.value_or(PageOrder{"-", 0, 0, 0});
+            const std::array<double, 3> v = o->voxelUm.value_or(std::array<double, 3>{-1.0, -1.0, -1.0});
+            const SimLayout sim = o->sim.value_or(SimLayout{});
+            char buf[256];
+            std::snprintf(buf, sizeof buf, "|%s %lld %lld %lld|%.17g %.17g %.17g|%d %d %d %d|%lld", po.order.c_str(),
+                          static_cast<long long>(po.c), static_cast<long long>(po.t), static_cast<long long>(po.z), v[0], v[1],
+                          v[2], sim.present ? 1 : 0, sim.ndirs, sim.nphases, sim.fastSi ? 1 : 0, static_cast<long long>(o->tile));
+            return buf;
+        }
+
+        // Empty error when the probe succeeded. With `options`, the meta that
+        // opening the dataset with them gives (probeDataset(path, options)).
+        std::string cachedProbe(const std::string& path, const OpenOptions* options, DatasetMeta& meta) {
             std::error_code ec;
             std::filesystem::path p(path);
             if (path.empty() || !std::filesystem::exists(p, ec)) return "file not found";
@@ -47,9 +62,10 @@ namespace sirius::app {
             const auto mtime = std::filesystem::last_write_time(p, ec);
             std::uintmax_t size = 0;
             if (std::filesystem::is_regular_file(p, ec)) size = std::filesystem::file_size(p, ec);
+            const std::string key = path + optionsKey(options);
             ProbeCache& c = probeCache();
             std::lock_guard<std::mutex> g(c.mutex);
-            auto it = c.entries.find(path);
+            auto it = c.entries.find(key);
             if (it != c.entries.end() && it->second.mtime == mtime && it->second.size == size) {
                 meta = it->second.meta;
                 return it->second.error;
@@ -58,52 +74,65 @@ namespace sirius::app {
             e.mtime = mtime;
             e.size = size;
             try {
-                e.meta = probeDataset(path);
+                e.meta = options ? probeDataset(path, *options) : probeDataset(path);
             } catch (const std::exception& ex) {
                 e.error = ex.what();
             }
-            c.entries[path] = e;
+            // every voxel size dragged through is a key of its own: keep it bounded
+            if (c.entries.size() >= 256) c.entries.clear();
+            c.entries[key] = e;
             meta = e.meta;
             return e.error;
         }
 
-        void applyOverrides(const ParamSet& p, DatasetMeta& meta) {
-            const double vx = p.getDouble("voxel_x"), vy = p.getDouble("voxel_y"), vz = p.getDouble("voxel_z");
-            if (vx > 0) meta.voxelUm[0] = vx;
-            if (vy > 0) meta.voxelUm[1] = vy;
-            if (vz > 0) meta.voxelUm[2] = vz;
-            const Index c = p.getInt("c"), t = p.getInt("t"), z = p.getInt("z");
-            if (c > 0 || t > 0 || z > 0) {
-                // the page count is fixed: derive the axis that was left at 0
-                const Index pages = meta.dims.planes();
-                Dims5 d = meta.dims;   // the axes left at 0 keep what the file says
-                d.c = c > 0 ? c : meta.dims.c;
-                d.t = t > 0 ? t : meta.dims.t;
-                d.z = z > 0 ? z : std::max<Index>(1, pages / std::max<Index>(d.c * d.t, 1));
-                if (d.planes() == pages) meta.dims = d;
-            }
+        // What the parameters add to an opened dataset beyond what the open
+        // itself applies (page order, voxel size, SIM layout, tile): the SIM
+        // description and the light-sheet angle. Never the dims: those are
+        // what the source serves.
+        void annotate(const ParamSet& p, DatasetMeta& meta) {
             const Index nd = p.getInt("sim_ndirs"), np = p.getInt("sim_nphases");
-            if (nd > 0 && np > 0) {
-                meta.sim.present = true;
-                meta.sim.ndirs = static_cast<int>(nd);
-                meta.sim.nphases = static_cast<int>(np);
-                meta.sim.fastSi = p.getBool("sim_fast");
-                if (meta.acquisition.empty())
-                    meta.acquisition = "3D-SIM raw · " + std::to_string(nd * np) + " phase images per plane";
-            }
+            if (nd > 0 && np > 0 && meta.acquisition.empty())
+                meta.acquisition = "3D-SIM raw · " + std::to_string(nd * np) + " phase images per plane";
             const double angle = p.getDouble("sheet_angle");
             if (angle > 0.0) {
                 meta.lightSheet = true;
                 meta.sheetAngleDeg = angle;
                 if (meta.acquisition.empty()) meta.acquisition = "Light-sheet";
             }
-            const Index tile = p.getInt("tile");
-            if (tile >= 0 && tile < static_cast<Index>(meta.tiles.size())) meta.tileIndex = tile;
             meta.normalizeChannels();
         }
 
         // Tiles a dataset has for the `tile` parameter: one unless a manifest says more.
         Index tileCountOf(const DatasetMeta& meta) { return std::max<Index>(1, static_cast<Index>(meta.tiles.size())); }
+
+        // The pages of a TIFF are mapped onto (c, t, z) by the parameters; a
+        // folder's manifest and a zarr store name their axes themselves.
+        bool pagedFormat(const DatasetMeta& meta) { return meta.format == "tiff" || meta.format == "ome-tiff"; }
+
+        bool axesGiven(const ParamSet& p) { return p.getInt("c") > 0 || p.getInt("t") > 0 || p.getInt("z") > 0; }
+
+        std::string axesNotAppliedError(const std::string& path) {
+            return isFolderDataset(path)
+                       ? "A multi-file folder takes its channels, time points and planes from its manifest: set Channels, Time points and Planes to 0."
+                       : "A zarr / N5 store names its own axes: set Channels, Time points and Planes to 0.";
+        }
+
+        // The dataset as these parameters open it, without reading pixels:
+        // what summary, validate and outputMeta describe, so they say what
+        // run() will produce. Empty when it opens, the reason otherwise.
+        std::string predict(const ParamSet& params, DatasetMeta& meta) {
+            const std::string path = params.getString("path");
+            DatasetMeta plain;
+            std::string err = cachedProbe(path, nullptr, plain);
+            if (!err.empty()) return err;
+            OpenOptions options = loadOpenOptions(params);
+            // an out-of-range tile is validate()'s to report; describe the nearest
+            options.tile = std::clamp<Index>(options.tile, 0, tileCountOf(plain) - 1);
+            err = cachedProbe(path, &options, meta);
+            if (!err.empty()) return err;
+            annotate(params, meta);
+            return {};
+        }
 
         // "tile 3/9 · tile_x2_y0" for multi-file datasets, empty otherwise.
         std::string tileSummary(const DatasetMeta& meta) {
@@ -153,9 +182,8 @@ namespace sirius::app {
                 const std::string path = params.getString("path");
                 if (path.empty()) return "no dataset";
                 DatasetMeta meta;
-                const std::string err = cachedProbe(path, meta);
+                const std::string err = predict(params, meta);
                 if (!err.empty()) return "cannot open · " + err;
-                applyOverrides(params, meta);
                 std::string mode = params.getString("read_as") == kFull ? "full" : "lazy";
                 std::string sim;
                 if (meta.sim.present)
@@ -170,8 +198,8 @@ namespace sirius::app {
                     v.errors.push_back("No dataset: choose a file (File ▸ Open dataset…).");
                     return v;
                 }
-                DatasetMeta meta;
-                const std::string err = cachedProbe(path, meta);
+                DatasetMeta plain;
+                const std::string err = cachedProbe(path, nullptr, plain);
                 if (!err.empty()) {
                     v.errors.push_back("Cannot open " + path + ": " + err);
                     return v;
@@ -179,10 +207,25 @@ namespace sirius::app {
                 const Index nd = params.getInt("sim_ndirs"), np = params.getInt("sim_nphases");
                 if ((nd > 0) != (np > 0)) v.errors.push_back("SIM layout needs both angles and phases.");
                 const Index tile = params.getInt("tile");
-                if (tile < 0 || tile >= tileCountOf(meta))
+                if (tile < 0 || tile >= tileCountOf(plain))
                     v.errors.push_back("Tile " + std::to_string(tile) + " is out of range: the dataset has " +
-                                       std::to_string(tileCountOf(meta)) + (tileCountOf(meta) == 1 ? " tile." : " tiles."));
-                applyOverrides(params, meta);
+                                       std::to_string(tileCountOf(plain)) + (tileCountOf(plain) == 1 ? " tile." : " tiles."));
+                if (axesGiven(params) && !pagedFormat(plain)) {
+                    v.errors.push_back(axesNotAppliedError(path));
+                    return v;
+                }
+                DatasetMeta meta;
+                const std::string predicted = predict(params, meta);
+                if (!predicted.empty()) {
+                    v.errors.push_back("Cannot open " + path + ": " + predicted);
+                    return v;
+                }
+                // a layout the pages do not divide into is not applied: the
+                // open reads the pages as z instead, and says so here
+                const Index c = params.getInt("c"), t = params.getInt("t"), z = params.getInt("z");
+                if ((c > 0 && meta.dims.c != c) || (t > 0 && meta.dims.t != t) || (z > 0 && meta.dims.z != z))
+                    v.warnings.push_back("Channels, time points and planes do not fit the file's " + std::to_string(meta.dims.planes()) +
+                                         " pages: they are read as " + meta.dims.toString() + ".");
                 if (meta.sim.present && meta.dims.z % meta.sim.sectionsPerPlane() != 0)
                     v.warnings.push_back(std::to_string(meta.dims.z) + " sections is not a multiple of " +
                                          std::to_string(meta.sim.sectionsPerPlane()) + " (angles × phases).");
@@ -191,51 +234,29 @@ namespace sirius::app {
 
             DatasetMeta outputMeta(const ParamSet& params, const DatasetMeta& input) const override {
                 DatasetMeta meta;
-                const std::string err = cachedProbe(params.getString("path"), meta);
+                const std::string err = predict(params, meta);
                 if (!err.empty()) return input;
-                applyOverrides(params, meta);
                 return meta;
             }
 
             StepOutput run(const StepInput&, const ParamSet& params, const StepContext& ctx) const override {
                 const std::string path = params.getString("path");
                 if (path.empty()) throw std::runtime_error("Load: no dataset selected");
-                OpenOptions options;
-                const Index c = params.getInt("c"), t = params.getInt("t"), z = params.getInt("z");
-                const std::string order = params.getString("page_order", "czt");
-                if (c > 0 || t > 0 || z > 0 || order != "czt") {
-                    PageOrder po;
-                    po.order = order.empty() ? "czt" : order;
-                    po.c = std::max<Index>(0, c);   // 0: the file's own (probeTiff)
-                    po.t = std::max<Index>(0, t);
-                    po.z = std::max<Index>(0, z);
-                    options.pageOrder = po;
-                }
-                const double vx = params.getDouble("voxel_x"), vy = params.getDouble("voxel_y"), vz = params.getDouble("voxel_z");
-                if (vx > 0 || vy > 0 || vz > 0) {
-                    DatasetMeta probe;
-                    cachedProbe(path, probe);
-                    options.voxelUm = {vx > 0 ? vx : probe.voxelUm[0], vy > 0 ? vy : probe.voxelUm[1],
-                                       vz > 0 ? vz : probe.voxelUm[2]};
-                }
-                const Index nd = params.getInt("sim_ndirs"), np = params.getInt("sim_nphases");
-                if (nd > 0 && np > 0) {
-                    SimLayout sim;
-                    sim.present = true;
-                    sim.ndirs = static_cast<int>(nd);
-                    sim.nphases = static_cast<int>(np);
-                    sim.fastSi = params.getBool("sim_fast");
-                    options.sim = sim;
-                }
-                options.readAll = params.getString("read_as") == kFull;
-                options.tile = std::max<Index>(0, params.getInt("tile"));
+                std::error_code ec;
+                if (axesGiven(params) && std::filesystem::is_directory(path, ec))
+                    throw std::runtime_error("Load: " + axesNotAppliedError(path));
+                const OpenOptions options = loadOpenOptions(params);
 
                 ctx.report(0.0, "opening " + std::filesystem::path(path).filename().string());
                 OpenResult opened = openDataset(path, options);
                 StepOutput out;
                 out.source = opened.source;
+                // The dims are the source's. Deriving the axes from the
+                // parameters again here, after the open had refused a layout
+                // the pages do not divide into, promised planes the source
+                // does not have, and every reader of a volume ran past it.
                 out.meta = opened.meta;
-                applyOverrides(params, out.meta);
+                annotate(params, out.meta);
                 if (options.readAll) {
                     out.array = opened.source->readAll([&](double f, const std::string& m) { ctx.report(f, m); });
                 }
@@ -250,6 +271,35 @@ namespace sirius::app {
         };
 
     } // namespace
+
+    OpenOptions loadOpenOptions(const ParamSet& p) {
+        OpenOptions o;
+        o.readAll = p.getString("read_as").rfind("Full", 0) == 0;
+        const std::string order = p.getString("page_order");
+        const Index c = p.getInt("c", 0), t = p.getInt("t", 0), z = p.getInt("z", 0);
+        if (c > 0 || t > 0 || z > 0 || (!order.empty() && order != "czt")) {
+            PageOrder po;
+            po.order = order.empty() ? "czt" : order;
+            po.c = std::max<Index>(c, 0);   // 0: the file's own (probeTiff)
+            po.t = std::max<Index>(t, 0);
+            po.z = std::max<Index>(z, 0);
+            o.pageOrder = po;
+        }
+        // any one of them overrides that axis; 0 keeps the file's
+        const double vx = p.getDouble("voxel_x", 0.0), vy = p.getDouble("voxel_y", 0.0), vz = p.getDouble("voxel_z", 0.0);
+        if (vx > 0.0 || vy > 0.0 || vz > 0.0) o.voxelUm = std::array<double, 3>{std::max(vx, 0.0), std::max(vy, 0.0), std::max(vz, 0.0)};
+        const int ndirs = static_cast<int>(p.getInt("sim_ndirs", 0)), nphases = static_cast<int>(p.getInt("sim_nphases", 0));
+        if (ndirs > 0 && nphases > 0) {
+            SimLayout sim;
+            sim.present = true;
+            sim.ndirs = ndirs;
+            sim.nphases = nphases;
+            sim.fastSi = p.getBool("sim_fast", false);
+            o.sim = sim;
+        }
+        o.tile = std::max<Index>(0, p.getInt("tile", 0));
+        return o;
+    }
 
     std::unique_ptr<Operation> makeLoadOperation() { return std::make_unique<LoadOperation>(); }
 

@@ -30,4 +30,8 @@ The manifest lists the channels with their names, the tiles with their nominal o
 
 ## Note
 
-Voxel sizes and channel names can be overridden here when the file's metadata is wrong; every step downstream reads the corrected values.
+Voxel sizes and channel names can be overridden here when the file's metadata is wrong; every step downstream reads the corrected values. A voxel size left at 0 keeps the file's for that axis.
+
+*Channels*, *Time points* and *Planes* (under More) map the pages of a TIFF; 0 keeps what the file says. A layout the page count does not divide into is not applied: the pages are read as z planes and the step warns. A folder's manifest and a zarr store name their own axes, so for those the three stay 0.
+
+Opening a dataset starts these overrides from their defaults; a pipeline that names the dataset opens it with its own.

@@ -33,9 +33,10 @@ in a way an older peer cannot understand.
 from __future__ import annotations
 
 import json
+import select
 import socket
 import struct
-from typing import Any, Dict, List, Optional, Sequence, Tuple, Union
+from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple, Union
 
 import numpy as np
 
@@ -259,11 +260,26 @@ class FrameReader:
         return len(self._buf)
 
 
-def recv_exactly(sock: socket.socket, n: int) -> bytes:
-    """Read n bytes or raise ConnectionError when the peer closes."""
+def recv_exactly(sock: socket.socket, n: int, keep_waiting: Optional[Callable[[], bool]] = None,
+                 poll: float = 0.5) -> bytes:
+    """Read n bytes or raise ConnectionError when the peer closes.
+
+    With `keep_waiting`, each chunk is waited for `poll` seconds at a time and
+    TimeoutError is raised as soon as keep_waiting() is false -- checked while
+    waiting and before every chunk, so neither a peer that stops halfway
+    through a frame nor one that drips it a byte at a time holds the reader
+    past the caller's deadline or stop flag. The socket itself stays blocking:
+    a large transfer, in either direction, is never cut short by a timeout."""
     chunks = []
     remaining = n
     while remaining > 0:
+        if keep_waiting is not None:
+            while True:
+                if not keep_waiting():
+                    raise TimeoutError(f"gave up on an incomplete frame ({n - remaining} of {n} bytes arrived)")
+                ready, _, _ = select.select([sock], [], [], poll)
+                if ready:
+                    break
         chunk = sock.recv(min(remaining, 1 << 20))
         if not chunk:
             raise ConnectionError("connection closed")
@@ -272,21 +288,22 @@ def recv_exactly(sock: socket.socket, n: int) -> bytes:
     return b"".join(chunks)
 
 
-def read_frame(sock: socket.socket, max_header: int = MAX_HEADER,
-               max_payload: int = MAX_PAYLOAD) -> Tuple[Dict[str, Any], Dict[str, np.ndarray]]:
+def read_frame(sock: socket.socket, max_header: int = MAX_HEADER, max_payload: int = MAX_PAYLOAD,
+               keep_waiting: Optional[Callable[[], bool]] = None) -> Tuple[Dict[str, Any], Dict[str, np.ndarray]]:
     """Blocking read of one frame from a socket.
 
     Each length is checked against its cap *before* the bytes it announces are
     read, so an oversize frame costs the peer one refused read and this side no
-    allocation at all; `recv_exactly` then accumulates in 1 MiB pieces."""
-    (hlen,) = HEADER_LEN.unpack(recv_exactly(sock, HEADER_LEN.size))
+    allocation at all; `recv_exactly` then accumulates in 1 MiB pieces.
+    `keep_waiting` (see recv_exactly) bounds the wait for the whole frame."""
+    (hlen,) = HEADER_LEN.unpack(recv_exactly(sock, HEADER_LEN.size, keep_waiting))
     if hlen > max_header:
         raise ProtocolError(f"header length {hlen} exceeds {max_header}")
-    hb = recv_exactly(sock, hlen)
-    (plen,) = PAYLOAD_LEN.unpack(recv_exactly(sock, PAYLOAD_LEN.size))
+    hb = recv_exactly(sock, hlen, keep_waiting)
+    (plen,) = PAYLOAD_LEN.unpack(recv_exactly(sock, PAYLOAD_LEN.size, keep_waiting))
     if plen > max_payload:
         raise ProtocolError(f"payload length {plen} exceeds {max_payload}")
-    payload = recv_exactly(sock, plen) if plen else b""
+    payload = recv_exactly(sock, plen, keep_waiting) if plen else b""
     header = _load_header(hb)
     return header, _decode_tensors(header, memoryview(payload))
 

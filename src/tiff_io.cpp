@@ -14,6 +14,7 @@
 #include <type_traits>
 #include <vector>
 
+#include <omp.h>
 #include <tiffio.h>
 
 namespace sirius {
@@ -72,8 +73,11 @@ namespace sirius {
             void operator()(TIFFOpenOptions* o) const { TIFFOpenOptionsFree(o); }
         };
 
+        std::atomic<std::size_t> g_readOpens{0};
+
         // The file is closed when TiffPtr goes out of scope, normally or via exception.
         TiffPtr openTiff(const std::string& path, const char* mode) {
+            if (mode[0] == 'r') g_readOpens.fetch_add(1, std::memory_order_relaxed);
             std::unique_ptr<TIFFOpenOptions, OpenOptionsDeleter> opts(TIFFOpenOptionsAlloc());
             if (opts) TIFFOpenOptionsSetWarningHandlerExtR(opts.get(), warningFilter, nullptr);
             TiffPtr tif(TIFFOpenExt(path.c_str(), mode, opts.get()));
@@ -519,7 +523,8 @@ namespace sirius {
 
         for (std::size_t i = 0; i < chainCount; ++i)
             if (!info.images[i].reducedResolution) info.pages.push_back(info.images[i].ifdOffset);
-        if (info.pages.empty())   // every IFD flagged reduced: treat the chain as pages anyway
+        const bool chainIsPages = info.pages.empty();
+        if (chainIsPages)   // every IFD flagged reduced: treat the chain as pages anyway
             for (std::size_t i = 0; i < chainCount; ++i) info.pages.push_back(info.images[i].ifdOffset);
 
         // Level 0: the full-resolution pages.
@@ -557,23 +562,29 @@ namespace sirius {
         }
 
         // Levels from reduced-resolution IFDs on the main chain (GDAL/Aperio
-        // style): consecutive reduced IFDs of one size form a level.
-        for (std::size_t i = 0; i < chainCount; ++i) {
+        // style): the reduced IFDs of one size form a level, in chain order,
+        // one per page -- whether each page is followed by its own reductions
+        // (page 0, its 1/2, its 1/4, page 1, its 1/2, ...) or the reductions
+        // come level by level after the pages. Grouping only consecutive IFDs
+        // split the first layout into a level per IFD. A chain that is all
+        // reduced IFDs already serves as the pages and forms no levels.
+        const std::size_t firstChainLevel = info.levels.size();
+        for (std::size_t i = 0; i < chainCount && !chainIsPages; ++i) {
             const auto& img = info.images[i];
             if (!img.reducedResolution) continue;
-            TiffLevel* last = info.levels.size() > 1 ? &info.levels.back() : nullptr;
-            const bool sameAsLast = last && last->width == img.width && last->height == img.height &&
-                                    info.image(last->ifds.back()).reducedResolution &&
-                                    info.image(last->ifds.back()).subIfds.empty() &&
-                                    std::find(info.pages.begin(), info.pages.end(), last->ifds.back()) == info.pages.end();
-            if (sameAsLast && last->ifds.size() < info.pages.size()) {
-                last->ifds.push_back(img.ifdOffset);
+            const auto level = std::find_if(info.levels.begin() + static_cast<std::ptrdiff_t>(firstChainLevel),
+                                            info.levels.end(), [&](const TiffLevel& l) {
+                                                return l.width == img.width && l.height == img.height &&
+                                                       l.ifds.size() < info.pages.size();
+                                            });
+            if (level != info.levels.end()) {
+                level->ifds.push_back(img.ifdOffset);
             } else {
-                TiffLevel level;
-                level.width = img.width;
-                level.height = img.height;
-                level.ifds.push_back(img.ifdOffset);
-                info.levels.push_back(std::move(level));
+                TiffLevel added;
+                added.width = img.width;
+                added.height = img.height;
+                added.ifds.push_back(img.ifdOffset);
+                info.levels.push_back(std::move(added));
             }
         }
         return info;
@@ -612,9 +623,28 @@ namespace sirius {
             }
         }
 
-        // Parallel over pages. Each thread opens its own handle once and
-        // reuses it for every page it processes: libtiff handles are not
-        // thread-safe, but one handle can hop between directories with
+        std::size_t libtiffReadOpens() noexcept { return g_readOpens.load(std::memory_order_relaxed); }
+
+        namespace {
+            // Bytes libtiff decodes for one page of a region read: every strip
+            // or tile the region touches, whole. A measure of the work, not of
+            // the output: a small window of a big compressed tile costs the tile.
+            std::size_t decodedBytesPerPage(const TiffImageInfo& g, const Region& r) {
+                const std::size_t bpp = bytesPerPixel(g.pixelType);
+                const std::size_t x0 = r.x, x1 = x0 + r.width, y0 = r.y, y1 = y0 + r.height;
+                if (g.layout == TiffLayout::Tiles && g.tileWidth > 0 && g.tileHeight > 0) {
+                    const std::size_t tw = g.tileWidth, th = g.tileHeight;
+                    return ((x1 + tw - 1) / tw - x0 / tw) * ((y1 + th - 1) / th - y0 / th) * tw * th * bpp;
+                }
+                const std::size_t rps = g.rowsPerStrip > 0 ? std::min(g.rowsPerStrip, g.height) : g.height;
+                if (rps == 0) return 0;
+                return ((y1 + rps - 1) / rps - y0 / rps) * rps * g.width * bpp;
+            }
+        } // namespace
+
+        // Parallel over pages. Each thread that decodes a page opens its own
+        // handle on its first page and reuses it for the rest: libtiff handles
+        // are not thread-safe, but one handle can hop between directories with
         // TIFFSetSubDirectory without reopening the file.
         void decodeWithLibtiff(const std::string& path, const DecodeJob& job, void* dstHost) {
             const auto& ifds = *job.ifds;
@@ -630,28 +660,31 @@ namespace sirius {
             std::exception_ptr ex;
             std::atomic<bool> failed{false};
 
-#pragma omp parallel
+            // Every thread of the team used to open the file -- and parse its
+            // first directory, which can carry megabytes of ImageJ / OME
+            // metadata -- before the loop: 32 opens and ~10 ms for a one-page
+            // read on 32 cores. A thread now opens the file only when it is
+            // handed a page, and the team is sized by the work: no more
+            // threads than pages, and about one per MiB decoded. Waking a
+            // full team for a few small pages cost ~9 ms a read; 40 pages of
+            // 96x128 decode in 0.25 ms on one thread (Release, 32 cores).
+            constexpr std::size_t kBytesPerThread = std::size_t{1} << 20;
+            const std::size_t work = decodedBytesPerPage(g, r) * static_cast<std::size_t>(n);
+            const std::ptrdiff_t wanted = std::min<std::ptrdiff_t>(n, static_cast<std::ptrdiff_t>(work / kBytesPerThread));
+            const int threads = static_cast<int>(std::clamp<std::ptrdiff_t>(wanted, 1, omp_get_max_threads()));
+#pragma omp parallel num_threads(threads) if (threads > 1)
             {
                 TiffPtr localTif;
-                bool openOk = false;
-                try {
-                    localTif = openTiff(path, "r");
-                    openOk = true;
-                } catch (...) {
-#pragma omp critical
-                    {
-                        if (!ex) ex = std::current_exception();
-                    }
-                    failed.store(true, std::memory_order_relaxed);
-                }
-
                 std::vector<std::uint8_t> scratch;      // one strip / tile
                 std::vector<std::uint8_t> nativePage;   // conversion path only
 
-#pragma omp for schedule(dynamic, 4)
+                // A page at a time: with the team sized to the work every page
+                // is worth handing out (chunks of 4 left most of a 3-page team idle).
+#pragma omp for schedule(dynamic, 1)
                 for (std::ptrdiff_t z = 0; z < n; ++z) {
-                    if (failed.load(std::memory_order_relaxed) || !openOk) continue;
+                    if (failed.load(std::memory_order_relaxed)) continue;
                     try {
+                        if (!localTif) localTif = openTiff(path, "r");
                         if (!TIFFSetSubDirectory(localTif.get(), ifds[static_cast<std::size_t>(z)]))
                             throw IoError("Failed to seek to TIFF directory at offset " +
                                           std::to_string(ifds[static_cast<std::size_t>(z)]));
