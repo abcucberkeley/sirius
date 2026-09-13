@@ -177,6 +177,7 @@ namespace sirius {
             if (nxIn < 4 || nyIn < 4 || nxIn % 2 != 0 || nyIn % 2 != 0)
                 throw std::invalid_argument("SimReconstructor: nx and ny must be even and >= 4, got " +
                                             std::to_string(nxIn) + " x " + std::to_string(nyIn));
+            if (nzIn < 1) throw std::invalid_argument("SimReconstructor: the raw stack has no sections");
             nx = nxIn;
             ny = nyIn;
             nz = nzIn;
@@ -193,7 +194,16 @@ namespace sirius {
 
             const double alpha = std::asin(p.na / p.nimm);
             axialSupport = ((1.0 - std::cos(alpha)) / lambdaEm) / dkz;
-            zdistcutoff = static_cast<int>(std::ceil(axialSupport));
+            // validate() keeps both finite for any sane parameters, but a
+            // pixel size near the double range still overflows here (dz =
+            // 1e308: nz * dz is inf). A NaN or infinite cutoff cast to int is
+            // INT_MIN, and the filter's "zero the planes beyond the cutoff"
+            // loop would index from there.
+            if (!std::isfinite(rdistcutoff) || !std::isfinite(axialSupport) || !std::isfinite(otfTable.kzscale))
+                throw std::invalid_argument("SimReconstructor: the OTF support is not finite for a " + std::to_string(nx) +
+                                            " x " + std::to_string(ny) + " x " + std::to_string(nz) +
+                                            " stack; check na, nimm, wavelength_nm and the pixel sizes");
+            zdistcutoff = static_cast<int>(std::ceil(std::min(axialSupport, static_cast<double>(nz))));
             // The overlap volumes hold 2 * zdistcutoff + 1 signed planes in
             // nz slots: with an even nz, kz = -nz/2 and kz = +nz/2 would map
             // to the same slot and two threads would write it with different
@@ -218,6 +228,12 @@ namespace sirius {
             xdim = static_cast<Index>(std::lround(p.zoomfact * static_cast<double>(nx)));
             ydim = static_cast<Index>(std::lround(p.zoomfact * static_cast<double>(ny)));
             zdim = static_cast<Index>(p.z_zoom) * nz;
+            // moveBandElement writes frequencies up to nx/2, ny/2 into the
+            // output grid; a smaller grid is a heap overflow (validate()
+            // requires zoomfact >= 1, which guarantees this)
+            if (xdim < nx || ydim < ny)
+                throw std::invalid_argument("SimReconstructor: zoomfact " + std::to_string(p.zoomfact) +
+                                            " makes the output grid smaller than the input");
 
             const auto di = [](Index v) { return static_cast<int>(v); };
             bandFft.emplace(std::vector<int>{di(nz), di(ny), di(nx)}, nbands, rigor, dev);
@@ -480,7 +496,7 @@ namespace sirius {
         std::vector<int> zdistCutoffs() const {
             const double lambdaexc = 0.88 * lambdaEm;
             std::vector<int> zd(static_cast<std::size_t>(norders), 0);
-            zd[0] = static_cast<int>(std::ceil(axialSupport));
+            zd[0] = static_cast<int>(std::ceil(std::min(axialSupport, static_cast<double>(nz))));
             zd[static_cast<std::size_t>(norders - 1)] = static_cast<int>(1.3 * zd[0]);
             for (int order = 1; order < norders - 1; ++order)
                 zd[static_cast<std::size_t>(order)] =

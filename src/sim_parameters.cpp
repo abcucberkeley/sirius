@@ -3,10 +3,12 @@
 
 #include <toml++/toml.hpp>
 
+#include <cmath>
 #include <fstream>
 #include <stdexcept>
 #include <string>
 #include <string_view>
+#include <utility>
 
 namespace sirius {
     namespace {
@@ -26,6 +28,16 @@ namespace sirius {
     } // namespace
 
     void SIMParameters::validate() const {
+        // NaN passes every range check below (each comparison with it is
+        // false), and an infinity overflows the cutoffs derived from these.
+        const std::pair<const char*, double> reals[] = {
+            {"k0_start_angle", k0_start_angle}, {"linespacing_um", linespacing_um}, {"na", na}, {"nimm", nimm}, {"wavelength_nm", wavelength_nm}, {"dx", dx}, {"dy", dy}, {"dz", dz}, {"dz_psf", dz_psf}, {"zoomfact", zoomfact}, {"wiener", wiener}, {"otfcutoff", otfcutoff}, {"background", background}, {"explodefact", explodefact}};
+        for (const auto& [name, value] : reals)
+            if (!std::isfinite(value)) throw std::runtime_error(std::string(name) + " must be finite");
+        if (k0_angles)
+            for (double a : *k0_angles)
+                if (!std::isfinite(a)) throw std::runtime_error("k0_angles must be finite");
+
         if (ndirs < 1) throw std::runtime_error("ndirs must be >= 1");
         if (nphases < 1) throw std::runtime_error("nphases must be >= 1");
         if (norders < 0) throw std::runtime_error("norders must be >= 0 (0 derives nphases / 2 + 1)");
@@ -42,12 +54,21 @@ namespace sirius {
         if (k0_angles && static_cast<int>(k0_angles->size()) != ndirs)
             throw std::runtime_error("k0_angles size must equal ndirs");
         if (na <= 0.0) throw std::runtime_error("na must be > 0");
+        if (nimm <= 0.0) throw std::runtime_error("nimm must be > 0");
+        // The reconstruction takes asin(na / nimm) for the OTF's axial
+        // support: beyond 1 that is NaN, which became an INT_MIN plane index
+        // and a write far outside the band storage. na == nimm is a
+        // 90-degree aperture and still reconstructs.
+        if (na > nimm)
+            throw std::runtime_error("na " + std::to_string(na) + " must not exceed the immersion index nimm " +
+                                     std::to_string(nimm));
         if (wavelength_nm <= 0.0) throw std::runtime_error("wavelength_nm must be > 0");
         if (dx <= 0.0) throw std::runtime_error("dx must be > 0");
         if (dy <= 0.0) throw std::runtime_error("dy must be > 0");
         if (dz <= 0.0) throw std::runtime_error("dz must be > 0");
         if (dz_psf <= 0.0) throw std::runtime_error("dz_psf must be > 0");
-        if (zoomfact <= 0.0) throw std::runtime_error("zoomfact must be > 0");
+        // the assembly writes every input frequency into the output grid
+        if (zoomfact < 1.0) throw std::runtime_error("zoomfact must be >= 1 (the output grid cannot be smaller than the input)");
         if (z_zoom < 1) throw std::runtime_error("z_zoom must be >= 1");
         if (wiener < 0.0) throw std::runtime_error("wiener must be >= 0");
         if (otfcutoff < 0.0) throw std::runtime_error("otfcutoff must be >= 0");

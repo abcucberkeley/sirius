@@ -120,6 +120,57 @@ TEST_CASE("The reconstructor refuses an order count it cannot fit", "[reconstruc
     CHECK_THROWS_AS(SimReconstructor(p, t.otf, Device::cpu(), PlanRigor::Estimate), std::runtime_error);
 }
 
+TEST_CASE("The reconstructor refuses optics and zooms that used to crash it", "[reconstruction][validation]") {
+    TestData t = loadTestData();
+    auto construct = [&](const SIMParameters& p) { return SimReconstructor(p, t.otf, Device::cpu(), PlanRigor::Estimate); };
+
+    SECTION("an NA above the immersion index, or no immersion index, with a measured OTF") {
+        // asin(na / nimm) and wavelength / nimm went NaN, the axial cutoff
+        // INT_MIN, and the filter zeroed planes far outside the bands (SIGSEGV)
+        SIMParameters p = t.params;
+        p.na = 1.6;
+        CHECK_THROWS_AS(construct(p), std::runtime_error);
+        p = t.params;
+        p.nimm = 0.0;
+        CHECK_THROWS_AS(construct(p), std::runtime_error);
+        p.nimm = -1.515;
+        CHECK_THROWS_AS(construct(p), std::runtime_error);
+    }
+    SECTION("an NA equal to the immersion index still reconstructs") {
+        SIMParameters p = t.params;
+        p.na = p.nimm;
+        SimReconstructor recon = construct(p);
+        const Buffer<double> out = recon.reconstruct(t.raw);
+        Index bad = 0;
+        for (Index i = 0; i < out.size(); ++i) bad += std::isfinite(out.data()[i]) ? 0 : 1;
+        CHECK(bad == 0);
+    }
+    SECTION("a zoom below 1") {
+        // the output grid was smaller than the frequencies written into it
+        SIMParameters p = t.params;
+        p.zoomfact = 0.5;
+        CHECK_THROWS_AS(construct(p), std::runtime_error);
+    }
+    SECTION("a pixel size whose frequency step overflows") {
+        // valid on its own, but nz * dz is infinite: the axial cutoff is not a
+        // number, and is reported instead of being cast to a plane index
+        SIMParameters p = t.params;
+        p.dz = 1e308;
+        SimReconstructor recon = construct(p);
+        try {
+            recon.reconstruct(t.raw);
+            FAIL("reconstructed with an infinite axial cutoff");
+        } catch (const std::invalid_argument& e) {
+            CHECK_THAT(e.what(), Catch::Matchers::ContainsSubstring("not finite"));
+        }
+    }
+    SECTION("a stack without sections") {
+        SimReconstructor recon = construct(t.params);
+        const Buffer<double> empty(Shape{0, 64, 64});
+        CHECK_THROWS_AS(recon.reconstruct(empty.view()), std::invalid_argument);
+    }
+}
+
 TEST_CASE("Repeated CPU reconstructions of the same input are bit-identical",
           "[reconstruction]") {
     // The k0 bracket search maximizes |modamp|^2, so a reduction whose

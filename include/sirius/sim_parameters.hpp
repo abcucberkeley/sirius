@@ -25,7 +25,7 @@ namespace sirius {
         int nphases = 5;      // number of phases (phi)
         int norders = 0;      // orders to separate; 0 derives nphases / 2 + 1 (resolvedOrders)
         double na = 1.0;    // detection numerical aperture
-        double nimm = 1.33;   // immersion refractive index
+        double nimm = 1.33;   // immersion refractive index (>= na)
         double wavelength_nm = 510.;   // emission wavelength (nm)
         std::optional<std::vector<double>> k0_angles; // null, derive from k0_start_angles
 
@@ -36,7 +36,7 @@ namespace sirius {
         double dz_psf = 0.15; // axial step size of the PSF/OTF
 
         // Output and filtering
-        double zoomfact = 2.0; // "Zoom factor" for the output grid transverse dimensions relative to the input data grid. SIM increases resolution.
+        double zoomfact = 2.0; // "Zoom factor" for the output grid transverse dimensions relative to the input data grid (>= 1). SIM increases resolution.
         int z_zoom = 1; // Zoom factor for the output grid axial dimension.
         double wiener = 0.01;
         double otfcutoff = 0.006;

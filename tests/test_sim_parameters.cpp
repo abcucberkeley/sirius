@@ -5,6 +5,7 @@
 #include <cstdio>
 #include <filesystem>
 #include <fstream>
+#include <limits>
 #include <string>
 
 #include "sirius/sim_parameters.hpp"
@@ -140,6 +141,47 @@ TEST_CASE("validate resolves the order count and needs 2 orders the phases can s
     }
 }
 
+TEST_CASE("validate rejects optics the reconstruction would crash on", "[params]") {
+    using Catch::Matchers::ContainsSubstring;
+    SECTION("an NA above the immersion index") {
+        // asin(na / nimm) was NaN, cast to an INT_MIN plane index: a segfault
+        SIMParameters p;
+        p.na = 1.6;
+        p.nimm = 1.515;
+        REQUIRE_THROWS_WITH(p.validate(), ContainsSubstring("nimm"));
+        p.na = p.nimm;   // a 90-degree aperture is still one
+        REQUIRE_NOTHROW(p.validate());
+    }
+    SECTION("a non-positive immersion index") {
+        SIMParameters p;
+        p.nimm = 0.0;
+        REQUIRE_THROWS_AS(p.validate(), std::runtime_error);
+        p.nimm = -1.515;
+        REQUIRE_THROWS_AS(p.validate(), std::runtime_error);
+    }
+    SECTION("NaN and infinite values, which pass every range check") {
+        SIMParameters p;
+        p.na = std::nan("");
+        REQUIRE_THROWS_WITH(p.validate(), ContainsSubstring("na must be finite"));
+        p = SIMParameters{};
+        p.dx = std::numeric_limits<double>::infinity();
+        REQUIRE_THROWS_WITH(p.validate(), ContainsSubstring("dx must be finite"));
+        p = SIMParameters{};
+        p.k0_angles = std::vector<double>{0.1, std::nan(""), 0.3};
+        REQUIRE_THROWS_WITH(p.validate(), ContainsSubstring("k0_angles"));
+    }
+    SECTION("a zoom below 1") {
+        // the assembly wrote input frequencies past the smaller output grid
+        SIMParameters p;
+        p.zoomfact = 0.5;
+        REQUIRE_THROWS_WITH(p.validate(), ContainsSubstring("zoomfact"));
+        p.zoomfact = 0.999;
+        REQUIRE_THROWS_AS(p.validate(), std::runtime_error);
+        p.zoomfact = 1.0;
+        REQUIRE_NOTHROW(p.validate());
+    }
+}
+
 TEST_CASE("validate enforces k0_angles size == ndirs", "[params]") {
     SIMParameters p;
     p.ndirs = 3;
@@ -227,11 +269,12 @@ TEST_CASE("TOML round-trip preserves every serialized field", "[params][toml]") 
 
 TEST_CASE("loadParameters keeps defaults for absent keys", "[params][toml]") {
     // Only override na; everything else must keep its default.
-    TempFile tf(".toml", "[optics]\nna = 1.49\n");
+    TempFile tf(".toml", "[optics]\nna = 1.25\n");
     SIMParameters out = loadParameters(tf.str());
 
     SIMParameters def;
-    REQUIRE(out.na == Approx(1.49));
+    REQUIRE(out.na == Approx(1.25));
+    REQUIRE(out.nimm == Approx(def.nimm));
     REQUIRE(out.nphases == def.nphases);
     REQUIRE(out.linespacing_um == Approx(def.linespacing_um));
     REQUIRE(out.zoomfact == Approx(def.zoomfact));
@@ -262,6 +305,13 @@ TEST_CASE("TOML norders: written, read, and derived when absent", "[params][toml
         TempFile tf(".toml", "[optics]\nnphases = 3\nnorders = 3\n");
         REQUIRE_THROWS_AS(loadParameters(tf.str()), std::runtime_error);
     }
+}
+
+TEST_CASE("loadParameters refuses an NA the default immersion index cannot carry", "[params][toml]") {
+    // an oil objective's NA without its nimm used to load and then crash the
+    // reconstruction with a measured OTF
+    TempFile tf(".toml", "[optics]\nna = 1.49\n");
+    REQUIRE_THROWS_WITH(loadParameters(tf.str()), Catch::Matchers::ContainsSubstring("nimm"));
 }
 
 TEST_CASE("loadParameters throws on malformed TOML", "[params][toml]") {

@@ -266,8 +266,13 @@ TEST_CASE("idealOTF tabulates the derived order count", "[otf][ideal][orders]") 
 
 TEST_CASE("idealOTF rejects unphysical inputs", "[otf][ideal]") {
     SIMParameters p = lowNaParams();
+    // an NA above the immersion index is invalid parameters for everything
     p.na = 1.5;
     p.nimm = 1.33;
+    REQUIRE_THROWS_AS(idealOTF(p, false), std::runtime_error);
+    // an NA equal to it is valid, but the ideal pupil needs it strictly below
+    p.na = 1.33;
+    REQUIRE_NOTHROW(p.validate());
     REQUIRE_THROWS_AS(idealOTF(p, false), std::invalid_argument);
     IdealOtfOptions bad;
     bad.lateralSamples = 15;
