@@ -12,6 +12,7 @@
 #include "sirius/sim_reconstruction.hpp"
 
 #include "sirius/constants.hpp"
+#include "sirius/errors.hpp"
 #include "sirius/fft.hpp"
 #include "sirius/real_fft.hpp"
 #include "sirius/separation.hpp"
@@ -327,22 +328,41 @@ namespace sirius {
             volFft->ifft(ovF1.data(), ov1.data(), stream);
         }
 
+        struct Modamp {
+            double amp2;
+            Cplx amp;
+            bool empty;   // the overlaps held nothing to measure (amp is 0)
+        };
+
         // Complex modulation amplitude relating the cached overlaps under a
-        // shift by (order2-order1)*k0 (port of findrealspacemodamp).
-        Cplx modampFromOverlaps(int order1, int order2, double k0x, double k0y) {
+        // shift by (order2-order1)*k0 (port of findrealspacemodamp). Overlaps
+        // without energy -- the shift put the side band outside the mutual
+        // support, nothing clears otfcutoff, the band is blank -- have no
+        // amplitude: the reference divided by the zero energy, and the NaN
+        // took over the bracket search, the pattern vector and every output
+        // voxel. 0 lets the search carry on; the caller decides whether an
+        // empty overlap is fatal.
+        Modamp modampFromOverlaps(int order1, int order2, double k0x, double k0y) {
             const double kx = k0x * (order2 - order1);
             const double ky = k0y * (order2 - order1);
             const double angleX = 2.0 * kPi * kx * p.dx;
             const double angleY = 2.0 * kPi * ky * p.dy;
             const auto s = backend->modampReduce(asCd(ov0.data()), asCd(ov1.data()),
                                                  nz, ny, nx, angleX, angleY);
-            return Cplx(s.xy.re, s.xy.im) / s.sumX;
+            if (!(s.sumX > 0.0) || !(s.sumY > 0.0) || !std::isfinite(s.sumX) || !std::isfinite(s.sumY))
+                return {0.0, Cplx(0, 0), true};
+            const Cplx amp = Cplx(s.xy.re, s.xy.im) / s.sumX;
+            return {std::norm(amp), amp, false};
         }
 
-        struct Modamp {
-            double amp2;
-            Cplx amp;
-        };
+        // What the k0 fit reports when the overlap it measures holds nothing.
+        SiriusError emptyOverlap(int d, int order) const {
+            return SiriusError("SimReconstructor: direction " + std::to_string(d) + ": the overlap of orders 0 and " +
+                               std::to_string(order) +
+                               " holds no signal, so the pattern vector cannot be fitted. Check the line spacing (" +
+                               std::to_string(p.linespacing_um) + " um), na, otfcutoff and no_kz0 against the data, " +
+                               "and that the stack is not blank or constant.");
+        }
 
         // Port of getmodamp: |modamp|^2 for a trial (angle, magnitude).
         Modamp getModamp(int d, double angle, double mag, int order1, int order2,
@@ -354,8 +374,7 @@ namespace sirius {
                 computeOverlaps(d, order1, order2, k0x, k0y);
                 overlapsValid = true;
             }
-            const Cplx amp = modampFromOverlaps(order1, order2, k0x, k0y);
-            return {std::norm(amp), amp};
+            return modampFromOverlaps(order1, order2, k0x, k0y);
         }
 
         // ---- findk0 -------------------------------------------------------
@@ -384,6 +403,10 @@ namespace sirius {
                     best = i;
                 }
             }
+            // No peak: every overlap sample was zero (a constant stack, a
+            // guess whose side band lies outside the OTF support, an otfcutoff
+            // nothing clears). The reference fitted on from index 0.
+            if (!(bestVal > 0.0) || !std::isfinite(bestVal)) throw emptyOverlap(d, fitorder2);
             const Index xc = best % nx;
             const Index yc = best / nx;
             auto inten = [&](Index iy, Index ix) {
@@ -487,7 +510,10 @@ namespace sirius {
             }
             mag = fitXYParabola(x1, amp1, x2, amp2, x3, amp3);
 
-            const Cplx modamp = getModamp(d, angle, mag, fitorder1, fitorder2, false, overlapsValid).amp;
+            const Modamp fitted = getModamp(d, angle, mag, fitorder1, fitorder2, false, overlapsValid);
+            // the overlaps the whole search measured, rebuilt at findK0's vector
+            if (fitted.empty || !std::isfinite(angle) || !std::isfinite(mag)) throw emptyOverlap(d, fitorder2);
+            const Cplx modamp = fitted.amp;
 
             k0 = {mag * std::cos(angle), mag * std::sin(angle)};
             amps.assign(static_cast<std::size_t>(norders), Cplx(0, 0));

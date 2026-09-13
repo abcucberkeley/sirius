@@ -12,6 +12,7 @@
 #include <stdexcept>
 
 #include "sirius/buffer.hpp"
+#include "sirius/errors.hpp"
 #include "sirius/legacy_config.hpp"
 #include "sirius/otf.hpp"
 #include "sirius/sim_reconstruction.hpp"
@@ -200,6 +201,42 @@ TEST_CASE("A shape that fails to bind is rebuilt on the next call, not reused ha
     for (Eigen::Index i = 0; i < first.size(); ++i)
         if (again.data()[i] != first.data()[i]) ++differing;
     CHECK(differing == 0);
+}
+
+TEST_CASE("An overlap with nothing in it is reported instead of fitted into NaN", "[reconstruction][overlap]") {
+    // The modulation amplitude divided by the overlap's energy unguarded:
+    // each of these produced a 100 % NaN volume without an error.
+    TestData t = loadTestData();
+    auto requireEmptyOverlap = [&](const SIMParameters& p, const Eigen::Tensor<double, 3, Eigen::RowMajor>& raw,
+                                   Device device) {
+        SimReconstructor recon(p, t.otf, device, PlanRigor::Estimate);
+        Buffer<double> input = toDevice(raw, device);
+        synchronizeDevice(device);
+        try {
+            recon.reconstruct(input.view());
+            FAIL("reconstructed from an empty overlap");
+        } catch (const SiriusError& e) {
+            CHECK_THAT(e.what(), Catch::Matchers::ContainsSubstring("holds no signal"));
+        }
+    };
+    const Device gpu = cudaAvailable() ? Device::cuda(0) : Device::cpu();
+
+    SECTION("a constant stack") {
+        Eigen::Tensor<double, 3, Eigen::RowMajor> constant = t.raw;
+        constant.setConstant(100.0);
+        requireEmptyOverlap(t.params, constant, Device::cpu());
+    }
+    SECTION("a line spacing that puts the side band outside the OTF") {
+        SIMParameters p = t.params;
+        p.linespacing_um = 0.05;
+        requireEmptyOverlap(p, t.raw, Device::cpu());
+        if (gpu.isCuda()) requireEmptyOverlap(p, t.raw, gpu);
+    }
+    SECTION("an otfcutoff nothing clears") {
+        SIMParameters p = t.params;
+        p.otfcutoff = 1.0;
+        requireEmptyOverlap(p, t.raw, Device::cpu());
+    }
 }
 
 TEST_CASE("Repeated CPU reconstructions of the same input are bit-identical",
