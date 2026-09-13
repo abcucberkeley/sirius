@@ -1107,6 +1107,19 @@ TEST_CASE("Annotations stay with the time point they were made on", "[app][label
         l.recomputeStats(0);
         CHECK(l.statsOf(3)->cls == "nucleus");
     }
+    SECTION("taking a mark back is remembered as well as giving it") {
+        l.recomputeStats(1);
+        l.recomputeStats(0);
+        REQUIRE(l.statsOf(4));
+        REQUIRE(l.statsOf(4)->reviewed);
+        REQUIRE(l.stats()[1].id == 4);
+        l.stats()[1].reviewed = false;   // back to saying nothing about it
+        l.recomputeStats(1);
+        CHECK_FALSE(l.annotationOf(0, 4).reviewed);
+        l.recomputeStats(0);
+        CHECK_FALSE(l.statsOf(4)->reviewed);
+        CHECK(l.statsOf(3)->cls == "nucleus");
+    }
     SECTION("an undone delete gets its annotations back") {
         const LabelDiff d = l.remove(0, 3);
         l.updateStats(d);

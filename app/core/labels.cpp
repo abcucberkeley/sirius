@@ -338,10 +338,23 @@ namespace sirius::app {
         if (t < 0 || t >= t_ || rows.empty()) return;
         if (static_cast<Index>(frameAnnotations_.size()) != t_) frameAnnotations_.resize(static_cast<std::size_t>(t_));
         std::shared_ptr<const AnnotationTable>& slot = frameAnnotations_[static_cast<std::size_t>(t)];
-        // a new table rather than an edit: share() and clone() hold the old one
-        auto frame = slot ? std::make_shared<AnnotationTable>(*slot) : std::make_shared<AnnotationTable>();
-        for (const LabelStats* s : rows) (*frame)[s->id] = LabelAnnotation{s->cls, s->confidence, s->reviewed};
-        slot = std::move(frame);
+        // A row that says nothing ("object", confidence 1, not reviewed) is
+        // what a lookup answers anyway, so the frame keeps no entry for it:
+        // the labels of a threshold cost nothing here, whatever their count.
+        auto plain = [](const LabelStats& s) { return s.cls == "object" && s.confidence == 1.0 && !s.reviewed; };
+        bool needed = static_cast<bool>(slot);
+        for (const LabelStats* s : rows) needed = needed || !plain(*s);
+        if (needed) {
+            // a new table rather than an edit: share() and clone() hold the old one
+            auto frame = slot ? std::make_shared<AnnotationTable>(*slot) : std::make_shared<AnnotationTable>();
+            for (const LabelStats* s : rows) {
+                if (plain(*s)) frame->erase(s->id);
+                else (*frame)[s->id] = LabelAnnotation{s->cls, s->confidence, s->reviewed};
+            }
+            slot = frame->empty() ? nullptr : std::move(frame);
+        }
+        // the track's marks are kept explicitly, plain ones too: they
+        // override what a frame put aside before the mark was taken back
         if (!tracked_) return;
         auto track = trackAnnotations_ ? std::make_shared<AnnotationTable>(*trackAnnotations_) : std::make_shared<AnnotationTable>();
         for (const LabelStats* s : rows) (*track)[s->id] = LabelAnnotation{s->cls, s->confidence, s->reviewed};
