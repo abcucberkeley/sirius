@@ -10,6 +10,7 @@
 #include <QPainter>
 #include <QPen>
 
+#include "qt/qt_strings.hpp"
 #include "qt/theme.hpp"
 #include "qt/widgets/controls.hpp"
 
@@ -79,7 +80,7 @@ namespace sirius::app {
         if (!caption_.isEmpty()) {
             QFont cf = theme::font(10);
             cf.setLetterSpacing(QFont::PercentageSpacing, 106);
-            w += 6 + QFontMetrics(cf).horizontalAdvance(caption_.toUpper()) + 8;
+            w += 6 + QFontMetrics(cf).horizontalAdvance(captionCase(caption_)) + 8;
         }
         return {w, 22};
     }
@@ -104,7 +105,7 @@ namespace sirius::app {
             p.setFont(cf);
             p.setPen(theme::kNeutral500);
             const QFontMetrics cfm(cf);
-            p.drawText(QPointF(x + 6, (height() + cfm.ascent() - cfm.descent()) / 2.0), caption_.toUpper());
+            p.drawText(QPointF(x + 6, (height() + cfm.ascent() - cfm.descent()) / 2.0), captionCase(caption_));
         }
         drawFocusRing(p, *this);
     }
