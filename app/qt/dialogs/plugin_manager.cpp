@@ -47,7 +47,11 @@ namespace sirius::app {
             kStatusRole,                    // Status below
             kErrorRole,                     // first line of the load error
         };
-        enum Status { kDirectory = 0, kMissingDirectory, kLoaded, kFailed, kSkipped };
+        enum Status { kDirectory = 0,
+                      kMissingDirectory,
+                      kLoaded,
+                      kFailed,
+                      kSkipped };
 
         constexpr int kDirRowHeight = 26;
         constexpr int kFileRowHeight = 28;
@@ -84,7 +88,7 @@ namespace sirius::app {
                     if (status == kMissingDirectory) text += QStringLiteral("  (not created)");
                     const QRect tr = r.adjusted(10, 0, -10, 0);
                     p->drawText(tr, Qt::AlignVCenter | Qt::AlignLeft,
-                                QFontMetrics(f).elidedText(text.toUpper(), Qt::ElideMiddle, tr.width()));
+                                QFontMetrics(f).elidedText(captionCase(text), Qt::ElideMiddle, tr.width()));
                     p->restore();
                     return;
                 }
@@ -99,7 +103,7 @@ namespace sirius::app {
                 const QFont nameFont = theme::heading(12);
                 const QFont kindFont = theme::caption();
                 const QString name = index.data(Qt::DisplayRole).toString();
-                const QString kind = index.data(kKindRole).toString().toUpper();
+                const QString kind = captionCase(index.data(kKindRole).toString());
                 const int left = r.left() + 14;
                 const int right = glyphRect.left() - 6;
                 const QRect line1(left, r.top(), right - left, kFileRowHeight);

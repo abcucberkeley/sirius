@@ -55,15 +55,24 @@ namespace sirius::app {
                 }
                 ++lineNo;
                 if (!frontDone) {
-                    if (lineNo == 1 && trimmed == "---") { inFront = true; continue; }
+                    if (lineNo == 1 && trimmed == "---") {
+                        inFront = true;
+                        continue;
+                    }
                     if (inFront) {
-                        if (trimmed == "---") { inFront = false; frontDone = true; }
+                        if (trimmed == "---") {
+                            inFront = false;
+                            frontDone = true;
+                        }
                         continue;
                     }
                     frontDone = true;
                 }
                 if (inTex) {
-                    if (trimmed.find("$$") != std::string::npos) { inTex = false; texDone = true; }
+                    if (trimmed.find("$$") != std::string::npos) {
+                        inTex = false;
+                        texDone = true;
+                    }
                     continue;
                 }
                 if (!texDone && trimmed.rfind("$$", 0) == 0) {
@@ -72,7 +81,10 @@ namespace sirius::app {
                     continue;
                 }
                 if (inIntro) {
-                    if (trimmed.empty()) { inIntro = false; introDone = true; }
+                    if (trimmed.empty()) {
+                        inIntro = false;
+                        introDone = true;
+                    }
                     continue;
                 }
                 if (!introDone && !trimmed.empty() && trimmed[0] != '#' && trimmed[0] != '|') {
@@ -206,7 +218,7 @@ namespace sirius::app {
         void load(const std::string& k) {
             kind = k;
             page = loadHelpPage(k);
-            caption->setText(QStringLiteral("HELP · %1").arg(fromStd(page.title).toUpper()));
+            caption->setText(QStringLiteral("HELP · %1").arg(captionCase(fromStd(page.title))));
             view->setPage(page);
             const QStringList watched = watcher.files();
             if (!watched.isEmpty()) watcher.removePaths(watched);

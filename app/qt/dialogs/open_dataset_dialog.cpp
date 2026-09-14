@@ -230,7 +230,7 @@ namespace sirius::app {
         root->addWidget(new Rule(2, Qt::Horizontal, this));
         root->addWidget(new CaptionLabel(QStringLiteral("Recent datasets"), this));
         impl_->recent = new QTableWidget(0, 3, this);
-        impl_->recent->setHorizontalHeaderLabels({QStringLiteral("Name"), QStringLiteral("Format"), QStringLiteral("Modified")});
+        impl_->recent->setHorizontalHeaderLabels({QStringLiteral("NAME"), QStringLiteral("FORMAT"), QStringLiteral("MODIFIED")});
         impl_->recent->horizontalHeader()->setSectionResizeMode(0, QHeaderView::Stretch);
         impl_->recent->horizontalHeader()->setSectionResizeMode(1, QHeaderView::ResizeToContents);
         impl_->recent->horizontalHeader()->setSectionResizeMode(2, QHeaderView::ResizeToContents);
