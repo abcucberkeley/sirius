@@ -17,6 +17,9 @@
 #include <sstream>
 #include <stdexcept>
 #include <tuple>
+#ifndef _WIN32
+#include <dirent.h>
+#endif
 
 #include <nlohmann/json.hpp>
 #include <toml++/toml.hpp>
@@ -522,15 +525,31 @@ namespace sirius::app {
     } // namespace
 
     // naturalLess above is what puts "f2" before "f10".
+    // Names only: QDir and directory_entry::is_regular_file stat every entry.
+    // On NFS / Vast, readdir reports DT_UNKNOWN, so a Files filter skips the
+    // TIFFs unless each one is stated — and stating hundreds of 300 MB stacks
+    // hangs the GUI. Extension of the name is enough here.
     std::vector<std::string> tiffNamesInOrder(const fs::path& folder) {
         std::vector<std::string> names;
+#ifdef _WIN32
         std::error_code ec;
         for (const fs::directory_entry& e : fs::directory_iterator(folder, ec)) {
             if (!e.is_regular_file(ec) || !isTiffName(e.path())) continue;
             const std::string name = e.path().filename().string();
-            if (!name.empty() && name.front() == '.') continue;   // resource forks and the like
+            if (!name.empty() && name.front() == '.') continue;
             names.push_back(name);
         }
+#else
+        DIR* dir = ::opendir(folder.string().c_str());
+        if (!dir) return names;
+        while (const dirent* ent = ::readdir(dir)) {
+            const char* n = ent->d_name;
+            if (n[0] == '.') continue;   // ".", ".." and resource forks
+            if (!isTiffName(fs::path(n))) continue;
+            names.emplace_back(n);
+        }
+        ::closedir(dir);
+#endif
         std::sort(names.begin(), names.end(), naturalLess);
         return names;
     }
@@ -555,10 +574,7 @@ namespace sirius::app {
     DatasetManifest manifestFromFolder(const fs::path& folder, const FilenameRule& rule, std::vector<std::string>* unmatched) {
         std::error_code ec;
         if (!fs::is_directory(folder, ec)) throw std::runtime_error("not a folder: " + folder.string());
-        std::vector<std::string> names;
-        for (const fs::directory_entry& e : fs::directory_iterator(folder, ec))
-            if (e.is_regular_file(ec) && isTiffName(e.path())) names.push_back(e.path().filename().string());
-        std::sort(names.begin(), names.end(), naturalLess);
+        std::vector<std::string> names = tiffNamesInOrder(folder);
 
         if (unmatched) unmatched->clear();
         std::vector<MatchedFile> matched;

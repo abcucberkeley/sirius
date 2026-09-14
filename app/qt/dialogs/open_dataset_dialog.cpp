@@ -39,14 +39,7 @@ namespace sirius::app {
         constexpr int kMaxRecent = 12;
 
         // TIFF files directly in a folder (what a manifest would describe).
-        int tiffCount(const QString& folder) {
-            int n = 0;
-            for (const QString& e : QDir(folder).entryList(QDir::Files | QDir::NoDotAndDotDot)) {
-                const QString l = e.toLower();
-                if (l.endsWith(QLatin1String(".tif")) || l.endsWith(QLatin1String(".tiff"))) ++n;
-            }
-            return n;
-        }
+        int tiffCount(const QString& folder) { return static_cast<int>(tiffNamesInOrder(toStd(folder)).size()); }
 
         QString fileFilter() {
             QStringList exts;

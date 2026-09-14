@@ -116,11 +116,6 @@ namespace sirius::app {
             return a < b;
         }
 
-        bool isTiff(const QString& name) {
-            const QString l = name.toLower();
-            return l.endsWith(QLatin1String(".tif")) || l.endsWith(QLatin1String(".tiff"));
-        }
-
         QColor chipColor(const ChannelInfo& ch) { return QColor(fromStd(ch.hexColor())); }
 
         constexpr auto kLastManifestDirKey = "folderDataset/lastManifestDir";
@@ -269,11 +264,7 @@ namespace sirius::app {
         setMinimumWidth(720);
         resize(720, 780);
 
-        // Names only: QDir::Files stats every entry, which hangs on a
-        // Vast/NFS folder of hundreds of stacks.
-        const QDir dir(impl_->folder);
-        for (const QString& e : dir.entryList(QDir::NoDotAndDotDot, QDir::Name))
-            if (isTiff(e)) impl_->names.push_back(toStd(e));
+        impl_->names = tiffNamesInOrder(std::filesystem::path(toStd(impl_->folder)));
         const std::filesystem::path manifestPath = std::filesystem::path(toStd(impl_->folder)) / DatasetManifest::kFileName;
         std::error_code ec;
         if (std::filesystem::exists(manifestPath, ec)) {
