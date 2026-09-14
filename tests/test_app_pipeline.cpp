@@ -421,7 +421,12 @@ TEST_CASE("A step whose operation is not loaded keeps its place and its paramete
     for (const Operation* op : allOperations()) CHECK(op->kind() != "test_not_loaded");
     for (const auto& group : operationGroups())
         for (const Operation* op : group.second) CHECK(op->kind() != "test_not_loaded");
-    for (const json& op : operationSchemas()["operations"]) CHECK(op["kind"] != "test_not_loaded");
+    // Named: iterating operationSchemas()["operations"] walks a member of a temporary that is gone by
+    // the first iteration (a range-for extends only the outermost temporary until C++23). GCC's freed
+    // memory still held the array; MSVC's debug heap did not ("cannot use operator[] with a string
+    // argument with number").
+    const json schemas = operationSchemas();
+    for (const json& op : schemas.at("operations")) CHECK(op.at("kind") != "test_not_loaded");
     CHECK_THROWS_WITH(Pipeline::fromJson({{"steps", json::array({{{"kind", "load"}}, json::object()})}}),
                       Catch::Matchers::ContainsSubstring("without a kind"));
 
