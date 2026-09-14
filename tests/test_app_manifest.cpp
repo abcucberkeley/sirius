@@ -168,6 +168,23 @@ TEST_CASE("plainPattern strips named groups and keeps their order", "[app][manif
     }
 }
 
+TEST_CASE("AOLLS Scan_Iter names parse camera, tile grid and time", "[app][manifest]") {
+    const std::string name =
+        "Scan_Iter_0003_0000_0000_0000_CamB_ch0_CAM1_stack0000_488nm_0000000msec_1573519287msecAbs_000x_002y_001z_0003t.tif";
+    const std::string pat =
+        R"(Scan_Iter_\d+_\d+_\d+_\d+_(?P<channel>Cam[A-Z])_ch\d+_CAM\d+_stack\d+_\d+nm_\d+msec_\d+msecAbs_(?P<x>\d+)x_(?P<y>\d+)y_(?P<z>\d+)z_(?P<t>\d+)t\.tiff?$)";
+    const auto matches = matchFilenames({name, "Calib_fish1.h5", "stack_c488_t0_x1_y2.tif"}, pat);
+    REQUIRE(matches.size() == 3);
+    CHECK(matches[0].matched);
+    CHECK(matches[0].groups.at("channel") == "CamB");
+    CHECK(matches[0].groups.at("x") == "000");
+    CHECK(matches[0].groups.at("y") == "002");
+    CHECK(matches[0].groups.at("z") == "001");
+    CHECK(matches[0].groups.at("t") == "0003");
+    CHECK_FALSE(matches[1].matched);
+    CHECK_FALSE(matches[2].matched);
+}
+
 TEST_CASE("matchFilenames reports the named groups of every file", "[app][manifest]") {
     const std::vector<std::string> names{"img_c488_t003_x1_y2.tif", "other.tif"};
     const auto matches = matchFilenames(names, R"(img_c(?P<channel>\d+)_t(?P<t>\d+)_x(?P<x>\d+)_y(?P<y>\d+)\.tif)");
@@ -526,6 +543,33 @@ TEST_CASE("A folder with a manifest opens as one tiled dataset", "[app][manifest
         p.set("tile", std::int64_t{4});
         CHECK_FALSE(load.validate(p, DatasetMeta{}).ok());
     }
+}
+
+TEST_CASE("a manifest saved outside the TIFF folder still opens the files", "[app][manifest]") {
+    const TempFolder folder;
+    writeTileFolder(folder.path);
+    DatasetManifest m = manifestFromFolder(folder.path, tileRule());
+    m.filesFolder = folder.path.string();
+    const test::TempFile sidecar("app_manifest_sidecar", ".toml");
+    m.save(sidecar.path);
+
+    CHECK(isDatasetManifestFile(sidecar.str));
+    CHECK_FALSE(isFolderDataset(folder.str));
+    const DatasetManifest loaded = DatasetManifest::load(sidecar.path);
+    CHECK(loaded.filesFolder == folder.path.string());
+    CHECK(loaded.filesRoot(sidecar.path) == folder.path);
+    CHECK(loaded.validate(loaded.filesRoot(sidecar.path)).empty());
+
+    const DatasetMeta probed = probeDataset(sidecar.str);
+    CHECK(probed.dims == Dims5{2, 2, kPlanes, kTile, kTile});
+    CHECK(probed.format == "folder");
+    CHECK(probed.sourcePath == sidecar.str);
+    CHECK(probed.tiles.size() == 4);
+
+    const OpenResult opened = openDataset(sidecar.str);
+    REQUIRE(opened.source);
+    CHECK(opened.source->tileCount() == 4);
+    CHECK(opened.meta.dims == probed.dims);
 }
 
 // --- stitching the tile set ------------------------------------------------------

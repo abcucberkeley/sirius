@@ -198,9 +198,16 @@ TEST_CASE("Load validates its path and describes the raw SIM stack", "[app][ops]
     REQUIRE(out.source);
     CHECK(out.meta.dims == meta.dims);
     CHECK(out.meta.sim.present);
-    CHECK_FALSE(out.array);   // lazy
+    REQUIRE(out.array);   // full load is the default
     Buffer<float> vol = out.asInput().readVolume(0, 0);
     CHECK(vol.shape() == Shape{135, 64, 64});
+
+    SECTION("Lazy keeps the pixels on disk") {
+        p.set("read_as", std::string("Lazy (chunk on demand)"));
+        const StepOutput lazy = load.run(StepInput{}, p, prog.ctx);
+        REQUIRE(lazy.source);
+        CHECK_FALSE(lazy.array);
+    }
 
     SECTION("Full load materializes") {
         p.set("read_as", std::string("Full load to RAM"));

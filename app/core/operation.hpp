@@ -126,7 +126,9 @@ namespace sirius::app {
 
     struct StepContext {
         Backend backend = Backend::Cpu;
-        Device device = Device::cpu();             // the CUDA device for Backend::Cuda
+        // CUDA device for Backend::Cuda. index < 0 means every visible GPU:
+        // volumes are round-robined across cuda:0..N-1.
+        Device device = Device::cpu();
         RemoteWorker* remote = nullptr;            // Backend::Hpc
         // Hugging Face access token for a step that fetches a gated model
         // through the worker: sent with that request, never put in the
@@ -141,6 +143,10 @@ namespace sirius::app {
         }
         bool isCancelled() const { return cancelled && cancelled(); }
         void throwIfCancelled() const;             // std::runtime_error("cancelled")
+        bool allCudaDevices() const noexcept;
+        // The device that should run volume (c, t). When allCudaDevices(),
+        // this is cuda:((t * nChannels + c) % cudaDeviceCount()).
+        Device deviceForVolume(Index c, Index t, Index nChannels) const;
     };
 
     class Operation {

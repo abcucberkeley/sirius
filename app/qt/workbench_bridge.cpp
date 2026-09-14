@@ -1,9 +1,12 @@
 #include "qt/workbench_bridge.hpp"
 
 #include <exception>
+#include <memory>
+#include <utility>
 
 #include <QMetaObject>
 
+#include "core/cancel.hpp"
 #include "qt/qt_strings.hpp"
 
 namespace sirius::app {
@@ -148,7 +151,7 @@ namespace sirius::app {
                         [this] { return taskCancel_.load(); });
                 } catch (const std::exception& e) {
                     std::lock_guard<std::mutex> g(taskMutex_);
-                    taskError_ = e.what();
+                    if (!isCancellation(e)) taskError_ = e.what();
                 } catch (...) {
                     std::lock_guard<std::mutex> g(taskMutex_);
                     taskError_ = "unknown error";
@@ -173,9 +176,42 @@ namespace sirius::app {
         // taskLabel(), and clearing it here left that title empty. The next
         // startTask() overwrites it.
         const QString label = taskLabel_;
-        if (error.empty()) wb_.logLine(toStd(label) + ": done");
+        if (error.empty() && taskCancel_.load()) wb_.logLine(toStd(label) + ": cancelled");
+        else if (error.empty()) wb_.logLine(toStd(label) + ": done");
         else wb_.logLine(toStd(label) + ": " + error);
         emit taskFinished(error.empty(), fromStd(error));
+    }
+
+    bool WorkbenchBridge::openDatasetAsync(const std::string& path, OpenOptions options) {
+        if (wb_.running()) {
+            wb_.logLine("A run is in progress: cancel it or wait before opening a dataset.");
+            return false;
+        }
+        options.progress = {};
+        return startTask(QStringLiteral("Loading dataset"), [this, path, options](const TaskProgress& progress,
+                                                                                 const TaskCancelled& cancelled) {
+            OpenOptions o = options;
+            o.progress = [&](double f, const std::string& m) {
+                if (cancelled()) throw CancelledError{};
+                progress(f, m);
+            };
+            OpenResult opened = sirius::app::openDataset(path, o);
+            if (cancelled()) throw CancelledError{};
+            o.progress = {};
+            auto result = std::make_shared<OpenResult>(std::move(opened));
+            std::exception_ptr ep;
+            QMetaObject::invokeMethod(
+                this,
+                [this, result, path, o, &ep]() {
+                    try {
+                        wb_.adoptDataset(std::move(*result), path, o);
+                    } catch (...) {
+                        ep = std::current_exception();
+                    }
+                },
+                Qt::BlockingQueuedConnection);
+            if (ep) std::rethrow_exception(ep);
+        });
     }
 
 } // namespace sirius::app

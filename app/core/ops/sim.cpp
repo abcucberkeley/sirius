@@ -11,6 +11,9 @@
 #include <cmath>
 #include <cstdio>
 #include <filesystem>
+#include <memory>
+#include <mutex>
+#include <vector>
 
 #include <sirius/constants.hpp>
 #include <sirius/device.hpp>
@@ -319,11 +322,18 @@ namespace sirius::app {
 
                 Device device = Device::cpu();
                 if (ctx.backend == Backend::Cuda && ctx.device.isCuda() && cudaAvailable()) device = ctx.device;
-                out.ranOn = device.isCuda() ? Backend::Cuda : Backend::Cpu;
+                out.ranOn = (device.isCuda() || ctx.allCudaDevices()) ? Backend::Cuda : Backend::Cpu;
 
-                ReconSession session;
-                session.setParameters(p);
-                session.setOtfPath(params.getString("otf"));
+                const int nSessions = ctx.allCudaDevices() ? std::max(1, cudaDeviceCount()) : 1;
+                std::vector<std::unique_ptr<ReconSession>> sessions;
+                std::vector<std::unique_ptr<std::mutex>> sessionLocks;
+                sessions.reserve(static_cast<std::size_t>(nSessions));
+                for (int i = 0; i < nSessions; ++i) {
+                    sessions.push_back(std::make_unique<ReconSession>());
+                    sessions.back()->setParameters(p);
+                    sessions.back()->setOtfPath(params.getString("otf"));
+                    sessionLocks.push_back(std::make_unique<std::mutex>());
+                }
                 const Index sections = input.meta.dims.z;
                 // Capturing the band spectra keeps two complex volumes covering
                 // every direction and band -- gigabytes on a full-size stack --
@@ -349,33 +359,45 @@ namespace sirius::app {
                 double seconds = 0.0;
                 bool plansReused = false;
                 bool first = true;
-                forEachVolume(input.meta, ctx, [&](Index c, Index t) {
+                std::mutex firstMu;
+                forEachVolumeOnGpus(input.meta, ctx, [&](Index c, Index t, Device volDevice) {
                     Buffer<float> raw = input.readVolume(c, t);
                     Buffer<double> rawD(raw.shape());
                     convert(raw, rawD);
+                    const int slot = volDevice.isCuda() ? volDevice.index % nSessions : 0;
+                    std::lock_guard<std::mutex> g(*sessionLocks[static_cast<std::size_t>(slot)]);
+                    ReconSession& session = *sessions[static_cast<std::size_t>(slot)];
                     session.setRaw(std::move(rawD), input.meta.name);
-                    session.setCaptureDiagnostics(first && capture);
-                    // The reconstruction of one volume is the long pole: minutes
-                    // on real data. Hand the library the cancel predicate so it
-                    // aborts at its next stage boundary instead of running to
-                    // completion; forEachVolume already checks between volumes.
-                    ReconResult r = session.reconstruct(device, PlanRigor::Measure,
+                    bool captureThis = false;
+                    {
+                        std::lock_guard<std::mutex> f(firstMu);
+                        captureThis = first && capture;
+                    }
+                    session.setCaptureDiagnostics(captureThis);
+                    ReconResult r = session.reconstruct(volDevice.isCuda() ? volDevice : device, PlanRigor::Measure,
                                                         [&ctx] { return ctx.isCancelled(); });
                     ctx.throwIfCancelled();
-                    seconds += r.seconds;
-                    plansReused = plansReused || r.plansReused;
+                    {
+                        std::lock_guard<std::mutex> f(firstMu);
+                        seconds += r.seconds;
+                        plansReused = plansReused || r.plansReused;
+                    }
                     if (r.volume.shape() != Shape{out.meta.dims.z, out.meta.dims.y, out.meta.dims.x})
                         throw std::runtime_error("SIM: unexpected output shape " + r.volume.shape().toString());
                     convert(r.volume, result->volume(c, t));
                     ctx.throwIfCancelled();
+                    std::lock_guard<std::mutex> f(firstMu);
                     if (first) {
                         out.diagnostics = diagnostics(input, raw, r, p, nz, *result, params, captureNote);
                         first = false;
                     }
                 });
                 out.array = result;
+                const std::string where = ctx.allCudaDevices()
+                                              ? ("all " + std::to_string(cudaDeviceCount()) + " GPUs")
+                                              : toString(device);
                 char note[128];
-                std::snprintf(note, sizeof note, "%.1f s · %s · %s · plans %s", seconds, toString(device).c_str(),
+                std::snprintf(note, sizeof note, "%.1f s · %s · %s · plans %s", seconds, where.c_str(),
                               params.getString("otf").empty() ? "theoretical OTF" : "measured OTF",
                               plansReused ? "reused" : "built");
                 out.note = note;

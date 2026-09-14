@@ -203,6 +203,14 @@ TEST_CASE("openDataset reads a plain TIFF as z pages and honours an explicit pag
         REQUIRE(r.source->inMemory());
         requireSame(*r.source->readAll(), a);
         REQUIRE(r.meta.dims == d);
+        SECTION("progress is forwarded from openDataset") {
+            OpenOptions po = o;
+            double last = -1.0;
+            po.progress = [&](double p, const std::string&) { last = p; };
+            const OpenResult full = openDataset(f.str(), po);
+            REQUIRE(full.source->inMemory());
+            REQUIRE(last == 1.0);
+        }
     }
 }
 

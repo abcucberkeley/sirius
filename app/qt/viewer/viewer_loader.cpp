@@ -130,7 +130,10 @@ namespace sirius::app {
                         vol = out->array->plane(c, t, 0);
                     } else if (out->source) {
                         auto buf = std::make_shared<Buffer<float>>(Shape{d.z, d.y, d.x});
-                        out->source->readVolume(c, t, buf->data());
+                        out->source->readVolume(c, t, buf->data(), [&](double f, const std::string& m) {
+                            if (generation->load() != gen || !self) return;
+                            emit self->volumeProgress(0.9 * f, QString::fromStdString(m));
+                        });
                         vol = buf->data();
                         result.volume = std::move(buf);
                     }

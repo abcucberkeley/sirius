@@ -3,6 +3,7 @@
 // usable CUDA device.
 
 #include <catch2/catch_test_macros.hpp>
+#include <catch2/catch_approx.hpp>
 #include <catch2/generators/catch_generators.hpp>
 #include <catch2/matchers/catch_matchers_string.hpp>
 
@@ -318,6 +319,28 @@ TEST_CASE("A CPU read opens the file only on the threads that decode a page", "[
         const std::size_t opens = opensDuring([&] { requireEqual(file.readStack<uint16_t>(), b, 1); });
         CHECK(opens >= 1);
         CHECK(opens <= 3);
+    }
+    SECTION("maxThreads 1 keeps a large stack on one handle") {
+        const auto a = pattern(1024, 1024, 0), b = pattern(1024, 1024, 1), c = pattern(1024, 1024, 2);
+        TempFile f(".tif");
+        writeTiffPages(f.path, {{&a, false, 0}, {&b, false, 0}, {&c, false, 0}}, false);
+        TiffFile file(f.path);
+        TiffReadOptions opts;
+        opts.maxThreads = 1;
+        CHECK(opensDuring([&] { requireEqual(file.readStack<uint16_t>(opts), b, 1); }) == 1);
+    }
+    SECTION("progress reports over pages") {
+        const auto a = pattern(64, 64, 0), b = pattern(64, 64, 1), c = pattern(64, 64, 2);
+        TempFile f(".tif");
+        writeTiffPages(f.path, {{&a, false, 0}, {&b, false, 0}, {&c, false, 0}}, false);
+        TiffFile file(f.path);
+        TiffReadOptions opts;
+        std::vector<double> seen;
+        opts.progress = [&](double p) { seen.push_back(p); };
+        requireEqual(file.readStack<uint16_t>(opts), b, 1);
+        REQUIRE_FALSE(seen.empty());
+        CHECK(seen.front() > 0.0);
+        CHECK(seen.back() == Catch::Approx(1.0));
     }
 }
 

@@ -44,6 +44,9 @@ namespace sirius::app {
     signals:
         void cursorChanged(const QString& text);
         void zoomChanged(const QString& text);
+        void loadStarted();
+        void loadProgress(double fraction, const QString& message);
+        void loadFinished();
 
     protected:
         // The ortho splitters take their saved (or design) balance once the

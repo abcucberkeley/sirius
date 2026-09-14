@@ -226,6 +226,13 @@ namespace sirius::app {
         return p.is_absolute() ? p : folder / p;
     }
 
+    fs::path DatasetManifest::filesRoot(const fs::path& loadedFrom) const {
+        if (!filesFolder.empty()) return fs::path(filesFolder);
+        std::error_code ec;
+        if (fs::is_directory(loadedFrom, ec)) return loadedFrom;
+        return loadedFrom.parent_path();
+    }
+
     Index DatasetManifest::channelIndex(const std::string& channel) const noexcept {
         for (std::size_t i = 0; i < channels.size(); ++i)
             if (channels[i].label == channel) return static_cast<Index>(i);
@@ -263,6 +270,7 @@ namespace sirius::app {
         j["frame_interval_s"] = frameIntervalS;
         j["acquisition"] = acquisition;
         j["pattern"] = pattern;
+        if (!filesFolder.empty()) j["files_folder"] = filesFolder;
         j["sim"] = json{{"present", sim.present}, {"ndirs", sim.ndirs}, {"nphases", sim.nphases}, {"fast_si", sim.fastSi}};
         j["channels"] = json::array();
         for (const ChannelInfo& c : channels) j["channels"].push_back(channelToJson(c));
@@ -282,6 +290,7 @@ namespace sirius::app {
         m.frameIntervalS = numberField(j, "frame_interval_s", 0.0);
         m.acquisition = stringField(j, "acquisition");
         m.pattern = stringField(j, "pattern");
+        m.filesFolder = stringField(j, "files_folder");
         if (j.contains("sim") && j["sim"].is_object()) {
             const json& s = j["sim"];
             m.sim.present = s.value("present", false);
@@ -619,25 +628,29 @@ namespace sirius::app {
             if (firstOfTile.emplace(f.tile, &f).second) tileNames.push_back(f.tile);
         std::sort(tileNames.begin(), tileNames.end(), naturalLess);
 
-        // every file must have the shape of the first one: the dataset has
-        // one (z, y, x) for all tiles, channels and time points
+        // Shape of the dataset: one (z, y, x) for every tile, channel and time
+        // point. Probe the first file of each tile — a diSPIM / AOLLS folder is
+        // hundreds of 800-page stacks, and inspectTiff of every file walks every
+        // IFD of every file (and used to get the process killed).
         std::uint32_t width = 0, height = 0;
         std::size_t pages = 0;
         std::string firstFile;
-        for (const MatchedFile& f : matched) {
-            const TiffInfo info = inspectTiff((folder / f.name).string());
-            if (info.pageCount() == 0) throw std::runtime_error(f.name + ": the TIFF has no pages");
+        auto probeShape = [&](const MatchedFile& f) {
+            const TiffStackShape info = inspectTiffShape((folder / f.name).string());
+            if (info.pages == 0) throw std::runtime_error(f.name + ": the TIFF has no pages");
             if (firstFile.empty()) {
-                width = info.width();
-                height = info.height();
-                pages = info.pageCount();
+                width = info.width;
+                height = info.height;
+                pages = info.pages;
                 firstFile = f.name;
-                continue;
+                return;
             }
-            if (info.width() != width || info.height() != height || info.pageCount() != pages)
-                throw std::runtime_error("tile shape mismatch: " + f.name + " is " + sizeText(info.width(), info.height(), info.pageCount()) +
+            if (info.width != width || info.height != height || info.pages != pages)
+                throw std::runtime_error("tile shape mismatch: " + f.name + " is " + sizeText(info.width, info.height, info.pages) +
                                          ", " + firstFile + " is " + sizeText(width, height, pages));
-        }
+        };
+        if (!matched.empty()) probeShape(matched.front());
+        for (const std::string& name : tileNames) probeShape(*firstOfTile[name]);
 
         std::vector<double> xs, ys, zs;   // Microns: for the grid ranks
         if (rule.positions == FilenameRule::Positions::Microns) {

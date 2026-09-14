@@ -733,6 +733,11 @@ TEST_CASE("TiffWriteOptions: description, resolution and BigTIFF are written and
     REQUIRE(info.page(0).resolutionUnit == 3);
     REQUIRE_THAT(info.page(0).xResolution, Catch::Matchers::WithinRel(1e4 / 0.1, 1e-4));
     REQUIRE_THAT(info.page(0).yResolution, Catch::Matchers::WithinRel(1e4 / 0.2, 1e-4));
+    const TiffStackShape shape = inspectTiffShape(f.path);
+    CHECK(shape.width == info.width());
+    CHECK(shape.height == info.height());
+    CHECK(shape.pages == info.pageCount());
+    CHECK(shape.pixelType == info.pixelType());
 
     // A file without the tags reports their absence
     TempFile g(uniqueTempPath(".tif"));

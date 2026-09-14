@@ -35,6 +35,8 @@ namespace sirius {
             const TiffImageInfo* geometry = nullptr;
             Region region;
             PixelType dstType = PixelType::UInt8;
+            int maxThreads = 0;   // 0 = automatic; see TiffReadOptions::maxThreads
+            std::function<void(double)> progress;   // 0..1 over pages; may be called from OpenMP threads
         };
 
         // libtiff: decode into dense host memory {ifds, region.height, region.width}

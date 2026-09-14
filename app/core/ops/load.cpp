@@ -1,7 +1,7 @@
-// Load: the pinned first step. Opens the dataset lazily (planes on demand)
-// or reads it fully, and lets the user override what the file's metadata
-// did not say: page order, voxel size, the raw SIM layout, the light-sheet
-// angle.
+// Load: the pinned first step. Opens the dataset into RAM by default, or
+// lazily (planes on demand), and lets the user override what the file's
+// metadata did not say: page order, voxel size, the raw SIM layout, the
+// light-sheet angle.
 #include "core/ops/builtin.hpp"
 
 #include <algorithm>
@@ -112,7 +112,7 @@ namespace sirius::app {
         bool axesGiven(const ParamSet& p) { return p.getInt("c") > 0 || p.getInt("t") > 0 || p.getInt("z") > 0; }
 
         std::string axesNotAppliedError(const std::string& path) {
-            return isFolderDataset(path)
+            return isManifestDataset(path)
                        ? "A multi-file folder takes its channels, time points and planes from its manifest: set Channels, Time points and Planes to 0."
                        : "A zarr / N5 store names its own axes: set Channels, Time points and Planes to 0.";
         }
@@ -155,8 +155,8 @@ namespace sirius::app {
                     pathParam("path", "Source")
                         .withFilter("Images (*.tif *.tiff *.ome.tif *.zarr *.n5);;All files (*)")
                         .withHelp("Multi-page TIFF / OME-TIFF, a zarr / N5 store, or a folder with a sirius-dataset.toml manifest."),
-                    choiceParam("read_as", "Read as", {kLazy, kFull}, kLazy)
-                        .withHelp("Lazy reads planes on demand; full load reads everything once."),
+                    choiceParam("read_as", "Read as", {kLazy, kFull}, kFull)
+                        .withHelp("Full load reads everything once into RAM (the default); lazy reads planes on demand."),
                     intParam("tile", "Tile", 0).range(0, 1000000).withHelp("Multi-file datasets: the tile to view; Stitch fuses all of them"),
                     stringParam("page_order", "Page order", "czt")
                         .withHelp("Axis order of the pages of a plain TIFF, fastest first (ImageJ: czt).")
@@ -245,7 +245,11 @@ namespace sirius::app {
                 std::error_code ec;
                 if (axesGiven(params) && std::filesystem::is_directory(path, ec))
                     throw std::runtime_error("Load: " + axesNotAppliedError(path));
-                const OpenOptions options = loadOpenOptions(params);
+                OpenOptions options = loadOpenOptions(params);
+                options.progress = [&](double f, const std::string& m) {
+                    ctx.throwIfCancelled();
+                    ctx.report(f, m);
+                };
 
                 ctx.report(0.0, "opening " + std::filesystem::path(path).filename().string());
                 OpenResult opened = openDataset(path, options);
@@ -258,7 +262,9 @@ namespace sirius::app {
                 out.meta = opened.meta;
                 annotate(params, out.meta);
                 if (options.readAll) {
-                    out.array = opened.source->readAll([&](double f, const std::string& m) { ctx.report(f, m); });
+                    // openDataset already materialized when readAll is set;
+                    // this is free on a MemorySource and a fallback otherwise.
+                    out.array = opened.source->readAll(options.progress);
                 }
                 out.note = joinSummary({out.meta.format, out.meta.shapeString(), options.readAll ? "in memory" : "lazy", tileSummary(out.meta)});
                 out.ranOn = Backend::Cpu;

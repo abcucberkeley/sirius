@@ -50,12 +50,14 @@
 #include <sirius/tiff_io.hpp>
 
 #include "core/export.hpp"
+#include "core/array_source.hpp"
 #include "qt/viewer/slice_pane.hpp"
 #include "qt/dialogs/export_dialog.hpp"
 #include "qt/dialogs/training_export_dialog.hpp"
 #include "qt/dialogs/folder_dataset_dialog.hpp"
 #include "qt/dialogs/model_hub_dialog.hpp"
 #include "qt/dialogs/open_dataset_dialog.hpp"
+#include "qt/fast_file_dialog.hpp"
 #include "qt/dialogs/plugin_manager.hpp"
 #include "qt/dialogs/preferences_dialog.hpp"
 #include "qt/panels/assistant_panel.hpp"
@@ -240,16 +242,36 @@ namespace sirius::app {
             return dock;
         }
 
-        QString gpuText(const Workbench& wb) {
-            if (!cudaAvailable()) return QStringLiteral("CPU only");
+        QString deviceLabel(int i) {
             try {
-                const DeviceProperties p = deviceProperties(Device::cuda(wb.cudaDevice()));
-                return QStringLiteral("GPU · %1 · %2 GB")
+                const DeviceProperties p = deviceProperties(Device::cuda(i));
+                return QStringLiteral("cuda:%1 · %2 · %3 GB")
+                    .arg(i)
                     .arg(fromStd(p.name))
                     .arg(static_cast<double>(p.totalMemoryBytes) / (1024.0 * 1024.0 * 1024.0), 0, 'f', 1);
             } catch (const std::exception&) {
-                return QStringLiteral("GPU");
+                return QStringLiteral("cuda:%1").arg(i);
             }
+        }
+
+        void fillGpuCombo(QComboBox* box, int current) {
+            const bool block = box->blockSignals(true);
+            box->clear();
+            const int n = cudaDeviceCount();
+            for (int i = 0; i < n; ++i) box->addItem(deviceLabel(i), i);
+            if (n > 1)
+                box->addItem(QStringLiteral("All %1 GPUs").arg(n), Workbench::kAllCudaDevices);
+            if (n == 0) {
+                box->addItem(QStringLiteral("CPU only"), 0);
+                box->setEnabled(false);
+            } else {
+                box->setEnabled(true);
+            }
+            int idx = 0;
+            for (int i = 0; i < box->count(); ++i)
+                if (box->itemData(i).toInt() == current) idx = i;
+            box->setCurrentIndex(idx);
+            box->blockSignals(block);
         }
 
     } // namespace
@@ -352,7 +374,7 @@ namespace sirius::app {
         QDockWidget* logDock = nullptr;
 
         QLabel* datasetLabel = nullptr;
-        QLabel* gpuLabel = nullptr;
+        QComboBox* gpuCombo = nullptr;
         AssistantButton* assistantButton = nullptr;
 
         QLabel* statusShape = nullptr;
@@ -493,10 +515,19 @@ namespace sirius::app {
             rl->setContentsMargins(0, 0, 14, 0);
             rl->setSpacing(18);
             datasetLabel = widgets::label(QString(), 12, theme::kNeutral600, -1, right);
-            gpuLabel = widgets::label(gpuText(wb()), 12, theme::kNeutral600, -1, right);
+            gpuCombo = new QComboBox(right);
+            gpuCombo->setMinimumContentsLength(18);
+            gpuCombo->setSizeAdjustPolicy(QComboBox::AdjustToContents);
+            fillGpuCombo(gpuCombo, wb().cudaDevice());
+            QObject::connect(gpuCombo, qOverload<int>(&QComboBox::currentIndexChanged), self, [this] {
+                const int id = gpuCombo->currentData().toInt();
+                if (!cudaAvailable()) return;
+                wb().setBackend(Backend::Cuda);
+                wb().setCudaDevice(id);
+            });
             assistantButton = new AssistantButton(right);
             rl->addWidget(datasetLabel);
-            rl->addWidget(gpuLabel);
+            rl->addWidget(gpuCombo);
             rl->addWidget(assistantButton);
             bar->setCornerWidget(right, Qt::TopRightCorner);
 
@@ -816,7 +847,7 @@ namespace sirius::app {
             const Workbench& w = wb();
             const QString name = w.hasDataset() ? fromStd(w.dataset().name) : QStringLiteral("no dataset");
             datasetLabel->setText(name);
-            gpuLabel->setText(gpuText(w));
+            fillGpuCombo(gpuCombo, w.cudaDevice());
             QString title = QStringLiteral("SIRIUS");
             if (w.hasDataset()) title += QStringLiteral(" — ") + name;
             if (!w.pipelinePath().empty()) title += QStringLiteral(" · ") + QFileInfo(fromStd(w.pipelinePath())).fileName();
@@ -987,15 +1018,20 @@ namespace sirius::app {
             openWith(dialog.path(), dialog.options());
         }
 
-        void openWith(const QString& path, const OpenOptions& options) {
-            try {
-                wb().openDataset(toStd(path), options);
-                OpenDatasetDialog::addRecentFile(path);
-                lastDir = QFileInfo(path).absolutePath();
-            } catch (const std::exception& e) {
-                wb().logLine(std::string("Open failed: ") + e.what());
-                QMessageBox::warning(self, QStringLiteral("Open dataset"), QString::fromUtf8(e.what()));
+        void openWith(const QString& path, OpenOptions options) {
+            options.readAll = true;
+            if (bridge.running() || !wb().canEdit()) {
+                QMessageBox::information(self, QStringLiteral("Open dataset"),
+                                         QStringLiteral("A run is in progress: cancel it (Esc) or wait before opening a dataset."));
+                return;
             }
+            if (!bridge.openDatasetAsync(toStd(path), options)) {
+                QMessageBox::warning(self, QStringLiteral("Open dataset"),
+                                     QStringLiteral("Another task is still running: cancel it or wait."));
+                return;
+            }
+            OpenDatasetDialog::addRecentFile(path);
+            lastDir = QFileInfo(path).absolutePath();
         }
 
         // Start or stop the session recording. The file is JSON lines, so it
@@ -1190,11 +1226,15 @@ namespace sirius::app {
         // A folder with a manifest opens directly; otherwise the pattern
         // dialog builds one first.
         void openFolderDataset() {
-            const QString folder = QFileDialog::getExistingDirectory(self, QStringLiteral("Open folder as dataset"), lastDir);
+            QString start = lastDir;
+            if (!start.isEmpty()) start = QFileInfo(start).isDir() ? QFileInfo(start).absolutePath() : start;
+            const QString folder = getExistingDirectoryFast(self, QStringLiteral("Open folder as dataset"), start);
             if (folder.isEmpty()) return;
             lastDir = folder;
             if (isFolderDataset(toStd(folder))) {
-                openWith(folder, OpenOptions{});
+                OpenOptions o;
+                o.readAll = true;
+                openWith(folder, o);
                 return;
             }
             FolderDatasetDialog dialog(bridge, folder, self);
@@ -1373,6 +1413,21 @@ namespace sirius::app {
         connect(d.viewer, &ViewerWidget::zoomChanged, this, [this](const QString& t) {
             impl_->statusZoom->setText(QStringLiteral("zoom %1").arg(t));
         });
+        connect(d.viewer, &ViewerWidget::loadStarted, this, [this] {
+            if (impl_->bridge.running() || impl_->bridge.taskRunning()) return;
+            impl_->progressClock.start();
+            impl_->progressMessage = QStringLiteral("Loading TIFF");
+            impl_->showProgress(0.0, QString());
+        });
+        connect(d.viewer, &ViewerWidget::loadProgress, this, [this](double f, const QString& msg) {
+            if (impl_->bridge.running() || impl_->bridge.taskRunning()) return;
+            impl_->showProgress(f, msg);
+        });
+        connect(d.viewer, &ViewerWidget::loadFinished, this, [this] {
+            if (impl_->bridge.running() || impl_->bridge.taskRunning()) return;
+            impl_->statusProgress->hide();
+            impl_->progressClock.invalidate();
+        });
         connect(&bridge, &WorkbenchBridge::selectionChanged, this, [this] {
             impl_->refreshActions();
             if (impl_->help->isVisible()) impl_->showHelpForSelected();
@@ -1470,7 +1525,10 @@ namespace sirius::app {
                 return;
             }
         }
-        impl_->openWith(path, OpenOptions{});
+        impl_->lastDir = QFileInfo(path).absolutePath();
+        OpenOptions o;
+        o.readAll = true;
+        impl_->openWith(path, o);
     }
 
     ViewerWidget& MainWindow::viewer() { return *impl_->viewer; }
@@ -1518,6 +1576,7 @@ namespace sirius::app {
             if (!info.isFile()) return DropKind::None;
             const QString name = info.fileName().toLower();
             if (name.endsWith(QStringLiteral(".sirius.toml"))) return DropKind::Pipeline;
+            if (isDatasetManifestFile(toStd(path))) return DropKind::Dataset;
             if (name.endsWith(QStringLiteral(".py"))) return DropKind::Plugin;
             static const char* datasets[] = {".tif", ".tiff", ".ome.tif", ".ome.tiff", ".zarr", ".n5", ".sir5"};
             for (const char* ext : datasets)

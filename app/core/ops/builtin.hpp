@@ -58,6 +58,11 @@ namespace sirius::app {
     // 0..1 and honouring cancellation.
     void forEachVolume(const DatasetMeta& meta, const StepContext& ctx,
                        const std::function<void(Index c, Index t)>& fn);
+    // Like forEachVolume, but when the context asks for every GPU the (c, t)
+    // volumes run in parallel (one OpenMP thread per device) and `fn` is
+    // given the device for that volume.
+    void forEachVolumeOnGpus(const DatasetMeta& meta, const StepContext& ctx,
+                             const std::function<void(Index c, Index t, Device device)>& fn);
     // "3 angles · 5 phases" style joining with " · ".
     std::string joinSummary(std::initializer_list<std::string> parts);
     // Channel label "488 α-actinin" for summaries.

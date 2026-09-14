@@ -231,9 +231,14 @@ namespace sirius::app::theme {
                    "QSpinBox::up-arrow, QDoubleSpinBox::up-arrow { width: 7px; height: 7px; }\n"
                    "QComboBox::drop-down { border: none; width: 22px; subcontrol-origin: padding; subcontrol-position: center right; }\n"
                    "QComboBox::down-arrow { image: url(:/icons/chevron-down.svg); width: 12px; height: 12px; }\n"
-                   "QComboBox QAbstractItemView { background: %1; border: 2px solid %7; selection-background-color: %8;"
-                   "  selection-color: %3; outline: none; padding: 2px 0; }\n"
-                   "QComboBox QAbstractItemView::item { min-height: 24px; padding: 2px 8px; }\n")
+                   // Combo and completer popups are top-level windows, not
+                   // children of QComboBox / QLineEdit, so a descendant
+                   // selector never reaches them. Colour and an opaque fill
+                   // live on the container and on QListView below.
+                   "QComboBoxPrivateContainer { background: %1; color: %7; border: 2px solid %7; }\n"
+                   "QComboBox QAbstractItemView { background: %1; color: %7; border: none;"
+                   "  selection-background-color: %8; selection-color: %7; outline: none; padding: 2px 0; }\n"
+                   "QComboBox QAbstractItemView::item { min-height: 24px; padding: 2px 8px; color: %7; }\n")
                    .arg(bg, divider, accent, n500, n300, surface, text, n200);
 
         // sliders, scroll bars, progress
@@ -259,10 +264,21 @@ namespace sirius::app::theme {
                    .arg(n300, accent, accent600, n400, n500);
 
         // tables, tabs, status bar, splitters, group boxes
+        // In-panel tables stay transparent so they sit on the page colour.
+        // QListView is the combo / QCompleter / file-dialog popup: those
+        // windows are not descendants of the control, and a transparent
+        // fill left them on a dark frame with dark text (unreadable).
         qss += QStringLiteral(
-                   "QTableView, QTableWidget, QTreeView, QListView { background: transparent; border: none; gridline-color: %1;"
+                   "QTableView, QTableWidget, QTreeView { background: transparent; border: none; gridline-color: %1;"
                    "  selection-background-color: %2; selection-color: %3; alternate-background-color: transparent; outline: none; }\n"
-                   "QTableView::item, QListView::item { padding: 4px 6px; border-bottom: 1px solid %1; }\n"
+                   "QTableView::item { padding: 4px 6px; border-bottom: 1px solid %1; }\n"
+                   "QListView { background: %6; color: %3; border: 1.5px solid %1; outline: none;"
+                   "  selection-background-color: %2; selection-color: %3; }\n"
+                   "QListView::item { padding: 4px 8px; min-height: 22px; color: %3; }\n"
+                   "QListView::item:selected, QListView::item:hover { background: %2; color: %3; }\n"
+                   "QFileDialog QTreeView, QFileDialog QListView, QFileDialog QTableView {"
+                   "  background: %6; color: %3; border: 1.5px solid %1; }\n"
+                   "QFileDialog QTreeView::item, QFileDialog QListView::item { color: %3; }\n"
                    "QHeaderView { background: transparent; }\n"
                    "QHeaderView::section { background: transparent; border: none; border-bottom: 2px solid %1;"
                    "  padding: 4px 6px; font-size: 10px; font-weight: 400; color: %4; text-transform: uppercase; }\n"

@@ -350,7 +350,7 @@ namespace sirius::app {
                                              "Stitch would be left out of the mosaic. Put Stitch directly after Load and the "
                                              "other steps after it, or stitch tile files (the Tiles parameter).");
                 if (input.source->tileCount() == n) return input.source;
-                if (isFolderDataset(input.meta.sourcePath)) return openDataset(input.meta.sourcePath, OpenOptions{}).source;
+                if (isManifestDataset(input.meta.sourcePath)) return openDataset(input.meta.sourcePath, OpenOptions{}).source;
                 throw std::runtime_error("Stitch: the tiles of " + input.meta.name + " are not readable here (" +
                                          (input.meta.sourcePath.empty() ? std::string("no source folder") : input.meta.sourcePath) + ")");
             }

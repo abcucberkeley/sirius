@@ -97,6 +97,7 @@ namespace sirius::app {
     signals:
         void volumeReady(const sirius::app::ViewerLoader::Volume& v);
         void reductionReady(const sirius::app::ViewerLoader::Reduction& r);
+        void volumeProgress(double fraction, const QString& message);
 
     private:
         struct Job {

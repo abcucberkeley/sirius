@@ -202,7 +202,8 @@ namespace sirius::app {
         // here, never on the GUI thread.
         ViewerLoader loader;
         quint64 volumeKey = 0;          // the reduction the 3D view is waiting for
-        QString sliceNotice;            // "Loading…" for the panes that need a volume
+        QString sliceNotice;            // "Loading 37%" for the panes that need a volume
+        bool loadActive = false;        // volume decode in flight; drives the status bar
         // (output, c, t) reads that threw: not asked for again until the
         // displayed output changes.
         std::set<std::tuple<const StepOutput*, Index, Index>> failedVolumes;
@@ -340,6 +341,9 @@ namespace sirius::app {
         DisplayModel::VolumeState ensureVolumes(DisplayModel& m, Index t);
         void onVolumeReady(const ViewerLoader::Volume& v);
         void onReductionReady(const ViewerLoader::Reduction& r);
+        void onVolumeProgress(double fraction, const QString& message);
+        void beginLoad();
+        void endLoad();
         bool canPaint() const { return wb.canEdit(); }
         // Compare's own plane when View ▸ Sync Z / T is off.
         Index compareZ() const;
@@ -899,6 +903,8 @@ namespace sirius::app {
                          [this](const ViewerLoader::Volume& v) { onVolumeReady(v); });
         QObject::connect(&loader, &ViewerLoader::reductionReady, q,
                          [this](const ViewerLoader::Reduction& r) { onReductionReady(r); });
+        QObject::connect(&loader, &ViewerLoader::volumeProgress, q,
+                         [this](double f, const QString& msg) { onVolumeProgress(f, msg); });
     }
 
     // --- asynchronous volumes ------------------------------------------------------
@@ -913,7 +919,7 @@ namespace sirius::app {
                 case DisplayModel::VolumeState::Wanted:
                     if (failedVolumes.count({m.output().get(), c, t})) break;
                     wanted = true;
-                    loader.prepare(m.output(), c, t);
+                    if (loader.prepare(m.output(), c, t)) beginLoad();
                     break;
                 case DisplayModel::VolumeState::TooLarge: tooLarge = true; break;
             }
@@ -926,13 +932,20 @@ namespace sirius::app {
         DisplayModel* target = nullptr;
         if (v.out == model.output()) target = &model;
         else if (v.out == rawModel.output()) target = &rawModel;
-        if (!target) return;                                  // the viewer moved on: drop it
-        if (target == &model && v.t != curT()) return;        // a time point ago: drop it too
+        if (!target) {
+            if (!loader.busy()) endLoad();
+            return;                                  // the viewer moved on: drop it
+        }
+        if (target == &model && v.t != curT()) {
+            if (!loader.busy()) endLoad();
+            return;        // a time point ago: drop it too
+        }
         if (!v.ok) {
             failedVolumes.insert({v.out.get(), v.c, v.t});
             sliceNotice = QStringLiteral("could not read the volume");
             refreshHints();
             wb.logLine("Viewer: " + toStd(v.error));
+            if (!loader.busy()) endLoad();
             return;
         }
         if (ScopedTrace::enabled())
@@ -944,6 +957,31 @@ namespace sirius::app {
         // channel has arrived.
         dirty = Dirty{};
         scheduleUpdate();
+        if (!loader.busy()) endLoad();
+    }
+
+    void ViewerWidget::Impl::onVolumeProgress(double fraction, const QString& message) {
+        if (!loadActive) beginLoad();
+        QString tail = message;
+        if (tail.startsWith(QLatin1String("reading "))) tail = tail.mid(8);
+        sliceNotice = QStringLiteral("Loading %1%").arg(static_cast<int>(std::clamp(fraction, 0.0, 1.0) * 100.0 + 0.5));
+        if (!tail.isEmpty()) sliceNotice += QStringLiteral(" · ") + tail;
+        refreshHints();
+        if (volume) volume->setPreparing(sliceNotice);
+        emit q->loadProgress(fraction, sliceNotice);
+    }
+
+    void ViewerWidget::Impl::beginLoad() {
+        if (loadActive) return;
+        loadActive = true;
+        if (sliceNotice.isEmpty()) sliceNotice = QStringLiteral("Loading…");
+        emit q->loadStarted();
+    }
+
+    void ViewerWidget::Impl::endLoad() {
+        if (!loadActive) return;
+        loadActive = false;
+        emit q->loadFinished();
     }
 
     void ViewerWidget::Impl::onReductionReady(const ViewerLoader::Reduction& r) {
@@ -981,6 +1019,7 @@ namespace sirius::app {
             if (changed) {
                 // results for the old output are no longer wanted
                 loader.cancelAll();
+                endLoad();
                 volumeKey = 0;
                 sliceNotice.clear();
                 failedVolumes.clear();
@@ -1470,7 +1509,9 @@ namespace sirius::app {
         const bool needsVolume = s.mode == ViewMode::Ortho;
         if (needsVolume) {
             const DisplayModel::VolumeState vstate = ensureVolumes(model, t);
-            const QString notice = vstate == DisplayModel::VolumeState::Wanted ? QStringLiteral("Loading…") : QString();
+            const QString notice = vstate == DisplayModel::VolumeState::Wanted
+                                       ? (sliceNotice.isEmpty() ? QStringLiteral("Loading…") : sliceNotice)
+                                       : QString();
             if (notice != sliceNotice) {
                 sliceNotice = notice;
                 if (ScopedTrace::enabled())
@@ -1630,7 +1671,7 @@ namespace sirius::app {
             return;
         }
         if (vstate == DisplayModel::VolumeState::Wanted) {
-            volume->setPreparing(QStringLiteral("Loading volume…"));
+            volume->setPreparing(sliceNotice.isEmpty() ? QStringLiteral("Loading volume…") : sliceNotice);
             return;   // the textures already up stay up until the new ones land
         }
         // The reduction to <= 256 texels per axis is a pass over every voxel:

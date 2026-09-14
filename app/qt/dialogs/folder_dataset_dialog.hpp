@@ -3,9 +3,9 @@
 
 // "Open folder as dataset": a folder of TIFF stacks (one per channel / time
 // point / tile) described by a filename pattern with named groups, previewed
-// live, saved as the folder's manifest (core/manifest.hpp) and opened. A
-// folder that already has a manifest opens directly; this dialog then serves
-// to inspect or redo the mapping.
+// live, saved as a manifest (core/manifest.hpp) — in the folder or anywhere
+// else — and opened. A folder that already has a manifest opens directly;
+// this dialog then serves to inspect or redo the mapping.
 
 #include <QDialog>
 #include <QString>

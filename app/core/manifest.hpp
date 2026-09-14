@@ -40,6 +40,12 @@ namespace sirius::app {
         SimLayout sim;
         std::string acquisition;
         std::string pattern;                            // FilenameRule::pattern that produced it, for reference
+        // TIFF directory when this file is stored somewhere else. Empty: the
+        // directory that holds the manifest (the usual in-folder case).
+        std::string filesFolder;
+
+        // Where relative file paths are resolved, given the path load() used.
+        std::filesystem::path filesRoot(const std::filesystem::path& loadedFrom) const;
 
         Index channelIndex(const std::string& channel) const noexcept;   // -1 when unknown
         Index tileIndex(const std::string& tile) const noexcept;         // -1 when unknown; "" -> 0
