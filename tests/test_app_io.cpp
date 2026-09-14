@@ -298,6 +298,22 @@ TEST_CASE("export options: extension, availability, estimate and validation", "[
     o.scaling = ExportScaling::Cast;
     o.range.t0 = 5;
     CHECK_THAT(validateExport(o, d), Catch::Matchers::ContainsSubstring("time range"));
+    // the inverted range is empty, not a negative count cast to 16 EB beside that message
+    CHECK(estimateExportBytes(d, o) == 0);
+    o.range.t0 = 0;
+    o.range.t1 = -1;
+    o.range.z0 = 3;
+    o.range.z1 = 1;
+    CHECK_THAT(validateExport(o, d), Catch::Matchers::ContainsSubstring("z range"));
+    CHECK(estimateExportBytes(d, o) == 0);
+    o.includeLabels = true;
+    CHECK(estimateExportBytes(d, o) == 0);
+}
+
+TEST_CASE("zarr export chunks are given as (c, t, z, y, x) and written as (t, c, z, y, x)", "[app][io][export][zarr]") {
+    ZarrExportOptions z;
+    z.chunk = {2, 5, 16, 256, 128};   // what the export dialog's "Chunk (c, t, z, y, x)" field says
+    CHECK(zarrChunkShape(z) == std::vector<Index>{5, 2, 16, 256, 128});   // was assigned verbatim: t and c swapped
 }
 
 TEST_CASE("omeXml describes the array", "[app][io][export][ome]") {

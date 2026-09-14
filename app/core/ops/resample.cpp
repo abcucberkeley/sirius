@@ -1,6 +1,8 @@
 // Resample: a new voxel size per axis (0 keeps the axis).
 #include "core/ops/builtin.hpp"
 
+#include <algorithm>
+#include <cmath>
 #include <cstdio>
 
 #include <sirius/image_ops.hpp>
@@ -8,6 +10,31 @@
 namespace sirius::app {
 
     namespace {
+
+        // The step an output axis is sampled with: the voxel ratio, pulled
+        // down by the rounding error that would put the last output centre
+        // past the last input centre. The extent keeps that centre inside the
+        // field (to its 1e-9 tolerance), but reached as resampleAffine reaches
+        // it -- (n - 1) * step along z and y, n - 1 additions of the step
+        // along x -- it could land a few ulps outside and read as fill: a
+        // 64-plane stack at 0.3 um resampled to 0.1 um lost its last plane.
+        // Both evaluations are held inside, and a real overshoot (more than
+        // rounding) is left alone. workbench.py's _fitted_step is the same.
+        double fittedStep(double step, Index samples, Index inputExtent) {
+            if (samples <= 1 || inputExtent <= 1) return step;
+            const double last = static_cast<double>(inputExtent - 1);
+            auto reach = [&](double s) {
+                double sum = 0.0;
+                for (Index i = 1; i < samples; ++i) sum += s;
+                return std::max(sum, static_cast<double>(samples - 1) * s);
+            };
+            for (int k = 0; k < 64; ++k) {
+                const double over = reach(step) - last;
+                if (over <= 0.0 || over > 1e-6) break;
+                step = std::nextafter(step - over / static_cast<double>(samples - 1), 0.0);
+            }
+            return step;
+        }
 
         class ResampleOperation final : public Operation {
         public:
@@ -55,9 +82,12 @@ namespace sirius::app {
 
             StepOutput run(const StepInput& input, const ParamSet& p, const StepContext& ctx) const override {
                 const DatasetMeta& meta = input.meta;
-                const ResampleGeometry g = geometry(p, meta);
+                ResampleGeometry g = geometry(p, meta);
+                g.A[0] = fittedStep(g.A[0], g.oz, meta.dims.z);
+                g.A[4] = fittedStep(g.A[4], g.oy, meta.dims.y);
+                g.A[8] = fittedStep(g.A[8], g.ox, meta.dims.x);
                 const std::string interpName = p.getString("interpolation", "linear");
-                const Interpolation interp = interpName == "cubic" ? Interpolation::Cubic
+                const Interpolation interp = interpName == "cubic"     ? Interpolation::Cubic
                                              : interpName == "nearest" ? Interpolation::Nearest
                                                                        : Interpolation::Linear;
                 StepOutput out;

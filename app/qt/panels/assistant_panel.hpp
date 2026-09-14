@@ -17,10 +17,23 @@ namespace sirius::app {
         QString provider = QStringLiteral("ollama");     // "ollama" | "openrouter" | "custom"
         QString baseUrl = QStringLiteral("http://localhost:11434/v1");
         QString model;
-        QString apiKey;                                  // OpenRouter / custom
+        // OpenRouter / custom: the key in the secret store, else the one in
+        // $OPENROUTER_API_KEY (OpenRouter) or $SIRIUS_LLM_API_KEY, in which
+        // case apiKeyVariable names the variable.
+        QString apiKey;
+        QString apiKeyVariable;
         bool askBeforeActing = false;
-        static AssistantSettings load();                 // QSettings
+        static AssistantSettings load();                 // QSettings and the secret store
+        // Everything but the key. It runs on every model pick and toggle,
+        // and writing the key there put a key from the environment into the
+        // secret store; storeApiKey() writes what the user typed.
         void save() const;
+        // The key a request carries: none for Ollama, which takes none, so
+        // a key kept for OpenRouter never travels to an Ollama server.
+        QString requestKey() const;
+        static bool storeApiKey(const QString& key);     // empty removes it; false when the store refused
+        // The environment's key for `provider`, and which variable held it.
+        static QString environmentKey(const QString& provider, QString* variable = nullptr);
     };
 
     class AssistantPanel : public QWidget {

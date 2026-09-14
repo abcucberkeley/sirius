@@ -1,6 +1,7 @@
 #include "core/ops/plugin.hpp"
 
 #include <algorithm>
+#include <atomic>
 #include <cstdlib>
 #include <filesystem>
 #include <cctype>
@@ -10,6 +11,7 @@
 #include <stdexcept>
 
 #include "core/array_source.hpp"
+#include "core/executor.hpp"
 #include "core/help_pages.hpp"
 #include "core/ops/builtin.hpp"
 
@@ -25,6 +27,10 @@ namespace sirius::app {
         std::mutex& kindsMutex() {
             static std::mutex m;
             return m;
+        }
+        std::atomic<unsigned>& loadCounter() {
+            static std::atomic<unsigned> n{0};
+            return n;
         }
 
         ParamSpec specFromJson(const json& p) {
@@ -83,6 +89,9 @@ namespace sirius::app {
                 info_.remoteCapable = true;
                 info_.plugin = true;
                 info_.source = spec.value("file", "");
+                // a file that cannot be stat'ed still gets a stamp of this load
+                info_.sourceStamp = fileStamp(info_.source);
+                if (info_.sourceStamp.empty()) info_.sourceStamp = "load#" + std::to_string(++loadCounter());
                 info_.helpPage = info_.kind;
                 if (spec.contains("params") && spec["params"].is_array())
                     for (const json& p : spec["params"]) info_.params.push_back(specFromJson(p));
@@ -222,12 +231,11 @@ namespace sirius::app {
                     for (Index t = 0; t < outLabels->t(); ++t) outLabels->recomputeStats(t);
                     outLabels->applyFlags(LabelFlagRules{});
                     out.labels = outLabels;
-                } else if (input.labels && outArray && input.labels->t() == outArray->dims().t && input.labels->z() == outArray->dims().z &&
-                           input.labels->y() == outArray->dims().y && input.labels->x() == outArray->dims().x) {
-                    // the input's labels follow only onto the same grid (a
-                    // plugin that resamples or crops leaves them behind)
-                    out.labels = input.labels->clone();
                 }
+                // Without labels of its own the executor carries the input's
+                // through, onto the same grid only (a plugin that resamples
+                // or crops leaves them behind), and with them the corrections
+                // painted on this step.
                 out.diagnostics = toDiagnostics(diagnostics, images, out);
                 out.ranOn = ctx.backend;
                 out.seconds = seconds;
@@ -322,6 +330,7 @@ namespace sirius::app {
         std::set<std::string> builtins;   // a name a built-in owns stays a built-in
         for (const Operation* op : allOperations())
             if (!op->info().plugin) builtins.insert(op->kind());
+        std::set<std::string> unloadable;   // files the worker lists that did not become an operation
         for (const json& spec : r.result["plugins"]) {
             const std::string file = spec.value("file", "?");
             PluginLoadResult::Entry entry{spec.value("kind", ""), spec.value("name", ""), file, ""};
@@ -330,6 +339,7 @@ namespace sirius::app {
                 entry.error = err;
                 result.entries.push_back(entry);
                 result.errors.push_back(file + ": " + err.substr(0, err.find('\n')));
+                unloadable.insert(file);
                 continue;
             }
             result.entries.push_back(entry);
@@ -338,6 +348,7 @@ namespace sirius::app {
                 const std::string kind = op->kind();
                 if (builtins.count(kind)) {
                     result.errors.push_back(file + ": kind '" + kind + "' is a built-in operation");
+                    unloadable.insert(file);
                     continue;
                 }
                 registerHelpPage(kind, static_cast<PluginOperation*>(op.get())->help());
@@ -349,7 +360,33 @@ namespace sirius::app {
                 result.kinds.push_back(kind);
             } catch (const std::exception& e) {
                 result.errors.push_back(file + ": " + e.what());
+                unloadable.insert(file);
             }
+        }
+        // A kind registered earlier that no file provides any more (its file
+        // was deleted, moved away, or now declares another kind) is gone from
+        // the add menu, the tools, the help and pluginKinds(). The steps and
+        // undo snapshots that name it still resolve, to a stand-in that says
+        // it is not loaded. A file that is still listed but fails to load now
+        // keeps its last good registration: a typo being fixed is not a removal.
+        // (Matching by kind alone would not do: a file that fails to import is
+        // listed under its file name.)
+        std::vector<std::string> previous;
+        {
+            std::lock_guard<std::mutex> g(kindsMutex());
+            previous.assign(registeredKinds().begin(), registeredKinds().end());
+        }
+        for (const std::string& kind : previous) {
+            if (std::find(result.kinds.begin(), result.kinds.end(), kind) != result.kinds.end()) continue;
+            const Operation* op = findOperation(kind);
+            if (op && !op->info().missing && unloadable.count(op->info().source)) continue;
+            registerOperation(makeMissingOperation(kind));
+            registerHelpPage(kind, std::string());   // an empty page is no page
+            {
+                std::lock_guard<std::mutex> g(kindsMutex());
+                registeredKinds().erase(kind);
+            }
+            result.removed.push_back(kind);
         }
         return result;
     }

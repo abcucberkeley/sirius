@@ -78,12 +78,15 @@ namespace sirius::app {
                         .withUnit("um")
                         .withHelp("Two peaks closer than this are one object. In microns, so it means the same "
                                   "thing on anisotropic data. 0 uses the bundle's value"),
+                    // Segment only: Detect marks one voxel per object, and in a
+                    // tracking run the label id is a track id (see run()).
                     intParam("min_voxels", "Min. voxels", 0)
                         .range(0, 1000000000)
+                        .visibleWhen("task", {kSegment})
                         .withHelp("Drop smaller objects (0 = keep all)"),
                     doubleListParam("tile", "Tile", {0.0, 0.0, 0.0})
                         .withUnit("px")
-                        .withHelp("Inference tile (z, y, x); all zero uses the bundle's own crop size")
+                        .withHelp("Inference tile (z, y, x); a zero extent uses the bundle's own crop size on that axis")
                         .asAdvanced(),
                     doubleParam("label_opacity", "Label opacity", 0.45).range(0.0, 1.0, 0.05, 2),
                     stringParam("class_name", "Class", "object").asAdvanced(),
@@ -113,7 +116,7 @@ namespace sirius::app {
                                        std::to_string(in.dims.t) + ".");
                 const std::vector<double> tile = p.getDoubleList("tile");
                 if (tile.size() != 3)
-                    v.errors.push_back("Tile must be three extents (z, y, x), or all zero for the bundle's own.");
+                    v.errors.push_back("Tile must be three extents (z, y, x); zero uses the bundle's own.");
                 else if (std::any_of(tile.begin(), tile.end(), [](double d) { return d < 0; }))
                     v.errors.push_back("Tile extents cannot be negative.");
                 return v;
@@ -170,7 +173,7 @@ namespace sirius::app {
                     {"device", ctx.backend == Backend::Cpu ? "cpu" : "auto"},
                 };
                 const std::vector<double> tile = p.getDoubleList("tile");
-                if (tile.size() == 3 && tile[0] > 0 && tile[1] > 0 && tile[2] > 0)
+                if (tile.size() == 3 && (tile[0] > 0 || tile[1] > 0 || tile[2] > 0))
                     params["tile"] = {static_cast<Index>(tile[0]), static_cast<Index>(tile[1]), static_cast<Index>(tile[2])};
 
                 rpc::TensorRef in;
@@ -206,16 +209,16 @@ namespace sirius::app {
                 auto labels = std::make_shared<LabelVolume>(d.t, d.z, d.y, d.x);
                 const std::uint32_t* src = got->asUInt32();
                 const std::string task = taskKey(p.getString("task", kSegment));
-                const Index minVoxels = p.getInt("min_voxels", 0);
                 std::uint32_t total = 0;
                 for (Index t = 0; t < d.t; ++t) {
                     ctx.throwIfCancelled();
                     std::uint32_t* dst = labels->volume(t);
+                    // The labels are used as they come. Min. voxels is the
+                    // worker's to apply, and it applies it to Segment only: a
+                    // detection is one voxel, so a size filter here removed
+                    // every object, and in a tracking run the label id is a
+                    // track id that dropping an object would punch a hole in.
                     std::copy_n(src + static_cast<std::size_t>(t) * volume, volume, dst);
-                    // Small objects are dropped here for detect and segment, but
-                    // NOT for a tracking run: there the label id is a track id,
-                    // and renumbering would break the identity that makes it one.
-                    if (task != "track" && minVoxels > 0) removeSmall(dst, volume, minVoxels);
                     labels->recomputeStats(t, confMatches ? confidence->asFloat32() + static_cast<std::size_t>(t) * volume
                                                           : nullptr);
                     for (const LabelStats& s : labels->stats()) total = std::max(total, s.id);
@@ -243,19 +246,22 @@ namespace sirius::app {
                 if (task == "track") {
                     const long long tracks = r.result.value("tracks", 0LL);
                     diag.facts.push_back({"Tracks", std::to_string(tracks)});
-                    diag.facts.push_back({"Divisions", std::to_string(r.result.value("divisions", 0LL))});
+                    // latents recovers divisions after the fact with a geometric
+                    // rule that under-calls on real detections (help page)
+                    diag.facts.push_back({"Divisions (approx.)", std::to_string(r.result.value("divisions", 0LL))});
                     diag.summary = summary(p, meta) + " · " + std::to_string(tracks) + " tracks";
                 } else {
                     diag.facts.push_back({"Objects", std::to_string(r.result.value("objects", 0LL))});
                     diag.summary = summary(p, meta) + " · " + std::to_string(total) + " labels";
                 }
-                out.diagnostics = std::move(diag);
 
+                // before diag is moved from: the note used to read "0.8 s ·  · cpu"
                 char note[240];
                 std::snprintf(note, sizeof note, "%.1f s · %s · %s", seconds, diag.summary.c_str(),
                               ctx.remote->capabilities().device.empty() ? "worker"
-                                                                       : ctx.remote->capabilities().device.c_str());
+                                                                        : ctx.remote->capabilities().device.c_str());
                 out.note = note;
+                out.diagnostics = std::move(diag);
                 ctx.report(1.0, "");
                 return out;
             }

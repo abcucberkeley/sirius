@@ -174,6 +174,7 @@ namespace sirius::app {
                 post.minVoxels = p.getInt("min_voxels", 0);
                 post.seedMinDistance = p.getDouble("seed_distance", 5.0);
                 post.className = p.getString("class_name", "nucleus");
+                post.poll = [&ctx] { ctx.throwIfCancelled(); };
 
                 nlohmann::json params = {
                     {"model", p.getString("model")},

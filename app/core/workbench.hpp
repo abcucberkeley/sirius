@@ -354,7 +354,7 @@ namespace sirius::app {
         void setCudaDevice(int index);
         const RemoteConfig& remoteConfig() const noexcept { return remote_; }
         void setRemoteConfig(RemoteConfig c);
-        // Steps that need the Python worker (Operation::remoteCapable) get a
+        // Steps that need the Python worker (Operation::needsWorker) get a
         // local worker from this launcher when the backend is not HPC; the
         // Qt layer installs one that spawns app/python/sirius_worker. A run
         // job calls it on its own thread; loadPlugins calls it here.
@@ -438,6 +438,12 @@ namespace sirius::app {
         // True (with a log line naming `what`) when a run is active.
         bool refuseIfRunning(const char* what);
         void installDataset(std::shared_ptr<ArraySource> source, DatasetMeta meta, std::string note);
+        // Open `path` with `options`; the Load step's parameters become
+        // `loadParams` with the options written into them.
+        void openDatasetAs(const std::string& path, const OpenOptions& options, ParamSet loadParams);
+        // Seeds the executor with loadOutput_ when the Load step's parameters
+        // are still the ones it was opened with (otherwise the step re-runs).
+        void seedLoadOutput();
         // The labels of step `id` as the executor holds them now, or null.
         std::shared_ptr<LabelVolume> labelsOf(StepId id) const;
         // The viewed labels and the step they belong to (0 when none).
@@ -480,6 +486,7 @@ namespace sirius::app {
         std::vector<std::string> log_;
         std::optional<std::pair<std::string, ParamSet>> clipboard_;
         std::shared_ptr<const StepOutput> loadOutput_;   // the Load step's lazy output
+        ParamSet loadOutputParams_;                      // the Load parameters it was opened with
         WorkerLauncher launcher_;
         std::function<std::string()> hubToken_;
         std::vector<PluginInfo> plugins_;

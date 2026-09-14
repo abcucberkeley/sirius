@@ -1705,7 +1705,16 @@
           "max": 1000000000.0,
           "min": 0.0,
           "read_only": false,
-          "type": "int"
+          "type": "int",
+          "visible_when": [
+            {
+              "key": "task",
+              "negate": false,
+              "values": [
+                "Segment objects"
+              ]
+            }
+          ]
         },
         {
           "advanced": true,
@@ -1714,7 +1723,7 @@
             0.0,
             0.0
           ],
-          "help": "Inference tile (z, y, x); all zero uses the bundle's own crop size",
+          "help": "Inference tile (z, y, x); a zero extent uses the bundle's own crop size on that axis",
           "key": "tile",
           "label": "Tile",
           "read_only": false,

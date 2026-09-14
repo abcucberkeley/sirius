@@ -164,7 +164,11 @@ namespace sirius::app {
 
     std::vector<std::array<double, 2>> predictedK0(const SIMParameters& p, Index nz) {
         double mag = 1.0 / p.linespacing_um;
-        if (nz > 1) mag /= static_cast<double>((p.nphases / 2 + 1) - 1);
+        // A 3D stack's line spacing is that of the highest order, nphases / 2
+        // times order 1's. The overlay draws parameters the form has not
+        // validated yet, so a single phase must not divide by zero.
+        const int highest = p.nphases / 2;
+        if (nz > 1 && highest > 0) mag /= static_cast<double>(highest);
         std::vector<std::array<double, 2>> k0(static_cast<std::size_t>(std::max(p.ndirs, 0)));
         for (int d = 0; d < p.ndirs; ++d) {
             const double angle = (p.k0_angles && p.k0_angles->size() >= static_cast<std::size_t>(p.ndirs))

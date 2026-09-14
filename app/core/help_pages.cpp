@@ -1,5 +1,7 @@
 #include "core/help_pages.hpp"
 
+#include "core/app_paths.hpp"
+
 #include <algorithm>
 #include <cctype>
 #include <cstdlib>
@@ -112,11 +114,20 @@ namespace sirius::app {
             while (end > 0) {
                 const std::size_t close = s.rfind('$', end - 1);
                 if (close == std::string::npos || close == 0) break;
-                if (close > 0 && s[close - 1] == '\\') { end = close; continue; }
+                if (close > 0 && s[close - 1] == '\\') {
+                    end = close;
+                    continue;
+                }
                 const std::size_t open = s.rfind('$', close - 1);
                 if (open == std::string::npos) break;
-                if (open > 0 && s[open - 1] == '\\') { end = open; continue; }
-                if (open + 1 == close) { end = open; continue; }   // "$$"
+                if (open > 0 && s[open - 1] == '\\') {
+                    end = open;
+                    continue;
+                }
+                if (open + 1 == close) {
+                    end = open;
+                    continue;
+                }   // "$$"
                 return {open, close};
             }
             return {std::string::npos, std::string::npos};
@@ -128,7 +139,12 @@ namespace sirius::app {
     namespace {
 
         struct Node {
-            enum class Kind { Text, Seq, Frac, Sup, Sub, Cases };
+            enum class Kind { Text,
+                              Seq,
+                              Frac,
+                              Sup,
+                              Sub,
+                              Cases };
             Kind kind = Kind::Text;
             std::string html;                       // Text
             std::vector<std::unique_ptr<Node>> kids;   // Seq; Frac (num, den); Sup/Sub (one); Cases (rows: Seq of cells)
@@ -152,24 +168,113 @@ namespace sirius::app {
 
         const std::map<std::string, std::string>& symbolTable() {
             static const std::map<std::string, std::string> t = {
-                {"cdot", "·"}, {"times", "×"}, {"in", "∈"}, {"notin", "∉"}, {"mid", "∣"}, {"ast", "∗"}, {"star", "⋆"},
-                {"nabla", "∇"}, {"rightarrow", "→"}, {"to", "→"}, {"leftarrow", "←"}, {"Rightarrow", "⇒"},
-                {"leftrightarrow", "↔"}, {"mapsto", "↦"}, {"sum", "∑"}, {"prod", "∏"}, {"int", "∫"}, {"infty", "∞"},
-                {"pm", "±"}, {"mp", "∓"}, {"leq", "≤"}, {"le", "≤"}, {"geq", "≥"}, {"ge", "≥"}, {"neq", "≠"},
-                {"ne", "≠"}, {"approx", "≈"}, {"sim", "∼"}, {"simeq", "≃"}, {"equiv", "≡"}, {"propto", "∝"},
-                {"partial", "∂"}, {"ldots", "…"}, {"cdots", "⋯"}, {"dots", "…"}, {"vdots", "⋮"}, {"langle", "⟨"},
-                {"rangle", "⟩"}, {"lfloor", "⌊"}, {"rfloor", "⌋"}, {"lceil", "⌈"}, {"rceil", "⌉"}, {"circ", "∘"},
-                {"forall", "∀"}, {"exists", "∃"}, {"subset", "⊂"}, {"subseteq", "⊆"}, {"cup", "∪"}, {"cap", "∩"},
-                {"emptyset", "∅"}, {"prime", "′"}, {"deg", "°"}, {"ell", "ℓ"}, {"hbar", "ℏ"}, {"Re", "ℜ"}, {"Im", "ℑ"},
-                {"otimes", "⊗"}, {"oplus", "⊕"}, {"perp", "⊥"}, {"parallel", "∥"}, {"angle", "∠"}, {"star", "⋆"},
-                {"lvert", "|"}, {"rvert", "|"}, {"lVert", "‖"}, {"rVert", "‖"}, {"vert", "|"}, {"Vert", "‖"},
+                {"cdot", "·"},
+                {"times", "×"},
+                {"in", "∈"},
+                {"notin", "∉"},
+                {"mid", "∣"},
+                {"ast", "∗"},
+                {"star", "⋆"},
+                {"nabla", "∇"},
+                {"rightarrow", "→"},
+                {"to", "→"},
+                {"leftarrow", "←"},
+                {"Rightarrow", "⇒"},
+                {"leftrightarrow", "↔"},
+                {"mapsto", "↦"},
+                {"sum", "∑"},
+                {"prod", "∏"},
+                {"int", "∫"},
+                {"infty", "∞"},
+                {"pm", "±"},
+                {"mp", "∓"},
+                {"leq", "≤"},
+                {"le", "≤"},
+                {"geq", "≥"},
+                {"ge", "≥"},
+                {"neq", "≠"},
+                {"ne", "≠"},
+                {"approx", "≈"},
+                {"sim", "∼"},
+                {"simeq", "≃"},
+                {"equiv", "≡"},
+                {"propto", "∝"},
+                {"partial", "∂"},
+                {"ldots", "…"},
+                {"cdots", "⋯"},
+                {"dots", "…"},
+                {"vdots", "⋮"},
+                {"langle", "⟨"},
+                {"rangle", "⟩"},
+                {"lfloor", "⌊"},
+                {"rfloor", "⌋"},
+                {"lceil", "⌈"},
+                {"rceil", "⌉"},
+                {"circ", "∘"},
+                {"forall", "∀"},
+                {"exists", "∃"},
+                {"subset", "⊂"},
+                {"subseteq", "⊆"},
+                {"cup", "∪"},
+                {"cap", "∩"},
+                {"emptyset", "∅"},
+                {"prime", "′"},
+                {"deg", "°"},
+                {"ell", "ℓ"},
+                {"hbar", "ℏ"},
+                {"Re", "ℜ"},
+                {"Im", "ℑ"},
+                {"otimes", "⊗"},
+                {"oplus", "⊕"},
+                {"perp", "⊥"},
+                {"parallel", "∥"},
+                {"angle", "∠"},
+                {"star", "⋆"},
+                {"lvert", "|"},
+                {"rvert", "|"},
+                {"lVert", "‖"},
+                {"rVert", "‖"},
+                {"vert", "|"},
+                {"Vert", "‖"},
                 // Greek
-                {"alpha", "α"}, {"beta", "β"}, {"gamma", "γ"}, {"delta", "δ"}, {"epsilon", "ε"}, {"varepsilon", "ε"},
-                {"zeta", "ζ"}, {"eta", "η"}, {"theta", "θ"}, {"vartheta", "ϑ"}, {"iota", "ι"}, {"kappa", "κ"},
-                {"lambda", "λ"}, {"mu", "μ"}, {"nu", "ν"}, {"xi", "ξ"}, {"pi", "π"}, {"rho", "ρ"}, {"varrho", "ϱ"},
-                {"sigma", "σ"}, {"tau", "τ"}, {"upsilon", "υ"}, {"phi", "φ"}, {"varphi", "ϕ"}, {"chi", "χ"},
-                {"psi", "ψ"}, {"omega", "ω"}, {"Gamma", "Γ"}, {"Delta", "Δ"}, {"Theta", "Θ"}, {"Lambda", "Λ"},
-                {"Xi", "Ξ"}, {"Pi", "Π"}, {"Sigma", "Σ"}, {"Upsilon", "Υ"}, {"Phi", "Φ"}, {"Psi", "Ψ"}, {"Omega", "Ω"},
+                {"alpha", "α"},
+                {"beta", "β"},
+                {"gamma", "γ"},
+                {"delta", "δ"},
+                {"epsilon", "ε"},
+                {"varepsilon", "ε"},
+                {"zeta", "ζ"},
+                {"eta", "η"},
+                {"theta", "θ"},
+                {"vartheta", "ϑ"},
+                {"iota", "ι"},
+                {"kappa", "κ"},
+                {"lambda", "λ"},
+                {"mu", "μ"},
+                {"nu", "ν"},
+                {"xi", "ξ"},
+                {"pi", "π"},
+                {"rho", "ρ"},
+                {"varrho", "ϱ"},
+                {"sigma", "σ"},
+                {"tau", "τ"},
+                {"upsilon", "υ"},
+                {"phi", "φ"},
+                {"varphi", "ϕ"},
+                {"chi", "χ"},
+                {"psi", "ψ"},
+                {"omega", "ω"},
+                {"Gamma", "Γ"},
+                {"Delta", "Δ"},
+                {"Theta", "Θ"},
+                {"Lambda", "Λ"},
+                {"Xi", "Ξ"},
+                {"Pi", "Π"},
+                {"Sigma", "Σ"},
+                {"Upsilon", "Υ"},
+                {"Phi", "Φ"},
+                {"Psi", "Ψ"},
+                {"Omega", "Ω"},
             };
             return t;
         }
@@ -177,17 +282,35 @@ namespace sirius::app {
         // Commands that read as upright words.
         const std::map<std::string, std::string>& operatorTable() {
             static const std::map<std::string, std::string> t = {
-                {"max", "max"}, {"min", "min"}, {"arg", "arg"}, {"argmax", "arg max"}, {"argmin", "arg min"},
-                {"log", "log"}, {"ln", "ln"}, {"exp", "exp"}, {"sin", "sin"}, {"cos", "cos"}, {"tan", "tan"},
-                {"lim", "lim"}, {"det", "det"}, {"sup", "sup"}, {"inf", "inf"}, {"clip", "clip"},
+                {"max", "max"},
+                {"min", "min"},
+                {"arg", "arg"},
+                {"argmax", "arg max"},
+                {"argmin", "arg min"},
+                {"log", "log"},
+                {"ln", "ln"},
+                {"exp", "exp"},
+                {"sin", "sin"},
+                {"cos", "cos"},
+                {"tan", "tan"},
+                {"lim", "lim"},
+                {"det", "det"},
+                {"sup", "sup"},
+                {"inf", "inf"},
+                {"clip", "clip"},
             };
             return t;
         }
 
         const std::map<std::string, std::string>& accentTable() {
             static const std::map<std::string, std::string> t = {
-                {"tilde", "\xCC\x83"}, {"hat", "\xCC\x82"}, {"bar", "\xCC\x84"}, {"vec", "\xE2\x83\x97"},
-                {"dot", "\xCC\x87"}, {"ddot", "\xCC\x88"}, {"overline", "\xCC\x85"},
+                {"tilde", "\xCC\x83"},
+                {"hat", "\xCC\x82"},
+                {"bar", "\xCC\x84"},
+                {"vec", "\xE2\x83\x97"},
+                {"dot", "\xCC\x87"},
+                {"ddot", "\xCC\x88"},
+                {"overline", "\xCC\x85"},
             };
             return t;
         }
@@ -221,7 +344,10 @@ namespace sirius::app {
                 while (pos_ < s_.size()) {
                     const char c = s_[pos_];
                     if (c == '}') {
-                        if (depth > 0) { ++pos_; return out; }
+                        if (depth > 0) {
+                            ++pos_;
+                            return out;
+                        }
                         ++pos_;   // stray
                         continue;
                     }
@@ -318,8 +444,11 @@ namespace sirius::app {
                     case '*': return text("∗", false);
                     case '\'': return text("′");
                     case ',': return text(", ", false);
-                    case '(': case '[': return text(std::string(1, c), false);
-                    case ')': case ']': case '|': return text(std::string(1, c), true);
+                    case '(':
+                    case '[': return text(std::string(1, c), false);
+                    case ')':
+                    case ']':
+                    case '|': return text(std::string(1, c), true);
                     case '&': return text("&amp;", false);
                     default: break;
                 }
@@ -337,7 +466,8 @@ namespace sirius::app {
                     ++pos_;
                     switch (first) {
                         case ',': return text("\xE2\x80\x89", false);          // thin space
-                        case ';': case ':': return text("\xE2\x80\x85", false); // four-per-em
+                        case ';':
+                        case ':': return text("\xE2\x80\x85", false); // four-per-em
                         case '!': return nullptr;
                         case '|': return text("‖");
                         case '{': return text("{", false);
@@ -403,7 +533,10 @@ namespace sirius::app {
                     name == "bigr" || name == "Bigl" || name == "Bigr" || name == "bigg" || name == "Bigg") {
                     skipSpaces();
                     if (pos_ < s_.size()) {
-                        if (s_[pos_] == '.') { ++pos_; return nullptr; }
+                        if (s_[pos_] == '.') {
+                            ++pos_;
+                            return nullptr;
+                        }
                         if (s_[pos_] == '\\') {
                             return parseCommand(depth, stopCommand);   // \left\| etc.
                         }
@@ -472,7 +605,10 @@ namespace sirius::app {
                     NodePtr cell = parseSequence(depth, "\\end");
                     row->kids.push_back(std::move(cell));
                     if (pos_ >= s_.size()) break;
-                    if (s_[pos_] == '&') { ++pos_; continue; }
+                    if (s_[pos_] == '&') {
+                        ++pos_;
+                        continue;
+                    }
                     // "\\" row break or "\end"
                     if (startsWith(s_.substr(pos_), "\\end")) {
                         pos_ += 4;
@@ -746,8 +882,14 @@ namespace sirius::app {
                     out += "&lt;";
                     continue;
                 }
-                if (c == '&') { out += "&amp;"; continue; }
-                if (c == '>') { out += "&gt;"; continue; }
+                if (c == '&') {
+                    out += "&amp;";
+                    continue;
+                }
+                if (c == '>') {
+                    out += "&gt;";
+                    continue;
+                }
                 out += c;
             }
             return out;
@@ -877,7 +1019,10 @@ namespace sirius::app {
         std::size_t i = 0;
         while (i < lines.size()) {
             const std::string t = trim(lines[i]);
-            if (t.empty()) { ++i; continue; }
+            if (t.empty()) {
+                ++i;
+                continue;
+            }
             if (startsWith(t, "$$")) {
                 html += displayBlockHtml(readDisplayBlock(lines, i));
                 continue;
@@ -888,7 +1033,8 @@ namespace sirius::app {
                 const std::string title = inlineMarkdownToHtml(trim(t.substr(level)), baseDir);
                 // paragraphs rather than <h*>: QTextDocument keeps its own
                 // heading sizes and ignores a font-size on them
-                const int px = level <= 1 ? 20 : level == 2 ? 15 : 13;
+                const int px = level <= 1 ? 20 : level == 2 ? 15
+                                                            : 13;
                 html += "<p style=\"font-size: " + std::to_string(px) +
                         "px; font-weight: 800; margin-top: 14px; margin-bottom: 4px\">" + title + "</p>";
                 ++i;
@@ -947,7 +1093,10 @@ namespace sirius::app {
         std::size_t i = 0;
         while (i < lines.size()) {
             const std::string t = trim(lines[i]);
-            if (t.empty()) { ++i; continue; }
+            if (t.empty()) {
+                ++i;
+                continue;
+            }
             if (startsWith(t, "$$")) {
                 const std::string tex = readDisplayBlock(lines, i);
                 if (page.tex.empty() && section.empty()) page.tex = tex;
@@ -968,7 +1117,10 @@ namespace sirius::app {
                     bool header = true;
                     for (const std::string& row : rows) {
                         if (isTableSeparator(row)) continue;
-                        if (header) { header = false; continue; }
+                        if (header) {
+                            header = false;
+                            continue;
+                        }
                         const std::vector<std::string> cells = splitTableRow(row);
                         if (cells.empty()) continue;
                         HelpParam p;
@@ -1020,12 +1172,20 @@ namespace sirius::app {
         auto usable = [](const std::string& dir) { return !dir.empty() && fs::is_directory(dir); };
         if (const char* env = std::getenv("SIRIUS_HELP_DIR"); env && usable(env)) return env;
         if (usable(hint)) return hint;
+        // An installed tree before the checkout: an install on the machine it
+        // was built on must still read its own pages, or a test of the
+        // install proves nothing.
+        if (std::string installed = installedDataDirectory("help"); !installed.empty()) return installed;
 #ifdef SIRIUS_APP_SOURCE_DIR
         {
+            // the checkout before the build tree's copy, so "Edit page" in a
+            // development build changes the file under version control
             const std::string src = std::string(SIRIUS_APP_SOURCE_DIR) + "/help";
             if (usable(src)) return src;
         }
 #endif
+        // a build tree moved away from its checkout (or a checkout deleted)
+        if (std::string beside = besideApplication("help"); !beside.empty()) return beside;
         if (!hint.empty()) return hint;
         return "help";
     }

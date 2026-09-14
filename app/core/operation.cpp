@@ -127,26 +127,77 @@ namespace sirius::app {
             std::mutex mutex;
             std::vector<std::unique_ptr<Operation>> ops;
             std::map<std::string, Operation*> byKind;
+            // Replaced by a later registration (a plugin reload): never
+            // destroyed, since a reference to one may still be in use. A
+            // plugin operation is a few hundred bytes.
+            std::vector<std::unique_ptr<Operation>> retired;
         };
         Registry& registry() {
             static Registry r;
             return r;
         }
+
+        void registerLocked(Registry& r, std::unique_ptr<Operation> op) {
+            const std::string kind = op->kind();
+            auto it = std::find_if(r.ops.begin(), r.ops.end(), [&](const auto& o) { return o->kind() == kind; });
+            if (it != r.ops.end()) {
+                r.retired.push_back(std::move(*it));
+                *it = std::move(op);
+                r.byKind[kind] = it->get();
+            } else {
+                r.byKind[kind] = op.get();
+                r.ops.push_back(std::move(op));
+            }
+        }
+
+        class MissingOperation final : public Operation {
+        public:
+            explicit MissingOperation(const std::string& kind) {
+                info_.kind = kind;
+                info_.name = kind;
+                info_.group = "User";
+                info_.kindLabel = "NOT LOADED";
+                info_.plugin = true;
+                info_.missing = true;
+                info_.helpPage = kind;
+            }
+            const OpInfo& info() const noexcept override { return info_; }
+            std::string summary(const ParamSet&, const DatasetMeta&) const override { return "not loaded"; }
+            Validation validate(const ParamSet&, const DatasetMeta&) const override {
+                Validation v;
+                v.errors.push_back(reason());
+                return v;
+            }
+            StepOutput run(const StepInput&, const ParamSet&, const StepContext&) const override {
+                throw std::runtime_error(reason());
+            }
+
+        private:
+            std::string reason() const {
+                return "The operation '" + info_.kind +
+                       "' is not loaded: no plugin provides it here. Put its plugin file in a plugin directory and reload "
+                       "plugins, or remove the step.";
+            }
+            OpInfo info_;
+        };
     } // namespace
 
     void registerOperation(std::unique_ptr<Operation> op) {
         if (!op) return;
         Registry& r = registry();
         std::lock_guard<std::mutex> g(r.mutex);
-        const std::string kind = op->kind();
-        auto it = std::find_if(r.ops.begin(), r.ops.end(), [&](const auto& o) { return o->kind() == kind; });
-        if (it != r.ops.end()) {
-            *it = std::move(op);
-            r.byKind[kind] = it->get();
-        } else {
-            r.byKind[kind] = op.get();
-            r.ops.push_back(std::move(op));
-        }
+        registerLocked(r, std::move(op));
+    }
+
+    std::unique_ptr<Operation> makeMissingOperation(const std::string& kind) { return std::make_unique<MissingOperation>(kind); }
+
+    const Operation* registerMissingOperation(const std::string& kind) {
+        Registry& r = registry();
+        std::lock_guard<std::mutex> g(r.mutex);
+        auto it = r.byKind.find(kind);
+        if (it != r.byKind.end()) return it->second;
+        registerLocked(r, makeMissingOperation(kind));
+        return r.byKind.at(kind);
     }
 
     const Operation* findOperation(const std::string& kind) noexcept {
@@ -166,7 +217,8 @@ namespace sirius::app {
         Registry& r = registry();
         std::lock_guard<std::mutex> g(r.mutex);
         std::vector<const Operation*> out;
-        for (const auto& o : r.ops) out.push_back(o.get());
+        for (const auto& o : r.ops)
+            if (!o->info().missing) out.push_back(o.get());
         return out;
     }
 

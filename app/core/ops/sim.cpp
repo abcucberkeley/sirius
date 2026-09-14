@@ -334,7 +334,7 @@ namespace sirius::app {
                 const bool capture = input.meta.dims.y * input.meta.dims.x <= 512 * 512 && sections <= 64 * perPlane;
                 std::string captureNote;
                 if (!capture) {
-                    const int bands = 2 * std::max(1, p.norders) - 1;
+                    const int bands = 2 * p.resolvedOrders() - 1;
                     const double bytes = 2.0 * p.ndirs * bands * static_cast<double>(nz) *
                                          static_cast<double>(input.meta.dims.y) * static_cast<double>(input.meta.dims.x) * 16.0;
                     char buf[256];
@@ -465,7 +465,7 @@ namespace sirius::app {
                     double gain = 1.0;
                     double kmax = 0.0;
                     for (const auto& k : r.fit.k0) kmax = std::max(kmax, std::hypot(k[0], k[1]));
-                    if (support > 0.0) gain = (support + (p.norders - 1) * kmax) / support;
+                    if (support > 0.0) gain = (support + (p.resolvedOrders() - 1) * kmax) / support;
                     char g[16];
                     std::snprintf(g, sizeof g, "%.1f×", gain);
                     sim.meta = g;

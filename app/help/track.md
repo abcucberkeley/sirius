@@ -19,7 +19,7 @@ $$
 | **Overlap weight** <br> 0 – 1 | 0 matches on centroid distance alone, 1 on shared voxels alone. Overlap is the stronger cue when objects move less than their own size between frames; distance is the only cue when they move further. |
 | **Close gaps** <br> frames | How many frames an object may be missed for and still continue the same track. The bridging is a second assignment, between the ends of tracks and the starts of later ones, so a dim frame does not split a track in two. |
 | **Min. track length** <br> frames | Tracks seen in fewer frames than this are dropped; the usual way to remove detections that appear once. |
-| **Relabel by track** <br> on · off | Give every object of a track the track's id, so one object keeps one colour and one row for its whole life. With it off the labels are left as the segmentation numbered them. |
+| **Relabel by track** <br> on · off | Give every object of a track the track's id, so one object keeps one colour and one row for its whole life. With it off the labels are left as the segmentation numbered them, and a delete, merge or split then works on the frame on screen, not on a whole track. |
 
 ## Reviewing the tracks
 

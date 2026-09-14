@@ -172,6 +172,16 @@ class WorkerServer:
     def resolved_device(self) -> str:
         return workbench().resolve_device(self.device)
 
+    def request_device(self, requested: Any = None) -> str:
+        """Where one request runs: the device it names ("cpu", "cuda",
+        "cuda:1"), or this worker's own (--device, resolved) for "auto" or
+        none. The application sends "cpu" when the step's backend is the CPU,
+        and reports the step as having run there."""
+        text = str(requested or "").strip().lower()
+        if not text or text == "auto":
+            return self.resolved_device()
+        return workbench().resolve_device(text)
+
     def capabilities(self) -> Dict[str, Any]:
         wb = workbench()
         methods = ["hello", "ping", "model_info", "run", "cancel", "shutdown", "list_plugins", "reload_plugins",
@@ -255,6 +265,13 @@ class WorkerServer:
         # to MAX_PREAUTH_FRAME.
         authenticated = False
 
+        def keep_reading() -> bool:
+            # A frame in flight is read to its end only while the worker is
+            # not stopping and, before `hello`, only until the hello deadline:
+            # one byte of a header used to block the reader for good, locking
+            # everyone else out and SIGTERM with them.
+            return not self._stop.is_set() and (authenticated or time.monotonic() <= hello_deadline)
+
         def send(header: Dict[str, Any], tensors=None) -> None:
             data = encode_frame(header, tensors)
             with send_lock:
@@ -270,7 +287,7 @@ class WorkerServer:
             # Wait for the next frame without blocking in recv: a blocked recv
             # ignores stop() (SIGTERM, the launcher) for as long as the client
             # stays silent, and a silent pre-hello peer would hold the worker
-            # forever. Once bytes are on the wire the frame is read in full.
+            # forever. The frame itself is then read under keep_reading.
             try:
                 readable, _, _ = select.select([conn], [], [], self.IDLE_POLL)
             except (OSError, ValueError):
@@ -282,10 +299,17 @@ class WorkerServer:
                 continue
             try:
                 if authenticated:
-                    header, tensors = read_frame(conn)
+                    header, tensors = read_frame(conn, keep_waiting=keep_reading)
                 else:
-                    header, tensors = read_frame(conn, MAX_PREAUTH_FRAME, MAX_PREAUTH_FRAME)
+                    header, tensors = read_frame(conn, MAX_PREAUTH_FRAME, MAX_PREAUTH_FRAME, keep_waiting=keep_reading)
             except ConnectionError:
+                break
+            except TimeoutError as e:
+                if self._stop.is_set():
+                    log.info("stopping with a frame from %s half read", peer)
+                else:
+                    log.warning("client %s sent no complete hello within %.0f s (%s); dropped", peer,
+                                self.HELLO_TIMEOUT, e)
                 break
             except ProtocolError as e:
                 log.warning("protocol error from %s: %s", peer, e)
@@ -501,7 +525,7 @@ class WorkerServer:
                 raise _Cancelled()
             progress(fraction, message)
 
-        path = model_hub.hub_download(repo, filename, report)
+        path = model_hub.hub_download(repo, filename, report, cancelled=cancel.is_set)
         return {"path": path, "bytes": os.path.getsize(path), "repo": repo, "file": filename or os.path.basename(path),
                 "spec": f"hf:{repo}:{filename or os.path.basename(path)}"}, None
 
@@ -543,7 +567,13 @@ class WorkerServer:
         wb = workbench()
         kind = str(params.get("kind", ""))
         p = params.get("params") or {}
-        device = self.resolved_device()
+        if kind != "plugin" and isinstance(p, dict) and "device" in p:
+            # the request's own device (seg.cpp sends "cpu" for the CPU
+            # backend); a plugin's parameters are its own, device included
+            p = dict(p)
+            device = self.request_device(p.pop("device"))
+        else:
+            device = self.resolved_device()
 
         def cancelled() -> bool:
             return cancel.is_set()
@@ -587,7 +617,7 @@ class WorkerServer:
                     out_t["prob"] = np.ascontiguousarray(prob, dtype=np.float32)
                 return {"labels": int(labels.max()) if labels.size else 0, "model": spec,
                         "format": model_hub.parse_spec(spec).family, "device": device}, out_t
-            _, path = model_hub.resolve(spec, progress)   # hf: specs download on first use
+            _, path = model_hub.resolve(spec, progress, cancelled)   # hf: specs download on first use
             model = wb.load_model(path, device)
             tile = _triple(p.get("tile"), (32, 256, 256))
             ov = p.get("overlap", 32)
@@ -741,7 +771,8 @@ def _jsonable(obj: Any) -> Any:
     if isinstance(obj, (list, tuple)):
         return [_jsonable(v) for v in obj]
     if isinstance(obj, np.generic):
-        return obj.item()
+        # .item() of a float64 NaN is a float NaN: scrubbed below like any other
+        return _jsonable(obj.item())
     if isinstance(obj, np.ndarray):
         # tolist() gives Python floats: scrubbed like any other (encode_frame
         # refuses NaN, and one inside a diagnostics table lost whole replies)

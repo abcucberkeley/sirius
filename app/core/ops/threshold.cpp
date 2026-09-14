@@ -13,37 +13,38 @@
 namespace sirius::app {
 
     float otsuThreshold(const float* v, Index n) {
-            float mn = std::numeric_limits<float>::infinity(), mx = -mn;
-            for (Index i = 0; i < n; ++i) {
-                if (std::isnan(v[i])) continue;
-                mn = std::min(mn, v[i]);
-                mx = std::max(mx, v[i]);
-            }
-            if (!(mx > mn)) return mn;
-            constexpr int bins = 256;
-            const std::vector<double> h = histogram(v, n, bins, mn, mx);
-            double total = 0.0, sumAll = 0.0;
-            for (int i = 0; i < bins; ++i) {
-                total += h[static_cast<std::size_t>(i)];
-                sumAll += i * h[static_cast<std::size_t>(i)];
-            }
-            double wB = 0.0, sumB = 0.0, best = -1.0;
-            int bestBin = 0;
-            for (int i = 0; i < bins; ++i) {
-                wB += h[static_cast<std::size_t>(i)];
-                if (wB == 0.0) continue;
-                const double wF = total - wB;
-                if (wF == 0.0) break;
-                sumB += i * h[static_cast<std::size_t>(i)];
-                const double mB = sumB / wB, mF = (sumAll - sumB) / wF;
-                const double between = wB * wF * (mB - mF) * (mB - mF);
-                if (between > best) {
-                    best = between;
-                    bestBin = i;
-                }
-            }
-            return mn + (mx - mn) * static_cast<float>(bestBin + 1) / bins;
+        // over the finite values: an infinite end has no bins to split
+        float mn = std::numeric_limits<float>::infinity(), mx = -mn;
+        for (Index i = 0; i < n; ++i) {
+            if (!std::isfinite(v[i])) continue;
+            mn = std::min(mn, v[i]);
+            mx = std::max(mx, v[i]);
         }
+        if (!(mx > mn)) return mn;
+        constexpr int bins = 256;
+        const std::vector<double> h = histogram(v, n, bins, mn, mx);
+        double total = 0.0, sumAll = 0.0;
+        for (int i = 0; i < bins; ++i) {
+            total += h[static_cast<std::size_t>(i)];
+            sumAll += i * h[static_cast<std::size_t>(i)];
+        }
+        double wB = 0.0, sumB = 0.0, best = -1.0;
+        int bestBin = 0;
+        for (int i = 0; i < bins; ++i) {
+            wB += h[static_cast<std::size_t>(i)];
+            if (wB == 0.0) continue;
+            const double wF = total - wB;
+            if (wF == 0.0) break;
+            sumB += i * h[static_cast<std::size_t>(i)];
+            const double mB = sumB / wB, mF = (sumAll - sumB) / wF;
+            const double between = wB * wF * (mB - mF) * (mB - mF);
+            if (between > best) {
+                best = between;
+                bestBin = i;
+            }
+        }
+        return mn + (mx - mn) * static_cast<float>(bestBin + 1) / bins;
+    }
 
     namespace {
 
@@ -104,10 +105,11 @@ namespace sirius::app {
                 auto labels = std::make_shared<LabelVolume>(d.t, d.z, d.y, d.x);
                 LabelPostOptions post;
                 post.post = p.getString("post", "Connected components").rfind("Watershed", 0) == 0 ? "Watershed (distance)"
-                                                                                                    : "Connected components";
+                                                                                                   : "Connected components";
                 post.minVoxels = p.getInt("min_voxels", 20);
                 post.seedMinDistance = p.getDouble("seed_distance", 5.0);
                 post.className = p.getString("class_name", "object");
+                post.poll = [&ctx] { ctx.throwIfCancelled(); };
                 const std::string method = p.getString("method", "Otsu");
                 std::uint32_t total = 0;
                 std::string cuts;
@@ -122,11 +124,12 @@ namespace sirius::app {
                     post.threshold = cut;
                     ctx.throwIfCancelled();
                     total += labelsFromProbabilities(vol.data(), nullptr, d.z, d.y, d.x, post, *labels, t);
+                    // the intensities are not probabilities: confidence is
+                    // unknown, in this frame's table (each frame keeps its own)
+                    for (LabelStats& s : labels->stats()) s.confidence = 1.0;
+                    labels->applyFlags(post.flags);
                     if (t == 0) cuts = formatNumber(cut, 4);
                 }
-                // the intensities are not probabilities: confidence is unknown
-                for (LabelStats& s : labels->stats()) s.confidence = 1.0;
-                labels->applyFlags(post.flags);
                 out.labels = labels;
                 out.ranOn = Backend::Cpu;
                 out.note = "threshold " + cuts + " · " + std::to_string(total) + " labels · CPU";

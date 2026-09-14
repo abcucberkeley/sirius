@@ -18,8 +18,16 @@ target_include_directories(sirius_app_core PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
 target_link_libraries(sirius_app_core
     PUBLIC sirius nlohmann_json::nlohmann_json
     PRIVATE OpenMP::OpenMP_CXX TIFF::TIFF tomlplusplus::tomlplusplus)
+# Where an installed tree keeps help/, python/ and plugins/, relative to the
+# executable's directory (core/app_paths.cpp): computed from the full install
+# directories so a --prefix given at install time moves both together.
+include(GNUInstallDirs)
+set(SIRIUS_APP_INSTALL_DATADIR "${CMAKE_INSTALL_DATADIR}/sirius")
+file(RELATIVE_PATH _sirius_app_datadir_from_bindir
+    "${CMAKE_INSTALL_FULL_BINDIR}" "${CMAKE_INSTALL_FULL_DATADIR}/sirius")
 target_compile_definitions(sirius_app_core PRIVATE
-    SIRIUS_APP_SOURCE_DIR="${CMAKE_CURRENT_SOURCE_DIR}")
+    SIRIUS_APP_SOURCE_DIR="${CMAKE_CURRENT_SOURCE_DIR}"
+    SIRIUS_APP_DATADIR_FROM_BINDIR="${_sirius_app_datadir_from_bindir}")
 if(WIN32)
     target_link_libraries(sirius_app_core PRIVATE ws2_32)
 endif()
@@ -95,4 +103,59 @@ if(SIRIUS_APP_DEPLOY_QT)
     else()
         message(WARNING "windeployqt not found; sirius-app needs the Qt bin directory on PATH to run")
     endif()
+endif()
+
+# --- install (Linux) --------------------------------------------------------
+#
+#   cmake --install <build> --component app --prefix <prefix>
+#
+#   bin/sirius-app
+#   share/sirius/{help,python,plugins}     what the build copies beside the executable
+#   share/sirius/python/workbench.py       the step library (and its op_schema.json) the
+#                                          worker loads when no sirius package is importable
+#   share/applications/sirius-app.desktop  the menu entry and "Open with" for TIFFs
+#   share/icons/hicolor/*/apps/sirius-app.{png,svg}
+#   lib/sirius/                            nvTIFF / nvCOMP of a CUDA build, found via $ORIGIN
+#
+# tests/CMakeLists.txt installs this into the build tree and runs the result
+# (app/linux/check_install.cmake). Windows deploys from the build tree
+# (windeployqt above); a macOS bundle would need a layout of its own.
+if(UNIX AND NOT APPLE)
+    set(_app_rpath "$ORIGIN/../${CMAKE_INSTALL_LIBDIR}/sirius")
+    if(SIRIUS_ENABLE_CUDA)
+        list(APPEND _app_rpath "${CUDAToolkit_LIBRARY_DIR}")
+    endif()
+    # a Qt outside the linker's own directories (SIRIUS_QT_DIR, a Qt installer kit)
+    get_target_property(_qt_core_location Qt${QT_VERSION_MAJOR}::Core LOCATION)
+    get_filename_component(_qt_lib_dir "${_qt_core_location}" DIRECTORY)
+    if(NOT _qt_lib_dir IN_LIST CMAKE_CXX_IMPLICIT_LINK_DIRECTORIES)
+        list(APPEND _app_rpath "${_qt_lib_dir}")
+    endif()
+    set_target_properties(sirius-app PROPERTIES INSTALL_RPATH "${_app_rpath}")
+
+    install(TARGETS sirius-app RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR} COMPONENT app)
+    install(DIRECTORY help python plugins
+        DESTINATION ${SIRIUS_APP_INSTALL_DATADIR} COMPONENT app
+        PATTERN __pycache__ EXCLUDE
+        PATTERN "python/tests" EXCLUDE)
+    install(FILES
+        ${PROJECT_SOURCE_DIR}/bindings/python/sirius/workbench.py
+        ${PROJECT_SOURCE_DIR}/bindings/python/sirius/op_schema.json
+        DESTINATION ${SIRIUS_APP_INSTALL_DATADIR}/python COMPONENT app)
+    install(FILES linux/sirius-app.desktop DESTINATION ${CMAKE_INSTALL_DATADIR}/applications COMPONENT app)
+    install(FILES qt/resources/icons/app/sirius-app.svg
+        DESTINATION ${CMAKE_INSTALL_DATADIR}/icons/hicolor/scalable/apps COMPONENT app)
+    foreach(_px 16 24 32 48 64 128 256)
+        install(FILES qt/resources/icons/app/sirius-app-${_px}.png
+            DESTINATION ${CMAKE_INSTALL_DATADIR}/icons/hicolor/${_px}x${_px}/apps
+            RENAME sirius-app.png COMPONENT app)
+    endforeach()
+    # The redistributables ship "libnvtiff.so.0 -> libnvtiff.so.0.8.0.82"
+    # symlinks; install the real file under the soname the executable needs
+    # (as bindings/CMakeLists.txt does for the wheel).
+    foreach(_lib IN LISTS SIRIUS_NVTIFF_RUNTIME_LIBS SIRIUS_NVCOMP_RUNTIME_LIBS)
+        get_filename_component(_soname "${_lib}" NAME)
+        file(REAL_PATH "${_lib}" _real)
+        install(FILES "${_real}" DESTINATION ${CMAKE_INSTALL_LIBDIR}/sirius COMPONENT app RENAME "${_soname}")
+    endforeach()
 endif()

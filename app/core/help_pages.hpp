@@ -28,8 +28,9 @@ namespace sirius::app {
         std::string path;                 // file it came from ("" = built in)
     };
 
-    // Directory searched for "<kind>.md": $SIRIUS_HELP_DIR, then `hint`
-    // (typically <exe dir>/help), then the source tree's app/help.
+    // Directory searched for "<kind>.md": $SIRIUS_HELP_DIR, then `hint`, then
+    // an installed tree's share/sirius/help, the source tree's app/help, and
+    // the copy beside the executable (core/app_paths.hpp).
     std::string helpDirectory(const std::string& hint = {});
     HelpPage loadHelpPage(const std::string& kind, const std::string& hint = {});
     // A page that lives in memory (a plugin's docstring); a file of the same

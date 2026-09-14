@@ -8,5 +8,12 @@
 </qresource>
 <qresource prefix="/icons">
     <file alias="chevron-down.svg">icons/chevron-down.svg</file>
+    <file alias="app/sirius-app-16.png">icons/app/sirius-app-16.png</file>
+    <file alias="app/sirius-app-24.png">icons/app/sirius-app-24.png</file>
+    <file alias="app/sirius-app-32.png">icons/app/sirius-app-32.png</file>
+    <file alias="app/sirius-app-48.png">icons/app/sirius-app-48.png</file>
+    <file alias="app/sirius-app-64.png">icons/app/sirius-app-64.png</file>
+    <file alias="app/sirius-app-128.png">icons/app/sirius-app-128.png</file>
+    <file alias="app/sirius-app-256.png">icons/app/sirius-app-256.png</file>
 </qresource>
 </RCC>

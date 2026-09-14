@@ -35,9 +35,9 @@ namespace sirius::app {
         explicit WorkerLauncher(QObject* parent = nullptr);
         ~WorkerLauncher() override;
 
-        // Interpreter and worker directory; empty = QSettings "worker/python"
-        // (then $SIRIUS_PYTHON, then "python3") and the directory next to
-        // the executable / the source tree.
+        // Interpreter and worker directory; empty = $SIRIUS_PYTHON (then
+        // QSettings "worker/python", then "python3") and the directory next
+        // to the executable / the source tree.
         void setPython(const QString& python);
         void setScriptDir(const QString& dir);
         void setDevice(const QString& device);   // "auto", "cuda", "cpu"

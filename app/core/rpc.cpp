@@ -1,5 +1,6 @@
 #include "core/rpc.hpp"
 
+#include "core/app_paths.hpp"
 #include "core/cancel.hpp"
 
 #include "core/errors.hpp"
@@ -185,11 +186,21 @@ namespace sirius::app::rpc {
             }
             ~WinsockInit() { WSACleanup(); }
         };
+        constexpr int kSendFlags = 0;   // Windows raises no signal for a closed peer
         void ensureWinsock() { static WinsockInit init; }
         void closeSocket(socket_t s) { closesocket(s); }
         int lastError() { return WSAGetLastError(); }
         bool wouldBlock(int e) { return e == WSAEWOULDBLOCK || e == WSAEINPROGRESS; }
 #else
+        // A worker that dies (out of memory, a wall-time limit) while a request
+        // is being sent must be a send error, not SIGPIPE, whose default action
+        // ends the whole application. Linux takes the flag per send; macOS has
+        // no MSG_NOSIGNAL and sets SO_NOSIGPIPE on the socket (connectTcp).
+#ifdef MSG_NOSIGNAL
+        constexpr int kSendFlags = MSG_NOSIGNAL;
+#else
+        constexpr int kSendFlags = 0;
+#endif
         void ensureWinsock() {}
         void closeSocket(socket_t s) { ::close(s); }
         int lastError() { return errno; }
@@ -223,7 +234,9 @@ namespace sirius::app::rpc {
             p.events = write ? POLLOUT : POLLIN;
             p.revents = 0;
             const int r = ::poll(&p, 1, static_cast<int>(timeout.count()));
-            return r > 0 && (p.revents & (write ? POLLOUT : (POLLIN | POLLHUP | POLLERR)));
+            // a peer that is gone is "ready" both ways: the send or receive
+            // then reports it at once instead of after the timeout
+            return r > 0 && (p.revents & ((write ? POLLOUT : POLLIN) | POLLHUP | POLLERR));
 #endif
         }
 
@@ -238,7 +251,7 @@ namespace sirius::app::rpc {
                 while (sent < bytes.size()) {
                     if (!waitFor(sock_, true, std::chrono::seconds(30))) throw ProtocolError("rpc: send timed out");
                     const auto n = ::send(sock_, reinterpret_cast<const char*>(bytes.data() + sent),
-                                          static_cast<int>(std::min<std::size_t>(bytes.size() - sent, 1u << 20)), 0);
+                                          static_cast<int>(std::min<std::size_t>(bytes.size() - sent, 1u << 20)), kSendFlags);
                     if (n < 0) {
                         if (wouldBlock(lastError())) continue;
                         throw ProtocolError("rpc: send failed");
@@ -348,6 +361,9 @@ namespace sirius::app::rpc {
             if (ok) {
                 int one = 1;
                 setsockopt(s, IPPROTO_TCP, TCP_NODELAY, reinterpret_cast<const char*>(&one), sizeof one);
+#ifdef SO_NOSIGPIPE
+                setsockopt(s, SOL_SOCKET, SO_NOSIGPIPE, reinterpret_cast<const char*>(&one), sizeof one);
+#endif
                 freeaddrinfo(res);
                 return std::make_unique<TcpTransport>(s);
             }
@@ -478,6 +494,9 @@ namespace sirius::app {
         namespace fs = std::filesystem;
         std::vector<fs::path> candidates;
         if (!scriptDir.empty()) candidates.push_back(fs::path(scriptDir));
+        // an installed tree, then the copy the build puts beside the executable
+        if (std::string installed = installedDataDirectory("python"); !installed.empty()) candidates.push_back(fs::path(installed));
+        if (std::string beside = besideApplication("python"); !beside.empty()) candidates.push_back(fs::path(beside));
         if (const char* env = std::getenv("SIRIUS_WORKER_DIR")) candidates.push_back(fs::path(env));
         candidates.push_back(fs::current_path() / "python");
 #ifdef SIRIUS_APP_SOURCE_DIR

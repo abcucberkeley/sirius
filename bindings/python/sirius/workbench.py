@@ -34,7 +34,10 @@ from __future__ import annotations
 import json
 import math
 import os
+import re
+import threading
 import warnings
+from collections import OrderedDict
 from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
@@ -103,11 +106,19 @@ def _float(params, keys, default: float) -> float:
         return float(default)
 
 
+def _llround(x: float) -> int:
+    """``std::llround``: halves away from zero (Python's round() goes to even)."""
+    a = abs(x)
+    f = math.floor(a)
+    n = int(f) + (1 if a - f >= 0.5 else 0)
+    return -n if x < 0 else n
+
+
 def _int(params, keys, default: int) -> int:
     v = _get(params, keys, default)
     try:
-        return int(round(float(v)))
-    except (TypeError, ValueError):
+        return _llround(float(v))
+    except (TypeError, ValueError, OverflowError):
         return int(default)
 
 
@@ -235,7 +246,48 @@ def _prepare_params(spec: StepSpec, params: Optional[Dict[str, Any]],
     for k, d in spec.defaults.items():
         if p.get(k) is None:
             p[k] = list(d) if isinstance(d, list) else d
+    _clamp_to_ranges(spec.kind, p)
     return p
+
+
+_schema_ranges: Optional[Dict[str, Dict[str, Tuple[str, float, float]]]] = None
+
+
+def _ranges_of(kind: str) -> Dict[str, Tuple[str, float, float]]:
+    """(type, min, max) of the int / double parameters of a kind, from the
+    snapshot of the C++ parameter tables beside this file (op_schema.json);
+    empty when the snapshot is not there (a copy of workbench.py alone)."""
+    global _schema_ranges
+    if _schema_ranges is None:
+        table: Dict[str, Dict[str, Tuple[str, float, float]]] = {}
+        try:
+            with open(os.path.join(os.path.dirname(os.path.abspath(__file__)), "op_schema.json"), encoding="utf-8") as f:
+                for op in json.load(f).get("operations", []):
+                    table[op.get("kind", "")] = {
+                        q["key"]: (q["type"], float(q["min"]), float(q["max"])) for q in op.get("params", [])
+                        if q.get("type") in ("int", "double") and "min" in q and "max" in q}
+        except (OSError, ValueError, KeyError, TypeError):
+            table = {}
+        _schema_ranges = table
+    return _schema_ranges.get(kind, {})
+
+
+def _clamp_to_ranges(kind: str, p: Dict[str, Any]) -> None:
+    """What loading a pipeline does to a number in the application
+    (coerceToSpec): clamped to the parameter's range, and an integer rounded
+    half away from zero. A value that is not a number is left to the step."""
+    for key, (kind_of, lo, hi) in _ranges_of(kind).items():
+        v = p.get(key)
+        if isinstance(v, bool) or v is None:
+            continue
+        try:
+            d = float(v)
+        except (TypeError, ValueError):
+            continue
+        if not math.isfinite(d):
+            continue
+        d = min(max(d, lo), hi)
+        p[key] = _llround(d) if kind_of == "int" else d
 
 
 def _progress(progress: ProgressFn, fraction: float, message: str = "") -> None:
@@ -296,10 +348,76 @@ def _default_meta(a: np.ndarray, source: str = "", fmt: str = "memory") -> Dict[
         "dims": _dims(a),
         "voxel_um": [0.1, 0.1, 0.2],  # x, y, z
         "frame_interval_s": 0.0,
-        "channels": [{"label": f"ch {i}", "wavelength_nm": 0.0, "color": "#ffffff"} for i in range(c)],
+        "channels": _normalize_channels([], c),
         "rgb": False,
         "sim": {"present": False, "ndirs": 3, "nphases": 5, "fast_si": False},
     }
+
+
+# The channel palette of dataset.cpp (colorForWavelength): 405, 488, 561 and
+# 640 nm, and the wavelengths a multi-channel file without any are given.
+_PALETTE = ((405.0, (0x7C, 0x9C, 0xFF)), (488.0, (0x63, 0xE0, 0x8A)), (561.0, (0xE8, 0x71, 0xD9)),
+            (640.0, (0xFF, 0x7A, 0x5C)))
+_PALETTE_FALLBACK_NM = (488.0, 561.0, 405.0, 640.0)
+
+
+def _color_for_wavelength(nm: float) -> Tuple[float, float, float]:
+    """``colorForWavelength``: the palette colour within 25 nm of a line, else
+    interpolated between its neighbours (float32 arithmetic, as there)."""
+    f32 = np.float32
+    stops = [(s, [f32(v) / f32(255.0) for v in rgb]) for s, rgb in _PALETTE]
+    if not nm > 0.0:
+        return 1.0, 1.0, 1.0
+    for s, c in stops:
+        if abs(s - nm) < 25.0:
+            return tuple(float(v) for v in c)  # type: ignore[return-value]
+    if nm <= stops[0][0]:
+        return tuple(float(v) for v in stops[0][1])  # type: ignore[return-value]
+    if nm >= stops[3][0]:
+        return tuple(float(v) for v in stops[3][1])  # type: ignore[return-value]
+    for i in range(3):
+        (s0, c0), (s1, c1) = stops[i], stops[i + 1]
+        if s0 <= nm <= s1:
+            f = f32((nm - s0) / (s1 - s0))
+            return tuple(float(c0[k] * (f32(1.0) - f) + c1[k] * f) for k in range(3))  # type: ignore[return-value]
+    return 1.0, 1.0, 1.0
+
+
+def _hex_color(rgb: Sequence[float]) -> str:
+    """``ChannelInfo::hexColor``: lround(clamp(v, 0, 1) * 255) per component."""
+    def byte(v: float) -> int:
+        return int(math.floor(float(np.float32(min(max(float(v), 0.0), 1.0)) * np.float32(255.0)) + 0.5))
+    return "#{:02x}{:02x}{:02x}".format(*(byte(v) for v in rgb))
+
+
+def _normalize_channels(channels: Sequence[Dict[str, Any]], c: int, rgb: bool = False) -> List[Dict[str, Any]]:
+    """``DatasetMeta::normalizeChannels``: one entry per channel; a missing
+    label is "ch <i>", and a white (default) colour becomes the colour of the
+    channel's wavelength -- or, in a multi-channel dataset without
+    wavelengths, the palette's 488 / 561 / 405 / 640 nm colours in turn."""
+    if rgb:
+        return [{"label": n, "wavelength_nm": 0.0, "color": col}
+                for n, col in (("R", "#ff0000"), ("G", "#00ff00"), ("B", "#0000ff"))]
+    n = max(int(c), 1)
+    out = []
+    for i in range(n):
+        ch = dict(channels[i]) if i < len(channels) and isinstance(channels[i], dict) else {}
+        label = str(ch.get("label") or "") or f"ch {i}"
+        try:
+            nm = float(ch.get("wavelength_nm") or 0.0)
+        except (TypeError, ValueError):
+            nm = 0.0
+        color = ch.get("color")
+        if not color or _hex_to_rgb(color) == (1.0, 1.0, 1.0):
+            if nm > 0.0:
+                color = _hex_color(_color_for_wavelength(nm))
+            elif n > 1:
+                color = _hex_color(_color_for_wavelength(_PALETTE_FALLBACK_NM[i % 4]))
+            else:
+                color = "#ffffff"
+        ch.update({"label": label, "wavelength_nm": nm, "color": str(color)})
+        out.append(ch)
+    return out
 
 
 def _reorder_to_ctzyx(a: np.ndarray, axes: str) -> np.ndarray:
@@ -322,88 +440,290 @@ def _reorder_to_ctzyx(a: np.ndarray, axes: str) -> np.ndarray:
     return out.reshape(shape)
 
 
-def _tiff_metadata(path: str) -> Tuple[Optional[str], Dict[str, Any]]:
-    """(axes string of the stored series, metadata dict) via tifffile, or (None, {})."""
+# --- TIFF metadata: a port of the application's parser (array_source.cpp) ---
+# The Python loader has to read a file exactly as the application does --
+# the same dimensions, page order and voxel size -- or an exported pipeline
+# runs on a different array. So this is the C++ code transcribed, not
+# tifffile's own interpretation of the metadata.
+
+_XML_SPACE = " \t\n\v\f\r"
+_STOD = re.compile(r"[ \t\n\v\f\r]*[+-]?(?:(?:[0-9]+\.?[0-9]*|\.[0-9]+)(?:[eE][+-]?[0-9]+)?|inf(?:inity)?|nan)",
+                   re.IGNORECASE)
+
+
+def _stod(text: Any, default: float) -> float:
+    """``std::stod``: the number at the start of `text`, else `default`."""
+    m = _STOD.match(str(text))
+    if not m:
+        return default
+    v = float(m.group(0))
+    if math.isinf(v) and "inf" not in m.group(0).lower():
+        return default   # out of range: stod throws
+    return v
+
+
+def _to_index(v: float) -> int:
+    """static_cast<Index> of a parsed count (truncation; nonsense is 0)."""
+    return int(v) if math.isfinite(v) else 0
+
+
+def _unit_to_um(unit: Any) -> float:
+    """``unitToUm``: a length unit in micrometres. Empty and unknown units are
+    micrometres; "pixel" means the size is not physical (0)."""
+    u = str(unit or "").strip(" \t\r\n").lower()
+    if u in ("", "\u00b5m", "\u03bcm", "um", "micron", "microns", "micrometer", "micrometre"):
+        return 1.0
+    return {"nm": 1e-3, "nanometer": 1e-3, "mm": 1e3, "millimeter": 1e3, "cm": 1e4, "centimeter": 1e4,
+            "m": 1e6, "meter": 1e6, "inch": 2.54e4, "in": 2.54e4, "pixel": 0.0, "pixels": 0.0}.get(u, 1.0)
+
+
+def _time_unit_to_s(unit: Any) -> float:
+    """``timeUnitToS``."""
+    u = str(unit or "").strip(" \t\r\n").lower()
+    return {"ms": 1e-3, "us": 1e-6, "\u00b5s": 1e-6, "min": 60.0, "h": 3600.0}.get(u, 1.0)
+
+
+def _xml_unescape(s: str) -> str:
+    """``xmlUnescape``: the five named entities, then numeric references."""
+    for entity, char in (("&amp;", "&"), ("&lt;", "<"), ("&gt;", ">"), ("&quot;", '"'), ("&apos;", "'")):
+        s = s.replace(entity, char)
+    pos = 0
+    while True:
+        pos = s.find("&#", pos)
+        if pos < 0:
+            break
+        end = s.find(";", pos)
+        if end < 0:
+            break
+        num = s[pos + 2:end]
+        m = (re.match(r"[ \t\n\v\f\r]*\+?([0-9a-fA-F]+)", num[1:]) if len(num) > 1 and num[0] in "xX"
+             else re.match(r"[ \t\n\v\f\r]*\+?([0-9]+)", num))
+        if not m:
+            pos = end + 1
+            continue
+        code = int(m.group(1), 16 if len(num) > 1 and num[0] in "xX" else 10)
+        char = chr(code) if code < 0x110000 else ""
+        s = s[:pos] + char + s[end + 1:]
+        pos += len(char)
+    return s
+
+
+def _parse_attrs(tag: str) -> Dict[str, str]:
+    """``parseAttrs``: the attributes of one start tag's text."""
+    out: Dict[str, str] = {}
+    i, n = 0, len(tag)
+    while i < n:
+        while i < n and (tag[i] in _XML_SPACE or tag[i] == "/"):
+            i += 1
+        start = i
+        while i < n and tag[i] != "=" and tag[i] not in _XML_SPACE:
+            i += 1
+        if i >= n:
+            break
+        name = tag[start:i]
+        while i < n and (tag[i] in _XML_SPACE or tag[i] == "="):
+            i += 1
+        if i >= n:
+            break
+        quote = tag[i]
+        if quote not in "\"'":
+            i += 1
+            continue
+        i += 1
+        end = tag.find(quote, i)
+        if end < 0:
+            break
+        out[name] = _xml_unescape(tag[i:end])
+        i = end + 1
+    return out
+
+
+def _find_tags(xml: str, name: str) -> List[Dict[str, str]]:
+    """``findTags``: every start tag `name` (any namespace prefix) in order."""
+    out = []
+    pos, n = 0, len(xml)
+    while True:
+        pos = xml.find("<", pos)
+        if pos < 0:
+            break
+        i = pos + 1
+        if i < n and xml[i] in "/?!":
+            pos += 1
+            continue
+        name_end = i
+        while name_end < n and xml[name_end] not in _XML_SPACE and xml[name_end] not in ">/":
+            name_end += 1
+        tag_name = xml[i:name_end]
+        tag_name = tag_name[tag_name.find(":") + 1:]
+        close = xml.find(">", name_end)
+        if close < 0:
+            break
+        if tag_name == name:
+            out.append(_parse_attrs(xml[name_end:close]))
+        pos = close + 1
+    return out
+
+
+def _ome_color(text: str) -> Optional[Tuple[float, float, float]]:
+    """``omeColor``: a signed 32-bit RGBA, or None when absent or unreadable."""
+    m = re.match(r"[ \t\n\v\f\r]*([+-]?[0-9]+)", text or "")
+    if not m:
+        return None
+    u = int(m.group(1)) & 0xFFFFFFFF
+    f32 = np.float32
+    return tuple(float(f32((u >> shift) & 0xFF) / f32(255.0)) for shift in (24, 16, 8))  # type: ignore[return-value]
+
+
+def _parse_tiff_description(description: str) -> Dict[str, Any]:
+    """``parseTiffDescription``: dimensions, page order, voxel size (µm; for
+    ImageJ the x / y entries are minus the unit, which the resolution tags
+    are then divided into), frame interval and channels of an OME-XML or
+    ImageJ ImageDescription."""
+    md: Dict[str, Any] = {"ome": False, "imagej": False, "c": 0, "t": 0, "z": 0, "dimension_order": "",
+                          "voxel_um": [0.0, 0.0, 0.0], "frame_interval_s": 0.0, "channels": []}
+    text = description or ""
+    if "<OME" in text or "<ome" in text:
+        md["ome"] = True
+        pixels = _find_tags(text, "Pixels")
+        if pixels:
+            p = pixels[0]
+            md["c"] = _to_index(_stod(p["SizeC"], 0.0)) if "SizeC" in p else 0
+            md["t"] = _to_index(_stod(p["SizeT"], 0.0)) if "SizeT" in p else 0
+            md["z"] = _to_index(_stod(p["SizeZ"], 0.0)) if "SizeZ" in p else 0
+            md["dimension_order"] = p.get("DimensionOrder", "")
+            md["voxel_um"] = [_stod(p.get(f"PhysicalSize{ax}", ""), 0.0) * _unit_to_um(p.get(f"PhysicalSize{ax}Unit", ""))
+                              for ax in "XYZ"]
+            md["frame_interval_s"] = _stod(p.get("TimeIncrement", ""), 0.0) * _time_unit_to_s(p.get("TimeIncrementUnit", ""))
+        for ch in _find_tags(text, "Channel"):
+            em = _stod(ch.get("EmissionWavelength", ""), 0.0)
+            unit = ch.get("EmissionWavelengthUnit", "")
+            entry: Dict[str, Any] = {"label": ch.get("Name", ""),
+                                     "wavelength_nm": em * _unit_to_um(unit or "nm") * 1e3 if em > 0 else 0.0}
+            color = _ome_color(ch.get("Color", ""))
+            if color is not None and color != (1.0, 1.0, 1.0):
+                entry["color"] = _hex_color(color)
+            md["channels"].append(entry)
+    elif text.startswith("ImageJ=") or "\nImageJ=" in text:
+        md["imagej"] = True
+        kv: Dict[str, str] = {}
+        for line in text.split("\n"):
+            eq = line.find("=")
+            if eq >= 0:
+                kv[line[:eq].strip(" \t\r\n")] = line[eq + 1:].strip(" \t\r\n")
+
+        def num(key: str, default: float) -> float:
+            return _stod(kv[key], default) if key in kv else default
+
+        md["c"] = _to_index(num("channels", 0.0))
+        md["z"] = _to_index(num("slices", 0.0))
+        md["t"] = _to_index(num("frames", 0.0))
+        md["dimension_order"] = "XYCZT"   # hyperstacks: channel fastest, then slice, then frame
+        unit = _unit_to_um(kv.get("unit", ""))
+        spacing = num("spacing", 0.0)
+        if spacing > 0 and unit > 0:
+            md["voxel_um"][2] = spacing * unit
+        md["frame_interval_s"] = num("finterval", 0.0)
+        if unit > 0:
+            md["voxel_um"][0] = md["voxel_um"][1] = -unit   # the resolution tags hold pixels per unit
+    return md
+
+
+def _normalize_order(order: str) -> str:
+    """``normalizeOrder``: c, t, z once each, fastest first; the rest dropped."""
+    out = ""
+    for ch in str(order).lower():
+        if ch in "ctz" and ch not in out:
+            out += ch
+    return out + "".join(ch for ch in "czt" if ch not in out)
+
+
+def _pixel_from_resolution(xres: float, yres: float, unit_tag: int, imagej_unit_um: float) -> List[float]:
+    """``pixelFromResolution``: x / y pixel size from the resolution tags; the
+    ResolutionUnit tag wins when it names a real unit (ImageJ writes "none"
+    and puts its unit in the description); only 1 nm .. 100 µm is believed."""
+    if not (xres > 0.0 and yres > 0.0):
+        return [0.0, 0.0]
+    unit = 1e4 if unit_tag == 3 else 2.54e4 if unit_tag == 2 else imagej_unit_um if imagej_unit_um > 0 else 0.0
+    if unit <= 0.0:
+        return [0.0, 0.0]
+    return [v if 1e-3 < v < 100.0 else 0.0 for v in (unit / xres, unit / yres)]
+
+
+def _resolution(tags, name: str) -> float:
+    """A resolution tag as libtiff hands it over: float32 of num / den."""
+    tag = tags.get(name)
+    if tag is None:
+        return 0.0
+    value = tag.value
+    try:
+        num, den = (value[0], value[1]) if isinstance(value, (tuple, list)) else (float(value), 1)
+    except (TypeError, IndexError, ValueError):
+        return 0.0
+    return float(np.float32(num / den)) if den else 0.0
+
+
+def _tiff_probe(path: str) -> Dict[str, Any]:
+    """What ``probeTiff`` reads before deciding anything: the number of
+    full-resolution pages, the first page's ImageDescription and resolution
+    tags, and its pixel type. tifffile reads the tags; the page count comes
+    from the sirius extension when it is there (the application's own
+    reader), else from tifffile skipping reduced-resolution pages."""
     try:
         import tifffile  # type: ignore
     except ImportError:
-        return None, {}
-    info: Dict[str, Any] = {}
+        tifffile = None
+    info: Dict[str, Any] = {"description": "", "xres": 0.0, "yres": 0.0, "res_unit": 2, "pages": None,
+                            "dtype": None, "reader": None}
+    ext = _sirius_tiff()
+    if ext is not None:
+        t = ext.inspect_tiff(path)
+        if not t.uniform_pages:
+            raise ValueError(f"TIFF pages differ in size or pixel type: {path}")
+        info.update(pages=int(t.page_count), dtype=str(np.dtype(t.dtype)), reader="sirius")
+    if tifffile is None:
+        if ext is None:
+            raise NotAvailable("loading TIFF needs the 'sirius' extension or 'tifffile'")
+        return info
     with tifffile.TiffFile(path) as tf:
-        series = tf.series[0] if tf.series else None
-        axes = series.axes if series is not None else None
-        if tf.is_ome:
-            info["format"] = "ome-tiff"
-            try:
-                info.update(_parse_ome_xml(tf.ome_metadata or ""))
-            except Exception:  # noqa: BLE001 - metadata is best effort
-                pass
-        elif tf.is_imagej:
-            info["format"] = "tiff"
-            ij = tf.imagej_metadata or {}
-            voxel = [0.0, 0.0, 0.0]
-            if "spacing" in ij:
-                voxel[2] = float(ij["spacing"])
-            if "finterval" in ij:
-                info["frame_interval_s"] = float(ij["finterval"])
-            page = tf.pages[0]
-            xres = page.tags.get("XResolution")
-            yres = page.tags.get("YResolution")
-            unit = str(ij.get("unit") or "").lower()
-            if xres is not None and yres is not None and unit in ("micron", "um", "µm", "μm"):
-                if xres.value[0] and yres.value[0]:
-                    voxel[0] = xres.value[1] / xres.value[0]
-                    voxel[1] = yres.value[1] / yres.value[0]
-            if any(voxel):
-                info["voxel_um"] = voxel
-        else:
-            info["format"] = "tiff"
-        info["dtype"] = str(tf.pages[0].dtype)
-        info["bytes_on_disk"] = os.path.getsize(path)
-    return axes, info
+        first = tf.pages[0]
+        info["description"] = first.description or ""
+        info["xres"] = _resolution(first.tags, "XResolution")
+        info["yres"] = _resolution(first.tags, "YResolution")
+        unit = first.tags.get("ResolutionUnit")
+        info["res_unit"] = int(unit.value) if unit is not None else 2
+        if ext is None:
+            full = [i for i, page in enumerate(tf.pages) if not int(getattr(page, "subfiletype", 0)) & 1]
+            shapes = {(tuple(tf.pages[i].shape), str(tf.pages[i].dtype)) for i in full}
+            if int(getattr(first, "samplesperpixel", 1)) != 1:
+                raise ValueError("Only single-channel (grayscale) TIFFs are supported.")
+            if len(shapes) != 1:
+                raise ValueError(f"TIFF pages differ in size or pixel type: {path}")
+            info.update(pages=len(full), dtype=str(first.dtype), reader="tifffile", full_pages=full)
+    return info
 
 
-def _parse_ome_xml(xml: str) -> Dict[str, Any]:
-    import xml.etree.ElementTree as ET
+def _sirius_tiff():
+    """The sirius extension when it imports (its TIFF reader is the
+    application's), else None."""
+    try:
+        import sirius  # type: ignore
 
-    out: Dict[str, Any] = {}
-    if not xml.strip():
-        return out
-    root = ET.fromstring(xml)
-    ns = root.tag[: root.tag.index("}") + 1] if root.tag.startswith("{") else ""
-    pixels = root.find(f".//{ns}Pixels")
-    if pixels is None:
-        return out
-    g = pixels.get
-    voxel = [float(g("PhysicalSizeX") or 0), float(g("PhysicalSizeY") or 0), float(g("PhysicalSizeZ") or 0)]
-    if any(voxel):
-        out["voxel_um"] = voxel
-    if g("TimeIncrement"):
-        out["frame_interval_s"] = float(g("TimeIncrement"))
-    channels = []
-    for ch in pixels.findall(f"{ns}Channel"):
-        nm = ch.get("EmissionWavelength") or ch.get("ExcitationWavelength") or 0
-        entry: Dict[str, Any] = {"label": ch.get("Name") or "", "wavelength_nm": float(nm)}
-        color = ch.get("Color")
-        if color:
-            try:
-                rgba = int(color) & 0xFFFFFFFF
-                entry["color"] = f"#{(rgba >> 24) & 255:02x}{(rgba >> 16) & 255:02x}{(rgba >> 8) & 255:02x}"
-            except ValueError:
-                pass
-        channels.append(entry)
-    if channels:
-        out["channels"] = channels
-    return out
+        sirius.inspect_tiff  # noqa: B018 - the extension, not a namespace package
+        return sirius
+    except Exception:  # noqa: BLE001 - fall back to tifffile
+        return None
 
 
 def load_dataset(path: str, page_order: str = "czt", c: Optional[int] = None, t: Optional[int] = None,
                  z: Optional[int] = None, progress: ProgressFn = None) -> Tuple[np.ndarray, Dict[str, Any]]:
     """Load a TIFF / OME-TIFF or a zarr / N5 store as (c, t, z, y, x) float32.
 
-    Plain multi-page TIFFs without dimension metadata are reshaped with
-    `page_order` (fastest axis first, ImageJ's "czt") and the explicit
-    counts; an unspecified count is derived from the page count.
+    A TIFF is read as the application's Load step reads it: the pages are
+    shaped by the explicit counts and `page_order` (fastest axis first,
+    ImageJ's "czt") when given, else by the OME / ImageJ metadata, else they
+    are z planes; a count left unset keeps what the file says, the plane count
+    is derived from the pages, and counts that do not multiply to the page
+    count fall back to pages as z. Voxel sizes honour the metadata's units.
     """
     path = str(path)
     if not os.path.exists(path):
@@ -470,71 +790,82 @@ def _load_zarr(path: str) -> Tuple[np.ndarray, Dict[str, Any]]:
             elif ax[0] == "z":
                 v[2] = s
     if channels:
-        meta["channels"] = (channels + meta["channels"])[: a.shape[0]]
+        meta["channels"] = _normalize_channels(channels, a.shape[0])
     meta["dtype"] = str(data.dtype)
     meta["dims_from_metadata"] = True
     return a, meta
 
 
-def _read_tiff_pages(path: str) -> Tuple[np.ndarray, Optional[str]]:
-    """(array, axes) -- the sirius extension for plain stacks, tifffile otherwise."""
-    axes, _ = _tiff_metadata(path)
-    if axes is None or len(axes) <= 3:
-        try:
-            import sirius  # type: ignore
-
-            return np.asarray(sirius.read_tiff(path, dtype=np.float32)), None
-        except Exception:  # noqa: BLE001 - fall back to tifffile
-            pass
-    try:
-        import tifffile  # type: ignore
-    except ImportError as e:
-        raise NotAvailable("loading TIFF needs the 'sirius' extension or 'tifffile'") from e
-    return np.asarray(tifffile.imread(path)), axes
-
-
 def _load_tiff(path: str, page_order: str, c: Optional[int], t: Optional[int], z: Optional[int]):
-    _, info = _tiff_metadata(path)
-    data, axes = _read_tiff_pages(path)
-    dims_from_meta = False
-    if axes is not None and len(axes) == data.ndim and data.ndim > 3:
-        norm = axes.upper().replace("Q", "T").replace("S", "C").replace("I", "T")
-        a = _as5(_reorder_to_ctzyx(data, norm))
-        dims_from_meta = True
+    """``probeTiff`` + ``TiffArraySource``: see load_dataset."""
+    probe = _tiff_probe(path)
+    md = _parse_tiff_description(probe["description"])
+    pages = int(probe["pages"])
+    # dimensions: explicit page order > OME / ImageJ metadata > pages as z.
+    # The Load step passes a page order as soon as a count is set or the
+    # order is not "czt" (load.cpp); an axis left at 0 keeps the file's.
+    pc, pt, pz = (max(int(v or 0), 0) for v in (c, t, z))
+    order_text = "czt" if page_order is None else str(page_order)
+    given = pc > 0 or pt > 0 or pz > 0 or order_text != "czt"
+    described = (md["ome"] or md["imagej"]) and (md["c"] > 0 or md["t"] > 0 or md["z"] > 0)
+    nc, nt, nz, order, from_meta = 1, 1, pages, "czt", False
+    if given:
+        po_order = order_text or "czt"
+        nc = pc if pc > 0 else (md["c"] if described and md["c"] > 0 else 1)
+        nt = pt if pt > 0 else (md["t"] if described and md["t"] > 0 else 1)
+        nz = pz if pz > 0 else max(pages // max(nc * nt, 1), 1)
+        order = (_normalize_order(md["dimension_order"]) if described and po_order == "czt" and md["dimension_order"]
+                 else _normalize_order(po_order))
+        from_meta = described and pc <= 0 and pt <= 0 and pz <= 0
+    elif described:
+        nc, nt = max(md["c"], 1), max(md["t"], 1)
+        nz = md["z"] if md["z"] > 0 else max(pages // (nc * nt), 1)
+        order = _normalize_order(md["dimension_order"])
+        from_meta = True
+    if nc * nt * nz != pages:
+        nc, nt, nz, order, from_meta = 1, 1, pages, "czt", False
+
+    if probe["reader"] == "sirius":
+        stack = np.asarray(_sirius_tiff().read_tiff(path, dtype=np.float32))
     else:
-        pages = data.reshape((-1,) + data.shape[-2:])
-        n = pages.shape[0]
-        counts = {"c": int(c or 0), "t": int(t or 0), "z": int(z or 0)}
-        unknown = [k for k, v in counts.items() if v <= 0]
-        known = 1
-        for v in counts.values():
-            if v > 0:
-                known *= v
-        if len(unknown) > 1:
-            for k in unknown:
-                counts[k] = 1
-            counts["z" if "z" in unknown else unknown[0]] = max(1, n // known)
-        elif unknown:
-            counts[unknown[0]] = max(1, n // known)
-        if counts["c"] * counts["t"] * counts["z"] != n:
-            raise ValueError(f"{n} pages do not factor into c{counts['c']} t{counts['t']} z{counts['z']}")
-        order = page_order.lower()
-        slowest_first = "".join(reversed(order))
-        shape = tuple(counts[ax] for ax in slowest_first)
-        a = _as5(_reorder_to_ctzyx(pages.reshape(shape + pages.shape[1:]), slowest_first + "yx"))
-    meta = _default_meta(a, path, info.get("format", "tiff"))
-    if info.get("voxel_um") and any(info["voxel_um"]):
-        v = meta["voxel_um"]
-        for i in range(3):
-            if info["voxel_um"][i]:
-                v[i] = float(info["voxel_um"][i])
-    if info.get("frame_interval_s"):
-        meta["frame_interval_s"] = float(info["frame_interval_s"])
-    for i, ch in enumerate(info.get("channels", [])[: a.shape[0]]):
-        meta["channels"][i].update({k: v for k, v in ch.items() if v not in ("", None)})
-    meta["dtype"] = info.get("dtype", str(data.dtype))
-    meta["bytes_on_disk"] = info.get("bytes_on_disk", os.path.getsize(path))
-    meta["dims_from_metadata"] = dims_from_meta
+        import tifffile  # type: ignore
+
+        with tifffile.TiffFile(path) as tf:
+            stack = np.stack([tf.pages[i].asarray() for i in probe["full_pages"]]).astype(np.float32, copy=False)
+    stack = stack.reshape((pages,) + stack.shape[-2:])
+    counts = {"c": nc, "t": nt, "z": nz}
+    slowest_first = order[::-1]
+    shape = tuple(counts[ax] for ax in slowest_first)
+    a = _as5(_reorder_to_ctzyx(stack.reshape(shape + stack.shape[1:]), slowest_first + "yx"))
+
+    fmt = "ome-tiff" if md["ome"] else "tiff"
+    meta = _default_meta(a, path, fmt)
+    if meta["name"].endswith(".ome"):   # stem of the stem, as probeTiff names it
+        meta["name"] = meta["name"][:-4]
+    # voxel size: OME physical sizes, else the resolution tags (in the
+    # ImageJ unit when the tag says "none"), ImageJ spacing for z; a missing
+    # x / y is 0.1 µm and a missing z twice x
+    voxel = list(md["voxel_um"]) if md["ome"] else [0.0, 0.0, 0.0]
+    imagej_unit = -md["voxel_um"][0] if md["imagej"] and md["voxel_um"][0] < 0 else 0.0
+    if voxel[0] <= 0.0 or voxel[1] <= 0.0:
+        xy = _pixel_from_resolution(probe["xres"], probe["yres"], probe["res_unit"], imagej_unit)
+        if xy[0] > 0.0:
+            voxel[0] = xy[0]
+        if xy[1] > 0.0:
+            voxel[1] = xy[1]
+    if voxel[2] <= 0.0 and md["imagej"]:
+        voxel[2] = md["voxel_um"][2]
+    known_xy = voxel[0] > 0.0 and voxel[1] > 0.0
+    if not known_xy:
+        voxel[0] = voxel[1] = 0.1
+    if voxel[2] <= 0.0:
+        voxel[2] = voxel[0] * 2.0 if known_xy else 0.2
+    meta["voxel_um"] = [float(v) for v in voxel]
+    meta["frame_interval_s"] = float(md["frame_interval_s"])
+    meta["channels"] = _normalize_channels(md["channels"] if md["ome"] else [], nc)
+    meta["dtype"] = probe["dtype"] or str(stack.dtype)
+    meta["bytes_on_disk"] = os.path.getsize(path)
+    meta["dims_from_metadata"] = bool(from_meta)
     return a, meta
 
 
@@ -606,25 +937,28 @@ def _percentiles(values: np.ndarray, lo_pct: float, hi_pct: float, max_samples: 
 
 
 def _histogram(values: np.ndarray, bins: int, lo: float, hi: float) -> np.ndarray:
-    """``sirius::histogram``: counts of `bins` equal bins over [lo, hi]; NaN and
-    values outside the range are not counted, hi lands in the last bin."""
-    counts = np.zeros(max(bins, 1), dtype=np.float64)
+    """``sirius::histogram``: counts of `bins` equal bins over [lo, hi]; NaN,
+    +-inf and values outside the range are not counted, hi lands in the last
+    bin, and an infinite bound counts nothing."""
+    bins = max(int(bins), 1)
+    counts = np.zeros(bins, dtype=np.float64)
     x = np.asarray(values, dtype=np.float64).reshape(-1)
-    if x.size == 0 or not hi > lo:
+    if x.size == 0 or not hi > lo or not (math.isfinite(lo) and math.isfinite(hi)):
         return counts
     scale = bins / (float(hi) - float(lo))
+    if not (scale > 0.0 and math.isfinite(scale)):
+        return counts
     x = x[(x >= lo) & (x <= hi)]
-    b = ((x - lo) * scale).astype(np.int64)
-    b[b >= bins] = bins - 1
+    b = np.clip(((x - lo) * scale).astype(np.int64), 0, bins - 1)
     return np.bincount(b, minlength=bins).astype(np.float64)
 
 
 def _otsu_threshold(values: np.ndarray) -> float:
     """``sirius::app::otsuThreshold`` (threshold.cpp): Otsu's cut on a 256-bin
     histogram between the data's min and max, returned as the upper edge of
-    the best bin."""
+    the best bin. NaN and +-inf are left out, as there."""
     v = np.asarray(values, dtype=np.float32).reshape(-1)
-    v = v[~np.isnan(v)]
+    v = v[np.isfinite(v)]
     if v.size == 0:
         return float("inf")
     mn, mx = float(v.min()), float(v.max())
@@ -642,10 +976,20 @@ def _otsu_threshold(values: np.ndarray) -> float:
     with np.errstate(divide="ignore", invalid="ignore"):
         m_b = sum_b / w_b
         m_f = (sum_all - sum_b) / w_f
-        between = w_b * w_f * (m_b - m_f) ** 2
+        # the C++ product order, ((wB wF) d) d: another order rounds a tie
+        # between two bins differently and picks the other one
+        between = w_b * w_f * (m_b - m_f) * (m_b - m_f)
     between[~valid] = -np.inf
     best = int(np.argmax(between))   # the first maximum, as the C++ strict '>' keeps
-    return mn + (mx - mn) * float(best + 1) / bins
+    return _bin_edge32(mn, mx, best + 1, bins)
+
+
+def _bin_edge32(lo: float, hi: float, k: int, bins: int) -> float:
+    """``lo + (hi - lo) * k / bins`` in float32 arithmetic, as the C++ cuts are
+    computed: the float64 result rounds to a neighbouring float32 about half
+    the time, and a voxel equal to the cut then lands on the other side."""
+    f32 = np.float32
+    return float(f32(lo) + (f32(hi) - f32(lo)) * f32(k) / f32(bins))
 
 
 def _rescale_gamma(a: np.ndarray, lo: float, hi: float, gamma: float) -> np.ndarray:
@@ -964,10 +1308,33 @@ def _resample_extent(n: int, d: float, t: float) -> int:
     return 1 if n == 1 else int(math.floor((n - 1) * d / t + 1e-9)) + 1
 
 
-def _axis_taps(n_in: int, n_out: int, ratio: float, interp: str) -> List[Tuple[np.ndarray, np.ndarray]]:
+def _fitted_step(step: float, samples: int, n_in: int) -> float:
+    """``fittedStep`` of resample.cpp: the ratio pulled down by the rounding
+    error that would put the last output centre past the last input centre,
+    for both ways resampleAffine reaches it (a product along z / y, a running
+    sum along x). Without it the last plane or column read as fill."""
+    if samples <= 1 or n_in <= 1:
+        return step
+    last = float(n_in - 1)
+    for _ in range(64):
+        reach = max(float(np.add.accumulate(np.full(samples - 1, step))[-1]), float(samples - 1) * step)
+        over = reach - last
+        if over <= 0.0 or over > 1e-6:
+            break
+        step = math.nextafter(step - over / (samples - 1), 0.0)
+    return step
+
+
+def _axis_taps(n_in: int, n_out: int, ratio: float, interp: str,
+               accumulated: bool = False) -> List[Tuple[np.ndarray, np.ndarray]]:
     """``axisTaps`` of image_ops.cpp for every output index of one axis:
-    (indices, weights) pairs; positions outside the input weigh 0 (fill)."""
-    p = np.arange(n_out, dtype=np.float64) * ratio
+    (indices, weights) pairs; positions outside the input weigh 0 (fill).
+    The positions are those resampleAffine evaluates: index * ratio, or along
+    x (`accumulated`) the ratio added once per index."""
+    if accumulated and n_out > 1:
+        p = np.concatenate(([0.0], np.add.accumulate(np.full(n_out - 1, ratio, dtype=np.float64))))
+    else:
+        p = np.arange(n_out, dtype=np.float64) * ratio
     if n_in == 1:
         ok = (p >= -0.5) & (p <= 0.5)
         return [(np.zeros(n_out, dtype=np.int64), ok.astype(np.float64))]
@@ -995,7 +1362,8 @@ def _resample_volume(v: np.ndarray, extents: Sequence[int], ratios: Sequence[flo
         if n_in == n_out and abs(ratios[axis] - 1.0) < 1e-12:
             continue
         acc = None
-        for idx, w in _axis_taps(n_in, n_out, ratios[axis], interp):
+        ratio = _fitted_step(ratios[axis], n_out, n_in)
+        for idx, w in _axis_taps(n_in, n_out, ratio, interp, accumulated=axis == 2):
             shape = [1, 1, 1]
             shape[axis] = n_out
             term = np.take(out, idx, axis=axis) * w.astype(np.float32).reshape(shape)
@@ -1043,6 +1411,13 @@ def _hex_to_rgb(s: str) -> Tuple[float, float, float]:
         return 1.0, 1.0, 1.0
 
 
+def _hex_to_rgb8(s: str) -> Tuple[float, float, float]:
+    """``colorFromHex``: "#rrggbb" as byte / 255 in float32 (white when unreadable)."""
+    f32 = np.float32
+    rgb = _hex_to_rgb(s)
+    return tuple(float(f32(round(v * 255.0)) / f32(255.0)) for v in rgb)  # type: ignore[return-value]
+
+
 _MERGE = StepSpec("merge", {"blend": "Additive", "colors": [], "weights": [], "normalize_percentile": 99.9},
                   choices={"blend": ("Additive", "Screen", "Max")}, aliases={"colours": "colors"})
 
@@ -1061,10 +1436,13 @@ def step_merge(a: np.ndarray, params: Dict[str, Any], meta: Dict[str, Any]) -> S
     if isinstance(colors, str):
         colors = [x.strip() for x in colors.split(",") if x.strip()]
     colors = list(colors or [])
-    channel_colors = [ch.get("color", "#ffffff") for ch in meta.get("channels", [])]
-    colors = [colors[i] if i < len(colors) else (channel_colors[i] if i < len(channel_colors) else "#ffffff")
-              for i in range(c)]
-    rgbs = [_hex_to_rgb(col) for col in colors]
+    # the channels' own colours as the application holds them: normalised,
+    # so a multi-channel file without colours merges in the palette's
+    # green / magenta / blue / orange rather than in white (grey)
+    channel_colors = [ch["color"] for ch in _normalize_channels(meta.get("channels") or [], c)]
+    colors = [colors[i] if i < len(colors) else channel_colors[i] for i in range(c)]
+    f32 = np.float32
+    rgbs = [tuple(f32(v) for v in _hex_to_rgb8(col)) for col in colors]
     weights = _floats(params.get("weights"))
     pct = _float(params, "normalize_percentile", 99.9)
     scales = []
@@ -1073,24 +1451,27 @@ def step_merge(a: np.ndarray, params: Dict[str, Any], meta: Dict[str, Any]) -> S
         finite = ch[~np.isnan(ch)]
         mn, mx = (float(finite.min()), float(finite.max())) if finite.size else (0.0, 1.0)
         if mn >= 0.0 and mx <= 1.0:
-            scales.append(1.0)
+            scales.append(f32(1.0))
             continue
-        hi = _percentiles(ch, 0.0, pct)[1]
-        scales.append(1.0 / hi if hi > 0.0 else 1.0)
+        hi = f32(_percentiles(ch, 0.0, pct)[1])
+        scales.append(f32(1.0) / hi if hi > 0.0 else f32(1.0))
     out = np.zeros((3,) + a.shape[1:], dtype=np.float32)
     for i in range(c):
-        w = float(weights[i]) if i < len(weights) else 1.0
-        v0 = np.clip(a[i] * np.float32(scales[i] * w), 0.0, 1.0)
+        w = f32(weights[i]) if i < len(weights) else f32(1.0)
+        # merge.cpp in float32, with std::clamp / std::min / std::max as they
+        # treat NaN: clamp keeps it, min(1, r + NaN) is 1 (an additive NaN
+        # voxel turns white), max(r, NaN) is r, and screen passes it on
+        v0 = a[i] * (scales[i] * w)
+        v0 = np.where(v0 < 0.0, f32(0.0), np.where(v0 > 1.0, f32(1.0), v0))
         for k in range(3):
-            if rgbs[i][k] == 0.0:
-                continue
-            contribution = v0 * np.float32(rgbs[i][k])
+            contribution = rgbs[i][k] * v0
             if blend == "Screen":
                 out[k] = 1.0 - (1.0 - out[k]) * (1.0 - contribution)
             elif blend == "Max":
-                np.maximum(out[k], contribution, out=out[k])
+                out[k] = np.where(out[k] < contribution, contribution, out[k])
             else:
-                out[k] = np.minimum(1.0, out[k] + contribution)
+                total = out[k] + contribution
+                out[k] = np.where(total < 1.0, total, f32(1.0))
     m = dict(meta, dims=_dims(out), rgb=True,
              channels=[{"label": n, "wavelength_nm": 0.0, "color": col}
                        for n, col in (("R", "#ff0000"), ("G", "#00ff00"), ("B", "#0000ff"))],
@@ -1154,15 +1535,39 @@ def _distance_seeds(mask: np.ndarray, min_distance: float) -> Tuple[np.ndarray, 
 
 
 def _watershed(landscape: np.ndarray, mask: np.ndarray, seeds: np.ndarray) -> np.ndarray:
-    """Marker-based flooding of `landscape` (higher = ridge) from `seeds`
-    inside `mask`, 6-connected -- scikit-image's watershed, which is the same
-    priority flood as the application's."""
-    try:
-        from skimage.segmentation import watershed  # type: ignore
-    except ImportError as e:
-        raise NotAvailable("watershed post-processing needs 'scikit-image' (pip install scikit-image); "
-                           "choose post = Connected components to run without it") from e
-    return watershed(landscape, markers=seeds, mask=mask, connectivity=1).astype(np.uint32)
+    """``watershed`` (labels.cpp): Meyer's priority flood of `landscape`
+    (higher = ridge) from `seeds` inside `mask`, 6-connected, in the
+    application's order. The queue is keyed by (height, insertion sequence),
+    the seeds entering in raster order and a voxel's neighbours in the order
+    -z, +z, -y, +y, -x, +x, so a plateau is shared out exactly as the C++
+    shares it. scikit-image's flood is the same algorithm but breaks those
+    ties its own way, which moved boundaries between the two."""
+    import heapq
+    shape = np.shape(mask)
+    nz, ny, nx = (1,) * (3 - len(shape)) + tuple(shape)   # (z, y, x); a plane is one z
+    plane = ny * nx
+    flat_inside = np.asarray(mask, dtype=bool).reshape(-1)
+    start = np.where(flat_inside, np.asarray(seeds, dtype=np.uint32).reshape(-1), 0).astype(np.uint32)
+    # plain lists: indexing one is several times cheaper than indexing numpy
+    lab = start.tolist()
+    inside = flat_inside.tolist()
+    height = np.asarray(landscape, dtype=np.float32).reshape(-1).tolist()
+    queue = [(height[i], k, i) for k, i in enumerate(np.flatnonzero(start).tolist())]
+    heapq.heapify(queue)   # keys are unique, so the pop order is the sequential pushes'
+    seq = len(queue)
+    pop, push = heapq.heappop, heapq.heappush
+    while queue:
+        i = pop(queue)[2]
+        label = lab[i]
+        iz, rest = divmod(i, plane)
+        iy, ix = divmod(rest, nx)
+        for j, ok in ((i - plane, iz > 0), (i + plane, iz + 1 < nz), (i - nx, iy > 0),
+                      (i + nx, iy + 1 < ny), (i - 1, ix > 0), (i + 1, ix + 1 < nx)):
+            if ok and inside[j] and not lab[j]:
+                lab[j] = label
+                push(queue, (height[j], seq, j))
+                seq += 1
+    return np.array(lab, dtype=np.uint32).reshape(shape)
 
 
 def _compact_ids(labels: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
@@ -1219,6 +1624,12 @@ def _labels_from_probabilities(fg: np.ndarray, boundary: Optional[np.ndarray], t
         else:
             landscape = boundary if boundary is not None else -distance
             labels = _watershed(landscape, mask, marks)
+            # a component no seed landed in is still an object: numbered
+            # after the seeds, in raster order, as segment_common.cpp does
+            rest = mask & (labels == 0)
+            if rest.any():
+                extra = _label_components(rest)
+                labels = np.where(extra > 0, extra + np.uint32(n), labels).astype(np.uint32)
     else:
         labels = _label_components(mask)
     return _remove_small(labels, min_voxels)
@@ -1283,18 +1694,19 @@ _THRESHOLD = StepSpec(
 
 def _multi_otsu_upper(values: np.ndarray) -> float:
     """``multiOtsuThresholds`` (classic.cpp): the upper of two Otsu cuts over a
-    128-bin histogram, which keeps only the brightest of three classes."""
+    128-bin histogram, which keeps only the brightest of three classes. NaN
+    and +-inf are left out, as there."""
     v = np.asarray(values, dtype=np.float32).reshape(-1)
-    v = v[~np.isnan(v)]
+    v = v[np.isfinite(v)]
     if v.size == 0:
-        return 0.0
+        return float("inf")
     lo, hi = float(v.min()), float(v.max())
     if not hi > lo:
         return lo
     bins = 128
-    counts, _ = np.histogram(v, bins=bins, range=(lo, hi))
-    w = np.concatenate([[0.0], np.cumsum(counts.astype(np.float64))])
-    m = np.concatenate([[0.0], np.cumsum(np.arange(bins) * counts.astype(np.float64))])
+    counts = _histogram(v, bins, lo, hi)   # sirius::histogram's binning, not np.histogram's
+    w = np.concatenate([[0.0], np.cumsum(counts)])
+    m = np.concatenate([[0.0], np.cumsum(np.arange(bins) * counts)])
     total, mean = w[bins], m[bins]
     if not total > 0.0:
         return hi
@@ -1312,12 +1724,14 @@ def _multi_otsu_upper(values: np.ndarray) -> float:
             continue
         m1 = np.where(ok, (m[a_ + 1:bins] - m[a_]) / np.where(ok, w1, 1.0), 0.0)
         m2 = np.where(ok, (mean - m[a_ + 1:bins]) / np.where(ok, w2, 1.0), 0.0)
-        between = w0 * (m0 - grand) ** 2 + w1 * (m1 - grand) ** 2 + w2 * (m2 - grand) ** 2
+        # the C++ product order, (w d) d: w d**2 rounds exact ties differently
+        between = (w0 * (m0 - grand) * (m0 - grand) + w1 * (m1 - grand) * (m1 - grand)
+                   + w2 * (m2 - grand) * (m2 - grand))
         between = np.where(ok, between, -1.0)
         k = int(np.argmax(between))
         if between[k] > best:
             best, best_b = float(between[k]), a_ + 1 + k
-    return lo + (hi - lo) * (best_b + 1) / bins
+    return _bin_edge32(lo, hi, best_b + 1, bins)
 
 
 def _global_cut(v: np.ndarray, method: str, params: Dict[str, Any]) -> float:
@@ -1364,26 +1778,37 @@ def step_threshold(a: np.ndarray, params: Dict[str, Any], meta: Dict[str, Any]) 
                             "class_name": _str(params, "class_name", "object")})
 
 
-def _local_mean_plane(pl: np.ndarray, r: int) -> np.ndarray:
-    """Mean over a (2r+1)² window clamped to the plane (integral image)."""
-    y, x = pl.shape
+def _local_box_mean(v: np.ndarray, r: int) -> np.ndarray:
+    """Float64 mean over a (2r+1)² window clamped to the plane, from an
+    integral image summed as classic.cpp sums it (along each row, then down
+    the rows), so the two agree to the last bit."""
+    y, x = v.shape
     integral = np.zeros((y + 1, x + 1), dtype=np.float64)
-    integral[1:, 1:] = pl.astype(np.float64).cumsum(axis=0).cumsum(axis=1)
+    integral[1:, 1:] = np.asarray(v, dtype=np.float64).cumsum(axis=1).cumsum(axis=0)
     yy, xx = np.arange(y), np.arange(x)
     y0, y1 = np.maximum(yy - r, 0), np.minimum(yy + r + 1, y)
     x0, x1 = np.maximum(xx - r, 0), np.minimum(xx + r + 1, x)
     s = (integral[y1[:, None], x1[None, :]] - integral[y0[:, None], x1[None, :]]
          - integral[y1[:, None], x0[None, :]] + integral[y0[:, None], x0[None, :]])
     count = (y1 - y0)[:, None] * (x1 - x0)[None, :]
-    return (s / count).astype(np.float32)
+    return s / count
+
+
+def _local_mean_plane(pl: np.ndarray, r: int) -> np.ndarray:
+    """Mean over a (2r+1)² window clamped to the plane -- ``localMeanPlane``
+    (float32, as the application stores it)."""
+    return _local_box_mean(pl, r).astype(np.float32)
 
 
 def _local_stats_plane(pl: np.ndarray, r: int) -> Tuple[np.ndarray, np.ndarray]:
     """Local mean and standard deviation over a (2r+1)² window clamped to the
-    plane -- ``localStatsPlane`` in classic.cpp."""
-    mean = _local_mean_plane(pl, r)
-    mean_sq = _local_mean_plane(np.asarray(pl, dtype=np.float64) ** 2, r)
-    return mean, np.sqrt(np.maximum(0.0, mean_sq - mean ** 2))
+    plane -- ``localStatsPlane`` in classic.cpp. The variance is a small
+    difference of two large numbers (camera data sits on an offset of
+    thousands), so it is taken in float64 and only the results are float32."""
+    v = np.asarray(pl, dtype=np.float64)
+    mean = _local_box_mean(v, r)
+    var = np.maximum(0.0, _local_box_mean(v * v, r) - mean * mean)
+    return mean.astype(np.float32), np.sqrt(var).astype(np.float32)
 
 
 def _dog_plane(pl: np.ndarray, sigma: float, ratio: float = 1.6) -> np.ndarray:
@@ -2010,7 +2435,10 @@ def _expand_labels(labels: np.ndarray, distance: float, z_aspect: float) -> np.n
     """``expandLabels``: a Dijkstra from every labelled voxel at once over the
     6-neighbourhood (a z step costs z_aspect, the planes being that much
     further apart than the pixels). A voxel the same distance
-    from two labels stays background so the two cannot fuse."""
+    from two labels stays background so the two cannot fuse. Equal distances
+    leave the queue in the order they entered it, labelled voxels first in
+    raster order, exactly as the C++ heap is keyed: a tied voxel passes on
+    the label that reached it first, and the two sides must agree on which."""
     import heapq
     if distance <= 0.0 or labels.size == 0:
         return labels
@@ -2021,14 +2449,16 @@ def _expand_labels(labels: np.ndarray, distance: float, z_aspect: float) -> np.n
     came_from = np.zeros(shape, dtype=np.uint32)
     tied = np.zeros(shape, dtype=bool)
     queue = []
+    seq = 0
     for idx in zip(*np.nonzero(labels)):
         best[idx] = 0.0
         came_from[idx] = labels[idx]
-        heapq.heappush(queue, (0.0, idx))
+        heapq.heappush(queue, (0.0, seq, idx))
+        seq += 1
     offsets = (((-1, 0, 0), step_z), ((1, 0, 0), step_z), ((0, -1, 0), 1.0),
                ((0, 1, 0), 1.0), ((0, 0, -1), 1.0), ((0, 0, 1), 1.0))
     while queue:
-        d, idx = heapq.heappop(queue)
+        d, _, idx = heapq.heappop(queue)
         if d > best[idx] or d >= distance:
             continue
         for (dz, dy, dx), step in offsets:
@@ -2044,7 +2474,8 @@ def _expand_labels(labels: np.ndarray, distance: float, z_aspect: float) -> np.n
                 best[j] = nd
                 came_from[j] = came_from[idx]
                 tied[j] = False
-                heapq.heappush(queue, (nd, j))
+                heapq.heappush(queue, (nd, seq, j))
+                seq += 1
             elif abs(nd - best[j]) <= 1e-9 and came_from[idx] != came_from[j]:
                 tied[j] = True
     grown = labels.copy()
@@ -2296,12 +2727,16 @@ def step_classic(a: np.ndarray, params: Dict[str, Any], meta: Dict[str, Any]) ->
             by_contrast = method == "Local contrast"
             rows, low_rows = [], []
             for pl in work:
+                # the cut in float64, as classic.cpp takes it: in float32 it
+                # rounds by whole counts on 16-bit data
                 if by_contrast:
                     mean, sd = _local_stats_plane(pl, window)
-                    cut_plane = mean + contrast_k * sd + offset
+                    mean = mean.astype(np.float64)
+                    cut_plane = mean + contrast_k * sd.astype(np.float64) + offset
                 else:
-                    mean = _local_mean_plane(pl, window)
+                    mean = _local_mean_plane(pl, window).astype(np.float64)
                     cut_plane = ratio * mean + offset
+                pl = pl.astype(np.float64)
                 rows.append(pl > cut_plane)
                 if hysteresis:
                     low_rows.append(pl > mean + hysteresis_ratio * (cut_plane - mean))
@@ -2546,9 +2981,9 @@ _CLEANUP = StepSpec(
 def step_cleanup(a: np.ndarray, params: Dict[str, Any], meta: Dict[str, Any],
                  labels: Optional[np.ndarray] = None) -> StepResult:
     """Label cleanup (cleanup.cpp) on the labels of the segmentation step
-    upstream: remove_border, min_voxels, relabel (densely); low_conf and
-    size_outlier_factor only set review flags (reported in info["flags"]).
-    The intensities pass through."""
+    upstream: remove_border, min_voxels, relabel (densely, one numbering for
+    every frame); low_conf and size_outlier_factor only set review flags
+    (reported in info["flags"]). The intensities pass through."""
     if labels is None or not labels.size:
         raise ValueError("Label cleanup needs labels: add a segmentation step before it")
     min_voxels = _int(params, "min_voxels", 50)
@@ -2567,10 +3002,16 @@ def step_cleanup(a: np.ndarray, params: Dict[str, Any], meta: Dict[str, Any],
             drop = _border_labels(vol)
             if drop.size:
                 vol[np.isin(vol, drop)] = 0
-        if min_voxels > 0 or relabel:
-            vol = _remove_small(vol, min_voxels, relabel)
+        # small objects are judged frame by frame, but the ids stay
+        if min_voxels > 0:
+            vol = _remove_small(vol, min_voxels, False)
         out[t] = vol
-        for key, ids in _label_flags(vol, low_conf, outlier).items():
+    if relabel:
+        # one numbering for every frame, as LabelVolume::relabelDensely: a
+        # track keeps one id, and a late object never takes an earlier one's
+        out = _remove_small(out, 0, True)
+    for t in range(out.shape[0]):
+        for key, ids in _label_flags(out[t], low_conf, outlier).items():
             have = flags.setdefault(key, [])
             have.extend(i for i in ids if i not in have)
     kept = int(np.count_nonzero(np.unique(out)))
@@ -2620,6 +3061,21 @@ def _sirius_ext():
     return sirius
 
 
+def _sim_parameter_format(path: str) -> str:
+    """"toml" or "legacy", decided as session.cpp's detectParameterFormat does:
+    a .toml extension, else the first line that is neither blank nor a comment
+    opening a [table]."""
+    if path.lower().endswith(".toml"):
+        return "toml"
+    with open(path, encoding="utf-8", errors="replace") as f:
+        for line in f:
+            s = line.lstrip(" \t\r\n")
+            if not s or s[0] in "#;":
+                continue
+            return "toml" if s[0] == "[" else "legacy"
+    return "legacy"   # an empty file: the legacy loader yields defaults
+
+
 def _sim_parameters(params: Dict[str, Any], meta: Dict[str, Any]):
     """SIMParameters as sim.cpp's buildParameters assembles them."""
     sirius = _sirius_ext()
@@ -2630,9 +3086,12 @@ def _sim_parameters(params: Dict[str, Any], meta: Dict[str, Any]):
         cfg = _str(params, "params_file")
         if not cfg:
             raise ValueError("SIM: From file mode needs a parameter file ('params_file')")
-        try:
-            p = sirius.load_parameters(cfg) if cfg.lower().endswith(".toml") else sirius.load_legacy_parameters(cfg)
-        except Exception:  # noqa: BLE001 - try the other format
+        # one format, chosen as the application chooses it: retrying a TOML
+        # file that failed (a parse or validation error) as a legacy config
+        # reported "Unknown legacy config key" instead of what was wrong
+        if _sim_parameter_format(cfg) == "toml":
+            p = sirius.load_parameters(cfg)
+        else:
             p = sirius.load_legacy_parameters(cfg)
     else:
         p = sirius.SIMParameters()
@@ -2786,7 +3245,15 @@ def resolve_device(device: str = "auto") -> str:
     return device
 
 
-_model_cache: Dict[Tuple[str, str], Any] = {}
+# Loaded models by (file, device), each with the file's (mtime, size) when it
+# was read: a model re-exported under the same name is another model. The
+# application re-runs the step because the file changed, and a long-lived
+# worker must not answer with the old weights. Least recently used models go
+# first once there are more than _MODEL_CACHE_SIZE (GPU memory is not free).
+_MODEL_CACHE_SIZE = 4
+_model_cache: OrderedDict[Tuple[str, str], Tuple[Optional[Tuple[int, int]], Any]] = OrderedDict()
+_model_lock = threading.Lock()
+_hf_spec_files: Dict[str, str] = {}   # hf: spec -> the cached file it resolved to (no network to find it again)
 
 # Model specs beyond a file path (the worker's ``sirius_worker.models`` has
 # the full hub / family machinery; the layout of the download cache is shared):
@@ -2890,17 +3357,21 @@ def load_model(path: str, device: str = "auto", progress: ProgressFn = None):
         raise NotAvailable(f"'{path}' is a {family} model family spec: it returns labels through the worker "
                            "(sirius_worker.models.run_family), not a loadable tensor model")
     device = resolve_device(device)
-    key = (path.strip(), device)
-    m = _model_cache.get(key)
-    if m is not None:
-        return m
-    path = resolve_model_spec(path, progress)
-    key = (os.path.abspath(path), device)
-    m = _model_cache.get(key)
+    spec = path.strip()
+    known = _hf_spec_files.get(spec)
+    if known is not None:
+        m = _cached_model(known, device)
+        if m is not None:
+            return m
+    path = os.path.abspath(resolve_model_spec(spec, progress))
+    if _is_hf_spec(spec):
+        _hf_spec_files[spec] = path
+    m = _cached_model(path, device)
     if m is not None:
         return m
     if not os.path.exists(path):
         raise FileNotFoundError(path)
+    stamp = _file_stamp(path)   # taken before reading: a rewrite during the load shows next time
     if path.lower().endswith(".onnx"):
         try:
             import onnxruntime as ort  # type: ignore
@@ -2916,8 +3387,38 @@ def load_model(path: str, device: str = "auto", progress: ProgressFn = None):
         except Exception as e:  # noqa: BLE001 - say what the file is instead of PytorchStreamReader details
             raise ValueError(_not_torchscript_message(path, e)) from e
         m.eval()
-    _model_cache[key] = m
+    with _model_lock:
+        for other in [k for k, (st, _) in _model_cache.items() if k[0] == path and st != stamp]:
+            del _model_cache[other]   # the same file on another device, read before it changed
+        _model_cache[(path, device)] = (stamp, m)
+        _model_cache.move_to_end((path, device))
+        while len(_model_cache) > _MODEL_CACHE_SIZE:
+            _model_cache.popitem(last=False)
     return m
+
+
+def _file_stamp(path: str) -> Optional[Tuple[int, int]]:
+    """(modification time in ns, size) of a model file; None when it is gone."""
+    try:
+        st = os.stat(path)
+    except OSError:
+        return None
+    return int(st.st_mtime_ns), int(st.st_size)
+
+
+def _cached_model(path: str, device: str):
+    """The cached model of `path` on `device` while the file is unchanged since
+    it was read; a stale entry is dropped."""
+    stamp = _file_stamp(path)
+    with _model_lock:
+        entry = _model_cache.get((path, device))
+        if entry is None:
+            return None
+        if stamp is None or entry[0] != stamp:
+            del _model_cache[(path, device)]
+            return None
+        _model_cache.move_to_end((path, device))
+        return entry[1]
 
 
 def _not_torchscript_message(path: str, error: BaseException) -> str:
@@ -2974,17 +3475,22 @@ def model_info(path: str, device: str = "cpu") -> Dict[str, Any]:
     return info
 
 
-def _blend_window(shape: Sequence[int], overlap: Sequence[int]) -> np.ndarray:
+def _blend_window(shape: Sequence[int], overlap: Sequence[int], taper_low: Sequence[bool] = (True, True, True),
+                  taper_high: Sequence[bool] = (True, True, True)) -> np.ndarray:
     """Separable raised-cosine window: 1 in the tile core, tapering over each
-    overlap band, so overlapping predictions cross-fade without seams."""
+    overlap band, so overlapping predictions cross-fade without seams. A face
+    with no neighbouring tile (taper_low / taper_high false: it lies on the
+    volume's border) is not tapered -- nothing else covers those voxels."""
     w = np.ones(tuple(shape), dtype=np.float32)
     for ax, (n, o) in enumerate(zip(shape, overlap)):
         o = int(min(max(o, 0), n // 2))
         prof = np.ones(n, dtype=np.float32)
         if o > 0:
             ramp = (0.5 - 0.5 * np.cos(np.pi * (np.arange(o) + 0.5) / o)).astype(np.float32)
-            prof[:o] = ramp
-            prof[n - o:] = ramp[::-1]
+            if taper_low[ax]:
+                prof[:o] = ramp
+            if taper_high[ax]:
+                prof[n - o:] = ramp[::-1]
         prof = np.maximum(prof, 1e-3)
         view = [1] * len(shape)
         view[ax] = n
@@ -3032,7 +3538,7 @@ def tiled_inference(volume: np.ndarray, model, tile: Sequence[int] = (32, 256, 2
         pos = list(range(0, n - t, step)) + [n - t]
         starts.append(sorted(set(pos)))
     tiles = [(z0, y0, x0) for z0 in starts[0] for y0 in starts[1] for x0 in starts[2]]
-    window = _blend_window(tile, overlap)
+    windows: Dict[Tuple[Tuple[bool, ...], Tuple[bool, ...]], np.ndarray] = {}
     is_onnx = isinstance(model, _OnnxModel)
     torch = None if is_onnx else _torch()
     dev = resolve_device(device)
@@ -3063,12 +3569,21 @@ def tiled_inference(volume: np.ndarray, model, tile: Sequence[int] = (32, 256, 2
         y = y[0][:, : patch.shape[0], : patch.shape[1], : patch.shape[2]]
         if acc is None:
             acc = np.zeros((y.shape[0],) + shape, dtype=np.float32)
+        # Taper only the faces another tile overlaps. A face on the volume's
+        # border used to taper too, and at a 3-D corner the weight fell to
+        # ~(1e-3)^3, below the old division floor: a constant 0.9 model came
+        # out as 0.03 in the corner voxels.
+        low = tuple(o > 0 for o in (z0, y0, x0))
+        high = tuple(o + t < n for o, t, n in zip((z0, y0, x0), tile, shape))
+        window = windows.get((low, high))
+        if window is None:
+            window = windows[(low, high)] = _blend_window(tile, overlap, low, high)
         w = window[: patch.shape[0], : patch.shape[1], : patch.shape[2]]
         sl = (slice(z0, z0 + patch.shape[0]), slice(y0, y0 + patch.shape[1]), slice(x0, x0 + patch.shape[2]))
         acc[(slice(None),) + sl] += y * w
         weight[sl] += w
     assert acc is not None
-    acc /= np.maximum(weight, 1e-6)
+    np.divide(acc, weight, out=acc, where=weight > 0)   # every voxel lies in some tile: weight > 0
     _progress(progress, 1.0, "tiles done")
     return _activation(acc, activation).astype(np.float32, copy=False)
 
@@ -3154,8 +3669,8 @@ _FOUNDATION = StepSpec(
              "channels": ("Selected channel", "All channels")},
     aliases={"bundle": "model", "model_path": "model", "channel": "input_channel",
              "min_sep": "min_separation", "minVoxels": "min_voxels", "tile_size": "tile"},
-    # Python-only: the voxel size to calibrate distances with, when the caller
-    # knows better than the dataset metadata does
+    # Python-only: the voxel size to calibrate distances with, [x, y, z] like the
+    # metadata's, when the caller knows better than the dataset metadata does
     extra=("voxel_um", "device"))
 
 
@@ -3164,8 +3679,9 @@ def step_foundation(a: np.ndarray, params: Dict[str, Any], meta: Dict[str, Any],
                     cancelled: CancelFn = None, device: str = "auto") -> StepResult:
     """The latents foundation model: model (a .ltb bundle), task (Segment
     objects | Detect centroids | Track over time), channels, input_channel,
-    threshold, min_separation (um), min_voxels, tile [z, y, x], class_name;
-    label_opacity is display-only.
+    threshold, min_separation (um), min_voxels (Segment only), tile [z, y, x]
+    (a zero extent uses the bundle's), class_name; label_opacity is
+    display-only.
 
     Unlike step_seg this passes the whole (c, t, z, y, x) array to the model in
     one call: the time and channel axes are inputs the model reasons over, not
@@ -3176,7 +3692,7 @@ def step_foundation(a: np.ndarray, params: Dict[str, Any], meta: Dict[str, Any],
         from sirius_worker import foundation as fm  # type: ignore
     except ImportError as e:
         raise NotAvailable(
-            f"the foundation model needs the sirius_worker package (app/python) on the Python path") from e
+            "the foundation model needs the sirius_worker package (app/python) on the Python path") from e
     path = _str(params, "model")
     if not path:
         raise ValueError("foundation: no model bundle given")
@@ -3190,9 +3706,12 @@ def step_foundation(a: np.ndarray, params: Dict[str, Any], meta: Dict[str, Any],
             "min_separation": _float(params, "min_separation", 0.0),
             "min_voxels": _int(params, "min_voxels", 0),
             "voxel_um": params.get("voxel_um") or (meta or {}).get("voxel_um")}
-    if all(v > 0 for v in tile):
+    if any(v > 0 for v in tile):
         call["tile"] = tile
-    labels, info, extras = fm.run(sub, call, device, progress=progress, cancelled=cancelled)
+    try:
+        labels, info, extras = fm.run(sub, call, device, progress=progress, cancelled=cancelled)
+    except fm.Cancelled as e:
+        raise Cancelled("cancelled") from e
     return StepResult(a, dict(meta), labels=np.asarray(labels, dtype=np.uint32),
                       prob=extras.get("confidence"), info=info)
 
@@ -3262,12 +3781,15 @@ def run_step(kind: str, params: Dict[str, Any], array: np.ndarray, meta: Optiona
     spec = _SPECS[k]
     p = _prepare_params(spec, params, meta)
     kwargs: Dict[str, Any] = {}
-    if k in ("sim", "seg"):
+    if k in ("sim", "seg", "foundation"):
         kwargs.update(progress=progress, cancelled=cancelled, device=device)
     if spec.needs_labels:
         kwargs["labels"] = labels
     res = fn(a, p, meta, **kwargs)
-    if res.labels is None and labels is not None and res.array.shape[1:] == a.shape[1:]:
+    # Labels a step does not make or move are carried through only while they
+    # still cover its output voxel for voxel (labelsFit in executor.cpp): a
+    # step that changes the grid (resample, projection) drops them.
+    if res.labels is None and labels is not None and tuple(labels.shape) == tuple(res.array.shape[1:]):
         res.labels = labels
     res.meta["dims"] = _dims(res.array)
     return res
@@ -3291,7 +3813,7 @@ def run_pipeline(dataset_path: str, pipeline: Any, progress: ProgressFn = None, 
             load_params = s.get("params", {}) or {}
             break
     lp = _prepare_params(_LOAD, load_params, None)
-    order = _str(lp, "page_order", "czt") or "czt"
+    order = _str(lp, "page_order", "czt")   # "" is not "czt" to load.cpp either: it still passes a page order
     counts = [_int(lp, k, 0) or None for k in ("c", "t", "z")]
     array, meta = load_dataset(dataset_path, order, counts[0], counts[1], counts[2],
                                progress=lambda f, m: _progress(progress, 0.0, m))
@@ -3319,8 +3841,7 @@ def run_pipeline(dataset_path: str, pipeline: Any, progress: ProgressFn = None, 
             skipped.append(kind)
             continue
         array, meta = res.array, res.meta
-        if res.labels is not None:
-            labels = res.labels
+        labels = res.labels   # None when the step moved the grid under them
     if labels is not None:
         meta["labels"] = labels
     if skipped:

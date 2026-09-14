@@ -20,6 +20,7 @@
 #include <QLineEdit>
 #include <QMouseEvent>
 #include <QPainter>
+#include <QPointer>
 #include <QPushButton>
 #include <QSlider>
 
@@ -182,6 +183,17 @@ namespace sirius::app {
             bridge.wb().setStepParam(index(), key, std::move(v), merge ? key : std::string());
         }
 
+        // A file, colour or model dialog runs an event loop of its own, in
+        // which a run finishing or another selection rebuilds this form --
+        // deleting the editor that opened the dialog -- or points it at
+        // another step. What the dialog returns applies only while the step
+        // it was opened for is still the selected one, and reaches the
+        // editor only if the editor is still there.
+        StepId selectedId() const {
+            const Step* st = step();
+            return st ? st->id : 0;
+        }
+
         // --- generic editors -----------------------------------------------------
         QWidget* editor(const ParamSpec& s, const ParamSet& params, const DatasetMeta& input, QWidget* parent) {
             const std::string key = s.key;
@@ -297,11 +309,13 @@ namespace sirius::app {
                                      [this, key, edit] { setParam(key, toStd(edit->text()), false); });
                     QObject::connect(browse, &QPushButton::clicked, panel, [this, key, edit, dir, filter] {
                         const QString start = edit->text().isEmpty() ? QString() : QFileInfo(edit->text()).absolutePath();
+                        const QPointer<QLineEdit> editor(edit);
+                        const StepId forStep = selectedId();
                         const QString path = dir ? QFileDialog::getExistingDirectory(panel, QStringLiteral("Choose directory"), start)
                                                  : QFileDialog::getOpenFileName(panel, QStringLiteral("Choose file"), start,
                                                                                 filter.isEmpty() ? QStringLiteral("All files (*)") : filter);
-                        if (path.isEmpty()) return;
-                        edit->setText(path);
+                        if (path.isEmpty() || selectedId() != forStep) return;
+                        if (editor) editor->setText(path);
                         setParam(key, toStd(path), false);
                     });
                     updaters[key] = [edit, key](const ParamSet& p) {
@@ -659,10 +673,12 @@ namespace sirius::app {
                     rl->addWidget(hub);
                     const std::string key = s.key;
                     QObject::connect(hub, &QPushButton::clicked, panel, [this, key, pathEditor] {
+                        const QPointer<QWidget> editor(pathEditor);
+                        const StepId forStep = selectedId();
                         ModelHubDialog dialog(bridge, panel);
-                        if (dialog.exec() != QDialog::Accepted || dialog.chosenModel().isEmpty()) return;
+                        if (dialog.exec() != QDialog::Accepted || dialog.chosenModel().isEmpty() || selectedId() != forStep) return;
                         const QString chosen = dialog.chosenModel();
-                        if (auto* edit = pathEditor->findChild<QLineEdit*>()) edit->setText(chosen);
+                        if (auto* edit = editor ? editor->findChild<QLineEdit*>() : nullptr) edit->setText(chosen);
                         setParam(key, toStd(chosen), false);
                     });
                     into->addWidget(field(fromStd(s.label), row, body));
@@ -736,9 +752,11 @@ namespace sirius::app {
                 std::vector<std::string> defaults;
                 for (const ChannelInfo& other : input.channels) defaults.push_back(other.hexColor());
                 QObject::connect(pick, &QAbstractButton::clicked, panel, [this, chip, ci, colorKey, hex, defaults] {
+                    const QPointer<QWidget> swatch(chip);
+                    const StepId forStep = selectedId();
                     const QColor chosen = QColorDialog::getColor(QColor(hex), panel, QStringLiteral("Channel colour"));
-                    if (!chosen.isValid()) return;
-                    widgets::setChipColor(chip, chosen);
+                    if (!chosen.isValid() || selectedId() != forStep) return;
+                    if (swatch) widgets::setChipColor(swatch, chosen);
                     if (colorKey.empty()) return;
                     const Step* st = this->step();
                     if (!st) return;

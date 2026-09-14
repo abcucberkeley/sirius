@@ -73,13 +73,13 @@ void bind_sim(nb::module_& m) {
         .value("Triangle", ApodizationType::Triangle);
 
     nb::class_<SIMParameters>(m, "SIMParameters",
-            "Parameters for 3-beam structured-illumination reconstruction.")
+                              "Parameters for 3-beam structured-illumination reconstruction.")
         .def(nb::init<>())
         .def_rw("k0_start_angle", &SIMParameters::k0_start_angle)
         .def_rw("linespacing_um", &SIMParameters::linespacing_um)
         .def_rw("ndirs", &SIMParameters::ndirs)
         .def_rw("nphases", &SIMParameters::nphases)
-        .def_rw("norders", &SIMParameters::norders)
+        .def_rw("norders", &SIMParameters::norders, "Orders to separate; 0 (the default) derives nphases // 2 + 1.")
         .def_rw("na", &SIMParameters::na)
         .def_rw("nimm", &SIMParameters::nimm)
         .def_rw("wavelength_nm", &SIMParameters::wavelength_nm)
@@ -113,13 +113,11 @@ void bind_sim(nb::module_& m) {
 
     m.def("load_parameters", &loadParameters, nb::arg("path"));
     m.def("save_parameters", &saveParameters, nb::arg("path"), nb::arg("parameters"));
-    m.def("load_legacy_parameters", [](const std::string& path) {
-        return fromLegacy(loadLegacyConfig(path));
-    }, nb::arg("path"));
+    m.def("load_legacy_parameters", [](const std::string& path) { return fromLegacy(loadLegacyConfig(path)); }, nb::arg("path"));
 
     nb::class_<PySimReconstructor>(m, "SimReconstructor",
-            "Reusable CPU/GPU SIM reconstructor. FFT plans and work buffers are retained "
-            "between calls; construct once for a time series.")
+                                   "Reusable CPU/GPU SIM reconstructor. FFT plans and work buffers are retained "
+                                   "between calls; construct once for a time series.")
         .def(nb::init<SIMParameters, const std::string&, Device, PlanRigor>(),
              nb::arg("parameters"), nb::arg("otf_path"),
              nb::arg("device") = Device::cpu(),

@@ -9,6 +9,7 @@
 #include <string>
 #include <vector>
 
+#include "core/app_paths.hpp"
 #include "core/help_pages.hpp"
 
 using namespace sirius::app;
@@ -267,6 +268,46 @@ TEST_CASE("helpDirectory honours SIRIUS_HELP_DIR and the hint", "[app][help]") {
     // a missing hint falls back to the shipped pages
     CHECK(fs::is_directory(helpDirectory("/definitely/not/a/dir")));
     fs::remove_all(tmp);
+}
+
+TEST_CASE("an installed tree's help pages come before the checkout's, the build tree's copy after", "[app][help]") {
+    // The layout cmake --install produces: <prefix>/bin/sirius-app and
+    // <prefix>/<datadir>/help. The checkout (SIRIUS_APP_SOURCE_DIR) exists
+    // wherever this test runs, which is exactly the case to get right: an
+    // install on the machine it was built on must read its own pages.
+    const std::string relative = installedDataDirectoryFromBindir();
+    REQUIRE(!relative.empty());
+    const fs::path prefix = fs::temp_directory_path() / "sirius-installed-help-test";
+    fs::remove_all(prefix);
+    const fs::path bin = prefix / "bin";
+    const fs::path installed = (bin / relative / "help").lexically_normal();
+    fs::create_directories(bin);
+    fs::create_directories(installed);
+    struct Restore {
+        ~Restore() { setApplicationDirectory({}); }
+    } restore;
+    setApplicationDirectory(bin.string());
+    CHECK(installedDataDirectory("help") == installed.string());
+    CHECK(fs::path(helpDirectory()) == installed);
+    // an explicit hint and $SIRIUS_HELP_DIR still come first
+    const fs::path hint = prefix / "hint";
+    fs::create_directories(hint);
+    CHECK(fs::path(helpDirectory(hint.string())) == hint);
+
+    // not installed: the checkout, never the copy beside the executable, so
+    // "Edit page" in a development build edits the file under version control
+    fs::remove_all(prefix / "share");
+    fs::create_directories(bin / "help");
+    CHECK(installedDataDirectory("help").empty());
+    CHECK(fs::path(besideApplication("help")) == (bin / "help").lexically_normal());
+    CHECK(fs::path(helpDirectory()) != (bin / "help").lexically_normal());
+    CHECK(fs::exists(fs::path(helpDirectory()) / "load.md"));
+
+    // with no executable directory set (a test, a library user) nothing is found
+    setApplicationDirectory({});
+    CHECK(installedDataDirectory("help").empty());
+    CHECK(besideApplication("help").empty());
+    fs::remove_all(prefix);
 }
 
 TEST_CASE("Markdown math accepts the \\( \\) and \\[ \\] delimiters", "[app][help][math]") {

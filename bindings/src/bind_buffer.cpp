@@ -14,12 +14,12 @@ namespace sirius_py {
         if (dtype.is_none()) return std::nullopt;
         nb::object np = nb::module_::import_("numpy");
         const std::string name = nb::cast<std::string>(np.attr("dtype")(dtype).attr("name"));
-        if (name == "uint8")   return PixelType::UInt8;
-        if (name == "int8")    return PixelType::Int8;
-        if (name == "uint16")  return PixelType::UInt16;
-        if (name == "int16")   return PixelType::Int16;
-        if (name == "uint32")  return PixelType::UInt32;
-        if (name == "int32")   return PixelType::Int32;
+        if (name == "uint8") return PixelType::UInt8;
+        if (name == "int8") return PixelType::Int8;
+        if (name == "uint16") return PixelType::UInt16;
+        if (name == "int16") return PixelType::Int16;
+        if (name == "uint32") return PixelType::UInt32;
+        if (name == "int32") return PixelType::Int32;
         if (name == "float32") return PixelType::Float32;
         if (name == "float64") return PixelType::Float64;
         throw std::invalid_argument("unsupported dtype '" + name +
@@ -56,18 +56,29 @@ namespace sirius_py {
                           buffer_);
     }
     nb::object PyBuffer::dtype() const { return dtypeObject(dtypeName()); }
-    Shape PyBuffer::shape() const { return std::visit([](const auto& b) { return b.shape(); }, buffer_); }
-    Device PyBuffer::device() const { return std::visit([](const auto& b) { return b.device(); }, buffer_); }
-    std::size_t PyBuffer::nbytes() const { return std::visit([](const auto& b) { return b.bytes(); }, buffer_); }
-    std::size_t PyBuffer::size() const { return std::visit([](const auto& b) { return static_cast<std::size_t>(b.size()); }, buffer_); }
-    bool PyBuffer::pinned() const { return std::visit([](const auto& b) { return b.pinned(); }, buffer_); }
+    Shape PyBuffer::shape() const {
+        return std::visit([](const auto& b) { return b.shape(); }, buffer_);
+    }
+    Device PyBuffer::device() const {
+        return std::visit([](const auto& b) { return b.device(); }, buffer_);
+    }
+    std::size_t PyBuffer::nbytes() const {
+        return std::visit([](const auto& b) { return b.bytes(); }, buffer_);
+    }
+    std::size_t PyBuffer::size() const {
+        return std::visit([](const auto& b) { return static_cast<std::size_t>(b.size()); }, buffer_);
+    }
+    bool PyBuffer::pinned() const {
+        return std::visit([](const auto& b) { return b.pinned(); }, buffer_);
+    }
 
     PyBuffer PyBuffer::to(Device device) const {
         return PyBuffer(std::visit([&](const auto& b) -> AnyPyBuffer {
             auto out = b.to(device);
             Stream::null().synchronize();
             return out;
-        }, buffer_));
+        },
+                                   buffer_));
     }
 
     nb::object PyBuffer::numpy() const {
@@ -75,7 +86,8 @@ namespace sirius_py {
             auto host = b.to(Device::cpu());
             Stream::null().synchronize();
             return hostBufferToNumpy(std::move(host));
-        }, buffer_);
+        },
+                          buffer_);
     }
 
     nb::object PyBuffer::ndarray(nb::handle self) const {
@@ -85,7 +97,8 @@ namespace sirius_py {
             const int32_t devType = b.device().isCuda() ? nb::device::cuda::value : nb::device::cpu::value;
             return nb::cast(nb::ndarray<>(const_cast<T*>(b.data()), shape.size(), shape.data(), self, nullptr,
                                           nb::dtype<T>(), devType, b.device().index));
-        }, buffer_);
+        },
+                          buffer_);
     }
 
     nb::object toPython(AnyPyBuffer&& buffer) {
@@ -102,10 +115,10 @@ using sirius_py::PyBuffer;
 
 void bind_buffer(nb::module_& m) {
     nb::class_<PyBuffer>(m, "Buffer",
-            "Owning, contiguous, row-major array on a device. Host results are returned as "
-            "numpy arrays; this type wraps device memory. It implements the DLPack protocol, so "
-            "`torch.from_dlpack(buf)` / `cupy.from_dlpack(buf)` adopt the GPU memory without a copy. "
-            "Element types: u/int 8/16/32, float32, float64, complex64, complex128.")
+                         "Owning, contiguous, row-major array on a device. Host results are returned as "
+                         "numpy arrays; this type wraps device memory. It implements the DLPack protocol, so "
+                         "`torch.from_dlpack(buf)` / `cupy.from_dlpack(buf)` adopt the GPU memory without a copy. "
+                         "Element types: u/int 8/16/32, float32, float64, complex64, complex128.")
         .def_prop_ro("shape", [](const PyBuffer& b) {
             const Shape s = b.shape();
             nb::list out;
@@ -143,9 +156,14 @@ void bind_buffer(nb::module_& m) {
             return os.str();
         });
 
-    m.def("to_device",
-          [](nb::ndarray<nb::c_contig, nb::device::cpu> array, Device device) {
+    // nb::ro: only read, so a read-only array (a memory map, a broadcast) is as good as any.
+    m.def("to_device", [](nb::ndarray<nb::ro, nb::c_contig, nb::device::cpu> array, Device device) {
               // Host array -> owning buffer on `device` (a copy). Supports every element type.
+              // A Shape of rank 0 is the empty shape (numel() == 0), not a scalar: a 0-d
+              // array would come back as a 0-d array over no memory at all.
+              if (array.ndim() == 0)
+                  throw std::invalid_argument("to_device: a 0-d array has no shape a Buffer can hold; "
+                                              "reshape it to (1,) first");
               std::vector<Index> shape(array.ndim());
               for (std::size_t i = 0; i < array.ndim(); ++i) shape[i] = static_cast<Index>(array.shape(i));
               const Shape s(shape.begin(), shape.end());
@@ -174,8 +192,5 @@ void bind_buffer(nb::module_& m) {
                   if (dt.bits == 128) return sirius_py::toPython(upload(std::complex<double>{}));
               }
               throw std::invalid_argument("to_device: unsupported dtype (supported: u/int 8/16/32, float32, "
-                                          "float64, complex64, complex128)");
-          },
-          nb::arg("array"), nb::arg("device"),
-          "Copy a C-contiguous host array to `device`. Returns a numpy array for 'cpu' and a Buffer for CUDA.");
+                                          "float64, complex64, complex128)"); }, nb::arg("array"), nb::arg("device"), "Copy a C-contiguous host array to `device`. Returns a numpy array for 'cpu' and a Buffer for CUDA.");
 }

@@ -14,12 +14,18 @@
 #include <catch2/matchers/catch_matchers_string.hpp>
 
 #include <atomic>
+#include <filesystem>
+#include <fstream>
 #include <limits>
+#include <mutex>
 #include <thread>
 
+#include "core/app_paths.hpp"
 #include "core/cancel.hpp"
 #include "core/errors.hpp"
+#include "core/ops/builtin.hpp"
 #include "core/rpc.hpp"
+#include "temp_path.hpp"
 
 using namespace sirius;
 using namespace sirius::app;
@@ -38,6 +44,8 @@ namespace {
         // field at all, as a worker predating the handshake does.
         int protocolVersion = rpc::kProtocolVersion;
         std::atomic<int> sawClientVersion{-1};   // the version the client sent in its hello
+        std::mutex sentMutex;
+        json foundationParams;   // what the last "foundation" run was sent
 
         explicit ScriptedWorker(std::unique_ptr<rpc::Transport> transport, std::string token = {}, bool slowRun = false,
                                 int version = rpc::kProtocolVersion)
@@ -69,7 +77,7 @@ namespace {
                             send({{"id", id}, {"type", "error"}, {"message", "bad token"}});
                             continue;
                         }
-                        json caps = {{"version", "test"}, {"methods", {"run:torch_segment", "model_info"}}, {"cuda", false}, {"device", "cpu"}, {"hostname", "loop"}};
+                        json caps = {{"version", "test"}, {"methods", {"run:torch_segment", "run:foundation", "model_info"}}, {"cuda", false}, {"device", "cpu"}, {"hostname", "loop"}};
                         if (protocolVersion >= 0) caps["protocol_version"] = protocolVersion;
                         send({{"id", id}, {"type", "result"}, {"result", caps}});
                     } else if (method == "cancel") {
@@ -92,6 +100,32 @@ namespace {
                                 auto c = rpc::decodeFrame(buf);
                                 if (!c) t->receive(buf, std::chrono::milliseconds(25));
                             }
+                            continue;
+                        }
+                        if (kind == "foundation") {
+                            // the foundation model's reply: (t, z, y, x) uint32
+                            // labels holding two one-voxel objects per frame,
+                            // which is what a Detect run returns, a confidence
+                            // map, and the facts the step reports
+                            {
+                                std::lock_guard<std::mutex> lock(sentMutex);
+                                foundationParams = h["params"].value("params", json::object());
+                            }
+                            const std::vector<Index> s = m->tensors.at(0).shape;   // (c, t, z, y, x)
+                            const Index volume = s.at(2) * s.at(3) * s.at(4);
+                            std::vector<std::uint32_t> labels(static_cast<std::size_t>(s[1] * volume), 0u);
+                            std::vector<float> confidence(labels.size(), 0.9f);
+                            for (Index t = 0; t < s[1]; ++t) {
+                                labels[static_cast<std::size_t>(t * volume + (s[3] + 1) * s[4] + 1)] = 1u;   // (1, 1, 1)
+                                labels[static_cast<std::size_t>((t + 1) * volume - 1)] = 2u;   // the last voxel
+                            }
+                            const std::vector<Index> shape{s[1], s[2], s[3], s[4]};
+                            rpc::TensorRef l{"labels", "uint32", shape, labels.data(), labels.size() * sizeof(std::uint32_t)};
+                            rpc::TensorRef c{"confidence", "float32", shape, confidence.data(), confidence.size() * sizeof(float)};
+                            send({{"id", id},
+                                  {"type", "result"},
+                                  {"result", {{"model", "stub"}, {"threshold", 0.5}, {"min_separation_um", 1.0}, {"objects", 2 * s[1]}, {"tracks", 2}, {"divisions", 1}}}},
+                                 {l, c});
                             continue;
                         }
                         REQUIRE(m->tensors.size() == 1);
@@ -332,9 +366,111 @@ TEST_CASE("A worker that ignores a cancel is given up after the grace period", "
     canceller.join();
 }
 
+TEST_CASE("the foundation step keeps the labels the worker returns and reports its run", "[app][rpc][foundation]") {
+    registerBuiltinOperations();
+    auto [client, server] = rpc::loopbackPair();
+    ScriptedWorker worker(std::move(server));
+    RemoteWorker rw(std::move(client));
+    test::TempFile bundle("foundation", ".ltb");
+    { std::ofstream(bundle.path) << "stub"; }
+
+    const Dims5 dims{1, 2, 4, 8, 8};
+    auto array = std::make_shared<Array5>(Array5::zeros(dims));
+    DatasetMeta meta;
+    meta.dims = dims;
+    meta.voxelUm = {0.15, 0.15, 0.75};
+    meta.normalizeChannels();
+    const Operation& op = requireOperation("foundation");
+    ParamSet p = op.defaults();
+    p.set("model", bundle.str);
+    StepContext ctx;
+    ctx.remote = &rw;
+    const auto sent = [&worker] {
+        std::lock_guard<std::mutex> lock(worker.sentMutex);
+        return worker.foundationParams;
+    };
+
+    SECTION("Detect with a Min. voxels keeps its one-voxel objects") {
+        // the step used to run its own size filter after the worker's, on
+        // every task but Track: a detection is one voxel, so all were removed
+        p.set("task", std::string("Detect centroids"));
+        p.set("min_voxels", std::int64_t{5});
+        const StepOutput out = op.run(StepInput{meta, array, nullptr, nullptr}, p, ctx);
+        REQUIRE(out.labels);
+        CHECK(out.labels->at(0, 1, 1, 1) == 1u);
+        CHECK(out.labels->at(1, 3, 7, 7) == 2u);
+        CHECK(out.labels->stats().size() >= 2);
+        // the note carries the summary: it was read after the diagnostics were moved from
+        CHECK_THAT(out.note, Catch::Matchers::ContainsSubstring("detect · 2 labels"));
+        CHECK_THAT(out.diagnostics.summary, Catch::Matchers::ContainsSubstring("2 labels"));
+        const json params = sent();
+        CHECK(params.value("task", "") == "detect");
+        // (x, y, z), the application's order; the worker turns it into latents' (z, y, x)
+        CHECK(params["voxel_um"] == json::array({0.15, 0.15, 0.75}));
+        CHECK_FALSE(params.contains("tile"));   // all zero: the bundle's own
+    }
+    SECTION("Segment keeps small objects as the worker sent them") {
+        p.set("min_voxels", std::int64_t{5});
+        const StepOutput out = op.run(StepInput{meta, array, nullptr, nullptr}, p, ctx);
+        REQUIRE(out.labels);
+        CHECK(out.labels->at(1, 1, 1, 1) == 1u);
+        CHECK(sent().value("min_voxels", 0) == 5);   // the worker applies it
+    }
+    SECTION("a tracking run is tracked and its division count says it is approximate") {
+        p.set("task", std::string("Track over time"));
+        const StepOutput out = op.run(StepInput{meta, array, nullptr, nullptr}, p, ctx);
+        REQUIRE(out.labels);
+        CHECK(out.labels->tracked());
+        CHECK_THAT(out.note, Catch::Matchers::ContainsSubstring("2 tracks"));
+        CHECK(std::any_of(out.diagnostics.facts.begin(), out.diagnostics.facts.end(),
+                          [](const DiagnosticFact& f) { return f.key == "Divisions (approx.)" && f.value == "1"; }));
+    }
+    SECTION("a tile with some extents given is sent, zero meaning the bundle's on that axis") {
+        p.set("tile", std::vector<double>{0, 32, 32});
+        (void)op.run(StepInput{meta, array, nullptr, nullptr}, p, ctx);
+        CHECK(sent()["tile"] == json::array({0, 32, 32}));
+    }
+    SECTION("Min. voxels is shown for Segment only") {
+        const auto spec = std::find_if(op.info().params.begin(), op.info().params.end(),
+                                       [](const ParamSpec& s) { return s.key == "min_voxels"; });
+        REQUIRE(spec != op.info().params.end());
+        CHECK(spec->visibleFor(p));
+        p.set("task", std::string("Detect centroids"));
+        CHECK_FALSE(spec->visibleFor(p));
+        p.set("task", std::string("Track over time"));
+        CHECK_FALSE(spec->visibleFor(p));
+    }
+}
+
 TEST_CASE("connectTcp reports an unreachable port", "[app][rpc]") {
     CHECK_THROWS(rpc::connectTcp("127.0.0.1", 1, std::chrono::milliseconds(500)));
     (void)workerScriptPath("/definitely/not/here");   // must not throw
+}
+
+TEST_CASE("workerScriptPath finds an installed worker before the build tree's and the checkout's", "[app][rpc]") {
+    namespace fs = std::filesystem;
+    const fs::path prefix = fs::temp_directory_path() / "sirius-installed-worker-test";
+    fs::remove_all(prefix);
+    const fs::path bin = prefix / "bin";
+    auto plant = [](const fs::path& dir) {
+        fs::create_directories(dir / "sirius_worker");
+        std::ofstream(dir / "sirius_worker" / "__main__.py") << "\n";
+        return dir.lexically_normal();
+    };
+    const fs::path installed = plant(bin / installedDataDirectoryFromBindir() / "python");
+    const fs::path beside = plant(bin / "python");
+    struct Restore {
+        ~Restore() { setApplicationDirectory({}); }
+    } restore;
+    setApplicationDirectory(bin.string());
+    CHECK(fs::path(workerScriptPath()) == installed);
+    // a directory the caller names (Preferences) wins over both
+    const fs::path chosen = plant(prefix / "chosen");
+    CHECK(fs::path(workerScriptPath(chosen.string())) == chosen);
+    // not installed: the copy the build puts beside the executable
+    fs::remove_all(prefix / "share");
+    CHECK(fs::path(workerScriptPath()) == beside);
+    fs::remove_all(prefix);
 }
 
 // --- the real Python worker ------------------------------------------------------
@@ -597,3 +733,266 @@ TEST_CASE("rpc tensor descriptors must hold non-negative integers", "[app][rpc]"
     std::vector<rpc::TensorRef> wrapped{{"a", "float32", {std::numeric_limits<Index>::max(), 4}, one.data(), 4}};
     CHECK_THROWS(rpc::encodeFrame({{"id", 1}}, wrapped));
 }
+
+// --- plugin reloads --------------------------------------------------------------
+
+#include <filesystem>
+#include <fstream>
+#include <mutex>
+
+#include "core/array_source.hpp"
+#include "core/help_pages.hpp"
+#include "core/ops/builtin.hpp"
+#include "core/ops/plugin.hpp"
+#include "core/pipeline.hpp"
+#include "core/workbench.hpp"
+
+#include "temp_path.hpp"
+
+namespace {
+
+    // A worker whose plugin list the test sets: it answers hello and
+    // list_plugins / reload_plugins, one loopback connection per launch.
+    struct PluginCatalog {
+        struct Connection {
+            std::unique_ptr<rpc::Transport> t;
+            std::thread thread;
+            Connection(std::unique_ptr<rpc::Transport> transport, PluginCatalog& catalog) : t(std::move(transport)) {
+                thread = std::thread([this, &catalog] { serve(catalog); });
+            }
+            ~Connection() {
+                t->close();
+                thread.join();
+            }
+            void serve(PluginCatalog& catalog) {
+                std::vector<std::byte> buf;
+                try {
+                    for (;;) {
+                        auto m = rpc::decodeFrame(buf);
+                        if (!m) {
+                            t->receive(buf, std::chrono::milliseconds(50));
+                            continue;
+                        }
+                        const std::uint64_t id = m->header.value("id", 0ull);
+                        const std::string method = m->header.value("method", "");
+                        json result;
+                        if (method == "hello")
+                            result = {{"version", "test"}, {"methods", json::array()}, {"protocol_version", rpc::kProtocolVersion}, {"device", "cpu"}, {"hostname", "loop"}};
+                        else if (method == "list_plugins" || method == "reload_plugins")
+                            result = {{"plugins", catalog.plugins()}, {"dirs", {"/plugins"}}};
+                        if (result.is_null()) t->send(rpc::encodeFrame({{"id", id}, {"type", "error"}, {"message", "unknown method " + method}}, {}));
+                        else t->send(rpc::encodeFrame({{"id", id}, {"type", "result"}, {"result", result}}, {}));
+                    }
+                } catch (const std::exception&) {
+                    // the client closed: done
+                }
+            }
+        };
+
+        std::mutex mutex;
+        json list = json::array();
+        std::vector<std::unique_ptr<Connection>> connections;
+
+        json plugins() {
+            std::lock_guard<std::mutex> g(mutex);
+            return list;
+        }
+        void set(json l) {
+            std::lock_guard<std::mutex> g(mutex);
+            list = std::move(l);
+        }
+        std::unique_ptr<RemoteWorker> connect() {
+            auto [client, server] = rpc::loopbackPair();
+            connections.push_back(std::make_unique<Connection>(std::move(server), *this));
+            return std::make_unique<RemoteWorker>(std::move(client));
+        }
+    };
+
+    json pluginSpec(const std::string& kind, double offset) {
+        return {{"kind", kind},
+                {"name", kind},
+                {"file", "/plugins/" + kind + ".py"},
+                {"params", json::array({{{"key", "gain"}, {"type", "double"}, {"default", 1.0}},
+                                        {{"key", "offset"}, {"type", "double"}, {"default", offset}}})},
+                {"help", "# " + kind + "\n\nA test plugin.\n"}};
+    }
+
+    bool inAddMenu(const std::string& kind) {
+        for (const auto& group : operationGroups())
+            for (const Operation* op : group.second)
+                if (op->kind() == kind) return true;
+        return false;
+    }
+
+    bool inPluginKinds(const std::string& kind) {
+        const std::vector<std::string> kinds = pluginKinds();
+        return std::find(kinds.begin(), kinds.end(), kind) != kinds.end();
+    }
+
+} // namespace
+
+TEST_CASE("A plugin whose file is gone stays in the pipeline as not loaded", "[app][rpc][plugin]") {
+    registerBuiltinOperations();
+    const std::filesystem::path scratch = test::uniqueTempPath("plugin_catalog", "");
+    PluginCatalog catalog;
+    {
+        Workbench wb(scratch);
+        wb.setLocalWorkerLauncher([&catalog] { return catalog.connect(); });
+        auto array = std::make_shared<Array5>(Array5::filled(Dims5{1, 1, 2, 4, 4}, 1.0f));
+        DatasetMeta meta;
+        meta.name = "synthetic";
+        meta.sourcePath = "memory://synthetic";
+        meta.dims = array->dims();
+        wb.setDataset(std::make_shared<MemorySource>(array, meta));
+
+        // a pipeline opened before its plugin is loaded
+        wb.replacePipeline(Pipeline::fromJson({{"steps", json::array({{{"kind", "load"}}, {{"kind", "zz_late"}, {"params", {{"gain", 3.0}}}}})}}),
+                           "Load pipeline");
+        REQUIRE(wb.pipeline().at(1).op().info().missing);
+        catalog.set(json::array({pluginSpec("zz_late", 5.0), pluginSpec("zz_gone", 0.0), pluginSpec("zz_broken", 0.0)}));
+        CHECK(wb.loadPlugins(false) == 3);
+        CHECK_FALSE(wb.pipeline().at(1).op().info().missing);
+        CHECK(wb.pipeline().at(1).params.getDouble("gain") == 3.0);     // as the pipeline said
+        CHECK(wb.pipeline().at(1).params.getDouble("offset") == 5.0);   // declared by the plugin
+        CHECK(inAddMenu("zz_gone"));
+        CHECK(inPluginKinds("zz_gone"));
+        wb.addStep("zz_gone");
+        wb.setStepParam(2, "gain", 2.0);
+
+        // zz_gone.py is deleted; zz_broken.py now fails to import (and is listed by its file name)
+        catalog.set(json::array({pluginSpec("zz_late", 5.0),
+                                 {{"kind", "zz_broken"}, {"name", "zz_broken"}, {"file", "/plugins/zz_broken.py"}, {"error", "SyntaxError: invalid syntax"}}}));
+        CHECK(wb.loadPlugins(true) == 1);
+        const Operation* gone = findOperation("zz_gone");
+        REQUIRE(gone);
+        CHECK(gone->info().missing);
+        CHECK_FALSE(inAddMenu("zz_gone"));       // was still offered by the add menu
+        CHECK_FALSE(inPluginKinds("zz_gone"));
+        CHECK(loadHelpPage("zz_gone").intro.find("A test plugin") == std::string::npos);
+        const Operation* broken = findOperation("zz_broken");
+        REQUIRE(broken);
+        CHECK_FALSE(broken->info().missing);   // a file still there keeps its last good registration
+        CHECK(inAddMenu("zz_broken"));
+        // the step keeps its place, its parameters and a reason
+        REQUIRE(wb.pipeline().size() == 3);
+        CHECK(wb.pipeline().at(2).kind == "zz_gone");
+        CHECK(wb.pipeline().at(2).params.getDouble("gain") == 2.0);
+        CHECK_THAT(wb.stepValidation(2).firstError(), Catch::Matchers::ContainsSubstring("not loaded"));
+        CHECK_THROWS_AS(wb.addStep("zz_gone"), std::out_of_range);
+        wb.undo();
+        wb.undo();
+        CHECK(wb.pipeline().size() == 2);
+        wb.redo();   // a snapshot naming the kind restores
+        REQUIRE(wb.pipeline().size() == 3);
+        CHECK(wb.pipeline().at(2).kind == "zz_gone");
+
+        // the file comes back
+        catalog.set(json::array({pluginSpec("zz_late", 5.0), pluginSpec("zz_gone", 0.0), pluginSpec("zz_broken", 0.0)}));
+        CHECK(wb.loadPlugins(true) == 3);
+        CHECK_FALSE(findOperation("zz_gone")->info().missing);
+        CHECK(inAddMenu("zz_gone"));
+        CHECK(wb.stepValidation(2).ok());
+    }
+    std::error_code ec;
+    std::filesystem::remove_all(scratch, ec);
+}
+
+#ifndef _WIN32
+TEST_CASE("a plugin file deleted and reloaded leaves the add menu", "[app][rpc][worker][plugin]") {
+    const char* python = std::getenv("SIRIUS_PYTHON");
+    if (!python || !*python) SKIP("SIRIUS_PYTHON is not set");
+    const std::string dir = workerScriptPath();
+    if (dir.empty()) SKIP("sirius_worker not found");
+    registerBuiltinOperations();
+    const std::filesystem::path pdir = test::uniqueTempPath("plugins_reload", "");
+    std::filesystem::create_directories(pdir);
+    for (const char* kind : {"zz_worker_gone", "zz_worker_kept"})
+        std::ofstream(pdir / (std::string(kind) + ".py")) << "STEP = {'kind': '" << kind << "', 'name': 'Test'}\n"
+                                                          << "def run(data, params, meta, ctx):\n    return data\n";
+    const std::string cmd = std::string("cd '") + dir + "' && SIRIUS_PLUGIN_DIRS='" + pdir.string() + "' exec '" + python +
+                            "' -m sirius_worker --host 127.0.0.1 --port 0 --token reload --device cpu 2>/dev/null";
+    FILE* pipe = ::popen(cmd.c_str(), "r");
+    REQUIRE(pipe);
+    char line[512] = {0};
+    REQUIRE(std::fgets(line, sizeof line, pipe));
+    const int port = json::parse(line).value("port", 0);
+    REQUIRE(port > 0);
+    auto worker = RemoteWorker::connect("127.0.0.1", port, "reload");
+
+    PluginLoadResult r = registerPluginOperations(*worker, false);
+    CHECK(inAddMenu("zz_worker_gone"));
+    CHECK(inAddMenu("zz_worker_kept"));
+    Pipeline p;
+    p.add("zz_worker_gone");
+    const json snapshot = p.toJson();
+
+    std::filesystem::remove(pdir / "zz_worker_gone.py");   // Plugin Manager ▸ Delete
+    r = registerPluginOperations(*worker, true);
+    CHECK(r.removed == std::vector<std::string>{"zz_worker_gone"});
+    REQUIRE(findOperation("zz_worker_gone"));
+    CHECK(findOperation("zz_worker_gone")->info().missing);
+    CHECK_FALSE(inAddMenu("zz_worker_gone"));
+    CHECK_FALSE(inPluginKinds("zz_worker_gone"));
+    CHECK(inAddMenu("zz_worker_kept"));
+    CHECK_NOTHROW(Pipeline::fromJson(snapshot));
+
+    // a file that breaks is not a removal
+    std::ofstream(pdir / "zz_worker_kept.py") << "this is not python (\n";
+    r = registerPluginOperations(*worker, true);
+    CHECK(r.removed.empty());
+    CHECK_FALSE(findOperation("zz_worker_kept")->info().missing);
+    CHECK(inAddMenu("zz_worker_kept"));
+
+    (void)worker->call("shutdown", json::object());
+    worker->close();
+    ::pclose(pipe);
+    std::filesystem::remove_all(pdir);
+}
+#endif
+
+// --- a worker that dies ------------------------------------------------------------
+
+#ifndef _WIN32
+#include <arpa/inet.h>
+#include <netinet/in.h>
+#include <sys/socket.h>
+
+TEST_CASE("A worker that dies while a request is sent is an error, not SIGPIPE", "[app][rpc]") {
+    const int listener = ::socket(AF_INET, SOCK_STREAM, 0);
+    REQUIRE(listener >= 0);
+    sockaddr_in addr{};
+    addr.sin_family = AF_INET;
+    addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    addr.sin_port = 0;
+    REQUIRE(::bind(listener, reinterpret_cast<sockaddr*>(&addr), sizeof addr) == 0);
+    REQUIRE(::listen(listener, 1) == 0);
+    socklen_t len = sizeof addr;
+    REQUIRE(::getsockname(listener, reinterpret_cast<sockaddr*>(&addr), &len) == 0);
+    // answers hello, then its process is gone (out of memory, a wall-time limit)
+    std::thread server([listener] {
+        const int s = ::accept(listener, nullptr, nullptr);
+        if (s < 0) return;
+        std::vector<std::byte> in;
+        std::vector<char> buf(1 << 16);
+        std::optional<rpc::Message> hello;
+        while (!(hello = rpc::decodeFrame(in))) {
+            const auto n = ::recv(s, buf.data(), buf.size(), 0);
+            if (n <= 0) break;
+            in.insert(in.end(), reinterpret_cast<const std::byte*>(buf.data()), reinterpret_cast<const std::byte*>(buf.data()) + n);
+        }
+        if (hello) {
+            const std::vector<std::byte> reply = rpc::encodeFrame(
+                {{"id", hello->header["id"]}, {"type", "result"}, {"result", {{"protocol_version", rpc::kProtocolVersion}}}}, {});
+            (void)::send(s, reply.data(), reply.size(), 0);
+        }
+        ::close(s);
+    });
+    std::unique_ptr<RemoteWorker> worker = RemoteWorker::connect("127.0.0.1", ntohs(addr.sin_port), "");
+    server.join();
+    ::close(listener);
+    std::vector<float> volume(16 << 20);   // 64 MB: more than the socket buffers take without a reader
+    const rpc::TensorRef ref{"volume", "float32", {static_cast<Index>(volume.size())}, volume.data(), volume.size() * sizeof(float)};
+    // before: the application ended here with SIGPIPE (exit status 141)
+    CHECK_THROWS_AS(worker->call("run", {{"kind", "x"}}, {ref}), ProtocolError);
+}
+#endif

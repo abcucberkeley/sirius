@@ -76,6 +76,20 @@ include(Catch)
 # binary passes on CPU-only CI. `ctest -L cuda` / the [cuda] tag select them.
 catch_discover_tests(sirius_tests TEST_PREFIX "sirius::")
 
+# The workbench as `cmake --install` lays it out, run from there (Linux only;
+# see app/CMakeLists.txt). With $SIRIUS_PYTHON set when the test runs it also
+# starts the installed worker.
+if(SIRIUS_ENABLE_APP AND UNIX AND NOT APPLE)
+    add_test(NAME sirius::app.install
+        COMMAND ${CMAKE_COMMAND}
+            -DBUILD_DIR=${PROJECT_BINARY_DIR}
+            -DPREFIX=${CMAKE_CURRENT_BINARY_DIR}/install-check
+            -DCONFIG=$<CONFIG>
+            -DRAW=${PROJECT_SOURCE_DIR}/tests/data/raw.tif
+            -P ${PROJECT_SOURCE_DIR}/app/linux/check_install.cmake)
+    set_tests_properties(sirius::app.install PROPERTIES TIMEOUT 300 LABELS app)
+endif()
+
 if(SIRIUS_ENABLE_WARNINGS)
     target_set_warnings(sirius_tests)
 endif()

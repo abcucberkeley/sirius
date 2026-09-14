@@ -20,7 +20,8 @@ Returned to the application, per timepoint or for the whole clip:
     labels      (t, z, y, x) uint32, 0 = background; for a tracking run one id
                 names the same object at every timepoint, which is how this
                 application represents a track
-    confidence  (t, z, y, x) float32, the model's centroid probability; the
+    confidence  (t, z, y, x) float32, the model's centroid probability (the
+                foreground probability for a three-class head); the
                 application folds it into per-label confidence
     lineage     JSON, {child track id: parent track id}; divisions only
 
@@ -29,13 +30,24 @@ is not installed.
 """
 from __future__ import annotations
 
+import copy
 import os
 import sys
-from typing import Any, Callable, Dict, Optional, Tuple
+import threading
+from typing import Any, Callable, Dict, Optional, Sequence, Tuple
 
 import numpy as np
 
 _BUNDLES: Dict[Tuple[str, float, str], Any] = {}
+# model_info runs on the connection thread while a job may be loading a bundle
+_BUNDLES_LOCK = threading.Lock()
+
+
+class Cancelled(RuntimeError):
+    """The run was cancelled. An Exception on purpose: the server answers the
+    request for any Exception, while a BaseException such as KeyboardInterrupt
+    escapes its handler and ends the job thread without a reply, which left the
+    application waiting out its grace period and then dropping the connection."""
 
 
 def _import_latents():
@@ -48,7 +60,7 @@ def _import_latents():
     if extra and extra not in sys.path:
         sys.path.insert(0, extra)
     try:
-        from latents import deploy                       # noqa: PLC0415
+        from latents import deploy
     except ImportError as exc:                           # pragma: no cover - install-dependent
         raise RuntimeError(
             "The foundation model needs the 'latents' package, which is not importable. "
@@ -57,29 +69,74 @@ def _import_latents():
     return deploy
 
 
-def load_bundle(path: str, device: str = "auto"):
-    """Load and cache a bundle. Re-reading a 500 MB file per timepoint would
-    dominate the run, and the application calls once per timepoint."""
-    deploy = _import_latents()
+def _bundle_file(path: str) -> Tuple[str, float]:
     if not path:
         raise ValueError("no model given: choose a .ltb bundle")
     if not os.path.exists(path):
         raise FileNotFoundError(f"model bundle not found: {path}")
-    key = (os.path.abspath(path), os.path.getmtime(path), device)
-    got = _BUNDLES.get(key)
+    return os.path.abspath(path), os.path.getmtime(path)
+
+
+def load_bundle(path: str, device: str = "auto"):
+    """Load and cache a bundle. Re-reading a 500 MB file per timepoint would
+    dominate the run, and the application calls once per timepoint.
+
+    The cached object is shared by every later run and by model_info, so
+    nothing may write to it; a per-run setting goes on a copy (see `run`)."""
+    deploy = _import_latents()
+    key = (*_bundle_file(path), device)
+    with _BUNDLES_LOCK:
+        got = _BUNDLES.get(key)
     if got is None:
         dev = None if device in ("auto", "") else device
         got = deploy.Bundle.load(path, device=dev)
-        _BUNDLES.clear()                                  # one model resident at a time
-        _BUNDLES[key] = got
+        with _BUNDLES_LOCK:
+            _BUNDLES.clear()                              # one model resident at a time
+            _BUNDLES[key] = got
     return got
+
+
+def _manifest(path: str):
+    """The bundle's manifest, without loading the model for inference.
+
+    model_info used to load the bundle on the CPU, and since one model stays
+    resident at a time that evicted the one a run had just put on the GPU: the
+    model dialog and a run, alternating, reloaded it every time. A bundle
+    already loaded on any device answers from memory; otherwise only the
+    checkpoint is opened (memory-mapped, the weights are not read) and nothing
+    is cached or evicted."""
+    deploy = _import_latents()
+    file_key = _bundle_file(path)
+    with _BUNDLES_LOCK:
+        for key, bundle in _BUNDLES.items():
+            if key[:2] == file_key:
+                return bundle.m
+    import torch
+
+    try:
+        ck = torch.load(str(path), map_location="cpu", weights_only=False, mmap=True)
+    except (TypeError, RuntimeError):                    # an older torch, or a file without the zip format
+        ck = torch.load(str(path), map_location="cpu", weights_only=False)
+    want = getattr(deploy, "BUNDLE_VERSION", 1)
+    if int(ck.get("bundle_version", 0)) != want:
+        raise ValueError(f"{path}: bundle version {ck.get('bundle_version')}, expected {want}")
+    return deploy.Manifest.from_dict(ck["manifest"])
+
+
+def _tasks(man) -> list:
+    # A three-class head predicts regions, not centroids: there is nothing to
+    # detect, and nothing to link.
+    return ["segment"] if man.head == "threeclass" else ["detect", "segment", "track"]
 
 
 def model_info(path: str) -> Dict[str, Any]:
     """What the bundle says about itself, for the model dialog and for the
-    application's parameter defaults."""
-    m = load_bundle(path, "cpu")
-    man = m.m
+    application's parameter defaults.
+
+    `voxel_um` is (x, y, z), the order the application uses for a voxel size
+    everywhere; the manifest stores latents' (z, y, x). `patch` and `crop` stay
+    (z, y, x), the order of the step's Tile."""
+    man = _manifest(path)
     return {
         "format": "latents-bundle",
         "name": man.name,
@@ -88,13 +145,13 @@ def model_info(path: str) -> Dict[str, Any]:
         "encoder": {k: man.encoder.get(k) for k in ("dim", "depth", "heads", "patch", "arch", "objective")},
         "patch": list(man.patch),
         "crop": list(man.crop),
-        "voxel_um": list(man.voxel_size),
+        "voxel_um": [float(v) for v in man.voxel_size][::-1],
         "peak_threshold": man.peak_threshold,
         "min_separation_um": man.min_separation_um,
         "link_max_dist_um": man.link_max_dist_um,
         "channels": man.channels,
         "notes": man.notes,
-        "tasks": ["detect", "segment", "track"],
+        "tasks": _tasks(man),
     }
 
 
@@ -108,16 +165,58 @@ def _as_ctzyx(a: np.ndarray) -> np.ndarray:
     return a
 
 
-def _labels_from_points(shape, points, probability, threshold: float, min_voxels: int):
-    """Centroids to regions, one timepoint.
+def _per_axis(given: Any, fallback: Sequence[float]) -> Tuple[float, ...]:
+    """Three values, each one missing or <= 0 replaced by the fallback's."""
+    try:
+        vals = [float(v) for v in (given if given is not None else [])][:3]
+    except (TypeError, ValueError):
+        vals = []
+    vals += [0.0] * (3 - len(vals))
+    return tuple(v if np.isfinite(v) and v > 0 else float(f) for v, f in zip(vals, list(fallback)[-3:]))
 
-    A detection model says where objects are, not how far they extend. Watershed
-    seeded on the peaks and bounded by the probability map turns one into the
-    other with no extra training, so a detection bundle is still usable where
-    the application wants regions rather than points."""
-    deploy = _import_latents()
-    lab = deploy.watershed_from_heatmap(probability, points, threshold=threshold, min_size=min_voxels)
-    return lab.reshape(shape).astype(np.uint32)
+
+def voxel_zyx(voxel_um: Any, bundle_zyx: Sequence[float]) -> Tuple[float, ...]:
+    """The application's (x, y, z) voxel size in latents' (z, y, x) order.
+
+    Every distance in latents is (z, y, x): the peak gate divides the separation
+    by it per axis of the heatmap, and the linker scales (z, y, x) coordinate
+    differences by it. Passed on as (x, y, z), a 0.75 um z step became 0.15 um,
+    so two nuclei 3 um apart in depth were gated into one, and a nucleus moving
+    1.5 um a frame in x started a new track every frame. An axis missing or
+    <= 0 uses the bundle's calibration."""
+    return _per_axis(voxel_um, list(bundle_zyx)[::-1])[::-1]
+
+
+def _dense(lab: np.ndarray) -> np.ndarray:
+    """Labels renumbered 1..n in the order of their old ids; 0 stays background."""
+    lab = np.asarray(lab)
+    if lab.size == 0 or int(lab.max()) == 0:
+        return lab.astype(np.uint32)
+    present = np.bincount(lab.ravel().astype(np.int64)) > 0
+    present[0] = False
+    remap = np.zeros(present.size, np.uint32)
+    remap[present] = np.arange(1, int(present.sum()) + 1, dtype=np.uint32)
+    return remap[lab]
+
+
+def _foreground(logits: np.ndarray) -> np.ndarray:
+    """(3, z, y, x) background / interior / boundary logits -> P(not background)."""
+    l = np.asarray(logits, np.float64)
+    e = np.exp(l - l.max(axis=0, keepdims=True))
+    return (1.0 - e[0] / e.sum(axis=0)).astype(np.float32)
+
+
+def lineage(parents: Dict[Any, Any]) -> Dict[int, int]:
+    """latents' parent map -> {daughter track id: mother track id}.
+
+    `track_points` records a parent of 0 for every track that starts without
+    one, and the first time a mother divides it also gives the daughter that
+    keeps the mother's id the mother as parent, i.e. itself (a `setdefault`).
+    Neither is a division, and counting half the entries, as this used to,
+    reported a track that divides twice as one division. Each division starts
+    exactly one new track whose parent is another track: those entries are the
+    divisions. The count is still only as good as latents' geometric rule."""
+    return {int(k): int(v) for k, v in parents.items() if int(v) and int(v) != int(k)}
 
 
 def run(volume: np.ndarray, params: Dict[str, Any], device: str = "auto",
@@ -130,11 +229,20 @@ def run(volume: np.ndarray, params: Dict[str, Any], device: str = "auto",
         task             detect | segment | track
         threshold        peak probability; <= 0 means use the bundle's
         min_separation   microns between two objects; <= 0 means the bundle's
-        min_voxels       drop smaller objects
-        voxel_um         (z, y, x) of THIS image; the bundle's value is what the
-                         thresholds were tuned at, not an assumption about the
-                         input, so the caller's wins when given
-        tile             (z, y, x) inference tile; empty means the bundle's
+        min_voxels       Segment only: drop smaller objects. Detect marks one
+                         voxel per object, and a tracking run keeps every
+                         object because there the label id is a track id
+        voxel_um         (x, y, z) of THIS image, the application's order; the
+                         bundle's value is what the thresholds were tuned at,
+                         not an assumption about the input, so the caller's
+                         wins on every axis it gives as > 0
+        tile             (z, y, x) inference tile; an extent <= 0, or no tile,
+                         uses the bundle's crop on that axis
+
+    All of these apply to this call only: the cached bundle is never written
+    to. The model runs once per frame (once for the whole clip when tracking),
+    and the peaks, the regions and the tracks all come from that one heatmap
+    with the values reported in `info`.
     """
     def report(f: float, msg: str = "") -> None:
         if progress:
@@ -142,89 +250,118 @@ def run(volume: np.ndarray, params: Dict[str, Any], device: str = "auto",
 
     def check() -> None:
         if cancelled and cancelled():
-            raise KeyboardInterrupt("cancelled")
+            raise Cancelled("cancelled")
 
     a = _as_ctzyx(volume)
-    C, T, Z, Y, X = a.shape
+    n_c, n_t, n_z, n_y, n_x = a.shape
     m = load_bundle(str(params.get("model") or ""), device)
     man = m.m
     task = str(params.get("task") or man.task or "detect").lower()
     if task not in ("detect", "segment", "track"):
         raise ValueError(f"unknown task '{task}'; expected detect, segment or track")
+    if task not in _tasks(man):
+        raise ValueError(f"this bundle's '{man.head}' head predicts regions, not centroids, so it cannot {task}; "
+                         "choose the Segment task")
+    deploy = _import_latents()
+    from latents.downstream.track import peaks_from_heatmap, track_points
 
     thr = float(params.get("threshold", 0) or 0)
-    thr = man.peak_threshold if thr <= 0 else thr
+    thr = float(man.peak_threshold) if thr <= 0 else thr
     sep = float(params.get("min_separation", 0) or 0)
-    sep = man.min_separation_um if sep <= 0 else sep
-    min_voxels = int(params.get("min_voxels", 0) or 0)
-    voxel = params.get("voxel_um") or man.voxel_size
-    voxel = tuple(float(v) for v in voxel)[:3]
-    tile = params.get("tile")
-    if tile:
-        m.m.crop = tuple(int(v) for v in tile)[:3]
+    sep = float(man.min_separation_um) if sep <= 0 else sep
+    min_voxels = max(0, int(params.get("min_voxels", 0) or 0))
+    voxel = voxel_zyx(params.get("voxel_um"), man.voxel_size)
+    crop = tuple(int(v) for v in _per_axis(params.get("tile"), man.crop))
+    if crop != tuple(int(v) for v in man.crop):
+        # Bundle.heatmap reads its tile from the manifest. Copies of both, so
+        # neither a later run without a tile nor model_info sees this one.
+        man = copy.copy(man)
+        man.crop = crop
+        m = copy.copy(m)
+        m.m = man
 
-    multi = C > 1
-    labels = np.zeros((T, Z, Y, X), np.uint32)
-    conf = np.zeros((T, Z, Y, X), np.float32)
+    multi = n_c > 1
+    labels = np.zeros((n_t, n_z, n_y, n_x), np.uint32)
+    conf = np.zeros((n_t, n_z, n_y, n_x), np.float32)
     info: Dict[str, Any] = {"task": task, "threshold": thr, "min_separation_um": sep,
-                            "voxel_um": list(voxel), "channels": int(C), "frames": int(T),
-                            "model": man.name, "device": str(m.device)}
+                            "voxel_um": list(voxel[::-1]), "tile": list(crop), "channels": int(n_c),
+                            "frames": int(n_t), "model": man.name, "device": str(m.device)}
     extras: Dict[str, Any] = {}
+
+    def peaks(hm: np.ndarray) -> np.ndarray:
+        return peaks_from_heatmap(hm, threshold=thr, voxel_size=voxel, min_sep_um=sep)
 
     if task == "track":
         # The whole clip in one call: this is the only path that uses the time
         # axis, and splitting it per frame would defeat the point of the model.
+        # Bundle.track would run it again and use the bundle's threshold and
+        # separation instead of these, so the linking is done here.
         report(0.05, "tracking")
         clip = a if multi else a[0]
-        res = m.track(clip, channels=multi, voxel_size=voxel)
+        hm = np.asarray(m.heatmap(clip, time=True, channels=multi), np.float32)
         check()
-        hm = m.heatmap(clip, time=True, channels=multi)
-        for t, (pts, ids) in enumerate(zip(res["points"], res["ids"])):
-            report(0.5 + 0.45 * t / max(T, 1), f"labelling frame {t + 1}/{T}")
+        pts = []
+        for t in range(n_t):
+            pts.append(peaks(hm[t]))
+            check()
+        ids, parents = track_points(pts, max_dist=man.link_max_dist_um, voxel_size=voxel,
+                                    division_dist=man.division_dist_um)
+        for t in range(n_t):
+            report(0.5 + 0.45 * t / max(n_t, 1), f"labelling frame {t + 1}/{n_t}")
             conf[t] = hm[t]
-            if len(pts):
+            if len(pts[t]):
                 # One track id names the same object at every timepoint: that
                 # is how this application stores a track, so the ids go
                 # straight into the label volume rather than alongside it.
-                lab = _labels_from_points((Z, Y, X), pts, hm[t], thr, min_voxels)
-                remap = np.zeros(int(lab.max()) + 1, np.uint32)
-                for i, tid in enumerate(np.asarray(ids, np.uint32), start=1):
-                    if i < remap.size:
-                        remap[i] = tid
+                # min_size 0: dropping an object whose region is small in one
+                # frame would punch a hole in its track.
+                lab = deploy.watershed_from_heatmap(hm[t], pts[t], threshold=thr, min_size=0)
+                remap = np.zeros(max(int(lab.max()), len(pts[t])) + 1, np.uint32)
+                remap[1:len(pts[t]) + 1] = np.asarray(ids[t], np.uint32)
                 labels[t] = remap[lab]
             check()
-        parents = {int(k): int(v) for k, v in res["parents"].items() if v}
-        info["tracks"] = int(max((int(i.max()) for i in res["ids"] if len(i)), default=0))
-        info["divisions"] = len(parents) // 2
-        info["links"] = int(sum(len(i) for i in res["ids"]))
-        extras["lineage"] = parents
+        kids = lineage(parents)
+        info["tracks"] = int(max((int(np.max(i)) for i in ids if len(i)), default=0))
+        info["divisions"] = len(kids)
+        info["links"] = int(sum(len(i) for i in ids))
+        extras["lineage"] = kids
         extras["confidence"] = conf
         report(1.0, "")
         return labels, info, extras
 
     total = 0
-    for t in range(T):
+    for t in range(n_t):
         check()
-        report(0.05 + 0.9 * t / max(T, 1), f"frame {t + 1}/{T}")
+        report(0.05 + 0.9 * t / max(n_t, 1), f"frame {t + 1}/{n_t}")
         frame = a[:, t] if multi else a[0, t]
-        hm = m.heatmap(frame, channels=multi)
-        conf[t] = hm
-        if task == "detect":
-            from latents.downstream.track import peaks_from_heatmap
-            pts = peaks_from_heatmap(hm, threshold=thr, voxel_size=voxel, min_sep_um=sep)
-            # A detection is a point; the application's unit is a region, so
-            # every point becomes a small ball of one voxel and grows no
-            # further. Use task "segment" for extents.
-            lab = np.zeros((Z, Y, X), np.uint32)
-            for i, pnt in enumerate(np.round(pts).astype(int), start=1):
-                pnt = np.clip(pnt, 0, np.array([Z, Y, X]) - 1)
-                lab[tuple(pnt)] = i
-            labels[t] = lab
-            total += len(pts)
+        if man.head == "threeclass":
+            # Bundle.heatmap cannot run this head (it writes three channels
+            # into a one-channel buffer and raises); Bundle.segment's own
+            # route for it is the class logits, and so is this one.
+            from latents.downstream.instance import instances_from_three_class
+
+            m._check_channels(n_c)
+            logits = np.asarray(m._class_logits(frame, channels=multi), np.float32)
+            conf[t] = _foreground(logits)
+            lab = _dense(instances_from_three_class(logits, min_size=min_voxels))
         else:
-            lab = m.segment(frame, min_size=min_voxels, channels=multi)
-            labels[t] = lab.astype(np.uint32)
-            total += int(lab.max())
+            hm = np.asarray(m.heatmap(frame, channels=multi), np.float32)
+            conf[t] = hm
+            pts = peaks(hm)
+            if task == "detect":
+                # A detection is a point; the application's unit is a region,
+                # so every point becomes one voxel and grows no further, and
+                # min_voxels does not apply. Use task "segment" for extents.
+                lab = np.zeros((n_z, n_y, n_x), np.uint32)
+                for i, pnt in enumerate(np.round(pts).astype(int), start=1):
+                    pnt = np.clip(pnt, 0, np.array([n_z, n_y, n_x]) - 1)
+                    lab[tuple(pnt)] = i
+            else:
+                # Bundle.segment would run the model twice more and use the
+                # bundle's threshold, separation and voxel size.
+                lab = _dense(deploy.watershed_from_heatmap(hm, pts, threshold=thr, min_size=min_voxels))
+        labels[t] = lab
+        total += int(lab.max())
     info["objects"] = int(total)
     extras["confidence"] = conf
     report(1.0, "")

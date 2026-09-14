@@ -1,9 +1,8 @@
 """Tests for the TIFF I/O bindings (sirius.read_tiff, write_tiff, TiffCompression).
 
-The C++ binding glues both `writeTiff` (2-D) and `writeTiffStack` (3-D) under the
-single overloaded Python name `write_tiff`. `read_tiff` always goes through
-`readTiffStackAny`, so it always returns a 3-D ndarray (depth=1 for files that
-were written from a 2-D image).
+`write_tiff` takes any host array and dispatches on its rank (2-D `writeTiff`,
+3-D `writeTiffStack`) and dtype. `read_tiff` always returns a 3-D ndarray
+(depth=1 for files that were written from a 2-D image).
 """
 
 from __future__ import annotations
@@ -17,7 +16,7 @@ from _helpers import silenced_stderr
 
 import sirius
 
-# Every scalar dtype with a registered write_tiff overload.
+# Every dtype write_tiff writes as itself.
 SUPPORTED_DTYPES = [
     np.int8, np.uint8,
     np.int16, np.uint16,
@@ -191,6 +190,57 @@ class TestReadTiffShapeContract(unittest.TestCase):
         np.testing.assert_array_equal(reloaded[0], original)
 
 
+class TestArraysNumpyHandsOver(unittest.TestCase):
+    """Views and dtypes that used to be cast to int8 without a word: one
+    Eigen overload per dtype, int8 registered first, and a converting caster
+    took the first that could be made to fit."""
+
+    def _round_trip(self, image):
+        with tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, "view.tif")
+            sirius.write_tiff(path, image, comp=sirius.TiffCompression.Deflate)
+            loaded = sirius.read_tiff(path)
+        return loaded if image.ndim == 3 else loaded[0]
+
+    def test_non_contiguous_views_round_trip_exactly(self):
+        f = np.random.default_rng(4).standard_normal((5, 7)).astype(np.float32)
+        u = (np.arange(3 * 4 * 5, dtype=np.uint16).reshape(3, 4, 5) * 1000).astype(np.uint16)
+        views = {
+            "float32 transpose": f.T,
+            "float32 flipud": np.flipud(f),
+            "uint16 stepped and reversed": u[:, ::2, ::-1],
+            "uint16 Fortran order": np.asfortranarray(u),
+            "int32 axes swapped": np.arange(24, dtype=np.int32).reshape(2, 3, 4).transpose(0, 2, 1),
+            "read-only": np.broadcast_to(np.float64(2.5), (3, 4)),
+        }
+        for name, image in views.items():
+            with self.subTest(view=name):
+                self.assertFalse(image.flags.c_contiguous and image.flags.writeable)
+                loaded = self._round_trip(image)
+                self.assertEqual(loaded.dtype, image.dtype)
+                np.testing.assert_array_equal(loaded, image)
+
+    def test_unsupported_dtypes_raise_instead_of_narrowing(self):
+        # np.arange's int64 was written as int8: 990 came back as -34
+        arrays = {
+            "int64": np.arange(100).reshape(10, 10) * 10,
+            "uint64": np.arange(6, dtype=np.uint64).reshape(2, 3),
+            "bool": np.ones((2, 3), dtype=bool),
+            "float16": np.ones((2, 2, 3), dtype=np.float16),
+            "complex64": np.ones((2, 3), dtype=np.complex64),
+        }
+        for name, image in arrays.items():
+            with self.subTest(dtype=name), tempfile.TemporaryDirectory() as d:
+                path = os.path.join(d, "x.tif")
+                with self.assertRaisesRegex(TypeError, name):
+                    sirius.write_tiff(path, image)
+                self.assertFalse(os.path.exists(path))
+
+    def test_converted_integers_keep_their_values(self):
+        image = (np.arange(100).reshape(10, 10) * 10).astype(np.uint16)
+        np.testing.assert_array_equal(self._round_trip(image), image)
+
+
 class TestErrors(unittest.TestCase):
     def test_read_nonexistent_file_raises(self):
         with silenced_stderr():
@@ -198,7 +248,7 @@ class TestErrors(unittest.TestCase):
                 sirius.read_tiff("/no/such/sirius_test_file.tif")
 
     def test_write_unsupported_rank_raises(self):
-        # 1-D and 4-D arrays have no registered overload.
+        # 1-D and 4-D arrays are neither an image nor a stack.
         with tempfile.TemporaryDirectory() as d:
             path = os.path.join(d, "x.tif")
             with self.assertRaises(TypeError):

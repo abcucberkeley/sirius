@@ -331,6 +331,17 @@ TEST_CASE("summarizeTracks attaches lineage only between tracks that exist", "[a
         CHECK(countDivisions(rows) == 1);
     }
 
+    SECTION("a latents mother that divides twice is two divisions") {
+        LabelVolume clip(4, 2, 16, 16);
+        for (Index t = 0; t < 4; ++t) cube(clip, t, 1, 0, 6, 6, 2);
+        cube(clip, 1, 2, 0, 0, 0, 2);
+        cube(clip, 3, 3, 0, 12, 12, 2);
+        const std::vector<TrackSummary> rows = summarizeTracks(TrackIndex(clip), {{2, 1}, {3, 1}}, kIsotropic);
+        REQUIRE(rows.size() == 3);
+        CHECK(rows[0].divisions == 2);
+        CHECK(countDivisions(rows) == 2);
+    }
+
     SECTION("ids that are gone, self-parents and cycles describe nothing and hang nothing") {
         const Lineage lineage{{2, 1}, {3, 99}, {4, 4}, {98, 1}, {1, 2}};
         const std::vector<TrackSummary> rows = summarizeTracks(index, lineage, kIsotropic);
@@ -531,15 +542,18 @@ TEST_CASE("Operations that rewrite tracked labels leave no stale tracks", "[app]
     in.labels = labels;
     const StepContext ctx;
 
-    SECTION("cleanup with relabel renumbers each frame: no longer tracks") {
+    SECTION("cleanup relabels with one map for every frame: tracks and lineage follow") {
         ParamSet p = cleanup->defaults();
         p.set("min_voxels", Index{2});
         p.set("relabel", true);
         const StepOutput out = cleanup->run(in, p, ctx);
         REQUIRE(out.labels);
-        CHECK_FALSE(out.labels->tracked());
-        CHECK_FALSE(out.labels->tracks());
-        CHECK(out.labels->lineage().empty());
+        CHECK(out.labels->tracked());
+        REQUIRE(out.labels->tracks());
+        requireSame(*out.labels->tracks(), TrackIndex(*out.labels));
+        CHECK(out.labels->tracks()->ids() == std::vector<std::uint32_t>{1, 2});   // 5 and 9, the speck gone
+        CHECK(out.labels->tracks()->points(1).size() == 3);
+        CHECK(out.labels->lineage() == Lineage{{2, 1}});
         REQUIRE(labels->tracks());   // the input is untouched
         CHECK(labels->tracks()->pointAt(12, 1).has_value());
     }

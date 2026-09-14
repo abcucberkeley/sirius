@@ -6,6 +6,7 @@
 // JSON, view state, label diffs), so any edit -- from the UI, the assistant
 // or a script -- is undone the same way.
 
+#include <cstdint>
 #include <functional>
 #include <string>
 #include <vector>
@@ -42,11 +43,25 @@ namespace sirius::app {
         void clear();
         std::size_t size() const noexcept { return undo_.size(); }
         void setLimit(std::size_t n) noexcept { limit_ = n; }
+        // The state the history stands at, as a number: every push -- a
+        // merge included -- makes a new one, undo and redo return to the
+        // number that state had, and clear() keeps it (forgetting how the
+        // state came about does not change it). Compare it with the number
+        // recorded at a save to tell whether anything changed since; the
+        // entry count cannot (a merged drag, or an undo and a new edit,
+        // leave it as it was).
+        std::uint64_t revision() const noexcept { return undo_.empty() ? base_ : undo_.back().revision; }
 
     private:
-        std::vector<Command> undo_, redo_;
+        struct Entry {
+            Command command;
+            std::uint64_t revision = 0;  // the state after the command
+        };
+        std::vector<Entry> undo_, redo_;
         bool mergeOpen_ = false;         // the top entry is still taking merges
         std::size_t limit_ = 200;
+        std::uint64_t base_ = 0;         // the state before the oldest undo entry
+        std::uint64_t lastRevision_ = 0;
     };
 
 } // namespace sirius::app

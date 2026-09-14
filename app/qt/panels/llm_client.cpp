@@ -146,26 +146,26 @@ namespace sirius::app {
         connect(reply_, &QNetworkReply::finished, this, &LlmClient::onReplyFinished);
     }
 
-    void LlmClient::consumeSseLine(const QByteArray& rawLine) {
+    bool LlmClient::consumeSseLine(const QByteArray& rawLine) {
         QByteArray line = rawLine.trimmed();
-        if (line.isEmpty() || line.startsWith(':')) return;
-        if (!line.startsWith("data:")) return;
+        if (line.isEmpty() || line.startsWith(':')) return true;
+        if (!line.startsWith("data:")) return true;
         line = line.mid(5).trimmed();
         if (line == "[DONE]") {
             done_ = true;
-            return;
+            return true;
         }
         const QJsonDocument doc = QJsonDocument::fromJson(line);
-        if (!doc.isObject()) return;
+        if (!doc.isObject()) return true;
         const QJsonObject obj = doc.object();
         if (obj.contains(QStringLiteral("error"))) {
             const QString msg = errorMessageOf(line, QStringLiteral("server error"));
             abort();
             emit failed(msg);
-            return;
+            return false;
         }
         const QJsonArray choices = obj[QStringLiteral("choices")].toArray();
-        if (choices.isEmpty()) return;
+        if (choices.isEmpty()) return true;
         const QJsonObject choice = choices[0].toObject();
         sawData_ = true;
         const QJsonObject delta = choice[QStringLiteral("delta")].toObject();
@@ -176,6 +176,7 @@ namespace sirius::app {
         if (acc_.reasoningChars > reasoningBefore) emit thinking(acc_.reasoningChars);
         const QJsonValue finish = choice[QStringLiteral("finish_reason")];
         if (finish.isString() && !finish.toString().isEmpty()) acc_.finishReason = finish.toString();
+        return true;
     }
 
     void LlmClient::onReadyRead() {
@@ -185,8 +186,7 @@ namespace sirius::app {
         while ((nl = buffer_.indexOf('\n')) >= 0) {
             const QByteArray line = buffer_.left(nl);
             buffer_.remove(0, nl + 1);
-            consumeSseLine(line);
-            if (!reply_) return;   // failed() aborted the reply
+            if (!consumeSseLine(line)) return;   // failed(): the reply was aborted
         }
     }
 
@@ -210,7 +210,10 @@ namespace sirius::app {
                     return;
                 }
             }
-            for (const QByteArray& line : buffer_.split('\n')) consumeSseLine(line);
+            // The last event may be an error with no newline after it, so it
+            // is only parsed here: failed() is then the reply's last word.
+            for (const QByteArray& line : buffer_.split('\n'))
+                if (!consumeSseLine(line)) return;
             if (r->error() != QNetworkReply::NoError && !sawData_) {
                 // servers that reject streaming answer 4xx: retry once without it
                 if (status >= 400 && status < 500 && status != 401 && status != 403 && status != 429 && request_.stream) {

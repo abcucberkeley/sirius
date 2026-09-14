@@ -88,6 +88,9 @@ namespace sirius::app {
                 out.array = result;
                 if (input.labels && !input.labels->empty()) {
                     auto labels = std::make_shared<LabelVolume>(meta.dims.t, b.z, b.y, b.x);
+                    // the same objects on a smaller grid: their classes,
+                    // confidences, review marks, flag rules and track ids go along
+                    labels->copyAnnotationsFrom(*input.labels);
                     for (Index t = 0; t < meta.dims.t; ++t) {
                         const std::uint32_t* src = input.labels->volume(t);
                         std::uint32_t* dst = labels->volume(t);
@@ -100,8 +103,11 @@ namespace sirius::app {
                                             ? src[(sz * meta.dims.y + sy) * meta.dims.x + sx]
                                             : 0u;
                                 }
-                        labels->recomputeStats(t);
+                        labels->recomputeStats(t);   // the boxes and border flags of the new extent
                     }
+                    // the table ends on the frame the input's was on
+                    if (input.labels->statsT() >= 0 && input.labels->statsT() < meta.dims.t - 1)
+                        labels->recomputeStats(input.labels->statsT());
                     // cropping keeps the ids, so tracks stay tracks (a track
                     // wholly outside the box is simply gone from the index)
                     if (input.labels->tracked()) {

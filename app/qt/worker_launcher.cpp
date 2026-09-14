@@ -3,7 +3,6 @@
 #include <exception>
 #include <stdexcept>
 
-#include <QCoreApplication>
 #include <QDir>
 #include <QFileInfo>
 #include <QJsonDocument>
@@ -156,10 +155,13 @@ namespace sirius::app {
             std::lock_guard<std::mutex> g(mutex_);
             if (!python_.isEmpty()) return python_;
         }
-        const QString fromSettings = QSettings().value(QStringLiteral("worker/python")).toString();
-        if (!fromSettings.isEmpty()) return fromSettings;
+        // The environment first, as Preferences and RemoteConfig say: a
+        // setting that won used to pin a Save's "python3" over a
+        // $SIRIUS_PYTHON pointing at the interpreter with torch.
         const QByteArray env = qgetenv("SIRIUS_PYTHON");
         if (!env.isEmpty()) return QString::fromLocal8Bit(env);
+        const QString fromSettings = QSettings().value(QStringLiteral("worker/python")).toString().trimmed();
+        if (!fromSettings.isEmpty()) return fromSettings;
         return QStringLiteral("python3");
     }
 
@@ -170,9 +172,8 @@ namespace sirius::app {
         }
         const QString fromSettings = QSettings().value(QStringLiteral("worker/dir")).toString();
         if (!fromSettings.isEmpty()) return fromSettings;
-        // next to the executable (the build copies app/python there), then the source tree
-        const QString beside = QCoreApplication::applicationDirPath() + QStringLiteral("/python");
-        if (QFileInfo::exists(beside + QStringLiteral("/sirius_worker/__main__.py"))) return beside;
+        // an installed tree, next to the executable (the build copies
+        // app/python there), then the environment and the source tree
         return fromStd(workerScriptPath());
     }
 

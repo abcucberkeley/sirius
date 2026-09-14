@@ -49,10 +49,7 @@ namespace sirius::app {
         a.model = s.value(QStringLiteral("model"), a.model).toString();
         a.apiKey = secrets::read(QStringLiteral("assistant/apiKey"));
         a.askBeforeActing = s.value(QStringLiteral("askBeforeActing"), a.askBeforeActing).toBool();
-        if (a.apiKey.isEmpty()) {
-            if (a.provider == QLatin1String("openrouter")) a.apiKey = qEnvironmentVariable("OPENROUTER_API_KEY");
-            if (a.apiKey.isEmpty()) a.apiKey = qEnvironmentVariable("SIRIUS_LLM_API_KEY");
-        }
+        if (a.apiKey.isEmpty()) a.apiKey = environmentKey(a.provider, &a.apiKeyVariable);
         return a;
     }
 
@@ -62,8 +59,25 @@ namespace sirius::app {
         s.setValue(QStringLiteral("provider"), provider);
         s.setValue(QStringLiteral("baseUrl"), baseUrl);
         s.setValue(QStringLiteral("model"), model);
-        secrets::write(QStringLiteral("assistant/apiKey"), apiKey);
         s.setValue(QStringLiteral("askBeforeActing"), askBeforeActing);
+    }
+
+    QString AssistantSettings::requestKey() const { return provider == QLatin1String("ollama") ? QString() : apiKey; }
+
+    bool AssistantSettings::storeApiKey(const QString& key) { return secrets::write(QStringLiteral("assistant/apiKey"), key); }
+
+    QString AssistantSettings::environmentKey(const QString& provider, QString* variable) {
+        QStringList names;
+        if (provider == QLatin1String("openrouter")) names << QStringLiteral("OPENROUTER_API_KEY");
+        names << QStringLiteral("SIRIUS_LLM_API_KEY");
+        for (const QString& name : names) {
+            const QString value = qEnvironmentVariable(name.toLatin1().constData());
+            if (value.isEmpty()) continue;
+            if (variable) *variable = name;
+            return value;
+        }
+        if (variable) variable->clear();
+        return QString();
     }
 
     namespace {
@@ -353,7 +367,7 @@ namespace sirius::app {
                 return;
             }
             setBusy(true, QStringLiteral("Looking up models…"));
-            client.fetchModels(settings.baseUrl, settings.apiKey, [this, next](QStringList ids, QString error) {
+            client.fetchModels(settings.baseUrl, settings.requestKey(), [this, next](QStringList ids, QString error) {
                 if (ids.isEmpty()) {
                     showError(error.isEmpty() ? QStringLiteral("No model configured and the server lists none. Set one in Preferences ▸ Assistant.")
                                               : QStringLiteral("Cannot reach the model server at %1 (%2). Configure the assistant in Preferences.")
@@ -390,7 +404,7 @@ namespace sirius::app {
             LlmClient::Request r;
             r.baseUrl = settings.baseUrl;
             r.model = settings.model;
-            r.apiKey = settings.apiKey;
+            r.apiKey = settings.requestKey();
             QJsonArray msgs = systemMessages();
             for (const QJsonValue& v : history) msgs.append(v);
             r.messages = msgs;
@@ -470,7 +484,19 @@ namespace sirius::app {
             h->addWidget(skip);
             static_cast<QVBoxLayout*>(streamingBlock->layout())->addWidget(row);
             scrollToBottom();
-            auto finish = [this, row, call](bool doIt) {
+            // Answered once. Apply can start a run, which the run hook waits
+            // for in a nested event loop; deleteLater() is not processed
+            // there, so the chips stayed on screen and live, and a second
+            // click popped the next pending call without running or
+            // answering it, answered this call twice and sent a chat request
+            // in the middle of the run.
+            auto answered = std::make_shared<bool>(false);
+            auto finish = [this, row, apply, skip, call, answered](bool doIt) {
+                if (*answered) return;
+                *answered = true;
+                apply->setEnabled(false);
+                skip->setEnabled(false);
+                row->hide();
                 row->deleteLater();
                 if (!pending.empty()) pending.pop_front();
                 if (doIt) {
@@ -491,13 +517,21 @@ namespace sirius::app {
 
         void executeCall(const PendingCall& call) {
             setBusy(true, QStringLiteral("Running %1…").arg(call.name));
-            nlohmann::json args = nlohmann::json::parse(toStd(call.arguments), nullptr, false);
-            if (args.is_discarded() || !args.is_object()) args = nlohmann::json::object();
+            // Arguments that are not a JSON object -- typically a reply cut
+            // off at the token limit -- go back to the model as an error.
+            // They used to run as {}: a `run` cut short ran every step, a
+            // set_step_param with its value missing reset to defaults.
+            nlohmann::json args = call.arguments.trimmed().isEmpty() ? nlohmann::json::object()
+                                                                     : nlohmann::json::parse(toStd(call.arguments), nullptr, false);
             nlohmann::json result;
-            try {
-                result = api.call(toStd(call.name), args);
-            } catch (const std::exception& e) {
-                result = {{"error", e.what()}};
+            if (args.is_discarded() || !args.is_object()) {
+                result = {{"error", "the arguments of this call are not a valid JSON object (was the reply cut off?); nothing was done"}};
+            } else {
+                try {
+                    result = api.call(toStd(call.name), args);
+                } catch (const std::exception& e) {
+                    result = {{"error", e.what()}};
+                }
             }
             const std::vector<ActionRecord> actions = api.takeActions();
             if (!actions.empty()) addCards(streamingBlock, actions);
@@ -566,7 +600,7 @@ namespace sirius::app {
             if (!keep.isEmpty()) modelBox->addItem(keep);
             modelBox->setCurrentText(keep);
             fillingModels = false;
-            client.fetchModels(settings.baseUrl, settings.apiKey, [this, keep](QStringList ids, QString error) {
+            client.fetchModels(settings.baseUrl, settings.requestKey(), [this, keep](QStringList ids, QString error) {
                 if (ids.isEmpty()) {
                     modelBox->setToolTip(QStringLiteral("Cannot list the models at %1 (%2): type a name").arg(settings.baseUrl, error));
                     return;

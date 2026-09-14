@@ -114,7 +114,9 @@ def run_btrack(labels: np.ndarray, voxel_um: Tuple[float, float, float], params:
     dx = float(voxel_um[0]) if voxel_um and voxel_um[0] > 0 else 1.0
     dy = float(voxel_um[1]) if voxel_um and len(voxel_um) > 1 and voxel_um[1] > 0 else dx
     dz = float(voxel_um[2]) if voxel_um and len(voxel_um) > 2 and voxel_um[2] > 0 else dx
-    scale = (dz, dy, dx) if z_ > 1 else (dy, dx)
+    # One scale per axis of a frame, and a frame is always (z, y, x): a 2-D
+    # series arrives as (t, 1, y, x), and btrack refuses a (y, x) scale for it.
+    scale = (dz, dy, dx)
     try:
         objects = btrack.utils.segmentation_to_objects(labels, scale=scale)
         physical = True
@@ -136,6 +138,9 @@ def run_btrack(labels: np.ndarray, voxel_um: Tuple[float, float, float], params:
         else:
             tracker.max_search_radius = max(1.0, max_distance / dx)
             tracker.volume = ((0, x_), (0, y_), (0, z_)) if z_ > 1 else ((0, x_), (0, y_))
+        # the only way objects reach btrack's engine: without it the queue is
+        # empty and every track -- so every voxel of the output -- is lost
+        tracker.append(objects)
         tracker.track(step_size=100)
         if bool(params.get("optimise", True)):
             # the hypothesis optimisation is what reconstructs lineages

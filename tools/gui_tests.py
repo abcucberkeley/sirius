@@ -5,9 +5,10 @@ The core is covered by tests/test_app_*.cpp, which run without a display. The
 widgets were covered by one screenshot that only proved the window came up.
 This drives the real application through the hooks it already has for
 scripting -- ``--tool`` for the assistant API, ``--action`` for a menu item,
-``--stroke`` and ``--wheel`` for mouse input on the XY pane, ``--drop`` for a
-drag and drop, ``--record`` for a machine-readable log of what happened -- and
-asserts on what comes back rather than on the process surviving.
+``--key`` for a key press on a named widget, ``--stroke`` and ``--wheel`` for
+mouse input on the XY pane, ``--drop`` for a drag and drop, ``--record`` for a
+machine-readable log of what happened -- and asserts on what comes back rather
+than on the process surviving.
 
     python3 tools/gui_tests.py --app build/linux-gcc-app-dev/app/sirius-app
 
@@ -17,6 +18,7 @@ Runs offscreen; no display needed.
 from __future__ import annotations
 
 import argparse
+import http.server
 import json
 import os
 import re
@@ -24,8 +26,9 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import threading
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 ROOT = Path(__file__).resolve().parent.parent
 RAW = ROOT / "tests" / "data" / "raw.tif"
@@ -36,6 +39,10 @@ _TOOL = re.compile(r"^tool (\w+) -> ", re.M)
 
 class Failure(Exception):
     pass
+
+
+class Skip(Exception):
+    """The scenario cannot run here (a platform, a permission); said, not failed."""
 
 
 def check_offscreen_plugin(app: Path) -> Optional[str]:
@@ -117,6 +124,79 @@ def run(app: Path, args: List[str], timeout: int = 300, env: Optional[Dict[str, 
     if code != 0:
         raise Failure(f"exit {code}: {' '.join(full)}\n{text[-4000:]}")
     return text
+
+
+def isolated_settings(tmp: Path, name: str) -> Dict[str, str]:
+    """A HOME and an XDG_CONFIG_HOME of the scenario's own.
+
+    The application keeps its settings (QSettings) and its secret store
+    (~/.sirius) under these on Linux, so a scenario that seeds or inspects them
+    neither reads the user's nor writes over them.
+    """
+    home, config = tmp / f"{name}-home", tmp / f"{name}-config"
+    home.mkdir(parents=True, exist_ok=True)
+    config.mkdir(parents=True, exist_ok=True)
+    return {"HOME": str(home), "XDG_CONFIG_HOME": str(config)}
+
+
+def settings_file(env: Dict[str, str]) -> Path:
+    """Where QSettings("sirius", "sirius-app") lives under an isolated_settings() environment."""
+    return Path(env["XDG_CONFIG_HOME"]) / "sirius" / "sirius-app.conf"
+
+
+# No proxy between the application and a FakeModelServer.
+LOCAL_ONLY = {"http_proxy": "", "HTTP_PROXY": "", "no_proxy": "127.0.0.1,localhost", "NO_PROXY": "127.0.0.1,localhost"}
+
+
+class FakeModelServer:
+    """An OpenAI-compatible model server on 127.0.0.1, for the assistant scenarios.
+
+    It lists one model ("foo") and answers the chats in turn with the messages
+    in `chats` (the last one from then on; "hello" by default), as plain JSON,
+    which the client takes even when it asked for a stream. It keeps the
+    method, path and Authorization header of every request it saw, and the
+    body of every chat request.
+    """
+
+    def __init__(self, chats: Optional[List[Dict[str, Any]]] = None) -> None:
+        seen: List[Tuple[str, str, Optional[str]]] = []
+        bodies: List[Dict[str, Any]] = []
+        replies = chats or [{"role": "assistant", "content": "hello"}]
+        self.requests = seen
+        self.bodies = bodies
+
+        class Handler(http.server.BaseHTTPRequestHandler):
+            def log_message(self, *args: Any) -> None:
+                pass
+
+            def answer(self, body: Dict[str, Any]) -> None:
+                seen.append((self.command, self.path, self.headers.get("Authorization")))
+                data = json.dumps(body).encode()
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(data)))
+                self.end_headers()
+                self.wfile.write(data)
+
+            def do_GET(self) -> None:  # noqa: N802 - the name http.server calls
+                self.answer({"data": [{"id": "foo"}], "models": [{"name": "foo"}]})
+
+            def do_POST(self) -> None:  # noqa: N802 - the name http.server calls
+                body = json.loads(self.rfile.read(int(self.headers.get("Content-Length", "0"))) or b"{}")
+                bodies.append(body)
+                message = replies[min(len(bodies), len(replies)) - 1]
+                self.answer({"choices": [{"message": message, "finish_reason": "stop"}]})
+
+        self.server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        self.url = f"http://127.0.0.1:{self.server.server_address[1]}/v1"
+        threading.Thread(target=self.server.serve_forever, daemon=True).start()
+
+    def __enter__(self) -> FakeModelServer:
+        return self
+
+    def __exit__(self, *exc: Any) -> None:
+        self.server.shutdown()
+        self.server.server_close()
 
 
 def tool_results(output: str) -> Dict[str, List[Any]]:
@@ -301,11 +381,118 @@ def test_the_wheel_zooms(app: Path, tmp: Path) -> None:
     check(float(state["view"]["zoom"]) > 1.0, f"zoom is {state['view']['zoom']} after scrolling in")
 
 
+def test_the_wheel_zooms_about_the_cursor_in_compare(app: Path, tmp: Path) -> None:
+    # Compare zoomed about a point of the XY pane, which is hidden there (a
+    # stale view, another size), so the image slid out from under the cursor.
+    out = run(
+        app,
+        [
+            "--dataset",
+            str(RAW),
+            "--tool",
+            '{"name":"set_view","args":{"mode":"compare"}}',
+            "--wheel",
+            "10,10,3",
+            "--tool",
+            '{"name":"get_state","args":{}}',
+            "--settle",
+            "600",
+            "--quit-after",
+            "6000",
+        ],
+        env=isolated_settings(tmp, "compare-wheel"),
+    )
+    state = only(tool_results(out), "get_state")
+    check(float(state["view"]["zoom"]) > 1.0, f"zoom is {state['view']['zoom']} after scrolling in")
+    m = re.search(r"wheel: .* on compareStepPane .*under the cursor now \(([-\d.]+), ([-\d.]+)\)", out)
+    check(m is not None, "the wheel did not report the compare pane")
+    x, y = float(m.group(1)), float(m.group(2))
+    check(abs(x - 10.0) < 0.05 and abs(y - 10.0) < 0.05, f"voxel (10, 10) under the cursor became ({x}, {y})")
+
+
 def test_a_dropped_file_opens(app: Path, tmp: Path) -> None:
     out = run(app, ["--drop", str(RAW), "--tool", '{"name":"get_state","args":{}}', "--settle", "900", "--quit-after", "6000"])
     state = only(tool_results(out), "get_state")
     check(state["dataset"] is not None, "dropping a TIFF did not open it")
     check(state["dataset"]["name"].startswith("raw"), f"opened {state['dataset']['name']}")
+
+
+def test_files_named_on_the_command_line_open(app: Path, tmp: Path) -> None:
+    # what a file manager's "Open with" (app/linux/sirius-app.desktop, Exec=sirius-app %F) passes
+    out = run(app, [str(RAW), "--tool", '{"name":"get_state","args":{}}', "--settle", "900", "--quit-after", "6000"])
+    state = only(tool_results(out), "get_state")
+    check(state["dataset"] is not None and state["dataset"]["name"].startswith("raw"), f"the dataset is {state['dataset']}")
+    out = run(app, [str(PIPELINE), "--tool", '{"name":"get_state","args":{}}', "--settle", "900", "--quit-after", "6000"])
+    kinds = [s["kind"] for s in only(tool_results(out), "get_state")["steps"]]
+    check("sim" in kinds, f"the pipeline file did not open: steps {kinds}")
+
+
+def test_an_invalid_step_says_so_in_the_error_colour(app: Path, tmp: Path) -> None:
+    # A step whose parameters do not validate shows why in its row, in the
+    # error colour. A universal "* { color }" rule in the style sheet used to
+    # repaint every palette colour in body text, so the line was there but read
+    # like any other summary. The same pipeline with and without a missing OTF
+    # differs only by that line, so the red it adds is the line's text.
+    try:
+        from PIL import Image  # noqa: PLC0415 - optional, as in image_is_not_blank
+    except ImportError:
+        raise Skip("needs Pillow to read the screenshot") from None
+    text = PIPELINE.read_text()
+    check("../tests/data/otf.tif" in text, f"{PIPELINE} no longer names ../tests/data/otf.tif")
+    data = (ROOT / "tests" / "data").as_posix()
+    valid = tmp / "valid.sirius.toml"
+    valid.write_text(text.replace("../tests/data/", data + "/"))
+    invalid = tmp / "invalid.sirius.toml"
+    missing = (tmp / "missing-otf.tif").as_posix()
+    invalid.write_text(text.replace("../tests/data/otf.tif", missing).replace("../tests/data/", data + "/"))
+
+    def red_pixels(pipeline: Path) -> int:
+        shot = tmp / f"{pipeline.stem}.png"
+        run(app, ["--pipeline", str(pipeline), "--screenshot", str(shot), "--settle", "900", "--quit-after", "6000"])
+        image_is_not_blank(shot)
+        with Image.open(shot) as im:
+            return sum(1 for r, g, b in im.convert("RGB").getdata() if r > 140 and g < 100 and b < 80 and r - g > 90)
+
+    added = red_pixels(invalid) - red_pixels(valid)
+    check(added > 60, f"the invalid step added {added} red pixels: its error line is not in the error colour")
+
+
+def test_a_run_that_fails_in_the_worker_ends_a_headless_run(app: Path, tmp: Path) -> None:
+    # A step that raises while it runs (as a CUDA error inside a model does)
+    # used to leave a headless --run waiting for its 600 s deadline: the "Run
+    # failed" message box blocked in the window's runFinished handler, and the
+    # handler that ends the headless run is connected after it.
+    env = isolated_settings(tmp, "failing")
+    plugins = Path(env["HOME"]) / ".sirius" / "plugins"
+    plugins.mkdir(parents=True, exist_ok=True)
+    (plugins / "fails_while_running.py").write_text(
+        "STEP = {'kind': 'fails_while_running', 'name': 'Fails while running', 'group': 'Intensity', 'params': []}\n"
+        "\n"
+        "def run(data, params, meta, ctx):\n"
+        "    raise RuntimeError('CUDA error: an illegal memory access was encountered')\n"
+    )
+    pipeline = tmp / "failing.sirius.toml"
+    pipeline.write_text(
+        "version = 1\n\n"
+        '[[steps]]\nkind = "load"\nname = "Load"\n[steps.params]\n'
+        f'path = "{RAW.as_posix()}"\n\n'
+        '[[steps]]\nkind = "fails_while_running"\nname = "Fails"\n'
+    )
+    shot = tmp / "failing.png"
+    args = ["--pipeline", str(pipeline), "--run", "--tool", '{"name":"get_log","args":{}}', "--screenshot", str(shot)]
+    try:
+        out = run(app, args, timeout=120, env=env)
+    except Failure as e:
+        out = str(e)
+        if out.startswith("timed out"):
+            raise Failure("a run that failed in the worker did not end the headless run (the Run failed box blocked)") from None
+        if "Plugins unavailable" in out or "not loaded" in out:
+            raise Skip("no Python worker to serve the failing step (set SIRIUS_PYTHON to an interpreter with numpy)") from None
+        check(out.startswith("exit 1:"), f"expected the failed run's exit status 1, got: {out[:300]}")
+    else:
+        raise Failure("the failing step's run exited 0")
+    check("illegal memory access" in out, "the worker's error is not in the log")
+    check(shot.is_file(), "no screenshot: the run ended without the grab")
 
 
 def test_menu_actions_reach_the_view(app: Path, tmp: Path) -> None:
@@ -357,15 +544,200 @@ def test_a_preset_fills_the_fields(app: Path, tmp: Path) -> None:
     check(abs(float(params["enhance_sigma"]) - 0.8) < 1e-9, f"sigma is {params['enhance_sigma']}")
 
 
+def test_a_token_the_secret_store_refuses_stays_in_the_settings(app: Path, tmp: Path) -> None:
+    # A token still in the plaintext settings moves into ~/.sirius/secrets.json
+    # at start-up (the HPC token is read then). When the store cannot take it,
+    # the settings entry is the only copy: deleting it anyway worked for one
+    # session and lost the token at the next launch. A store that exists but
+    # does not parse must not be written over either -- that dropped every
+    # other secret in it.
+    if not sys.platform.startswith("linux"):
+        raise Skip("QSettings is an INI file under XDG_CONFIG_HOME only on Linux")
+    if os.geteuid() == 0:
+        raise Skip("root writes through a read-only file mode")
+    env = isolated_settings(tmp, "secrets")
+    conf = settings_file(env)
+    conf.parent.mkdir(parents=True, exist_ok=True)
+    conf.write_text("[hpc]\ntoken=tok_LEGACY\n")
+    store = Path(env["HOME"]) / ".sirius" / "secrets.json"
+    store.parent.mkdir(parents=True, exist_ok=True)
+    store.write_text("{}\n")
+    store.chmod(0o400)
+    try:
+        for launch in (1, 2):
+            out = run(app, ["--quit-after", "1500"], env=env)
+            check("tok_LEGACY" in conf.read_text(), f"launch {launch} deleted the plaintext token the store refused")
+        check(out.count("could not move 'hpc/token'") == 1, "the refused migration was not reported exactly once in a launch")
+    finally:
+        store.chmod(0o600)
+    corrupt = '{"hub/token": "kept", '
+    store.write_text(corrupt)
+    run(app, ["--quit-after", "1500"], env=env)
+    check(store.read_text() == corrupt, f"a store that does not parse was written over: {store.read_text()!r}")
+    check("tok_LEGACY" in conf.read_text(), "the plaintext token went although the store could not take it")
+
+
+def focused(out: str, spec: str) -> None:
+    """The --key press `spec` ("Z plane=Right") reached the widget it named."""
+    target, key = spec.split("=", 1)
+    check(f"key {key} to {target}: focus yes" in out, f"--key {spec} did not get the focus onto {target}")
+
+
+def test_arrow_keys_reach_the_focused_control(app: Path, tmp: Path) -> None:
+    # Left / Right are also Segment > Previous / Next flagged label. The
+    # shortcut stood back for a focused slider or slice pane only after Qt had
+    # already given it the key press, so the arrows moved nothing at all.
+    env = isolated_settings(tmp, "arrows")
+    out = run(
+        app,
+        [
+            "--dataset",
+            str(RAW),
+            "--tool",
+            '{"name":"get_state","args":{}}',
+            "--key",
+            "Z plane=Right",
+            "--key",
+            "xyPane=Right",
+            "--tool",
+            '{"name":"get_state","args":{}}',
+            "--settle",
+            "600",
+            "--quit-after",
+            "6000",
+        ],
+        env=env,
+    )
+    focused(out, "Z plane=Right")
+    focused(out, "xyPane=Right")
+    before, after = tool_results(out)["get_state"][-2:]
+    z0, z1 = before["view"]["z"], after["view"]["z"]
+    check(z1 == z0 + 1, f"Right on the Z slider: z {z0} -> {z1}")
+    x0, x1 = before["view"]["crosshair_x"], after["view"]["crosshair_x"]
+    check(x1 == x0 + 1, f"Right on the XY pane: crosshair x {x0} -> {x1}")
+
+
+def test_space_in_a_read_only_view_leaves_the_step_alone(app: Path, tmp: Path) -> None:
+    # Space is Edit > Enable / skip step. Pressed in the (read-only) session
+    # log, which pages with it, it silently skipped the selected step. With the
+    # focus on a widget that has no use for Space it still does.
+    env = isolated_settings(tmp, "space")
+    out = run(
+        app,
+        [
+            "--dataset",
+            str(RAW),
+            "--tool",
+            '{"name":"add_step","args":{"kind":"classic"}}',
+            "--tool",
+            '{"name":"select_step","args":{"step":3}}',
+            "--key",
+            "Session log=Space",
+            "--tool",
+            '{"name":"get_step","args":{"step":3}}',
+            "--key",
+            "xyPane=Space",
+            "--tool",
+            '{"name":"get_step","args":{"step":3}}',
+            "--settle",
+            "600",
+            "--quit-after",
+            "6000",
+        ],
+        env=env,
+    )
+    focused(out, "Session log=Space")
+    focused(out, "xyPane=Space")
+    in_log, on_pane = tool_results(out)["get_step"][-2:]
+    check(in_log["enabled"] is True, "Space in the session log skipped the selected step")
+    check(on_pane["enabled"] is False, "Space on the XY pane no longer skips the selected step (the shortcut is gone)")
+
+
+def test_ollama_never_gets_the_api_key(app: Path, tmp: Path) -> None:
+    # One stored key serves OpenRouter and custom servers. With the provider
+    # switched to Ollama (whose key field is disabled) every request still
+    # carried it -- to a local server, or a remote one over plain http.
+    if not sys.platform.startswith("linux"):
+        raise Skip("the settings are seeded as an INI file under XDG_CONFIG_HOME, which only Linux reads")
+    env = isolated_settings(tmp, "ollama-key")
+    env.update(LOCAL_ONLY)
+    env.update({"OPENROUTER_API_KEY": "", "SIRIUS_LLM_API_KEY": ""})
+    with FakeModelServer() as server:
+        conf = settings_file(env)
+        conf.parent.mkdir(parents=True, exist_ok=True)
+        # a plaintext key from before the secret store: read, and migrated, at start-up
+        conf.write_text(f"[assistant]\nprovider=ollama\nbaseUrl={server.url}\napiKey=sk-or-STORED\n")
+        run(app, ["--ask", "hello", "--quit-after", "6000"], env=env)
+        asked = any(method == "POST" for method, _, _ in server.requests)
+        check(asked, f"the question never reached the server: {server.requests}")
+        sent = [(method, path) for method, path, auth in server.requests if auth]
+        check(not sent, f"requests to Ollama carried the API key: {sent}")
+
+
+def test_an_api_key_from_the_environment_is_not_stored(app: Path, tmp: Path) -> None:
+    # OPENROUTER_API_KEY is used when no key is stored, and it was written
+    # into ~/.sirius/secrets.json by the first save of any assistant
+    # setting -- which start-up does as soon as the server lists its models.
+    if not sys.platform.startswith("linux"):
+        raise Skip("the settings are seeded as an INI file under XDG_CONFIG_HOME, which only Linux reads")
+    env = isolated_settings(tmp, "env-key")
+    env.update(LOCAL_ONLY)
+    env.update({"OPENROUTER_API_KEY": "sk-or-FROMENV"})
+    with FakeModelServer() as server:
+        conf = settings_file(env)
+        conf.parent.mkdir(parents=True, exist_ok=True)
+        conf.write_text(f"[assistant]\nprovider=openrouter\nbaseUrl={server.url}\n")
+        run(app, ["--ask", "hello", "--quit-after", "6000"], env=env)
+        used = ("POST", "/v1/chat/completions", "Bearer sk-or-FROMENV") in server.requests
+        check(used, f"the environment's key was not used: {server.requests}")
+    check("model=foo" in conf.read_text(), "the model the server listed was not saved (the save this is about never ran)")
+    store = Path(env["HOME"]) / ".sirius" / "secrets.json"
+    check(not store.exists() or "assistant/apiKey" not in store.read_text(), f"the environment's key was written to {store}")
+
+
+def test_a_cut_off_tool_call_is_answered_not_run(app: Path, tmp: Path) -> None:
+    # A reply cut off at the token limit leaves a tool call with arguments that
+    # are not JSON. They ran as {} -- a cut-off `run` ran every step -- and the
+    # model heard the result as if its call had worked.
+    if not sys.platform.startswith("linux"):
+        raise Skip("the settings are seeded as an INI file under XDG_CONFIG_HOME, which only Linux reads")
+    env = isolated_settings(tmp, "cut-off")
+    env.update(LOCAL_ONLY)
+    env.update({"OPENROUTER_API_KEY": "", "SIRIUS_LLM_API_KEY": ""})
+    call = {"id": "call_1", "type": "function", "function": {"name": "set_view", "arguments": '{"mode": "3'}}
+    cut = {"role": "assistant", "content": "", "tool_calls": [call]}
+    with FakeModelServer(chats=[cut, {"role": "assistant", "content": "done"}]) as server:
+        conf = settings_file(env)
+        conf.parent.mkdir(parents=True, exist_ok=True)
+        conf.write_text(f"[assistant]\nprovider=custom\nbaseUrl={server.url}\nmodel=foo\naskBeforeActing=false\n")
+        run(app, ["--dataset", str(RAW), "--ask", "show it in 3D", "--quit-after", "8000"], env=env)
+    answers = [m for body in server.bodies for m in body.get("messages", []) if m.get("role") == "tool"]
+    check(bool(answers), f"the cut-off call was never answered ({len(server.bodies)} chat requests)")
+    check(
+        "not a valid JSON object" in answers[0]["content"],
+        f"the cut-off call ran with no arguments: {answers[0]['content'][:200]}",
+    )
+
+
 SCENARIOS = [
     test_ortho_view_shows_the_dataset,
     test_every_view_mode_renders,
     test_compare_shows_raw_beside_the_result,
     test_painting_reaches_the_labels,
     test_the_wheel_zooms,
+    test_the_wheel_zooms_about_the_cursor_in_compare,
     test_a_dropped_file_opens,
+    test_files_named_on_the_command_line_open,
+    test_an_invalid_step_says_so_in_the_error_colour,
+    test_a_run_that_fails_in_the_worker_ends_a_headless_run,
     test_menu_actions_reach_the_view,
     test_a_preset_fills_the_fields,
+    test_a_token_the_secret_store_refuses_stays_in_the_settings,
+    test_arrow_keys_reach_the_focused_control,
+    test_space_in_a_read_only_view_leaves_the_step_alone,
+    test_ollama_never_gets_the_api_key,
+    test_an_api_key_from_the_environment_is_not_stored,
+    test_a_cut_off_tool_call_is_answered_not_run,
 ]
 
 
@@ -396,6 +768,8 @@ def main() -> int:
             except Failure as e:
                 failures += 1
                 print(f"FAIL  {name}\n      {e}", file=sys.stderr, flush=True)
+            except Skip as e:
+                print(f"skip  {name}\n      {e}", flush=True)
             else:
                 print(f"ok    {name}", flush=True)
     finally:

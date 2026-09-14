@@ -1,10 +1,13 @@
 // sirius-app: the SIRIUS microscopy workbench (docs/design/README.md).
 //
-//   sirius-app [--dataset stack.tif] [--pipeline steps.sirius.toml] [--run]
+//   sirius-app [--dataset stack.tif] [--pipeline steps.sirius.toml] [--run] [files...]
 //
 // Everything can also be opened from the File menu; --run runs every
-// enabled step as soon as the window is up.
+// enabled step as soon as the window is up. Files named without an option
+// open as though dropped on the window, which is what a file manager's
+// "Open with" passes (app/linux/sirius-app.desktop).
 
+#include <algorithm>
 #include <chrono>
 #include <filesystem>
 #include <functional>
@@ -17,13 +20,18 @@
 #include <QEventLoop>
 #include <QDialog>
 #include <QFileInfo>
+#include <QIcon>
 #include <QMenu>
 #include <QDockWidget>
 #include <QJsonDocument>
 #include <QJsonObject>
+#include <QKeyEvent>
+#include <QKeySequence>
 #include <QStandardPaths>
 #include <QTimer>
 
+#include "core/app_paths.hpp"
+#include "core/help_pages.hpp"
 #include "core/operation.hpp"
 #include "core/tool_api.hpp"
 #include "core/workbench.hpp"
@@ -41,6 +49,19 @@ int main(int argc, char** argv) {
     QCoreApplication::setApplicationName(QStringLiteral("sirius-app"));
     QCoreApplication::setOrganizationName(QStringLiteral("sirius"));
     QCoreApplication::setApplicationVersion(QStringLiteral("0.2"));
+    // The window's app id on Wayland and its WM_CLASS on X11: how a desktop
+    // matches the window to sirius-app.desktop for its icon and name.
+    QGuiApplication::setDesktopFileName(QStringLiteral("sirius-app"));
+    {
+        // PNGs rather than the SVG: an SVG icon needs Qt's SVG plugin, which
+        // a deployment may not carry (app/qt/resources/icons/app/README.md)
+        QIcon icon;
+        for (int px : {16, 24, 32, 48, 64, 128, 256})
+            icon.addFile(QStringLiteral(":/icons/app/sirius-app-%1.png").arg(px), QSize(px, px));
+        QApplication::setWindowIcon(icon);
+    }
+    // the help pages, the worker and the plugins are found relative to it
+    sirius::app::setApplicationDirectory(sirius::app::toStd(QCoreApplication::applicationDirPath()));
     sirius::app::theme::applyTheme(app);
 
     QCommandLineParser parser;
@@ -70,15 +91,21 @@ int main(int argc, char** argv) {
                                      QStringLiteral("path"));
     const QCommandLineOption strokeOpt(QStringLiteral("stroke"), QStringLiteral("Drag on the XY pane: x0,y0,x1,y1,moves in voxels (repeatable, after the tools)"),
                                        QStringLiteral("spec"));
-    const QCommandLineOption wheelOpt(QStringLiteral("wheel"), QStringLiteral("Wheel on the XY pane: x,y,steps in voxels (repeatable, before the strokes)"),
+    const QCommandLineOption wheelOpt(QStringLiteral("wheel"), QStringLiteral("Wheel on the XY pane (the step pane in Compare): x,y,steps in voxels (repeatable, before the strokes)"),
                                       QStringLiteral("spec"));
     const QCommandLineOption actionOpt(QStringLiteral("action"), QStringLiteral("Trigger a menu action by its text (repeatable)"),
                                        QStringLiteral("text"));
+    const QCommandLineOption keyOpt(QStringLiteral("key"), QStringLiteral("Focus a widget by its accessible or object name and press a key: \"Z plane=Right\" (repeatable)"),
+                                    QStringLiteral("name=key"));
     const QCommandLineOption askOpt(QStringLiteral("ask"), QStringLiteral("Send a message to the assistant"), QStringLiteral("text"));
     const QCommandLineOption settleOpt(QStringLiteral("settle"), QStringLiteral("Milliseconds to wait before the screenshot (default 600)"),
                                        QStringLiteral("ms"));
-    parser.addOptions({datasetOpt, pipelineOpt, runOpt, screenshotOpt, quitAfterOpt, toolOpt, actionOpt, askOpt, settleOpt, strokeOpt, wheelOpt, dropOpt, recordOpt});
+    parser.addOptions({datasetOpt, pipelineOpt, runOpt, screenshotOpt, quitAfterOpt, toolOpt, actionOpt, keyOpt, askOpt, settleOpt, strokeOpt, wheelOpt, dropOpt, recordOpt});
+    parser.addPositionalArgument(QStringLiteral("files"), QStringLiteral("Datasets or pipeline files to open, as though dropped on the window"),
+                                 QStringLiteral("[files...]"));
     parser.process(app);
+    const QStringList files = parser.positionalArguments();
+    const bool filesHavePipeline = std::any_of(files.begin(), files.end(), [](const QString& f) { return f.endsWith(QStringLiteral(".toml"), Qt::CaseInsensitive); });
 
     sirius::app::registerBuiltinOperations();
 
@@ -103,7 +130,7 @@ int main(int argc, char** argv) {
     // User operations come from the Python worker. A pipeline given on the
     // command line may use them, so load them first in that case; otherwise
     // after the window is up so start-up stays quick.
-    if (parser.isSet(pipelineOpt)) workbench.loadPlugins(false);
+    if (parser.isSet(pipelineOpt) || filesHavePipeline) workbench.loadPlugins(false);
     else QTimer::singleShot(400, &window, [&workbench] { workbench.loadPlugins(false); });
     if (parser.isSet(pipelineOpt)) window.openPipelinePath(parser.value(pipelineOpt));
     // recording starts before anything scripted happens, so the run is in it
@@ -121,9 +148,12 @@ int main(int argc, char** argv) {
         const QString dataset = parser.value(datasetOpt);
         QTimer::singleShot(0, &window, [&window, dataset] { window.openDatasetPath(dataset); });
     }
+    if (!files.isEmpty()) QTimer::singleShot(0, &window, [&window, files] { window.dropPaths(files); });
     const QStringList toolCalls = parser.values(toolOpt);
     const QStringList actions = parser.values(actionOpt);
     sirius::app::ToolApi tools(workbench);
+    // get_help answers from the pages the application reads, as it does for the assistant
+    tools.setHelpHook([](const std::string& kind) { return sirius::app::loadHelpPage(kind).markdown; });
     // Scripted runs block on the worker thread the way the assistant does.
     tools.setRunHook([&bridge](int target) {
         QEventLoop loop;
@@ -168,6 +198,46 @@ int main(int argc, char** argv) {
         workbench.logLine("no action named " + sirius::app::toStd(text));
         qWarning("no action named %s", qPrintable(text));
     };
+    // A key press as a user makes it: to the focused widget, through the
+    // application -- so a shortcut the key matches is asked about first --
+    // with the dock the widget sits in raised so that it can take the focus.
+    auto pressKey = [&](const QString& spec) {
+        const int eq = spec.indexOf(QLatin1Char('='));
+        const QString target = spec.left(eq);
+        const QKeySequence key(eq < 0 ? QString() : spec.mid(eq + 1));
+        QWidget* widget = nullptr;
+        for (QWidget* top : QApplication::topLevelWidgets()) {
+            for (QWidget* w : top->findChildren<QWidget*>())
+                if (!widget && (w->accessibleName() == target || w->objectName() == target)) widget = w;
+        }
+        if (!widget || key.isEmpty()) {
+            qWarning("--key %s: no widget of that name, or no key", qPrintable(spec));
+            return;
+        }
+        for (QWidget* w = widget; w; w = w->parentWidget())
+            if (auto* dock = qobject_cast<QDockWidget*>(w)) {
+                dock->show();
+                dock->raise();
+            }
+        widget->window()->activateWindow();
+        letTheWindowCatchUp();
+        widget->setFocus(Qt::OtherFocusReason);
+        letTheWindowCatchUp();
+        const QKeyCombination combo = key[0];
+        const Qt::KeyboardModifiers mods = combo.keyboardModifiers();
+        QString text;
+        if (combo.key() >= Qt::Key_Space && combo.key() <= Qt::Key_AsciiTilde && !(mods & (Qt::ControlModifier | Qt::AltModifier | Qt::MetaModifier))) {
+            text = QChar(static_cast<char16_t>(combo.key()));
+            if (!(mods & Qt::ShiftModifier)) text = text.toLower();
+        }
+        QWidget* receiver = QApplication::focusWidget() ? QApplication::focusWidget() : widget;
+        qInfo("key %s to %s: focus %s", qPrintable(key.toString()), qPrintable(target), receiver == widget ? "yes" : "no");
+        QKeyEvent press(QEvent::KeyPress, combo.key(), mods, text);
+        QCoreApplication::sendEvent(receiver, &press);
+        QKeyEvent release(QEvent::KeyRelease, combo.key(), mods, text);
+        QCoreApplication::sendEvent(receiver, &release);
+        letTheWindowCatchUp();
+    };
     auto script = [&] {
         const QStringList argv = QCoreApplication::arguments();
         for (int i = 1; i < argv.size(); ++i) {
@@ -184,6 +254,7 @@ int main(int argc, char** argv) {
             }
             if (name == QLatin1String("tool")) runTool(value);
             else if (name == QLatin1String("action")) runAction(value);
+            else if (name == QLatin1String("key")) pressKey(value);
             else if (name == QLatin1String("drop")) {
                 window.dropPaths({value});
                 letTheWindowCatchUp();
@@ -202,7 +273,7 @@ int main(int argc, char** argv) {
             }
         }
     };
-    const bool scripted = !toolCalls.isEmpty() || !actions.isEmpty() || parser.isSet(askOpt) || parser.isSet(strokeOpt) || parser.isSet(wheelOpt) || parser.isSet(dropOpt);
+    const bool scripted = !toolCalls.isEmpty() || !actions.isEmpty() || parser.isSet(keyOpt) || parser.isSet(askOpt) || parser.isSet(strokeOpt) || parser.isSet(wheelOpt) || parser.isSet(dropOpt);
     const bool headless = scripted || parser.isSet(screenshotOpt);
     // An interactive --run just starts; a headless one (below) also decides
     // the exit code and when the window is grabbed.

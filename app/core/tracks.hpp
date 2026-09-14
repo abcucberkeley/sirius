@@ -94,18 +94,19 @@ namespace sirius::app {
         double meanVoxels = 0.0;
         std::uint32_t parent = 0;        // 0: none, or not in the labels any more
         std::vector<std::uint32_t> children;   // ascending; present in the labels
-        // Whether the lineage still describes a division here. Trackers
-        // record one two ways: btrack ends the mother and starts two
-        // daughters that name her; the latents model keeps the mother's id on
-        // one daughter and starts only the other. So: two or more children,
-        // or one child that starts while this track is still present (and
-        // after it began). One
-        // child after this track has ended is a continuation (the other
-        // daughter was deleted, or never kept), not a division.
-        bool division = false;
+        // How many divisions the lineage still describes here. Trackers record
+        // one two ways: btrack ends the mother and starts two daughters that
+        // name her; the latents model keeps the mother's id on one daughter
+        // and starts only the other, so a mother that divides twice has two
+        // children born while she is still present. Each child born after this
+        // track began and while it is present is one division; children that
+        // start after it ended count as one division when there are two or
+        // more of them, and as a continuation, not a division, when one is left
+        // (its sister deleted, or never kept).
+        Index divisions = 0;
 
         Index span() const noexcept { return last - first + 1; }
-        bool divides() const noexcept { return division; }
+        bool divides() const noexcept { return divisions > 0; }
     };
 
     // One row per track, ascending id. Distances in microns from `voxelUm`
@@ -120,8 +121,8 @@ namespace sirius::app {
     // the lineage an annotation of them.
     Lineage lineageFromJson(const nlohmann::json& j);
 
-    // Tracks that divide (TrackSummary::division): the divisions the lineage
-    // still describes after any edits.
+    // The divisions the lineage still describes after any edits (the sum of
+    // TrackSummary::divisions).
     Index countDivisions(const std::vector<TrackSummary>& tracks);
 
 } // namespace sirius::app

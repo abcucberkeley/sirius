@@ -115,9 +115,12 @@ namespace sirius::simdetail {
     }
 
     // Smooth high-pass for the widefield order (port of dev_order0damping).
+    // A zero axial limit -- a 2D or thin stack, whose filter keeps kz = 0
+    // alone -- has no axial term: the reference's 0/0 there made every
+    // output voxel NaN.
     SIRIUS_HD double order0Damping(double radius, double zindex, double rlimit, double zlimit) {
         const double rfrac = radius / rlimit;
-        const double zfrac = fabs(zindex / zlimit);
+        const double zfrac = zlimit > 0.0 ? fabs(zindex / zlimit) : 0.0;
         return rfrac * rfrac + zfrac * zfrac * zfrac;
     }
 
@@ -318,9 +321,9 @@ namespace sirius::simdetail {
         // output apodization on the *absolute* (assembled) frequency
         const double zdistabs = fabs(z0);
         double rho = c.zapocutoff > 0
-            ? sqrt((rdistabs / c.apocutoff) * (rdistabs / c.apocutoff) +
-                   (zdistabs / c.zapocutoff) * (zdistabs / c.zapocutoff))
-            : rdistabs / c.apocutoff;
+                         ? sqrt((rdistabs / c.apocutoff) * (rdistabs / c.apocutoff) +
+                                (zdistabs / c.zapocutoff) * (zdistabs / c.zapocutoff))
+                         : rdistabs / c.apocutoff;
         if (rho > 1.0) rho = 1.0;
         double apofact = 1.0;
         if (c.apodizeOutput == 1) apofact = cos(0.5 * kPi * rho);
@@ -331,7 +334,11 @@ namespace sirius::simdetail {
     // Filter application, first pass: the stored (kx >= 0) half; scales the
     // plus component in place. `scale` already includes conjamp.
     SIRIUS_HD void filterApplySide(Cd* re, Cd* im, Cd scale, bool inSupport) {
-        if (!inSupport) { *re = cd(0, 0); *im = cd(0, 0); return; }
+        if (!inSupport) {
+            *re = cd(0, 0);
+            *im = cd(0, 0);
+            return;
+        }
         const Cd bandplus = cmul(cplusi(*re, *im), scale);
         const Cd bandminus = cminusi(*re, *im);
         *re = cscale(cadd(bandplus, bandminus), 0.5);
@@ -389,7 +396,10 @@ namespace sirius::simdetail {
         } else {
             Cd re = bandRe[src];
             Cd im = bandIm[src];
-            if (conjFlag) { re = cconj(re); im = cconj(im); }
+            if (conjFlag) {
+                re = cconj(re);
+                im = cconj(im);
+            }
             v = cplusi(re, im);
         }
         big[(zout * c.ydim + yout) * c.xdim + xout] = v;

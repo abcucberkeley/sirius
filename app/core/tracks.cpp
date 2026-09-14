@@ -192,11 +192,13 @@ namespace sirius::app {
             p->second.children.push_back(child);   // lineage is ordered by child, so ascending
         }
         for (auto& [id, row] : rows) {
-            if (row.children.size() >= 2) row.division = true;
-            else if (row.children.size() == 1) {
-                const Index born = rows.at(row.children.front()).first;
-                row.division = row.first < born && born <= row.last;   // appears beside a mother already there
+            Index after = 0;
+            for (std::uint32_t child : row.children) {
+                const Index born = rows.at(child).first;
+                if (row.first < born && born <= row.last) ++row.divisions;   // beside a mother still there
+                else if (born > row.last) ++after;
             }
+            if (after >= 2) ++row.divisions;
         }
 
         std::vector<TrackSummary> out;
@@ -233,7 +235,9 @@ namespace sirius::app {
     }
 
     Index countDivisions(const std::vector<TrackSummary>& tracks) {
-        return static_cast<Index>(std::count_if(tracks.begin(), tracks.end(), [](const TrackSummary& s) { return s.divides(); }));
+        Index n = 0;
+        for (const TrackSummary& s : tracks) n += s.divisions;
+        return n;
     }
 
 } // namespace sirius::app

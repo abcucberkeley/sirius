@@ -17,6 +17,7 @@ two agree bit for bit.
     python bench_tiff_regions.py --files '/path/*.tif' --repeat 3
     python bench_tiff_regions.py --files ... --device cuda     # nvTIFF path
 """
+
 from __future__ import annotations
 
 import argparse
@@ -41,6 +42,32 @@ def timeit(fn, repeat: int, warmup: int = 1):
     return min(ts), statistics.median(ts)
 
 
+def access_patterns(sirius, tifffile, path, f, n_pages, first, count, rect, device):
+    """(sirius, tifffile) callables per pattern for one file.
+
+    Built in a function so every callable binds this file's values. read_region
+    decodes the rectangle of every page (it has no page range), so the tifffile
+    side of "region" decodes every page and slices too; comparing it with a
+    decode of `count` pages timed different amounts of work and could never match."""
+    x0, y0, rw, rh = rect
+
+    def tiff_shape():
+        with tifffile.TiffFile(path) as t:
+            return t.series[0].shape
+
+    return {
+        "metadata": (lambda: sirius.inspect_tiff(path), tiff_shape),
+        "pages": (
+            lambda: f.read_pages(first, count, device=device),
+            lambda: tifffile.imread(path, key=range(first, first + count)),
+        ),
+        "region": (
+            lambda: f.read_region(x0, y0, rw, rh, level=0, device=device),
+            lambda: tifffile.imread(path, key=range(n_pages))[..., y0 : y0 + rh, x0 : x0 + rw],
+        ),
+    }
+
+
 def main():
     p = argparse.ArgumentParser()
     p.add_argument("--files", required=True, help="glob of TIFFs to benchmark")
@@ -52,16 +79,21 @@ def main():
     p.add_argument("--no-verify", action="store_true")
     a = p.parse_args()
 
-    import sirius
     import tifffile
+
+    import sirius
 
     paths = sorted(glob.glob(a.files))[: a.limit]
     if not paths:
         raise SystemExit(f"no files matched {a.files}")
-    print(f"sirius {getattr(sirius, '__version__', '?')}  tifffile {tifffile.__version__}  "
-          f"device={a.device}  {len(paths)} files, {a.repeat} repeats (minimum reported)")
-    print(f"{'file':34s} {'pages':>6s} {'shape':>18s} {'pattern':>9s} "
-          f"{'sirius ms':>10s} {'tifffile ms':>12s} {'speedup':>8s} {'match':>6s}")
+    print(
+        f"sirius {getattr(sirius, '__version__', '?')}  tifffile {tifffile.__version__}  "
+        f"device={a.device}  {len(paths)} files, {a.repeat} repeats (minimum reported)"
+    )
+    print(
+        f"{'file':34s} {'pages':>6s} {'shape':>18s} {'pattern':>9s} "
+        f"{'sirius ms':>10s} {'tifffile ms':>12s} {'speedup':>8s} {'match':>6s}"
+    )
 
     totals = {}
     for path in paths:
@@ -75,33 +107,31 @@ def main():
         rh, rw = min(a.region[0], h), min(a.region[1], w)
         y0, x0 = (h - rh) // 2, (w - rw) // 2
 
-        cases = {
-            "metadata": (lambda: sirius.inspect_tiff(path),
-                         lambda: tifffile.TiffFile(path).series[0].shape),
-            "pages": (lambda: f.read_pages(first, count, device=a.device),
-                      lambda: tifffile.imread(path, key=range(first, first + count))),
-            "region": (lambda: f.read_region(x0, y0, rw, rh, level=0, device=a.device),
-                       # tifffile has no region read: the honest comparison is
-                       # decode the pages then slice, which is what we do today
-                       lambda: tifffile.imread(path, key=range(first, first + count))[:, y0:y0 + rh, x0:x0 + rw]),
-        }
+        cases = access_patterns(sirius, tifffile, path, f, n_pages, first, count, (x0, y0, rw, rh), a.device)
         for pattern, (sfn, tfn) in cases.items():
             try:
                 s_min, _ = timeit(sfn, a.repeat)
                 t_min, _ = timeit(tfn, a.repeat)
             except Exception as exc:  # noqa: BLE001 -- a failure is a result
-                print(f"{name:34s} {n_pages:6d} {str((n_pages, h, w)):>18s} {pattern:>9s} "
-                      f"   ERROR {type(exc).__name__}: {str(exc)[:40]}")
+                print(
+                    f"{name:34s} {n_pages:6d} {str((n_pages, h, w)):>18s} {pattern:>9s} "
+                    f"   ERROR {type(exc).__name__}: {str(exc)[:40]}"
+                )
                 continue
             match = "-"
             if not a.no_verify and pattern in ("pages", "region"):
-                sa = np.asarray(sfn()); ta = np.asarray(tfn())
+                sa = np.asarray(sfn())
+                ta = np.asarray(tfn())
+                if ta.size == sa.size:
+                    ta = ta.reshape(sa.shape)  # tifffile squeezes a single page
                 if sa.shape == ta.shape:
                     match = "yes" if np.array_equal(sa, ta) else "NO"
                 else:
                     match = f"{sa.shape}!={ta.shape}"
-            print(f"{name:34s} {n_pages:6d} {str((n_pages, h, w)):>18s} {pattern:>9s} "
-                  f"{1e3 * s_min:10.1f} {1e3 * t_min:12.1f} {t_min / max(s_min, 1e-9):7.2f}x {match:>6s}")
+            print(
+                f"{name:34s} {n_pages:6d} {str((n_pages, h, w)):>18s} {pattern:>9s} "
+                f"{1e3 * s_min:10.1f} {1e3 * t_min:12.1f} {t_min / max(s_min, 1e-9):7.2f}x {match:>6s}"
+            )
             totals.setdefault(pattern, []).append(t_min / max(s_min, 1e-9))
 
     print("\nmedian speedup over tifffile, by pattern:")
