@@ -446,13 +446,8 @@ class WorkerServer:
         """Run `work(progress, cancel_event) -> (result, tensors)` on its own
         thread; `send(header, tensors)` is the connection's locked sender,
         shared by progress frames and the reply."""
-        with self._job_lock:
-            if self._job is not None and self._job["thread"].is_alive():
-                send({"id": rid, "type": "error", "message": f"busy: request {self._job['id']} is still running"})
-                return
-            cancel = threading.Event()
-            job: Dict[str, Any] = {"id": rid, "cancel": cancel, "thread": None}
-            self._job = job
+        cancel = threading.Event()
+        job: Dict[str, Any] = {"id": rid, "cancel": cancel, "thread": None}
 
         def progress(fraction: float, message: str = "") -> None:
             try:
@@ -488,9 +483,27 @@ class WorkerServer:
                     if self._job is job:
                         self._job = None
 
-        thread = threading.Thread(target=run, name=f"sirius-run-{rid}", daemon=True)
-        job["thread"] = thread
-        thread.start()
+        # The job is published and its thread started under one lock: a
+        # request arriving in between used to find the slot taken by a job
+        # whose thread was still None (AttributeError on is_alive) or not yet
+        # started (is_alive False, so it took the slot and two jobs ran).
+        # run()'s own finally waits for the lock, so a job that ends at once
+        # cannot clear the slot before it is set.
+        job["thread"] = threading.Thread(target=run, name=f"sirius-run-{rid}", daemon=True)
+        with self._job_lock:
+            current = self._job
+            if current is not None and current["thread"].is_alive():
+                busy = current["id"]
+            else:
+                busy = None
+                self._job = job
+                try:
+                    job["thread"].start()
+                except RuntimeError:
+                    self._job = None
+                    raise
+        if busy is not None:
+            send({"id": rid, "type": "error", "message": f"busy: request {busy} is still running"})
 
     # --- models ----------------------------------------------------------------------
 

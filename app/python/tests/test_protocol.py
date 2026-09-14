@@ -17,6 +17,7 @@ import tempfile
 import threading
 import time
 import unittest
+import unittest.mock
 import warnings
 
 import numpy as np
@@ -792,3 +793,57 @@ class TestReloadWhileBusy(unittest.TestCase):
         if job is not None:
             job["thread"].join(timeout=30)
         server.plugin_list(reload=True)   # and afterwards a reload is
+
+
+class TestJobSlot(unittest.TestCase):
+    """One job at a time, also when two requests race for the slot."""
+
+    def test_two_requests_racing_for_the_slot_start_one_job(self):
+        server = WorkerServer("127.0.0.1", 0, "t", "cpu")
+        release = threading.Event()
+        started = []
+        replies = []
+        replies_lock = threading.Lock()
+
+        def send(header, tensors=None):
+            with replies_lock:
+                replies.append(header)
+
+        def work(progress, cancel):
+            started.append(threading.current_thread().name)
+            release.wait(5)
+            return {}, {}
+
+        # widen the window between claiming the slot and starting the thread,
+        # which is where the second request used to slip in
+        real_start = threading.Thread.start
+
+        def slow_start(thread):
+            time.sleep(0.05)
+            real_start(thread)
+
+        errors = []
+
+        def request(rid):
+            try:
+                server._start_job(rid, "race", send, work)
+            except Exception as e:  # noqa: BLE001 - the failure under test
+                errors.append(e)
+
+        with unittest.mock.patch.object(threading.Thread, "start", slow_start):
+            racers = [threading.Thread(target=request, args=(rid,)) for rid in (1, 2)]
+            for r in racers:
+                real_start(r)
+            for r in racers:
+                r.join(5)
+        time.sleep(0.1)
+        self.assertEqual(errors, [])
+        self.assertEqual(len(started), 1, "exactly one job runs")
+        busy = [h for h in replies if h.get("type") == "error" and "busy" in h.get("message", "")]
+        self.assertEqual(len(busy), 1, "the other request is told the worker is busy")
+        release.set()
+        for _ in range(50):
+            if server._current_job() is None:
+                break
+            time.sleep(0.02)
+        self.assertIsNone(server._current_job(), "the slot is free again once the job ends")
