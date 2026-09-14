@@ -32,6 +32,13 @@ namespace sirius::app::secrets {
 
     namespace {
 
+        // Where the file store lives when a run keeps settings of its own
+        // (setStoreDirectory); empty for ~/.sirius.
+        QString& storeDirectory() {
+            static QString dir;
+            return dir;
+        }
+
 #ifdef Q_OS_WIN
 
         // The QSettings subtree the DPAPI blobs live in, next to (but not on
@@ -107,7 +114,10 @@ namespace sirius::app::secrets {
             return out;
         }
 
-        QString storePath() { return QDir::homePath() + QStringLiteral("/.sirius/secrets.json"); }
+        QString storePath() {
+            const QString dir = storeDirectory().isEmpty() ? QDir::homePath() + QStringLiteral("/.sirius") : storeDirectory();
+            return dir + QStringLiteral("/secrets.json");
+        }
 
         // The store as it is on disk: an empty object when there is no file
         // (or an empty one). False when the file is there but cannot be read
@@ -228,6 +238,11 @@ namespace sirius::app::secrets {
         const bool ok = removeBackend(key);
         QSettings().remove(key);
         return ok;
+    }
+
+    void setStoreDirectory(const QString& dir) {
+        const std::lock_guard<std::mutex> lock(storeMutex());
+        storeDirectory() = dir;
     }
 
 } // namespace sirius::app::secrets

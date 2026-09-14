@@ -45,6 +45,14 @@ namespace sirius::app::secrets {
     // False when the store could not be rewritten without the secret.
     bool remove(const QString& key);
 
+    // Keeps the file store in `dir` instead of ~/.sirius; an empty `dir` goes
+    // back to ~/.sirius. main() calls it with --settings, before the first
+    // read: QSettings is moved to that directory then, and the file store has
+    // to follow, or a run with settings of its own reads the user's real
+    // tokens and migrates its own plaintext ones into the user's store.
+    // Windows keeps its secrets in QSettings, which moves with it anyway.
+    void setStoreDirectory(const QString& dir);
+
 } // namespace sirius::app::secrets
 
 #endif // SIRIUS_APP_SECRET_STORE_HPP
