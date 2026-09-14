@@ -430,6 +430,23 @@ TEST_CASE("the foundation step keeps the labels the worker returns and reports i
         (void)op.run(StepInput{meta, array, nullptr, nullptr}, p, ctx);
         CHECK(sent()["tile"] == json::array({0, 32, 32}));
     }
+    SECTION("a bundle this machine cannot see is left to the worker") {
+        // A bundle picked from a registry on a cluster lives on the worker's
+        // filesystem. Refusing it here, because it is not on this machine,
+        // made the HPC backend unable to run any registry bundle.
+        const std::string remote = "/cluster/only/registry/track-nih-ls-2d-pretrained.ltb";
+        REQUIRE_FALSE(std::filesystem::exists(remote));
+        p.set("model", remote);
+        const Validation v = op.validate(p, meta);
+        CHECK(v.ok());
+        REQUIRE(v.warnings.size() >= 1);
+        CHECK_THAT(v.warnings.front(), Catch::Matchers::ContainsSubstring("not found on this machine"));
+        const StepOutput out = op.run(StepInput{meta, array, nullptr, nullptr}, p, ctx);
+        REQUIRE(out.labels);
+        CHECK(sent().value("model", "") == remote);   // sent as given
+        p.set("model", std::string());
+        CHECK_FALSE(op.validate(p, meta).ok());        // no model at all is still an error
+    }
     SECTION("Min. voxels is shown for Segment only") {
         const auto spec = std::find_if(op.info().params.begin(), op.info().params.end(),
                                        [](const ParamSpec& s) { return s.key == "min_voxels"; });
