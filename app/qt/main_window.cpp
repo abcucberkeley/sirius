@@ -537,7 +537,10 @@ namespace sirius::app {
             action(file, QStringLiteral("Open folder as dataset…"), QKeySequence(Qt::CTRL | Qt::SHIFT | Qt::Key_O),
                    [this] { openFolderDataset(); });
             recentMenu = file->addMenu(QStringLiteral("Open recent"));
-            closeDataset = action(file, QStringLiteral("Close dataset"), QKeySequence::Close, [this] { wb().closeDataset(); });
+            closeDataset = action(file, QStringLiteral("Close dataset"), QKeySequence::Close, [this] {
+                if (bridge.taskRunning()) bridge.cancelTask();
+                wb().closeDataset();
+            });
             file->addSeparator();
             savePipeline = action(file, QStringLiteral("Save pipeline"), QKeySequence::Save, [this] { savePipelineTo(fromStd(wb().pipelinePath())); });
             savePipelineAs = action(file, QStringLiteral("Save pipeline as…"), QKeySequence::SaveAs, [this] { savePipelineTo(QString()); });
@@ -883,11 +886,13 @@ namespace sirius::app {
             const bool stepOk = i >= 0 && i < p.size();
             const bool movable = stepOk && i > 0;
             const bool running = bridge.running();
+            const bool busy = running || bridge.taskRunning();
             // The workbench refuses every edit while a run is active
             // (Workbench::canEdit): the menu has to say so rather than let
             // the user pick an item that quietly does nothing.
-            const bool edit = w.canEdit();
-            const QString frozen = QStringLiteral("Not while a run is in progress — cancel it (Esc) or wait");
+            const bool edit = w.canEdit() && !bridge.taskRunning();
+            const QString frozen = busy ? QStringLiteral("Not while a run or load is in progress — cancel it (Esc) or wait")
+                                        : QString();
             undo->setEnabled(edit && w.history().canUndo());
             undo->setText(w.history().canUndo() ? QStringLiteral("Undo %1").arg(fromStd(w.history().undoLabel()))
                                                 : QStringLiteral("Undo"));
@@ -907,18 +912,18 @@ namespace sirius::app {
                 a->setEnabled(edit);
                 a->setStatusTip(edit ? QString() : frozen);
             }
-            runAllAct->setEnabled(w.hasDataset() && !running);
-            runSelected->setEnabled(w.hasDataset() && !running && stepOk);
-            runTo->setEnabled(w.hasDataset() && !running && stepOk);
-            cancelRun->setEnabled(running || bridge.taskRunning());
+            runAllAct->setEnabled(w.hasDataset() && !busy);
+            runSelected->setEnabled(w.hasDataset() && !busy && stepOk);
+            runTo->setEnabled(w.hasDataset() && !busy && stepOk);
+            cancelRun->setEnabled(busy);
             clearCache->setEnabled(edit && stepOk);
             clearAll->setEnabled(edit);
-            exportResult->setEnabled(w.hasDataset() && !running);
+            exportResult->setEnabled(w.hasDataset() && !busy);
             // It reads a step's output and its labels on the task thread, which
             // a run is free to replace underneath it, so it goes with the rest.
-            exportTraining->setEnabled(w.hasDataset() && !running);
+            exportTraining->setEnabled(w.hasDataset() && !busy);
             exportPython->setEnabled(true);
-            closeDataset->setEnabled(edit && w.hasDataset());
+            closeDataset->setEnabled((edit && w.hasDataset()) || bridge.taskRunning());
             savePipeline->setEnabled(true);
             const ViewState& v = w.viewState();
             viewOrtho->setChecked(v.mode == ViewMode::Ortho);

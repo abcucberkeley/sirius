@@ -1053,17 +1053,18 @@ namespace sirius::app {
             name->setText(fromStd(st->name));
             name->setToolTip(QStringLiteral("Double-click to rename"));
             const bool running = bridge.running();
+            const bool busy = running || bridge.taskRunning();
             // Every parameter edit is refused while a run holds the pipeline
             // (Workbench::canEdit), so the whole form goes with it rather
             // than accepting values that are dropped.
-            const bool editable = wb.canEdit();
+            const bool editable = wb.canEdit() && !bridge.taskRunning();
             scroll->setEnabled(editable);
             cache->setEnabled(editable);
-            run->setEnabled(!running && wb.hasDataset());
+            run->setEnabled(!busy && wb.hasDataset());
             view->setEnabled(true);
             remove->setVisible(!st->pinned);
             remove->setEnabled(editable);
-            const QString frozen = QStringLiteral("Not while a run is in progress — cancel it (Esc) or wait");
+            const QString frozen = QStringLiteral("Not while a run or load is in progress — cancel it (Esc) or wait");
             scroll->setToolTip(editable ? QString() : frozen);
             cache->setToolTip(editable ? QString() : frozen);
             remove->setToolTip(editable ? QString() : frozen);
@@ -1242,6 +1243,8 @@ namespace sirius::app {
             impl_->builtFor = -1;   // diagnostics-driven notes may have changed
             impl_->refresh();
         });
+        connect(&bridge, &WorkbenchBridge::taskStarted, this, [this] { impl_->refreshHeader(); });
+        connect(&bridge, &WorkbenchBridge::taskFinished, this, [this] { impl_->refreshHeader(); });
         impl_->refresh();
     }
 

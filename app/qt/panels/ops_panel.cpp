@@ -262,13 +262,13 @@ namespace sirius::app {
                 reorder_->setVisible(!step.pinned);
                 // While a run is active the workbench refuses every pipeline
                 // edit, so the row's controls say so instead of doing nothing.
-                const bool editable = wb.canEdit();
+                const bool editable = wb.canEdit() && !bridge_.taskRunning();
                 enable_->setEnabled(editable);
                 remove_->setEnabled(editable);
                 up_->setEnabled(editable && index > 1);
                 down_->setEnabled(editable && index < wb.pipeline().size() - 1);
                 if (!editable) {
-                    const QString frozen = QStringLiteral(" — not while a run is in progress");
+                    const QString frozen = QStringLiteral(" — not while a run or load is in progress");
                     for (QWidget* w : {static_cast<QWidget*>(enable_), static_cast<QWidget*>(up_),
                                        static_cast<QWidget*>(down_), static_cast<QWidget*>(remove_)})
                         w->setToolTip(w->toolTip().section(QStringLiteral(" — "), 0, 0) + frozen);
@@ -731,6 +731,8 @@ namespace sirius::app {
         connect(&bridge, &WorkbenchBridge::runStarted, this, refreshAll);
         connect(&bridge, &WorkbenchBridge::runFinished, this, refreshAll);
         connect(&bridge, &WorkbenchBridge::runStateChanged, this, refreshAll);
+        connect(&bridge, &WorkbenchBridge::taskStarted, this, refreshAll);
+        connect(&bridge, &WorkbenchBridge::taskFinished, this, refreshAll);
         connect(&bridge, &WorkbenchBridge::runProgress, this, [this](double f, int, const QString&) {
             if (impl_->bridge.running())
                 impl_->runAll->setText(QStringLiteral("Running · %1 %").arg(static_cast<int>(f * 100.0 + 0.5)));
@@ -765,17 +767,18 @@ namespace sirius::app {
         impl_->addHint->setText(n < 2 ? QStringLiteral("Reconstruct, reduce, adjust, combine, segment…")
                                       : QStringLiteral("Runs after step %1").arg(fromStd(Step::number(n - 1))));
         const bool running = impl_->bridge.running();
-        impl_->runAll->setEnabled(!running && wb.hasDataset());
-        if (!running) impl_->runAll->setText(QStringLiteral("Run all enabled"));
-        impl_->exportBtn->setEnabled(wb.hasDataset() && !running);
+        const bool busy = running || impl_->bridge.taskRunning();
+        impl_->runAll->setEnabled(!busy && wb.hasDataset());
+        if (!busy) impl_->runAll->setText(QStringLiteral("Run all enabled"));
+        impl_->exportBtn->setEnabled(wb.hasDataset() && !busy);
         // Adding a step is an edit like any other: refused while a run holds
         // the pipeline, so the row (and the menu it opens) go with it.
-        const bool editable = wb.canEdit();
+        const bool editable = wb.canEdit() && !impl_->bridge.taskRunning();
         impl_->addRow->setEnabled(editable);
         impl_->addTitle->setEnabled(editable);
         impl_->addHint->setEnabled(editable);
         impl_->addRow->setToolTip(editable ? QString()
-                                           : QStringLiteral("Not while a run is in progress — cancel it (Esc) or wait"));
+                                           : QStringLiteral("Not while a run or load is in progress — cancel it (Esc) or wait"));
         if (!editable && impl_->addMenu->isVisible()) {
             impl_->addMenu->hide();
             impl_->addRow->setSelected(false);

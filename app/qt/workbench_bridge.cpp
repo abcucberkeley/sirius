@@ -58,6 +58,10 @@ namespace sirius::app {
             wb_.logLine("A run is already in progress.");
             return false;
         }
+        if (taskActive_.load()) {
+            wb_.logLine("Wait for " + toStd(taskLabel_) + " to finish.");
+            return false;
+        }
         std::shared_ptr<RunJob> job = wb_.createRun(target);
         if (!job) return false;
         job_ = job;
@@ -123,6 +127,10 @@ namespace sirius::app {
     // --- tasks -----------------------------------------------------------------
 
     bool WorkbenchBridge::startTask(const QString& label, Task task) {
+        if (wb_.running()) {
+            wb_.logLine("A run is already in progress.");
+            return false;
+        }
         if (taskActive_.load()) {
             wb_.logLine("Another task is still running: " + toStd(taskLabel_));
             return false;
@@ -204,6 +212,7 @@ namespace sirius::app {
                 this,
                 [this, result, path, o, &ep]() {
                     try {
+                        if (taskCancel_.load()) throw CancelledError{};
                         wb_.adoptDataset(std::move(*result), path, o);
                     } catch (...) {
                         ep = std::current_exception();
