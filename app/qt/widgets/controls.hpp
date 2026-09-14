@@ -44,7 +44,10 @@ namespace sirius::app::widgets {
         // Segmented: compact, 26 px, 12 px text, hugs its content.
         void setTileMode(bool tiles);
         // Selected option drawn with the accent instead of ink (the "active" semantic).
-        void setAccentSelection(bool accent) { accent_ = accent; update(); }
+        void setAccentSelection(bool accent) {
+            accent_ = accent;
+            update();
+        }
         void setOptionEnabled(int index, bool enabled);
         void setOptionToolTip(int index, const QString& tip);
         QSize sizeHint() const override;
@@ -101,22 +104,46 @@ namespace sirius::app::widgets {
         void setActive(bool on);
         bool isActive() const { return active_; }
         // Painted size of a text glyph inside the button.
-        void setGlyphPx(int px) { glyphPx_ = px; update(); }
+        void setGlyphPx(int px) {
+            glyphPx_ = px;
+            update();
+        }
         // Side of the icon's box; 0 (the default) scales it to the button.
-        void setIconPx(int px) { iconPx_ = px; update(); }
+        void setIconPx(int px) {
+            iconPx_ = px;
+            update();
+        }
         // No border when idle (the reorder chevrons).
-        void setBorderless(bool on) { borderless_ = on; update(); }
+        void setBorderless(bool on) {
+            borderless_ = on;
+            update();
+        }
         // Dashed border (the "+" add square).
-        void setDashed(bool on) { dashed_ = on; update(); }
+        void setDashed(bool on) {
+            dashed_ = on;
+            update();
+        }
         // Idle icon colour (default: text).
-        void setIdleColor(const QColor& c) { idle_ = c; update(); }
+        void setIdleColor(const QColor& c) {
+            idle_ = c;
+            update();
+        }
         // Idle border colour (default: divider).
-        void setBorderColor(const QColor& c) { border_ = c; update(); }
+        void setBorderColor(const QColor& c) {
+            border_ = c;
+            update();
+        }
         // Sitting on the viewer ground: paper icon, translucent idle border.
-        void setOnDark(bool on) { onDark_ = on; update(); }
+        void setOnDark(bool on) {
+            onDark_ = on;
+            update();
+        }
         // Half-strength idle colours (a control that is available but not
         // the one in play).
-        void setDimmed(bool on) { dimmed_ = on; update(); }
+        void setDimmed(bool on) {
+            dimmed_ = on;
+            update();
+        }
         QSize sizeHint() const override { return {w_, h_}; }
         QSize minimumSizeHint() const override { return {w_, h_}; }
 
@@ -197,9 +224,18 @@ namespace sirius::app::widgets {
         void setSelected(bool on);
         bool isSelected() const { return selected_; }
         void setHoverable(bool on) { hoverable_ = on; }
-        void setTopRule(int px) { topRule_ = px; update(); }
-        void setEdge(bool on) { edge_ = on; update(); }   // 3 px accent left edge when selected
-        void setFill(const QColor& c) { fill_ = c; update(); }   // idle background
+        void setTopRule(int px) {
+            topRule_ = px;
+            update();
+        }
+        void setEdge(bool on) {
+            edge_ = on;
+            update();
+        }   // 3 px accent left edge when selected
+        void setFill(const QColor& c) {
+            fill_ = c;
+            update();
+        }   // idle background
 
     signals:
         void clicked();
