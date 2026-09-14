@@ -68,6 +68,14 @@ if(SIRIUS_ENABLE_APP)
     target_link_libraries(sirius_tests PRIVATE sirius::app_core)
 endif()
 
+# The same UTF-8 code page the application gets. Without it this binary dies
+# before main, in a modal Visual C++ runtime dialog with nothing on stdout,
+# whenever TEMP holds a character the ANSI code page cannot represent -- which
+# is every developer whose Windows account name has an accent in it.
+if(MSVC)
+    target_sources(sirius_tests PRIVATE ${CMAKE_SOURCE_DIR}/cmake/utf8-codepage.manifest)
+endif()
+
 sirius_copy_runtime_dlls(sirius_tests)
 
 include(Catch)
