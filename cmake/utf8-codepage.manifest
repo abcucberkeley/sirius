@@ -1,0 +1,21 @@
+<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<!-- Embedded by the linker into every MSVC executable this project builds
+     (app/CMakeLists.txt, tests/CMakeLists.txt). activeCodePage makes the
+     narrow Win32 APIs (CreateFileA, fopen, std::filesystem::path(std::string))
+     read their char* arguments as UTF-8, which is what this code hands them.
+
+     Without it a dataset under a folder with an accent in its name cannot be
+     opened. Less obviously, a process whose TEMP holds a character outside the
+     ANSI code page (a Windows account named Mueller with an umlaut, say) dies
+     before main in a Visual C++ runtime dialog, because
+     std::filesystem::temp_directory_path() cannot represent what it finds.
+
+     Keep this comment free of doubled hyphens: XML forbids them inside a
+     comment, and mt.exe then fails the link with c1010070. -->
+<assembly xmlns="urn:schemas-microsoft-com:asm.v1" manifestVersion="1.0">
+  <application>
+    <windowsSettings>
+      <activeCodePage xmlns="http://schemas.microsoft.com/SMI/2019/WindowsSettings">UTF-8</activeCodePage>
+    </windowsSettings>
+  </application>
+</assembly>
