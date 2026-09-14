@@ -11,6 +11,7 @@
 #include <chrono>
 #include <filesystem>
 #include <functional>
+#include <optional>
 
 #include <QApplication>
 #include <QCommandLineParser>
@@ -29,6 +30,7 @@
 #include <QKeySequence>
 #include <QSettings>
 #include <QStandardPaths>
+#include <QTemporaryDir>
 #include <QTimer>
 
 #include "core/app_paths.hpp"
@@ -121,18 +123,29 @@ int main(int argc, char** argv) {
     // Before anything reads a setting: PreferencesDialog::applyStored below and
     // the window's saved layout both use a default-constructed QSettings, so
     // pointing the default format and path at a directory of our own moves the
-    // whole store, secrets included.
+    // settings, and the secret store is pointed at the same directory (on
+    // Windows its secrets are in QSettings already; elsewhere they are a file
+    // that would otherwise stay in the user's ~/.sirius).
+    // Declared before everything that saves settings on the way out (the
+    // window's layout), so a scratch directory goes last, when main returns.
+    std::optional<QTemporaryDir> scratchSettings;
     if (parser.isSet(settingsOpt)) {
         QString dir = parser.value(settingsOpt);
-        if (dir == QLatin1String("scratch"))
-            dir = QDir(QStandardPaths::writableLocation(QStandardPaths::TempLocation))
-                      .filePath(QStringLiteral("sirius-settings-%1").arg(QCoreApplication::applicationPid()));
-        if (!QDir().mkpath(dir)) {
+        if (dir == QLatin1String("scratch")) {
+            scratchSettings.emplace(QDir(QStandardPaths::writableLocation(QStandardPaths::TempLocation))
+                                        .filePath(QStringLiteral("sirius-settings-XXXXXX")));
+            if (!scratchSettings->isValid()) {
+                qCritical("cannot create a scratch settings directory: %s", qPrintable(scratchSettings->errorString()));
+                return 2;
+            }
+            dir = scratchSettings->path();
+        } else if (!QDir().mkpath(dir)) {
             qCritical("cannot create the settings directory %s", qPrintable(dir));
             return 2;
         }
         QSettings::setDefaultFormat(QSettings::IniFormat);
         QSettings::setPath(QSettings::IniFormat, QSettings::UserScope, dir);
+        sirius::app::secrets::setStoreDirectory(dir);
         qInfo("settings: %s", qPrintable(QSettings().fileName()));
     }
 

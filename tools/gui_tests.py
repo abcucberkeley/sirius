@@ -92,17 +92,12 @@ def run(app: Path, args: List[str], timeout: int = 300, env: Optional[Dict[str, 
     # Settings of this run's own. Otherwise every scenario reads the settings of
     # whoever is logged in -- dock widths, backend, cache policy -- and saves its
     # own layout back over them when it exits. A scenario that passes here and
-    # fails on another machine, or the other way round, is the usual sign.
-    #
-    # Unless the scenario has already arranged a settings home of its own:
-    # isolated_settings() sets XDG_CONFIG_HOME, and the scenarios that seed a
-    # settings file into it are testing what the application reads at start-up.
-    # Pointing the store somewhere else would hide the very file under test.
-    own_settings = "XDG_CONFIG_HOME" in (env or {})
-    full = [str(app), "-platform", "offscreen"]
-    if not own_settings:
-        full += ["--settings", "scratch"]
-    full += args
+    # fails on another machine, or the other way round, is the usual sign. A
+    # scenario that seeds or inspects the settings names its directory
+    # (isolated_settings); the rest get a scratch one the run removes.
+    env = dict(env or {})
+    settings = env.pop(SETTINGS_DIR, "scratch")
+    full = [str(app), "-platform", "offscreen", "--settings", settings, *args]
     # The scenarios read the application's own qInfo lines. sirius-app is a
     # WIN32 (no console) binary, and Qt's default handler then sends those to
     # OutputDebugString rather than the pipe, so every run comes back empty
@@ -111,7 +106,7 @@ def run(app: Path, args: List[str], timeout: int = 300, env: Optional[Dict[str, 
         **os.environ,
         "QT_QPA_PLATFORM": "offscreen",
         "QT_FORCE_STDERR_LOGGING": "1",
-        **(env or {}),
+        **env,
     }
     # Files, not pipes. A worker that outlives the application inherits the
     # write end of a pipe, and reading one to EOF then blocks for as long as
@@ -139,22 +134,34 @@ def run(app: Path, args: List[str], timeout: int = 300, env: Optional[Dict[str, 
     return text
 
 
-def isolated_settings(tmp: Path, name: str) -> Dict[str, str]:
-    """A HOME and an XDG_CONFIG_HOME of the scenario's own.
+# The key of an isolated_settings() environment that run() turns into
+# --settings <dir> rather than passing on to the application.
+SETTINGS_DIR = "--settings"
 
-    The application keeps its settings (QSettings) and its secret store
-    (~/.sirius) under these on Linux, so a scenario that seeds or inspects them
-    neither reads the user's nor writes over them.
+
+def isolated_settings(tmp: Path, name: str) -> Dict[str, str]:
+    """A settings directory, a HOME and an XDG_CONFIG_HOME of the scenario's own.
+
+    run() gives the application --settings <directory>, which keeps its
+    settings there as an INI file on every platform, and its secret store
+    beside them; HOME and XDG_CONFIG_HOME are the scenario's too, so that
+    anything still reaching for the user's own (~/.sirius, ~/.config) finds a
+    directory the scenario can look into instead.
     """
-    home, config = tmp / f"{name}-home", tmp / f"{name}-config"
-    home.mkdir(parents=True, exist_ok=True)
-    config.mkdir(parents=True, exist_ok=True)
-    return {"HOME": str(home), "XDG_CONFIG_HOME": str(config)}
+    home, config, settings = tmp / f"{name}-home", tmp / f"{name}-config", tmp / f"{name}-settings"
+    for d in (home, config, settings):
+        d.mkdir(parents=True, exist_ok=True)
+    return {"HOME": str(home), "XDG_CONFIG_HOME": str(config), SETTINGS_DIR: str(settings)}
 
 
 def settings_file(env: Dict[str, str]) -> Path:
     """Where QSettings("sirius", "sirius-app") lives under an isolated_settings() environment."""
-    return Path(env["XDG_CONFIG_HOME"]) / "sirius" / "sirius-app.conf"
+    return Path(env[SETTINGS_DIR]) / "sirius" / "sirius-app.ini"
+
+
+def secret_store(env: Dict[str, str]) -> Path:
+    """The secret store file under an isolated_settings() environment (not on Windows: DPAPI in the settings)."""
+    return Path(env[SETTINGS_DIR]) / "secrets.json"
 
 
 # No proxy between the application and a FakeModelServer.
@@ -558,21 +565,21 @@ def test_a_preset_fills_the_fields(app: Path, tmp: Path) -> None:
 
 
 def test_a_token_the_secret_store_refuses_stays_in_the_settings(app: Path, tmp: Path) -> None:
-    # A token still in the plaintext settings moves into ~/.sirius/secrets.json
+    # A token still in the plaintext settings moves into the secret store file
     # at start-up (the HPC token is read then). When the store cannot take it,
     # the settings entry is the only copy: deleting it anyway worked for one
     # session and lost the token at the next launch. A store that exists but
     # does not parse must not be written over either -- that dropped every
     # other secret in it.
-    if not sys.platform.startswith("linux"):
-        raise Skip("QSettings is an INI file under XDG_CONFIG_HOME only on Linux")
+    if os.name == "nt":
+        raise Skip("Windows keeps secrets with DPAPI inside the settings, not in a file with a mode")
     if os.geteuid() == 0:
         raise Skip("root writes through a read-only file mode")
     env = isolated_settings(tmp, "secrets")
     conf = settings_file(env)
     conf.parent.mkdir(parents=True, exist_ok=True)
     conf.write_text("[hpc]\ntoken=tok_LEGACY\n")
-    store = Path(env["HOME"]) / ".sirius" / "secrets.json"
+    store = secret_store(env)
     store.parent.mkdir(parents=True, exist_ok=True)
     store.write_text("{}\n")
     store.chmod(0o400)
@@ -588,6 +595,32 @@ def test_a_token_the_secret_store_refuses_stays_in_the_settings(app: Path, tmp: 
     run(app, ["--quit-after", "1500"], env=env)
     check(store.read_text() == corrupt, f"a store that does not parse was written over: {store.read_text()!r}")
     check("tok_LEGACY" in conf.read_text(), "the plaintext token went although the store could not take it")
+
+
+def test_a_run_with_settings_of_its_own_leaves_the_users_alone(app: Path, tmp: Path) -> None:
+    # --settings moved QSettings, but the secret store stayed in ~/.sirius: a
+    # scripted run read the user's real tokens, and migrated the plaintext token
+    # of its own settings into the user's store.
+    if os.name == "nt":
+        raise Skip("Windows keeps secrets with DPAPI inside the settings, which --settings moves as a whole")
+    env = isolated_settings(tmp, "own")
+    users_store = Path(env["HOME"]) / ".sirius" / "secrets.json"
+    users_store.parent.mkdir(parents=True, exist_ok=True)
+    users_store.write_text('{"sentinel": "the user\'s"}\n')
+    users_conf = Path(env["XDG_CONFIG_HOME"]) / "sirius" / "sirius-app.conf"
+    users_conf.parent.mkdir(parents=True, exist_ok=True)
+    users_conf.write_text("[hpc]\ntoken=tok_USERS\n")
+    before = (users_store.read_bytes(), users_store.stat().st_mtime_ns, users_conf.read_bytes())
+    conf = settings_file(env)
+    conf.parent.mkdir(parents=True, exist_ok=True)
+    conf.write_text("[hpc]\ntoken=tok_RUNS\n")
+    out = run(app, ["--quit-after", "1500"], env=env)
+    check(f"settings: {conf}" in out, f"the run did not use {conf}")
+    after = (users_store.read_bytes(), users_store.stat().st_mtime_ns, users_conf.read_bytes())
+    check(after == before, "the run wrote to the user's own ~/.sirius/secrets.json or settings")
+    store = secret_store(env)
+    check(store.is_file() and "hpc/token" in store.read_text(), f"the run's plaintext token did not move into {store}")
+    check("tok_RUNS" not in conf.read_text(), "the run's plaintext token stayed in its settings once stored")
 
 
 def focused(out: str, spec: str) -> None:
@@ -670,8 +703,6 @@ def test_ollama_never_gets_the_api_key(app: Path, tmp: Path) -> None:
     # One stored key serves OpenRouter and custom servers. With the provider
     # switched to Ollama (whose key field is disabled) every request still
     # carried it -- to a local server, or a remote one over plain http.
-    if not sys.platform.startswith("linux"):
-        raise Skip("the settings are seeded as an INI file under XDG_CONFIG_HOME, which only Linux reads")
     env = isolated_settings(tmp, "ollama-key")
     env.update(LOCAL_ONLY)
     env.update({"OPENROUTER_API_KEY": "", "SIRIUS_LLM_API_KEY": ""})
@@ -691,8 +722,6 @@ def test_an_api_key_from_the_environment_is_not_stored(app: Path, tmp: Path) -> 
     # OPENROUTER_API_KEY is used when no key is stored, and it was written
     # into ~/.sirius/secrets.json by the first save of any assistant
     # setting -- which start-up does as soon as the server lists its models.
-    if not sys.platform.startswith("linux"):
-        raise Skip("the settings are seeded as an INI file under XDG_CONFIG_HOME, which only Linux reads")
     env = isolated_settings(tmp, "env-key")
     env.update(LOCAL_ONLY)
     env.update({"OPENROUTER_API_KEY": "sk-or-FROMENV"})
@@ -704,16 +733,15 @@ def test_an_api_key_from_the_environment_is_not_stored(app: Path, tmp: Path) -> 
         used = ("POST", "/v1/chat/completions", "Bearer sk-or-FROMENV") in server.requests
         check(used, f"the environment's key was not used: {server.requests}")
     check("model=foo" in conf.read_text(), "the model the server listed was not saved (the save this is about never ran)")
-    store = Path(env["HOME"]) / ".sirius" / "secrets.json"
+    store = secret_store(env)
     check(not store.exists() or "assistant/apiKey" not in store.read_text(), f"the environment's key was written to {store}")
+    check("secrets/assistant" not in conf.read_text(), "the environment's key was written to the settings (DPAPI)")
 
 
 def test_a_cut_off_tool_call_is_answered_not_run(app: Path, tmp: Path) -> None:
     # A reply cut off at the token limit leaves a tool call with arguments that
     # are not JSON. They ran as {} -- a cut-off `run` ran every step -- and the
     # model heard the result as if its call had worked.
-    if not sys.platform.startswith("linux"):
-        raise Skip("the settings are seeded as an INI file under XDG_CONFIG_HOME, which only Linux reads")
     env = isolated_settings(tmp, "cut-off")
     env.update(LOCAL_ONLY)
     env.update({"OPENROUTER_API_KEY": "", "SIRIUS_LLM_API_KEY": ""})
@@ -746,6 +774,7 @@ SCENARIOS = [
     test_menu_actions_reach_the_view,
     test_a_preset_fills_the_fields,
     test_a_token_the_secret_store_refuses_stays_in_the_settings,
+    test_a_run_with_settings_of_its_own_leaves_the_users_alone,
     test_arrow_keys_reach_the_focused_control,
     test_space_in_a_read_only_view_leaves_the_step_alone,
     test_ollama_never_gets_the_api_key,
