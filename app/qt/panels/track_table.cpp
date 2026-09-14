@@ -160,6 +160,7 @@ namespace sirius::app {
         view_->setSortingEnabled(true);
         view_->sortByColumn(TrackTableModel::Id, Qt::AscendingOrder);
         view_->setAccessibleName(QStringLiteral("Tracks"));
+        view_->setObjectName(QStringLiteral("trackTable"));   // the toolbar's Tracks toggle has the accessible name too
         view_->setAccessibleDescription(
             QStringLiteral("One row per track: id, frames, frames present, gaps, speed, net displacement, parent, children"));
         view_->verticalHeader()->setVisible(false);
