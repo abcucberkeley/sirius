@@ -118,7 +118,8 @@ namespace sirius::app {
 
     void SlicePane::setTracks(std::shared_ptr<const QVector<TrackPath>> paths, const TrackPaintOptions& options) {
         const bool same = paths == tracks_ && options.t == trackOptions_.t && options.selected == trackOptions_.selected &&
-                          options.tail == trackOptions_.tail && options.future == trackOptions_.future;
+                          options.tail == trackOptions_.tail && options.future == trackOptions_.future &&
+                          options.depth == trackOptions_.depth && options.depthRange == trackOptions_.depthRange;
         tracks_ = std::move(paths);
         trackOptions_ = options;
         if (!same) update();

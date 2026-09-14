@@ -1,6 +1,7 @@
 #include "qt/viewer/track_overlay.hpp"
 
 #include <algorithm>
+#include <cmath>
 #include <limits>
 #include <map>
 
@@ -21,6 +22,24 @@ namespace sirius::app {
                 case TrackPlane::XY: break;
             }
             return {x, y};
+        }
+
+        double depthOf(const TrackPoint& p, TrackPlane plane) {
+            switch (plane) {
+                case TrackPlane::XZ: return p.centroid[1];
+                case TrackPlane::YZ: return p.centroid[2];
+                case TrackPlane::XY: break;
+            }
+            return p.centroid[0];
+        }
+
+        // Where the path is at t, or at the frame closest to it.
+        int nearestFrame(const TrackPath& path, Index t) {
+            const auto it = std::lower_bound(path.frames.begin(), path.frames.end(), t);
+            if (it == path.frames.end()) return path.frames.size() - 1;
+            const int i = static_cast<int>(it - path.frames.begin());
+            if (*it == t || i == 0) return i;
+            return (t - path.frames[i - 1] <= *it - t) ? i - 1 : i;
         }
 
         // The pane's voxel (i, j) covers [i, i + 1): a centroid at 3.0 is the
@@ -46,6 +65,7 @@ namespace sirius::app {
             }
             path.points.push_back(at);
             path.frames.push_back(point.t);
+            path.depths.push_back(depthOf(point, plane));
         });
         QVector<TrackPath> out;
         out.reserve(static_cast<int>(byId.size()));
@@ -74,6 +94,9 @@ namespace sirius::app {
 
         for (const TrackPath* path : order) {
             if (path->points.isEmpty()) continue;
+            if (options.depthRange >= 0.0 && path->id != options.selected &&
+                std::abs(path->depths[nearestFrame(*path, options.t)] - options.depth) > options.depthRange)
+                continue;   // not near this slice (the selected track is always drawn)
             const QRectF screenBounds = QRectF(toScreen(path->bounds.topLeft()), toScreen(path->bounds.bottomRight())).normalized();
             if (!screenBounds.adjusted(-1, -1, 1, 1).intersects(margin)) continue;
 

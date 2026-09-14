@@ -30,6 +30,7 @@ namespace sirius::app {
         QColor color;
         QVector<QPointF> points;   // voxel coordinates of the pane's plane (column, row)
         QVector<Index> frames;     // the time point of each point
+        QVector<double> depths;    // each point along the axis the plane is a slice of (voxels)
         QRectF bounds;             // of the points, for skipping paths off screen
     };
 
@@ -45,6 +46,11 @@ namespace sirius::app {
         std::uint32_t selected = 0;     // drawn heavier; the others dim while one is selected
         Index tail = 0;                 // frames of history drawn before t; 0 = all
         bool future = true;             // draw the part after t, faint
+        // A slice shows the tracks near it: a path is drawn when, at t (or the
+        // closest frame it exists in), its centroid lies within `depthRange`
+        // voxels of `depth`. A negative range draws every path (projections).
+        double depth = 0.0;
+        double depthRange = -1.0;
     };
 
     // `toScreen` maps the pane's voxel coordinates to widget pixels (SlicePane::toScreen);

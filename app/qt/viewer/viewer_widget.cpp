@@ -1587,14 +1587,23 @@ namespace sirius::app {
                 trackCache.xy = trackCache.xz = trackCache.yz = nullptr;
             }
         }
-        TrackPaintOptions o;
-        o.t = curT();
-        o.selected = s.selectedLabel;
-        xy->setTracks(trackCache.xy, o);
-        mip->setTracks(trackCache.xy, o);
-        xz->setTracks(trackCache.xz, o);
-        yz->setTracks(trackCache.yz, o);
-        cmpRight->setTracks(s.mode == ViewMode::Compare ? trackCache.xy : nullptr, o);
+        // The slices show the tracks within a nucleus or so of the plane on
+        // screen (kTrackSliceUm, converted per axis); the projection shows all.
+        constexpr double kTrackSliceUm = 4.0;
+        const auto& um = model.meta().voxelUm;   // x, y, z
+        const auto voxels = [&](double axisUm) { return axisUm > 0.0 ? kTrackSliceUm / axisUm : 4.0; };
+        TrackPaintOptions all;
+        all.t = curT();
+        all.selected = s.selectedLabel;
+        TrackPaintOptions nearZ = all, nearY = all, nearX = all;
+        nearZ.depth = curZ() + 0.5, nearZ.depthRange = voxels(um[2]);
+        nearY.depth = curY() + 0.5, nearY.depthRange = voxels(um[1]);
+        nearX.depth = curX() + 0.5, nearX.depthRange = voxels(um[0]);
+        xy->setTracks(trackCache.xy, nearZ);
+        mip->setTracks(trackCache.xy, all);
+        xz->setTracks(trackCache.xz, nearY);
+        yz->setTracks(trackCache.yz, nearX);
+        cmpRight->setTracks(s.mode == ViewMode::Compare ? trackCache.xy : nullptr, nearZ);
     }
 
     void ViewerWidget::Impl::followTrackIntoView() {
