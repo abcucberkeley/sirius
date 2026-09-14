@@ -28,11 +28,13 @@ fi
 
 count=0
 while IFS= read -r line; do
+    line=${line%$'\r'}   # ctest writes its logs in text mode: CRLF on Windows
+    [ -z "$line" ] && continue
     name=${line#*:}
     count=$((count + 1))
     # a job shows at most 10 error annotations per step; keep one for the summary
     if [ "$count" -gt 9 ]; then
-        echo "::error title=ctest::$(escape "$(($(wc -l < "$failed") - 9)) more failed tests are only in the log")"
+        echo "::error title=ctest::$(escape "$(($(grep -c . "$failed") - 9)) more failed tests are only in the log")"
         break
     fi
     detail=""
@@ -40,6 +42,7 @@ while IFS= read -r line; do
         # the test's own output, from its "N/M Test: <name>" header to <end of output>,
         # from the first failed assertion on
         detail=$(awk -v name="$name" '
+            { sub(/\r$/, "") }
             !on && /^[0-9]+\/[0-9]+ Test: / && substr($0, index($0, "Test: ") + 6) == name { on = 1; next }
             on && !out && /^Output:$/ { out = 1; next }
             out && /^<end of output>$/ { exit }
