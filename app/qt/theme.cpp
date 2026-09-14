@@ -55,7 +55,8 @@ namespace sirius::app::theme {
 
     QFont caption() {
         QFont f = font(kCaptionPx);
-        f.setCapitalization(QFont::AllUppercase);
+        // no QFont::AllUppercase: it uppercases µ into Μ as it draws, so the
+        // text is given in caption case instead (captionCase, qt_strings.hpp)
         f.setLetterSpacing(QFont::PercentageSpacing, 110.0);
         return f;
     }
@@ -265,7 +266,7 @@ namespace sirius::app::theme {
                    "QTableView::item, QListView::item { padding: 4px 6px; border-bottom: 1px solid %1; }\n"
                    "QHeaderView { background: transparent; }\n"
                    "QHeaderView::section { background: transparent; border: none; border-bottom: 2px solid %1;"
-                   "  padding: 4px 6px; font-size: 10px; font-weight: 400; color: %4; text-transform: uppercase; }\n"
+                   "  padding: 4px 6px; font-size: 10px; font-weight: 400; color: %4; }\n"
                    "QTabWidget::pane { border: none; border-top: 2px solid %1; }\n"
                    "QTabBar { background: transparent; }\n"
                    "QTabBar::tab { background: transparent; border: none; border-bottom: 2px solid transparent;"

@@ -793,7 +793,7 @@ namespace sirius::app {
                 return;
             }
             const Step& step = p.at(sel);
-            captionLabel->setText(QStringLiteral("DIAGNOSTICS · %1").arg(fromStd(step.name).toUpper()));
+            captionLabel->setText(QStringLiteral("DIAGNOSTICS · %1").arg(captionCase(fromStd(step.name))));
             const Operation* op = findOperation(step.kind);
             const DiagnosticsKind kind = op ? op->info().diagnostics : DiagnosticsKind::Generic;
             Diagnostics d;
