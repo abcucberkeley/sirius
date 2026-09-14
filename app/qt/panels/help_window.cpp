@@ -218,7 +218,7 @@ namespace sirius::app {
         void load(const std::string& k) {
             kind = k;
             page = loadHelpPage(k);
-            caption->setText(QStringLiteral("HELP · %1").arg(fromStd(page.title).toUpper()));
+            caption->setText(QStringLiteral("HELP · %1").arg(captionCase(fromStd(page.title))));
             view->setPage(page);
             const QStringList watched = watcher.files();
             if (!watched.isEmpty()) watcher.removePaths(watched);

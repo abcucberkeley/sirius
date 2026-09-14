@@ -286,8 +286,8 @@ namespace sirius::app {
 
         // live preview
         impl_->preview = new QTableWidget(0, 7, this);
-        impl_->preview->setHorizontalHeaderLabels({QStringLiteral("File"), QStringLiteral("Channel"), QStringLiteral("t"),
-                                                   QStringLiteral("Tile"), QStringLiteral("x"), QStringLiteral("y"), QStringLiteral("z")});
+        impl_->preview->setHorizontalHeaderLabels({QStringLiteral("FILE"), QStringLiteral("CHANNEL"), QStringLiteral("T"),
+                                                   QStringLiteral("TILE"), QStringLiteral("X"), QStringLiteral("Y"), QStringLiteral("Z")});
         impl_->preview->horizontalHeader()->setSectionResizeMode(0, QHeaderView::Stretch);
         for (int c = 1; c < 7; ++c) impl_->preview->horizontalHeader()->setSectionResizeMode(c, QHeaderView::ResizeToContents);
         impl_->preview->verticalHeader()->hide();
@@ -385,7 +385,7 @@ namespace sirius::app {
         chanCol->setSpacing(6);
         chanCol->addWidget(new CaptionLabel(QStringLiteral("Channels"), this));
         impl_->channels = new QTableWidget(0, 4, this);
-        impl_->channels->setHorizontalHeaderLabels({QStringLiteral("Token"), QStringLiteral("Label"), QStringLiteral("Wavelength (nm)"), QStringLiteral("Colour")});
+        impl_->channels->setHorizontalHeaderLabels({QStringLiteral("TOKEN"), QStringLiteral("LABEL"), QStringLiteral("WAVELENGTH (nm)"), QStringLiteral("COLOUR")});
         impl_->channels->horizontalHeader()->setSectionResizeMode(0, QHeaderView::ResizeToContents);
         impl_->channels->horizontalHeader()->setSectionResizeMode(1, QHeaderView::Stretch);
         impl_->channels->horizontalHeader()->setSectionResizeMode(2, QHeaderView::ResizeToContents);

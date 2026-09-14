@@ -379,7 +379,7 @@ namespace sirius::app::widgets {
         setPalette(p);
     }
 
-    void CaptionLabel::setText(const QString& text) { QLabel::setText(text.toUpper()); }
+    void CaptionLabel::setText(const QString& text) { QLabel::setText(captionCase(text)); }
 
     // --- Rule ------------------------------------------------------------------------
 

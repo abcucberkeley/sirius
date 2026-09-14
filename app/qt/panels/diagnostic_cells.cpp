@@ -22,7 +22,7 @@ namespace sirius::app {
 
     namespace {
         QLabel* captionLabel(const QString& text, QWidget* parent) {
-            auto* l = new QLabel(text.toUpper(), parent);
+            auto* l = new QLabel(captionCase(text), parent);
             l->setFont(theme::caption());
             QPalette p = l->palette();
             p.setColor(QPalette::WindowText, theme::kNeutral600);
@@ -119,7 +119,7 @@ namespace sirius::app {
     }
 
     void DiagnosticCell::setCaption(const QString& title, const QString& meta) {
-        title_->setText(title.toUpper());
+        title_->setText(captionCase(title));
         meta_->setText(meta);
     }
 
@@ -440,7 +440,7 @@ namespace sirius::app {
         clear();
         setColumnCount(static_cast<int>(table.header.size()));
         QStringList header;
-        for (const std::string& h : table.header) header << fromStd(h).toUpper();
+        for (const std::string& h : table.header) header << captionCase(fromStd(h));
         setHorizontalHeaderLabels(header);
         setRowCount(static_cast<int>(table.rows.size()));
         QFont bold = theme::heading(theme::kSmallPx);

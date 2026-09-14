@@ -152,7 +152,6 @@ namespace sirius::app {
                 kind_ = new QLabel(body_);
                 QFont kf = theme::font(10);
                 kf.setLetterSpacing(QFont::PercentageSpacing, 106.0);
-                kf.setCapitalization(QFont::AllUppercase);
                 kind_->setFont(kf);
                 QPalette kp = kind_->palette();
                 kp.setColor(QPalette::WindowText, theme::kNeutral600);
@@ -246,7 +245,7 @@ namespace sirius::app {
                 name_->setFullText(fromStd(step.name));
                 // The kind label keeps its natural width (it is a short, fixed
                 // vocabulary); the name is what gives way in a narrow dock.
-                kind_->setText(fromStd(step.op().info().kindLabel));
+                kind_->setText(captionCase(fromStd(step.op().info().kindLabel)));
                 cacheLook_ = cacheLook(step.cache);
                 cache_->setToolTip(cacheLook_.title);
                 QString sum = fromStd(wb.stepSummary(index));

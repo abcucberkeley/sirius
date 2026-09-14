@@ -77,7 +77,9 @@ namespace sirius::app {
 
         QTableWidget* makeTable(const QStringList& headers, int stretchColumn, QWidget* parent) {
             auto* t = new QTableWidget(0, headers.size(), parent);
-            t->setHorizontalHeaderLabels(headers);
+            QStringList captions;   // headers are in caption case (qt_strings.hpp), not transformed by the style
+            for (const QString& h : headers) captions << captionCase(h);
+            t->setHorizontalHeaderLabels(captions);
             for (int c = 0; c < headers.size(); ++c)
                 t->horizontalHeader()->setSectionResizeMode(c, c == stretchColumn ? QHeaderView::Stretch : QHeaderView::ResizeToContents);
             t->verticalHeader()->hide();
