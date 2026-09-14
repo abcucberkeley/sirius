@@ -8,6 +8,7 @@
 
 #include <complex>
 #include <cstdint>
+#include <limits>
 #include <numeric>
 #include <stdexcept>
 #include <string>
@@ -397,10 +398,20 @@ TEST_CASE("Device buffers round-trip through the GPU", "[buffer][cuda]") {
         auto back = toEigen<3>(devF);
         for (Index i = 0; i < host.size(); ++i) REQUIRE(back.data()[i] == hostF.data()[i]);
 
+        // Float to a narrower integer saturates, on both sides: 300 is not a
+        // representable int8, and a C++ cast would wrap it to 44, which is a
+        // plausible intensity and therefore the worst possible answer. What is
+        // checked is that the device agrees with the host element by element,
+        // so the contract lives in one place (detail::convertScalar) rather
+        // than in a literal here; the explicit case documents it.
         Buffer<std::int8_t> devI8(host.shape(), gpu);
         convert(devF, devI8);
+        Buffer<std::int8_t> hostI8(host.shape());
+        convert(hostF, hostI8);
         auto backI8 = toEigen<3>(devI8);
-        REQUIRE(backI8.data()[300] == static_cast<std::int8_t>(300));
+        for (Index i = 0; i < host.size(); ++i) REQUIRE(backI8.data()[i] == hostI8.data()[i]);
+        REQUIRE(hostF.data()[300] == 300.0f);
+        REQUIRE(backI8.data()[300] == std::numeric_limits<std::int8_t>::max());
     }
 
     SECTION("views of device memory cannot be mapped as Eigen tensors") {
