@@ -93,7 +93,16 @@ def run(app: Path, args: List[str], timeout: int = 300, env: Optional[Dict[str, 
     # whoever is logged in -- dock widths, backend, cache policy -- and saves its
     # own layout back over them when it exits. A scenario that passes here and
     # fails on another machine, or the other way round, is the usual sign.
-    full = [str(app), "-platform", "offscreen", "--settings", "scratch", *args]
+    #
+    # Unless the scenario has already arranged a settings home of its own:
+    # isolated_settings() sets XDG_CONFIG_HOME, and the scenarios that seed a
+    # settings file into it are testing what the application reads at start-up.
+    # Pointing the store somewhere else would hide the very file under test.
+    own_settings = "XDG_CONFIG_HOME" in (env or {})
+    full = [str(app), "-platform", "offscreen"]
+    if not own_settings:
+        full += ["--settings", "scratch"]
+    full += args
     # The scenarios read the application's own qInfo lines. sirius-app is a
     # WIN32 (no console) binary, and Qt's default handler then sends those to
     # OutputDebugString rather than the pipe, so every run comes back empty
