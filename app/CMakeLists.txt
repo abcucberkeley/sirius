@@ -46,7 +46,7 @@ target_link_libraries(sirius-app PRIVATE sirius::app_core sirius::qt)
 # their UTF-8 bytes through the narrow Win32 APIs. The linker merges .manifest
 # sources into the executable's manifest.
 if(MSVC)
-    target_sources(sirius-app PRIVATE qt/resources/sirius-app.manifest)
+    target_sources(sirius-app PRIVATE ${CMAKE_SOURCE_DIR}/cmake/utf8-codepage.manifest)
 endif()
 # crypt32: DPAPI (CryptProtectData) behind qt/secret_store.cpp
 if(WIN32)
