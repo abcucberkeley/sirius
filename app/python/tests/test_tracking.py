@@ -3,6 +3,7 @@ compiled core loads, and a clear refusal when it is not."""
 
 from __future__ import annotations
 
+import json
 import os
 import sys
 import types
@@ -191,6 +192,23 @@ class TestRelabelling(unittest.TestCase):
         _, info = tracking.run_btrack(labels, (1.0, 1.0, 1.0), {"min_length": 2})
         self.assertEqual(info["tracks"], 2)
         self.assertEqual(info["divisions"], 1)
+
+    def test_lineage_is_reported_in_the_ids_the_labels_carry(self):
+        # btrack ids are not label ids: tracks come back renumbered 1..n in
+        # the order they are kept, and a dropped track takes its links along
+        labels = np.zeros((3, 1, 12, 12), np.uint32)
+        labels[:, 0, 1:4, 1:4] = 1
+        labels[:, 0, 5:8, 5:8] = 2
+        labels[:, 0, 9:12, 9:12] = 3
+        _StubTracker.planned = [_StubTrack(40, [0, 1, 2], [0] * 3, [2.0] * 3, [2.0] * 3, parent=40),
+                               _StubTrack(41, [1, 2], [0] * 2, [6.0] * 2, [6.0] * 2, parent=40),
+                               _StubTrack(42, [2], [0], [10.0], [10.0], parent=40),        # too short
+                               _StubTrack(43, [1, 2], [0] * 2, [10.0] * 2, [10.0] * 2, parent=99)]
+        out, info = tracking.run_btrack(labels, (1.0, 1.0, 1.0), {"min_length": 2})
+        self.assertEqual(info["tracks"], 3)
+        self.assertEqual(info["lineage"], {"2": 1})
+        self.assertEqual(set(np.unique(out).tolist()), {0, 1, 2, 3})
+        json.dumps(info)   # it travels in the result header
 
 
 if __name__ == "__main__":

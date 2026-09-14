@@ -253,7 +253,7 @@ namespace sirius::app {
                  return json{{"selected_step", i + 1}};
              }});
         add({"set_view",
-             "Change the viewer: mode (ortho|3d|compare), tool (nav|probe|measure|roi|paint), z, t, crosshair [x, y], labels overlay, label (select one and jump to it), solo (draw only the selected label), channel visibility list, yaw/pitch, diagnostics tab is not part of this.",
+             "Change the viewer: mode (ortho|3d|compare), tool (nav|probe|measure|roi|paint), z, t, crosshair [x, y], labels overlay, label (select one and jump to it), solo (draw only the selected label), trajectories and follow_track (tracked labels), channel visibility list, yaw/pitch, diagnostics tab is not part of this.",
              obj({{"mode", {{"type", "string"}, {"enum", {"ortho", "3d", "compare"}}}},
                   {"tool", {{"type", "string"}, {"enum", {"nav", "probe", "measure", "roi", "paint"}}}},
                   {"z", {{"type", "integer"}}},
@@ -262,6 +262,8 @@ namespace sirius::app {
                   {"labels", {{"type", "boolean"}}},
                   {"label", {{"type", "integer"}, {"description", "label id to select; the view jumps to it"}}},
                   {"solo", {{"type", "boolean"}, {"description", "show only the selected label"}}},
+                  {"trajectories", {{"type", "boolean"}, {"description", "tracked labels: draw each track's path over time"}}},
+                  {"follow_track", {{"type", "boolean"}, {"description", "tracked labels: keep the selected track under the crosshair as t changes"}}},
                   {"channels", {{"type", "array"}, {"items", {{"type", "boolean"}}}}},
                   {"yaw", {{"type", "number"}}},
                   {"pitch", {{"type", "number"}}}}),
@@ -304,6 +306,14 @@ namespace sirius::app {
                      s.soloLabel = a["solo"].get<bool>();
                      note(s.soloLabel ? "solo label" : "all labels");
                  }
+                 if (a.contains("trajectories")) {
+                     s.trajectories = a["trajectories"].get<bool>();
+                     note(s.trajectories ? "trajectories on" : "trajectories off");
+                 }
+                 if (a.contains("follow_track")) {
+                     s.followTrack = a["follow_track"].get<bool>();
+                     note(s.followTrack ? "following the track" : "not following");
+                 }
                  std::uint32_t focus = 0;
                  if (a.contains("label")) {
                      focus = a["label"].get<std::uint32_t>();
@@ -330,6 +340,38 @@ namespace sirius::app {
                  actions_.push_back({ActionRecord::Kind::View, "Viewer → " + (text.empty() ? std::string("unchanged") : text), "view",
                                      json{{"view", wb_.viewState().toJson()}}, "set_view"});
                  return wb_.viewState().toJson();
+             }});
+        add({"list_tracks",
+             "The tracks of the viewed labels, when a tracking step made them: id, first and last frame, frames present, "
+             "gaps (frames missing between first and last, where identity may have been lost), um per frame, net "
+             "displacement, parent and children. Division counts are the tracker's estimate, not a measurement.",
+             obj({{"limit", {{"type", "integer"}, {"description", "rows to return, those with the most gaps first (default 50)"}}}}),
+             [this](const json& a) {
+                 std::vector<TrackSummary> rows = wb_.viewedTrackSummaries();
+                 if (rows.empty()) return json{{"tracks", json::array()}, {"message", "the viewed labels are not tracked"}};
+                 const std::size_t total = rows.size();
+                 Index gapped = 0;
+                 for (const TrackSummary& r : rows) gapped += r.gaps > 0 ? 1 : 0;
+                 const Index divisions = countDivisions(rows);
+                 std::stable_sort(rows.begin(), rows.end(), [](const TrackSummary& x, const TrackSummary& y) { return x.gaps > y.gaps; });
+                 const std::size_t limit = static_cast<std::size_t>(std::max<long long>(1, a.value("limit", 50LL)));
+                 if (rows.size() > limit) rows.resize(limit);
+                 json list = json::array();
+                 for (const TrackSummary& r : rows)
+                     list.push_back({{"id", r.id}, {"first", r.first}, {"last", r.last}, {"frames", r.frames}, {"gaps", r.gaps},
+                                     {"um_per_frame", r.umPerFrame}, {"net_um", r.netUm}, {"parent", r.parent}, {"children", r.children}});
+                 return json{{"total", total}, {"with_gaps", gapped}, {"divisions", divisions}, {"tracks", list}};
+             }});
+        add({"focus_track",
+             "Select a track of the viewed labels and bring it into view: the time point moves to the nearest one the "
+             "track exists in, the crosshair onto its centroid.",
+             obj({{"id", {{"type", "integer"}}}}, {"id"}),
+             [this](const json& a) {
+                 const std::uint32_t id = a.at("id").get<std::uint32_t>();
+                 if (!wb_.focusTrack(id)) return json{{"ok", false}, {"message", "no track " + std::to_string(id) + " in the viewed labels"}};
+                 actions_.push_back({ActionRecord::Kind::View, "Viewer → track " + std::to_string(id), "view",
+                                     json{{"view", wb_.viewState().toJson()}}, "focus_track"});
+                 return json{{"ok", true}, {"view", wb_.viewState().toJson()}};
              }});
         add({"get_diagnostics",
              "Diagnostics of a step (default: the selected one): summary, table, facts, curves, histograms, warnings.",

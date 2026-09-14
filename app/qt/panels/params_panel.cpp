@@ -104,9 +104,8 @@ namespace sirius::app {
                     p.drawText(r.adjusted(0, 6, 0, -14), Qt::AlignHCenter | Qt::AlignTop, QString(ax));
                     QFont sf = theme::font(9);
                     sf.setLetterSpacing(QFont::PercentageSpacing, 108.0);
-                    sf.setCapitalization(QFont::AllUppercase);
                     p.setFont(sf);
-                    p.drawText(r.adjusted(0, 0, 0, -5), Qt::AlignHCenter | Qt::AlignBottom, keep ? QStringLiteral("keep") : reduction_);
+                    p.drawText(r.adjusted(0, 0, 0, -5), Qt::AlignHCenter | Qt::AlignBottom, captionCase(keep ? QStringLiteral("keep") : reduction_));
                 }
             }
             void mousePressEvent(QMouseEvent* e) override {

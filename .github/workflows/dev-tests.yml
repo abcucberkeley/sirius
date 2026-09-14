@@ -127,6 +127,13 @@ jobs:
       - name: Test
         run: ctest --preset linux-gcc-dev
 
+      # The job log needs a GitHub login; annotations do not. See the script.
+      - name: Name the failed tests
+        if: failure()
+        # Git Bash on Windows; a bare `bash` there may resolve to WSL
+        shell: bash
+        run: bash tools/ci_failed_tests.sh build/linux-gcc-dev
+
   app-tests:
     # The workbench (Qt Widgets) with its Qt-free core tests, plus a headless
     # smoke run of the bundled SIM pipeline. TensorStore stays off here: its
@@ -180,6 +187,13 @@ jobs:
         env:
           SIRIUS_PYTHON: ${{ steps.python.outputs.python-path }}
         run: ctest --preset linux-gcc-app-dev
+
+      # The job log needs a GitHub login; annotations do not. See the script.
+      - name: Name the failed tests
+        if: failure()
+        # Git Bash on Windows; a bare `bash` there may resolve to WSL
+        shell: bash
+        run: bash tools/ci_failed_tests.sh build/linux-gcc-app-dev
 
       - name: Headless smoke run
         run: |
@@ -282,6 +296,13 @@ jobs:
           UBSAN_OPTIONS: print_stacktrace=1:halt_on_error=1
         run: ctest --preset linux-clang-dev
 
+      # The job log needs a GitHub login; annotations do not. See the script.
+      - name: Name the failed tests
+        if: failure()
+        # Git Bash on Windows; a bare `bash` there may resolve to WSL
+        shell: bash
+        run: bash tools/ci_failed_tests.sh build/linux-clang-dev
+
   windows:
     # MSVC, the library and the workbench. Configured without a preset: the
     # checked-in Windows presets pin the Visual Studio generators of the
@@ -328,6 +349,13 @@ jobs:
 
       - name: Test
         run: ctest --test-dir build/ci-windows --output-on-failure -R "^sirius::"
+
+      # The job log needs a GitHub login; annotations do not. See the script.
+      - name: Name the failed tests
+        if: failure()
+        # Git Bash on Windows; a bare `bash` there may resolve to WSL
+        shell: bash
+        run: bash tools/ci_failed_tests.sh build/ci-windows
 
       # The same run as the Linux app job. QT_PLUGIN_PATH comes from
       # install-qt-action, so the offscreen platform plugin is found whether or
@@ -377,3 +405,10 @@ jobs:
 
       - name: Test (CPU paths; CUDA cases skip)
         run: ctest --preset linux-cuda-dev
+
+      # The job log needs a GitHub login; annotations do not. See the script.
+      - name: Name the failed tests
+        if: failure()
+        # Git Bash on Windows; a bare `bash` there may resolve to WSL
+        shell: bash
+        run: bash tools/ci_failed_tests.sh build/linux-cuda-dev

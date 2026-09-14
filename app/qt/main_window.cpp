@@ -139,7 +139,7 @@ namespace sirius::app {
                 auto* h = new QHBoxLayout(this);
                 h->setContentsMargins(12, 0, 6, 0);
                 h->setSpacing(6);
-                h->addWidget(widgets::label(name.toUpper(), 11, theme::kNeutral700, QFont::DemiBold, this));
+                h->addWidget(widgets::label(captionCase(name), 11, theme::kNeutral700, QFont::DemiBold, this));
                 h->addWidget(widgets::label(QStringLiteral("drag to move · double-click or Dock to put back"), 11, theme::kNeutral600, -1, this), 1);
                 auto* back = new QPushButton(QStringLiteral("Dock"), this);
                 widgets::setButtonClass(back, "ghost small");

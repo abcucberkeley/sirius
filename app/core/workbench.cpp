@@ -110,7 +110,9 @@ namespace sirius::app {
                 {"clip_z", {clipZ[0], clipZ[1]}},
                 {"label_opacity", labelOpacity},
                 {"selected_label", selectedLabel},
-                {"solo_label", soloLabel}};
+                {"solo_label", soloLabel},
+                {"trajectories", trajectories},
+                {"follow_track", followTrack}};
     }
 
     ViewState ViewState::fromJson(const json& j) { return fromJson(j, ViewState{}); }
@@ -156,6 +158,8 @@ namespace sirius::app {
         num("label_opacity", s.labelOpacity);
         num("selected_label", s.selectedLabel);
         boolean("solo_label", s.soloLabel);
+        boolean("trajectories", s.trajectories);
+        boolean("follow_track", s.followTrack);
         return s;
     }
 
@@ -944,10 +948,58 @@ namespace sirius::app {
     void Workbench::setViewState(const ViewState& s) {
         const bool jump = s.soloLabel && s.selectedLabel != 0 && s.selectedLabel != view_.selectedLabel;
         const bool tChanged = s.t != view_.t;
+        const bool follow = s.followTrack && (tChanged || !view_.followTrack || s.selectedLabel != view_.selectedLabel);
         view_ = s;
         if (tChanged) syncLabelStats();
         // inspecting one label at a time: a new selection brings it into view
         if (jump) centreOnLabel(s.selectedLabel);
+        if (follow) followSelectedTrack();
+        notify(&Observer::viewStateChanged);
+    }
+
+    std::vector<TrackSummary> Workbench::viewedTrackSummaries() const {
+        const std::shared_ptr<const StepOutput> out = displayOutput();
+        if (!out || !out->labels || !out->labels->tracked()) return {};
+        const std::shared_ptr<const TrackIndex> index = out->labels->tracks();
+        if (!index) return {};
+        const std::array<double, 3>& v = out->meta.voxelUm;   // x, y, z
+        return summarizeTracks(*index, out->labels->lineage(), {v[2], v[1], v[0]});
+    }
+
+    bool Workbench::followSelectedTrack() {
+        const std::shared_ptr<LabelVolume> labels = viewedLabels();
+        if (!labels || !labels->tracked() || view_.selectedLabel == 0) return false;
+        const std::shared_ptr<const TrackIndex> index = labels->tracks();
+        const std::optional<TrackPoint> p = index ? index->pointAt(view_.selectedLabel, view_.t) : std::nullopt;
+        if (!p) return false;   // missing from this frame: stay where the eye is
+        const auto near = [](double c, Index n) { return std::clamp<Index>(static_cast<Index>(std::floor(c)), 0, std::max<Index>(n - 1, 0)); };
+        view_.z = near(p->centroid[0], labels->z());
+        view_.cy = near(p->centroid[1], labels->y());
+        view_.cx = near(p->centroid[2], labels->x());
+        return true;
+    }
+
+    bool Workbench::focusTrack(std::uint32_t id) {
+        const std::shared_ptr<LabelVolume> labels = viewedLabels();
+        const std::shared_ptr<const TrackIndex> index = labels && labels->tracked() ? labels->tracks() : nullptr;
+        const std::optional<TrackPoint> p = index && id ? index->nearestPoint(id, view_.t) : std::nullopt;
+        if (!p) return false;
+        endPaintStroke();
+        view_.selectedLabel = id;
+        view_.labels = true;
+        if (view_.t != p->t) {
+            view_.t = p->t;
+            syncLabelStats();
+        }
+        followSelectedTrack();
+        notify(&Observer::viewStateChanged);
+        return true;
+    }
+
+    void Workbench::setFollowTrack(bool on) {
+        if (view_.followTrack == on) return;
+        view_.followTrack = on;
+        if (on) followSelectedTrack();
         notify(&Observer::viewStateChanged);
     }
 
@@ -1012,6 +1064,7 @@ namespace sirius::app {
         if (view_.t == t) return;
         view_.t = t;
         syncLabelStats();
+        if (view_.followTrack) followSelectedTrack();
         notify(&Observer::viewStateChanged);
     }
 

@@ -35,6 +35,7 @@
 
 #include "core/ops/builtin.hpp"
 #include "qt/panels/diagnostic_cells.hpp"
+#include "qt/panels/track_table.hpp"
 #include "qt/qt_strings.hpp"
 #include "qt/theme.hpp"
 #include "qt/trace.hpp"
@@ -658,7 +659,16 @@ namespace sirius::app {
         QStackedWidget* stack = nullptr;
         DiagnosticsBody* body = nullptr;
         SegmentCleanupView* segment = nullptr;
+        TrackTable* tracks = nullptr;   // the "Tracks" tab of a segment step whose labels are tracked
         QTimer refreshTimer;
+
+        // The track table's selection and follow toggle from the view state,
+        // without rebuilding its rows.
+        void syncTracksView() {
+            const ViewState& vs = bridge.wb().viewState();
+            tracks->setSelectedTrack(vs.selectedLabel);
+            tracks->setFollow(vs.followTrack);
+        }
         QFrame* rule = nullptr;
 
         explicit Impl(WorkbenchBridge& b) : bridge(b) {}
@@ -783,7 +793,7 @@ namespace sirius::app {
                 return;
             }
             const Step& step = p.at(sel);
-            captionLabel->setText(QStringLiteral("DIAGNOSTICS · %1").arg(fromStd(step.name).toUpper()));
+            captionLabel->setText(QStringLiteral("DIAGNOSTICS · %1").arg(captionCase(fromStd(step.name))));
             const Operation* op = findOperation(step.kind);
             const DiagnosticsKind kind = op ? op->info().diagnostics : DiagnosticsKind::Generic;
             Diagnostics d;
@@ -791,13 +801,25 @@ namespace sirius::app {
                 d = wb.selectedDiagnostics();
             } catch (const std::exception&) {
             }
-            const QStringList names = DiagnosticsBody::tabNames(d, kind);
+            QStringList names = DiagnosticsBody::tabNames(d, kind);
+            // tracked labels add a table of their tracks beside the cleanup tools
+            const bool tracked = kind == DiagnosticsKind::Segment && [&] {
+                const std::shared_ptr<LabelVolume> labels = wb.viewedLabels();
+                return labels && labels->tracked() && labels->tracks();
+            }();
+            if (tracked) names.prepend(QStringLiteral("Tracks"));   // what a tracking step is for: first
             tab = std::clamp(tab, 0, std::max(0, static_cast<int>(names.size()) - 1));
             rebuildTabs(names);
             hintText = collapsed ? QStringLiteral("Click to expand") : QStringLiteral("Updates live as parameters change");
             applyHint();
             if (collapsed) return;
             if (kind == DiagnosticsKind::Segment) {
+                if (tracked && tab == 0) {
+                    tracks->setTracks(wb.viewedTrackSummaries());
+                    syncTracksView();
+                    stack->setCurrentWidget(tracks);
+                    return;
+                }
                 segment->refresh();
                 stack->setCurrentWidget(segment);
                 return;
@@ -842,8 +864,12 @@ namespace sirius::app {
         d.stack = new QStackedWidget(this);
         d.body = new DiagnosticsBody(d.stack);
         d.segment = new SegmentCleanupView(bridge, d.stack);
+        d.tracks = new TrackTable(d.stack);
         d.stack->addWidget(d.body);
         d.stack->addWidget(d.segment);
+        d.stack->addWidget(d.tracks);
+        connect(d.tracks, &TrackTable::trackChosen, this, [this](std::uint32_t id) { impl_->bridge.wb().focusTrack(id); });
+        connect(d.tracks, &TrackTable::followToggled, this, [this](bool on) { impl_->bridge.wb().setFollowTrack(on); });
         v->addWidget(d.stack, 1);
         setMinimumHeight(theme::kDiagnosticsHeaderH);
 
@@ -858,6 +884,7 @@ namespace sirius::app {
         connect(&bridge, &WorkbenchBridge::labelsChanged, this, [this](quint64) { impl_->scheduleRefresh(); });
         connect(&bridge, &WorkbenchBridge::viewStateChanged, this, [this] {
             if (impl_->stack->currentWidget() == impl_->segment) impl_->segment->refreshView();
+            if (impl_->stack->currentWidget() == impl_->tracks) impl_->syncTracksView();
         });
         connect(&bridge, &WorkbenchBridge::runFinished, this, [this](bool, const QString&) { impl_->refresh(); });
         // What the cleanup tools may do depends on the run state.

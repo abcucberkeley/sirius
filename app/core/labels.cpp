@@ -1,5 +1,7 @@
 #include "core/labels.hpp"
 
+#include "core/tracks.hpp"
+
 #include <algorithm>
 #include <array>
 #include <deque>
@@ -123,6 +125,11 @@ namespace sirius::app {
     LabelVolume::LabelVolume(Index t, Index z, Index y, Index x) : t_(t), z_(z), y_(y), x_(x) {
         if (t < 1) throw std::invalid_argument("LabelVolume: t must be >= 1");
         requireExtent(z, y, x, "LabelVolume");
+        // t * z * y * x voxels of 4 bytes must be addressable without wrapping
+        const Index most = std::numeric_limits<Index>::max() / static_cast<Index>(sizeof(std::uint32_t));
+        if (z > most / y || z * y > most / x || z * y * x > most / t)
+            throw std::invalid_argument("LabelVolume: " + std::to_string(t) + " x " + std::to_string(z) + " x " +
+                                        std::to_string(y) + " x " + std::to_string(x) + " voxels cannot be addressed");
         data_ = std::make_shared<Buffer<std::uint32_t>>(Shape{t, z, y, x});
         std::fill(data_->data(), data_->data() + data_->size(), 0u);
     }
@@ -134,13 +141,43 @@ namespace sirius::app {
     }
 
     std::uint32_t* LabelVolume::volume(Index t) {
+        // A write here is not seen by the track index: rather than show
+        // trajectories of voxels that may have moved, there is none until
+        // indexTracks() is called again.
+        tracks_.reset();
+        return writable(t);
+    }
+
+    namespace {
+        void requireIndex(Index i, Index n, const char* what) {
+            if (i < 0 || i >= n)
+                throw std::out_of_range(std::string("LabelVolume: ") + what + " " + std::to_string(i) + " outside [0, " +
+                                        std::to_string(n) + ")");
+        }
+    } // namespace
+
+    std::uint32_t* LabelVolume::writable(Index t) {
+        requireIndex(t, t_, "t");
         detach();
         return data_->data() + t * volumeSize();
     }
-    const std::uint32_t* LabelVolume::volume(Index t) const noexcept { return data_->data() + t * volumeSize(); }
-    std::uint32_t* LabelVolume::plane(Index t, Index z) { return volume(t) + z * y_ * x_; }
-    const std::uint32_t* LabelVolume::plane(Index t, Index z) const noexcept { return volume(t) + z * y_ * x_; }
-    std::uint32_t LabelVolume::at(Index t, Index z, Index y, Index x) const noexcept { return plane(t, z)[y * x_ + x]; }
+    const std::uint32_t* LabelVolume::volume(Index t) const {
+        requireIndex(t, t_, "t");
+        return data_->data() + t * volumeSize();
+    }
+    std::uint32_t* LabelVolume::plane(Index t, Index z) {
+        requireIndex(z, z_, "z");
+        return volume(t) + z * y_ * x_;
+    }
+    const std::uint32_t* LabelVolume::plane(Index t, Index z) const {
+        requireIndex(z, z_, "z");
+        return volume(t) + z * y_ * x_;
+    }
+    std::uint32_t LabelVolume::at(Index t, Index z, Index y, Index x) const {
+        requireIndex(y, y_, "y");
+        requireIndex(x, x_, "x");
+        return plane(t, z)[y * x_ + x];
+    }
 
     std::uint32_t LabelVolume::maxLabel() const noexcept { return maxLabel_; }
 
@@ -471,7 +508,7 @@ namespace sirius::app {
         diff.t = t;
         if (t < 0 || t >= t_) throw std::out_of_range("LabelVolume::paint: t out of range");
         edited_ = true;
-        std::uint32_t* v = volume(t);
+        std::uint32_t* v = writable(t);
         const double r = std::max(radius, 0.0);
         const Index ri = static_cast<Index>(std::ceil(r));
         zRadius = std::max<Index>(zRadius, 0);
@@ -497,7 +534,7 @@ namespace sirius::app {
         }
         maxLabel_ = std::max(maxLabel_, label);
         if (!diff.empty()) ++generation_;
-        return diff;
+        return indexed(std::move(diff));
     }
 
     LabelDiff LabelVolume::fill(Index t, Index z, Index y, Index x, std::uint32_t label) {
@@ -507,10 +544,10 @@ namespace sirius::app {
         if (z < 0 || z >= z_ || y < 0 || y >= y_ || x < 0 || x >= x_)
             throw std::out_of_range("LabelVolume::fill: seed outside the volume");
         edited_ = true;
-        std::uint32_t* v = volume(t);
+        std::uint32_t* v = writable(t);
         const Index seed = (z * y_ + y) * x_ + x;
         const std::uint32_t from = v[seed];
-        if (from == label) return diff;
+        if (from == label) return indexed(std::move(diff));
         // the changed value doubles as the visited mark
         std::vector<Index> stack{seed};
         v[seed] = label;
@@ -534,7 +571,7 @@ namespace sirius::app {
         diff.after.assign(diff.indices.size(), label);
         maxLabel_ = std::max(maxLabel_, label);
         ++generation_;
-        return diff;
+        return indexed(std::move(diff));
     }
 
     LabelDiff LabelVolume::merge(Index t, const std::vector<std::uint32_t>& ids) {
@@ -544,12 +581,12 @@ namespace sirius::app {
         std::vector<std::uint32_t> sources;
         for (std::uint32_t id : ids)
             if (id) sources.push_back(id);
-        if (sources.size() < 2) return diff;
+        if (sources.size() < 2) return indexed(std::move(diff));
         std::sort(sources.begin(), sources.end());
         sources.erase(std::unique(sources.begin(), sources.end()), sources.end());
         const std::uint32_t target = sources.front();
         edited_ = true;
-        std::uint32_t* v = volume(t);
+        std::uint32_t* v = writable(t);
         const Index n = volumeSize();
         for (Index i = 0; i < n; ++i) {
             const std::uint32_t cur = v[i];
@@ -561,16 +598,16 @@ namespace sirius::app {
             v[i] = target;
         }
         if (!diff.empty()) ++generation_;
-        return diff;
+        return indexed(std::move(diff));
     }
 
     LabelDiff LabelVolume::remove(Index t, std::uint32_t id) {
         LabelDiff diff;
         diff.t = t;
         if (t < 0 || t >= t_) throw std::out_of_range("LabelVolume::remove: t out of range");
-        if (!id) return diff;
+        if (!id) return indexed(std::move(diff));
         edited_ = true;
-        std::uint32_t* v = volume(t);
+        std::uint32_t* v = writable(t);
         const Index n = volumeSize();
         for (Index i = 0; i < n; ++i) {
             if (v[i] != id) continue;
@@ -580,7 +617,7 @@ namespace sirius::app {
             v[i] = 0;
         }
         if (!diff.empty()) ++generation_;
-        return diff;
+        return indexed(std::move(diff));
     }
 
     LabelDiff LabelVolume::split(Index t, std::uint32_t id, std::array<Index, 3> seedA, std::array<Index, 3> seedB,
@@ -590,7 +627,7 @@ namespace sirius::app {
         if (t < 0 || t >= t_) throw std::out_of_range("LabelVolume::split: t out of range");
         if (!id) throw std::invalid_argument("LabelVolume::split: cannot split the background");
         edited_ = true;
-        std::uint32_t* v = volume(t);
+        std::uint32_t* v = writable(t);
         auto inside = [&](const std::array<Index, 3>& s) {
             return s[0] >= 0 && s[0] < z_ && s[1] >= 0 && s[1] < y_ && s[2] >= 0 && s[2] < x_ &&
                    v[(s[0] * y_ + s[1]) * x_ + s[2]] == id;
@@ -614,7 +651,7 @@ namespace sirius::app {
                         x1 = std::max(x1, x);
                     }
             }
-        if (z1 < 0) return diff;
+        if (z1 < 0) return indexed(std::move(diff));
         const Index bz = z1 - z0 + 3, by = y1 - y0 + 3, bx = x1 - x0 + 3;   // one voxel of padding each side
         const Index oz = z0 - 1, oy = y0 - 1, ox = x0 - 1;
         const Index bn = bz * by * bx;
@@ -652,7 +689,7 @@ namespace sirius::app {
             maxLabel_ = std::max(maxLabel_, newId);
             ++generation_;
         }
-        return diff;
+        return indexed(std::move(diff));
     }
 
     void LabelVolume::apply(const LabelDiff& diff, bool forward) {
@@ -660,7 +697,7 @@ namespace sirius::app {
         if (diff.before.size() != diff.indices.size() || diff.after.size() != diff.indices.size())
             throw std::invalid_argument("LabelVolume::apply: malformed diff");
         edited_ = true;
-        std::uint32_t* v = volume(diff.t);
+        std::uint32_t* v = writable(diff.t);
         const std::vector<std::uint32_t>& values = forward ? diff.after : diff.before;
         const Index n = volumeSize();
         // A stroke's diff is the concatenation of every mouse move, so one
@@ -675,7 +712,21 @@ namespace sirius::app {
             maxLabel_ = std::max(maxLabel_, values[k]);
         }
         if (count) ++generation_;
+        if (tracks_) {
+            if (tracks_.use_count() > 1) tracks_ = std::make_shared<TrackIndex>(*tracks_);
+            tracks_->apply(diff, forward);
+        }
     }
+
+    LabelDiff LabelVolume::indexed(LabelDiff diff) {
+        if (tracks_ && !diff.empty()) {
+            if (tracks_.use_count() > 1) tracks_ = std::make_shared<TrackIndex>(*tracks_);
+            tracks_->apply(diff);
+        }
+        return diff;
+    }
+
+    void LabelVolume::indexTracks() { tracks_ = std::make_shared<TrackIndex>(*this); }
 
     std::shared_ptr<LabelVolume> LabelVolume::clone() const {
         auto c = share();
@@ -697,6 +748,8 @@ namespace sirius::app {
         c->flagRules_ = flagRules_;
         c->maxLabel_ = maxLabel_;
         c->tracked_ = tracked_;
+        c->lineage_ = lineage_;
+        c->tracks_ = tracks_;
         return c;
     }
 
@@ -1217,6 +1270,12 @@ namespace sirius::app {
         };
         for (auto& frame : frameAnnotations_) frame = renumbered(frame);
         trackAnnotations_ = renumbered(trackAnnotations_);
+        // the lineage too; an entry naming an id that is gone names nothing
+        Lineage lineage;
+        for (const auto& [child, parent] : lineage_)
+            if (const std::uint32_t c = mapped(child), p = mapped(parent); c && p) lineage[c] = p;
+        lineage_ = std::move(lineage);
+        if (tracks_) indexTracks();   // the voxels were rewritten under it
         maxLabel_ = next;
         ++generation_;
         return next;

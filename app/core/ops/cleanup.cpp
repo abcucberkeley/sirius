@@ -89,6 +89,9 @@ namespace sirius::app {
                     labels->recomputeStats(t);
                     labels->applyFlags(rules);
                 }
+                // one map for every frame keeps a track one id (relabelDensely
+                // carries the lineage along); dropped objects leave the index
+                if (labels->tracked()) labels->indexTracks();
                 out.labels = labels;
                 out.ranOn = Backend::Cpu;
                 out.note = std::to_string(labels->stats().size()) + " labels kept · CPU";
