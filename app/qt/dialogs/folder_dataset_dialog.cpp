@@ -432,8 +432,8 @@ namespace sirius::app {
             const Preset& p = kPresets[i - 1];
             impl_->pattern->setText(QString::fromLatin1(p.pattern));
             impl_->positions->setCurrentIndex(p.positions == FilenameRule::Positions::GridIndex ? 1
-                                              : p.positions == FilenameRule::Positions::Microns  ? 2
-                                                                                                 : 0);
+                                              : p.positions == FilenameRule::Positions::Microns ? 2
+                                                                                                : 0);
             impl_->overlap->setEnabled(p.positions == FilenameRule::Positions::GridIndex);
             QSignalBlocker b(impl_->presets);
             impl_->presets->setCurrentIndex(0);
@@ -490,7 +490,9 @@ namespace sirius::app {
                 anyGrid = anyGrid || t.gridIndex[1] != 0 || t.gridIndex[2] != 0;
                 anyPos = anyPos || t.positionUm[1] != 0.0 || t.positionUm[2] != 0.0;
             }
-            impl_->positions->setCurrentIndex(m.tiles.size() <= 1 ? 0 : anyGrid ? 1 : anyPos ? 2 : 0);
+            impl_->positions->setCurrentIndex(m.tiles.size() <= 1 ? 0 : anyGrid ? 1
+                                                                    : anyPos    ? 2
+                                                                                : 0);
             impl_->overlap->setEnabled(impl_->positions->currentIndex() == 1);
             if (!m.pattern.empty()) impl_->pattern->setText(fromStd(m.pattern));
         }

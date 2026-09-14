@@ -341,7 +341,10 @@ namespace sirius::app {
             std::string out;
             bool math = false;
             for (char c : intro) {
-                if (c == '$') { math = !math; continue; }
+                if (c == '$') {
+                    math = !math;
+                    continue;
+                }
                 if (math || c == '*' || c == '`' || c == '_' || c == '\n' || c == '\r') {
                     if (c == '\n' || c == '\r') out += ' ';
                     continue;

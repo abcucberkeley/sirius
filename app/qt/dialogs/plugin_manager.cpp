@@ -47,7 +47,11 @@ namespace sirius::app {
             kStatusRole,                    // Status below
             kErrorRole,                     // first line of the load error
         };
-        enum Status { kDirectory = 0, kMissingDirectory, kLoaded, kFailed, kSkipped };
+        enum Status { kDirectory = 0,
+                      kMissingDirectory,
+                      kLoaded,
+                      kFailed,
+                      kSkipped };
 
         constexpr int kDirRowHeight = 26;
         constexpr int kFileRowHeight = 28;
