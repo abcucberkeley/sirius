@@ -191,6 +191,13 @@ namespace sirius::app {
             c->second.parent = parent;
             p->second.children.push_back(child);   // lineage is ordered by child, so ascending
         }
+        for (auto& [id, row] : rows) {
+            if (row.children.size() >= 2) row.division = true;
+            else if (row.children.size() == 1) {
+                const Index born = rows.at(row.children.front()).first;
+                row.division = row.first < born && born <= row.last;   // appears beside a mother already there
+            }
+        }
 
         std::vector<TrackSummary> out;
         out.reserve(rows.size());

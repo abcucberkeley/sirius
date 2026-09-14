@@ -94,9 +94,18 @@ namespace sirius::app {
         double meanVoxels = 0.0;
         std::uint32_t parent = 0;        // 0: none, or not in the labels any more
         std::vector<std::uint32_t> children;   // ascending; present in the labels
+        // Whether the lineage still describes a division here. Trackers
+        // record one two ways: btrack ends the mother and starts two
+        // daughters that name her; the latents model keeps the mother's id on
+        // one daughter and starts only the other. So: two or more children,
+        // or one child that starts while this track is still present (and
+        // after it began). One
+        // child after this track has ended is a continuation (the other
+        // daughter was deleted, or never kept), not a division.
+        bool division = false;
 
         Index span() const noexcept { return last - first + 1; }
-        bool divides() const noexcept { return children.size() >= 2; }
+        bool divides() const noexcept { return division; }
     };
 
     // One row per track, ascending id. Distances in microns from `voxelUm`
@@ -111,7 +120,7 @@ namespace sirius::app {
     // the lineage an annotation of them.
     Lineage lineageFromJson(const nlohmann::json& j);
 
-    // Parents with two or more children present: the divisions the lineage
+    // Tracks that divide (TrackSummary::division): the divisions the lineage
     // still describes after any edits.
     Index countDivisions(const std::vector<TrackSummary>& tracks);
 

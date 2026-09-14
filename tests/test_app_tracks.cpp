@@ -317,6 +317,20 @@ TEST_CASE("summarizeTracks attaches lineage only between tracks that exist", "[a
         CHECK(countDivisions(rows) == 1);
     }
 
+    SECTION("a division the latents way: the mother keeps her id on one daughter") {
+        // track 1 goes on through frame 2, where daughter 5 appears beside it;
+        // the model also reports {1: 1}, which names nothing
+        LabelVolume clip(labels);
+        cube(clip, 2, 1, 0, 6, 6, 2);
+        cube(clip, 2, 5, 0, 6, 10, 2);
+        const std::vector<TrackSummary> rows = summarizeTracks(TrackIndex(clip), lineageFromJson(nlohmann::json{{"1", 1}, {"5", 1}}), kIsotropic);
+        REQUIRE(rows.size() == 5);
+        CHECK(rows[0].children == std::vector<std::uint32_t>{5});
+        CHECK(rows[0].parent == 0);
+        CHECK(rows[0].divides());
+        CHECK(countDivisions(rows) == 1);
+    }
+
     SECTION("ids that are gone, self-parents and cycles describe nothing and hang nothing") {
         const Lineage lineage{{2, 1}, {3, 99}, {4, 4}, {98, 1}, {1, 2}};
         const std::vector<TrackSummary> rows = summarizeTracks(index, lineage, kIsotropic);
