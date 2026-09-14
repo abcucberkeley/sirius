@@ -123,14 +123,16 @@ namespace sirius::app {
         void indexTracks();
         std::shared_ptr<const TrackIndex> tracks() const noexcept { return tracks_; }
 
+        // All of them check their coordinates (std::out_of_range): a pointer
+        // computed from a bad t or z points into someone else's memory.
         // The mutable accessors detach a shared copy first (see the header note),
         // and drop the track index: the edits below keep it current, a raw
         // write cannot (call indexTracks() again when the ids still name tracks).
         std::uint32_t* volume(Index t);                          // (z, y, x)
-        const std::uint32_t* volume(Index t) const noexcept;
+        const std::uint32_t* volume(Index t) const;
         std::uint32_t* plane(Index t, Index z);
-        const std::uint32_t* plane(Index t, Index z) const noexcept;
-        std::uint32_t at(Index t, Index z, Index y, Index x) const noexcept;
+        const std::uint32_t* plane(Index t, Index z) const;
+        std::uint32_t at(Index t, Index z, Index y, Index x) const;
         BufferView<const std::uint32_t> view() const noexcept { return data_->view(); }
 
         // Highest id handed out so far: monotonic, so ids never collide with

@@ -1273,3 +1273,22 @@ TEST_CASE("recomputeStats copes with an id near 2^32", "[app][labels]") {
     CHECK(l.stats()[1].bbox == std::array<Index, 6>{0, 1, 1, 2, 1, 3});
     CHECK(l.maxLabel() == 3000000000u);
 }
+
+TEST_CASE("LabelVolume accessors refuse coordinates outside the volume", "[app][labels]") {
+    LabelVolume labels(2, 3, 4, 5);
+    const LabelVolume& read = labels;
+    CHECK_NOTHROW(labels.volume(1));
+    CHECK_NOTHROW(read.plane(1, 2));
+    CHECK(read.at(1, 2, 3, 4) == 0u);
+    CHECK_THROWS_AS(labels.volume(2), std::out_of_range);
+    CHECK_THROWS_AS(labels.volume(-1), std::out_of_range);
+    CHECK_THROWS_AS(read.volume(2), std::out_of_range);
+    CHECK_THROWS_AS(labels.plane(0, 3), std::out_of_range);
+    CHECK_THROWS_AS(read.plane(0, -1), std::out_of_range);
+    CHECK_THROWS_AS(read.at(0, 0, 4, 0), std::out_of_range);
+    CHECK_THROWS_AS(read.at(0, 0, 0, 5), std::out_of_range);
+    CHECK_THROWS_AS(LabelVolume{}.volume(0), std::out_of_range);
+    // extents whose product wraps are refused before anything is allocated
+    const Index big = Index{1} << 20;
+    CHECK_THROWS_AS(LabelVolume(big, big, big, big), std::invalid_argument);
+}

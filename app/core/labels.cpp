@@ -125,6 +125,11 @@ namespace sirius::app {
     LabelVolume::LabelVolume(Index t, Index z, Index y, Index x) : t_(t), z_(z), y_(y), x_(x) {
         if (t < 1) throw std::invalid_argument("LabelVolume: t must be >= 1");
         requireExtent(z, y, x, "LabelVolume");
+        // t * z * y * x voxels of 4 bytes must be addressable without wrapping
+        const Index most = std::numeric_limits<Index>::max() / static_cast<Index>(sizeof(std::uint32_t));
+        if (z > most / y || z * y > most / x || z * y * x > most / t)
+            throw std::invalid_argument("LabelVolume: " + std::to_string(t) + " x " + std::to_string(z) + " x " +
+                                        std::to_string(y) + " x " + std::to_string(x) + " voxels cannot be addressed");
         data_ = std::make_shared<Buffer<std::uint32_t>>(Shape{t, z, y, x});
         std::fill(data_->data(), data_->data() + data_->size(), 0u);
     }
@@ -143,14 +148,36 @@ namespace sirius::app {
         return writable(t);
     }
 
+    namespace {
+        void requireIndex(Index i, Index n, const char* what) {
+            if (i < 0 || i >= n)
+                throw std::out_of_range(std::string("LabelVolume: ") + what + " " + std::to_string(i) + " outside [0, " +
+                                        std::to_string(n) + ")");
+        }
+    } // namespace
+
     std::uint32_t* LabelVolume::writable(Index t) {
+        requireIndex(t, t_, "t");
         detach();
         return data_->data() + t * volumeSize();
     }
-    const std::uint32_t* LabelVolume::volume(Index t) const noexcept { return data_->data() + t * volumeSize(); }
-    std::uint32_t* LabelVolume::plane(Index t, Index z) { return volume(t) + z * y_ * x_; }
-    const std::uint32_t* LabelVolume::plane(Index t, Index z) const noexcept { return volume(t) + z * y_ * x_; }
-    std::uint32_t LabelVolume::at(Index t, Index z, Index y, Index x) const noexcept { return plane(t, z)[y * x_ + x]; }
+    const std::uint32_t* LabelVolume::volume(Index t) const {
+        requireIndex(t, t_, "t");
+        return data_->data() + t * volumeSize();
+    }
+    std::uint32_t* LabelVolume::plane(Index t, Index z) {
+        requireIndex(z, z_, "z");
+        return volume(t) + z * y_ * x_;
+    }
+    const std::uint32_t* LabelVolume::plane(Index t, Index z) const {
+        requireIndex(z, z_, "z");
+        return volume(t) + z * y_ * x_;
+    }
+    std::uint32_t LabelVolume::at(Index t, Index z, Index y, Index x) const {
+        requireIndex(y, y_, "y");
+        requireIndex(x, x_, "x");
+        return plane(t, z)[y * x_ + x];
+    }
 
     std::uint32_t LabelVolume::maxLabel() const noexcept { return maxLabel_; }
 
