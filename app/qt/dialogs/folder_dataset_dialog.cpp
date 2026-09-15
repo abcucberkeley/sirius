@@ -19,6 +19,7 @@
 #include <QBrush>
 #include <QCheckBox>
 #include <QColorDialog>
+#include <QCryptographicHash>
 #include <QDir>
 #include <QDoubleSpinBox>
 #include <QFileInfo>
@@ -33,8 +34,10 @@
 #include <QSettings>
 #include <QSignalBlocker>
 #include <QSpinBox>
+#include <QStandardPaths>
 #include <QTableWidget>
 #include <QTimer>
+#include <QVariantMap>
 
 #include "core/array_source.hpp"
 #include "core/manifest.hpp"
@@ -119,6 +122,45 @@ namespace sirius::app {
         QColor chipColor(const ChannelInfo& ch) { return QColor(fromStd(ch.hexColor())); }
 
         constexpr auto kLastManifestDirKey = "folderDataset/lastManifestDir";
+        constexpr auto kLastPatternKey = "folderDataset/lastPattern";
+        constexpr auto kLastPositionsKey = "folderDataset/lastPositions";
+        constexpr auto kLastOverlapKey = "folderDataset/lastOverlap";
+        constexpr auto kPatternMapKey = "folderDataset/patternMap";
+
+        QString canonicalFolderString(const QString& folder) {
+            return fromStd(canonicalPath(std::filesystem::path(toStd(folder))).string());
+        }
+
+        // Per-folder regex if this directory was opened before, else the last
+        // pattern that successfully opened a folder (most acquisitions share one).
+        QString rememberedPatternFor(const QString& folder) {
+            QSettings s;
+            const QVariantMap map = s.value(QLatin1String(kPatternMapKey)).toMap();
+            const QString specific = map.value(canonicalFolderString(folder)).toString();
+            if (!specific.isEmpty()) return specific;
+            return s.value(QLatin1String(kLastPatternKey)).toString();
+        }
+
+        void rememberPatternFor(const QString& folder, const QString& pattern, int positions, double overlap) {
+            const QString pat = pattern.trimmed();
+            if (pat.isEmpty()) return;
+            QSettings s;
+            s.setValue(QLatin1String(kLastPatternKey), pat);
+            s.setValue(QLatin1String(kLastPositionsKey), positions);
+            s.setValue(QLatin1String(kLastOverlapKey), overlap);
+            QVariantMap map = s.value(QLatin1String(kPatternMapKey)).toMap();
+            map.insert(canonicalFolderString(folder), pat);
+            s.setValue(QLatin1String(kPatternMapKey), map);
+        }
+
+        QString cachedManifestPath(const QString& folder) {
+            const QString root = QStandardPaths::writableLocation(QStandardPaths::AppLocalDataLocation);
+            QDir dir(root);
+            dir.mkpath(QStringLiteral("folder-manifests"));
+            const QString key = QString::fromUtf8(
+                QCryptographicHash::hash(canonicalFolderString(folder).toUtf8(), QCryptographicHash::Sha1).toHex());
+            return dir.filePath(QStringLiteral("folder-manifests/") + key + QStringLiteral(".toml"));
+        }
 
         QString manifestBrowseDirectory(const QString& dest, const QString& tiffFolder) {
             const QString destDir = QFileInfo(dest).absolutePath();
@@ -203,7 +245,8 @@ namespace sirius::app {
         WorkbenchBridge& bridge;
         QString folder;
         std::vector<std::string> names;              // the folder's TIFF files, sorted
-        std::optional<DatasetManifest> existing;     // a manifest already in the folder
+        std::optional<DatasetManifest> existing;     // a manifest already in the folder or loaded
+        QString loadedManifestPath;                  // toml we loaded; empty if none
 
         QLineEdit* pattern = nullptr;
         QPushButton* presets = nullptr;
@@ -251,6 +294,8 @@ namespace sirius::app {
         }
 
         FilenameRule rule() const;
+        void applyManifest(const DatasetManifest& m);
+        void loadManifestFile();
         void runPreview();
         void refreshChannels();
         void refreshTileMap();
@@ -295,13 +340,19 @@ namespace sirius::app {
         manifestRow->setSpacing(8);
         impl_->manifestPath = new QLineEdit(this);
         impl_->manifestPath->setText(impl_->folder + QLatin1Char('/') + QLatin1String(DatasetManifest::kFileName));
-        impl_->manifestPath->setToolTip(QStringLiteral("Where to write the manifest. Does not have to be inside the TIFF folder."));
-        auto* browseManifest = new QPushButton(QStringLiteral("Browse"), this);
+        impl_->manifestPath->setToolTip(QStringLiteral(
+            "Optional. Load an existing .toml, or choose where to write one. Leave the default: "
+            "Open writes it next to the TIFFs when that folder is writable, otherwise a local cache."));
+        auto* loadManifest = new QPushButton(QStringLiteral("Load…"), this);
+        widgets::setButtonClass(loadManifest, "secondary small");
+        loadManifest->setToolTip(QStringLiteral("Open an existing dataset manifest and use its filename pattern"));
+        auto* browseManifest = new QPushButton(QStringLiteral("Save as…"), this);
         widgets::setButtonClass(browseManifest, "secondary small");
         browseManifest->setToolTip(QStringLiteral(
-            "Choose where to write the manifest. Opens outside the TIFF folder so the dialog does not list hundreds of stacks"));
+            "Choose where to write a new manifest. Opens outside the TIFF folder so the dialog does not list hundreds of stacks"));
         manifestRow->addWidget(fieldLabel(QStringLiteral("Manifest")), 0);
         manifestRow->addWidget(impl_->manifestPath, 1);
+        manifestRow->addWidget(loadManifest);
         manifestRow->addWidget(browseManifest);
         root->addLayout(manifestRow);
 
@@ -471,11 +522,11 @@ namespace sirius::app {
         buttons->addStretch(1);
         auto* cancel = new QPushButton(QStringLiteral("Cancel"), this);
         widgets::setButtonClass(cancel, "ghost");
-        impl_->save = new QPushButton(QStringLiteral("Save manifest & open"), this);
+        impl_->save = new QPushButton(QStringLiteral("Open"), this);
         widgets::setButtonClass(impl_->save, "primary");
         impl_->save->setDefault(true);
         impl_->save->setEnabled(false);
-        impl_->save->setToolTip(QStringLiteral("Writes the manifest to the path above and opens the dataset"));
+        impl_->save->setToolTip(QStringLiteral("Open the folder as a dataset. Remembers this filename pattern for next time."));
         buttons->addWidget(cancel);
         buttons->addWidget(impl_->save);
         root->addLayout(buttons);
@@ -517,6 +568,7 @@ namespace sirius::app {
             impl_->manifestPath->setText(chosen);
             QSettings().setValue(QLatin1String(kLastManifestDirKey), QFileInfo(chosen).absolutePath());
         });
+        connect(loadManifest, &QPushButton::clicked, this, [this] { impl_->loadManifestFile(); });
         impl_->previewTimer.setSingleShot(true);
         impl_->previewTimer.setInterval(150);
         connect(&impl_->previewTimer, &QTimer::timeout, this, [this] { impl_->runPreview(); });
@@ -556,32 +608,28 @@ namespace sirius::app {
         });
         connect(impl_->save, &QPushButton::clicked, this, [this] { impl_->saveAndOpen(); });
 
-        // preload from the folder's manifest
+        // preload: in-folder manifest, else the regex remembered for this
+        // folder, else the last pattern that opened any folder, else AOLLS.
         {
             QSignalBlocker blockPattern(impl_->pattern);
             QSignalBlocker blockPos(impl_->positions);
+            const QString remembered = rememberedPatternFor(impl_->folder);
             if (impl_->existing) {
-                const DatasetManifest& m = *impl_->existing;
-                impl_->vx->setValue(m.voxelUm[0] > 0.0 ? m.voxelUm[0] : 0.1);
-                impl_->vy->setValue(m.voxelUm[1] > 0.0 ? m.voxelUm[1] : 0.1);
-                impl_->vz->setValue(m.voxelUm[2] > 0.0 ? m.voxelUm[2] : 0.2);
-                impl_->interval->setValue(m.frameIntervalS);
-                impl_->acquisition->setText(fromStd(m.acquisition));
-                impl_->sim->setChecked(m.sim.present);
-                impl_->dirs->setValue(m.sim.ndirs);
-                impl_->phases->setValue(m.sim.nphases);
-                impl_->fastSi->setChecked(m.sim.fastSi);
-                bool anyGrid = false, anyPos = false;
-                for (const TileInfo& t : m.tiles) {
-                    anyGrid = anyGrid || t.gridIndex[1] != 0 || t.gridIndex[2] != 0;
-                    anyPos = anyPos || t.positionUm[1] != 0.0 || t.positionUm[2] != 0.0;
-                }
-                impl_->positions->setCurrentIndex(m.tiles.size() <= 1 ? 0 : anyGrid ? 1 : anyPos ? 2 : 0);
+                impl_->loadedManifestPath =
+                    impl_->folder + QLatin1Char('/') + QLatin1String(DatasetManifest::kFileName);
+                impl_->applyManifest(*impl_->existing);
+                if (impl_->pattern->text().trimmed().isEmpty() && !remembered.isEmpty())
+                    impl_->pattern->setText(remembered);
+            } else if (!remembered.isEmpty()) {
+                impl_->pattern->setText(remembered);
+                QSettings s;
+                const int pos = s.value(QLatin1String(kLastPositionsKey), 1).toInt();
+                impl_->positions->setCurrentIndex(std::clamp(pos, 0, 2));
+                impl_->overlap->setValue(s.value(QLatin1String(kLastOverlapKey), 10.0).toDouble());
                 impl_->overlap->setEnabled(impl_->positions->currentIndex() == 1);
-                if (!m.pattern.empty()) impl_->pattern->setText(fromStd(m.pattern));
+                const int i = indexOfPresetPattern(remembered);
+                impl_->presets->setText(i > 0 ? QString::fromUtf8(kPresets[i - 1].label) : QStringLiteral("Presets"));
             } else {
-                // No manifest yet: if the files are ABC AOLLS Scan_Iter names,
-                // start from that preset instead of the Micro-Manager ones.
                 const bool aolls = std::any_of(impl_->names.begin(), impl_->names.end(), looksLikeAollsScanIter);
                 if (aolls) {
                     impl_->pattern->setText(QString::fromLatin1(kPresets[0].pattern));
@@ -616,6 +664,60 @@ namespace sirius::app {
             if (it != chans.end()) r.channelInfo[token] = it->second.info;
         }
         return r;
+    }
+
+    void FolderDatasetDialog::Impl::applyManifest(const DatasetManifest& m) {
+        vx->setValue(m.voxelUm[0] > 0.0 ? m.voxelUm[0] : 0.1);
+        vy->setValue(m.voxelUm[1] > 0.0 ? m.voxelUm[1] : 0.1);
+        vz->setValue(m.voxelUm[2] > 0.0 ? m.voxelUm[2] : 0.2);
+        interval->setValue(m.frameIntervalS);
+        acquisition->setText(fromStd(m.acquisition));
+        sim->setChecked(m.sim.present);
+        dirs->setValue(m.sim.ndirs);
+        phases->setValue(m.sim.nphases);
+        fastSi->setChecked(m.sim.fastSi);
+        bool anyGrid = false, anyPos = false;
+        for (const TileInfo& t : m.tiles) {
+            anyGrid = anyGrid || t.gridIndex[1] != 0 || t.gridIndex[2] != 0;
+            anyPos = anyPos || t.positionUm[1] != 0.0 || t.positionUm[2] != 0.0;
+        }
+        positions->setCurrentIndex(m.tiles.size() <= 1 ? 0 : anyGrid ? 1 : anyPos ? 2 : 0);
+        overlap->setEnabled(positions->currentIndex() == 1);
+        if (!m.pattern.empty()) {
+            pattern->setText(fromStd(m.pattern));
+            const int i = indexOfPresetPattern(fromStd(m.pattern));
+            presets->setText(i > 0 ? QString::fromUtf8(kPresets[i - 1].label) : QStringLiteral("Presets"));
+        }
+        existing = m;
+    }
+
+    void FolderDatasetDialog::Impl::loadManifestFile() {
+        const QString dest = manifestPath->text().trimmed();
+        QString start = dest;
+        const QString last = QSettings().value(QLatin1String(kLastManifestDirKey)).toString();
+        if (QFileInfo(start).isDir() || start.isEmpty()) start = last;
+        const QString chosen = getOpenFileNameFast(
+            q, QStringLiteral("Load dataset manifest"), start, QStringLiteral("SIRIUS dataset (*.toml);;All files (*)"));
+        if (chosen.isEmpty()) return;
+        DatasetManifest m;
+        try {
+            m = DatasetManifest::load(std::filesystem::path(toStd(chosen)));
+        } catch (const std::exception& e) {
+            QMessageBox::warning(q, QStringLiteral("Load manifest"),
+                                 QStringLiteral("Could not read %1:\n%2").arg(chosen, QString::fromUtf8(e.what())));
+            return;
+        }
+        QSignalBlocker blockPattern(pattern);
+        QSignalBlocker blockPos(positions);
+        applyManifest(m);
+        const std::filesystem::path chosenPath(toStd(chosen));
+        if (canonicalPath(m.filesRoot(chosenPath)) == canonicalPath(std::filesystem::path(toStd(folder)))) {
+            manifestPath->setText(chosen);
+            loadedManifestPath = chosen;
+        }
+        QSettings().setValue(QLatin1String(kLastManifestDirKey), QFileInfo(chosen).absolutePath());
+        previewTimer.stop();
+        runPreview();
     }
 
     // Match the pattern against the folder, fill the preview and derive the
@@ -824,48 +926,83 @@ namespace sirius::app {
         tileMap->setTiles(std::move(pts), mode == FilenameRule::Positions::GridIndex, note);
     }
 
-    // Build the manifest from the rule, write it (asking before replacing a
-    // file that is there) and open the dataset through the workbench.
+    // Build the mapping from the rule and open it. A sidecar is written next
+    // to the TIFFs when that folder is writable; otherwise a local cache with
+    // files_folder. An already-valid loaded manifest is opened as-is.
     void FolderDatasetDialog::Impl::saveAndOpen() {
         const std::filesystem::path folderPath(toStd(folder));
+        rememberPatternFor(folder, pattern->text(), positions->currentIndex(), overlap->value());
         QString destText = manifestPath->text().trimmed();
         if (destText.isEmpty()) destText = folder + QLatin1Char('/') + QLatin1String(DatasetManifest::kFileName);
         std::filesystem::path dest(toStd(destText));
         std::error_code ec;
         if (std::filesystem::is_directory(dest, ec)) dest /= DatasetManifest::kFileName;
         if (dest.extension().empty()) dest += ".toml";
+
+        const FilenameRule r = rule();
+        const bool destIsLoaded = !loadedManifestPath.isEmpty() &&
+                                  canonicalPath(dest) == canonicalPath(std::filesystem::path(toStd(loadedManifestPath)));
+        if (destIsLoaded && existing && existing->pattern == r.pattern &&
+            canonicalPath(existing->filesRoot(dest)) == canonicalPath(folderPath)) {
+            const std::vector<std::string> problems = existing->validate(folderPath);
+            if (problems.empty()) {
+                OpenOptions options;
+                options.tile = 0;
+                options.readAll = true;
+                if (!bridge.openDatasetAsync(dest.string(), options)) {
+                    QMessageBox::warning(q, QStringLiteral("Open folder as dataset"),
+                                         QStringLiteral("Another task is still running: cancel it or wait, then open the dataset."));
+                    return;
+                }
+                q->accept();
+                return;
+            }
+        }
+
         DatasetManifest manifest;
         std::vector<std::string> unmatched;
         try {
-            manifest = manifestFromFolder(folderPath, rule(), &unmatched);
+            manifest = manifestFromFolder(folderPath, r, &unmatched);
         } catch (const std::exception& e) {
             QMessageBox::warning(q, QStringLiteral("Open folder as dataset"),
                                  QStringLiteral("The files do not form a dataset:\n%1").arg(QString::fromUtf8(e.what())));
             return;
         }
-        if (canonicalPath(dest.parent_path()) != canonicalPath(folderPath))
-            manifest.filesFolder = canonicalPath(folderPath).string();
-        if (std::filesystem::exists(dest, ec)) {
-            const auto answer = QMessageBox::question(
-                q, QStringLiteral("Replace manifest"),
-                QStringLiteral("Replace the existing file?\n%1").arg(fromStd(dest.string())),
-                QMessageBox::Yes | QMessageBox::Cancel, QMessageBox::Cancel);
-            if (answer != QMessageBox::Yes) return;
-        }
-        std::filesystem::create_directories(dest.parent_path(), ec);
+        auto writeManifest = [&](const std::filesystem::path& path) {
+            if (canonicalPath(path.parent_path()) != canonicalPath(folderPath))
+                manifest.filesFolder = canonicalPath(folderPath).string();
+            else
+                manifest.filesFolder.clear();
+            std::filesystem::create_directories(path.parent_path(), ec);
+            manifest.save(path);
+        };
         try {
-            manifest.save(dest);
-        } catch (const std::exception& e) {
-            QMessageBox::warning(q, QStringLiteral("Save manifest"),
-                                 QStringLiteral("Could not write %1:\n%2").arg(fromStd(dest.string()), QString::fromUtf8(e.what())));
-            return;
+            writeManifest(dest);
+        } catch (const std::exception& first) {
+            const std::filesystem::path cache(toStd(cachedManifestPath(folder)));
+            if (canonicalPath(cache) == canonicalPath(dest)) {
+                QMessageBox::warning(q, QStringLiteral("Open folder as dataset"),
+                                     QStringLiteral("Could not write %1:\n%2")
+                                         .arg(fromStd(dest.string()), QString::fromUtf8(first.what())));
+                return;
+            }
+            try {
+                writeManifest(cache);
+                dest = cache;
+                manifestPath->setText(fromStd(dest.string()));
+            } catch (const std::exception& e) {
+                QMessageBox::warning(q, QStringLiteral("Open folder as dataset"),
+                                     QStringLiteral("Could not write a manifest (the TIFF folder may not be writable):\n%1")
+                                         .arg(QString::fromUtf8(e.what())));
+                return;
+            }
         }
         OpenOptions options;
         options.tile = 0;
         options.readAll = true;
         if (!bridge.openDatasetAsync(dest.string(), options)) {
             QMessageBox::warning(q, QStringLiteral("Open folder as dataset"),
-                                 QStringLiteral("The manifest was saved but another task is still running: cancel it or wait, then open the dataset."));
+                                 QStringLiteral("The mapping is ready but another task is still running: cancel it or wait, then open the dataset."));
             return;
         }
         q->accept();

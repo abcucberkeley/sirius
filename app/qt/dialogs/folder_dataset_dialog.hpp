@@ -1,11 +1,12 @@
 #ifndef SIRIUS_APP_FOLDER_DATASET_DIALOG_HPP
 #define SIRIUS_APP_FOLDER_DATASET_DIALOG_HPP
 
-// "Open folder as dataset": a folder of TIFF stacks (one per channel / time
-// point / tile) described by a filename pattern with named groups, previewed
-// live, saved as a manifest (core/manifest.hpp) — in the folder or anywhere
-// else — and opened. A folder that already has a manifest opens directly;
-// this dialog then serves to inspect or redo the mapping.
+// "Open folder as dataset": a folder of TIFF stacks described by a filename
+// pattern with named groups, previewed live, then opened. The pattern is
+// remembered (last used, and per folder) so the next acquisition of the same
+// layout does not need a new regex. An existing manifest can be loaded to
+// recover its pattern; a sidecar is written only when the mapping is new or
+// the TIFF folder cannot hold one (then a local cache file with files_folder).
 
 #include <QDialog>
 #include <QString>
@@ -20,7 +21,7 @@ namespace sirius::app {
         FolderDatasetDialog(WorkbenchBridge& bridge, const QString& folder, QWidget* parent = nullptr);
         ~FolderDatasetDialog() override;
 
-        // Accepting writes the manifest and opens the dataset through the workbench.
+        // Accepting opens the dataset. A manifest is written when needed.
         QString folder() const;
 
     private:
