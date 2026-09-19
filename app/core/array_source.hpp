@@ -88,6 +88,9 @@ namespace sirius::app {
     struct OpenResult {
         std::shared_ptr<ArraySource> source;
         DatasetMeta meta;                   // == source->meta()
+        // Why a full load that was asked for did not happen (the dataset is
+        // then served lazily); empty otherwise. See fullLoadLimitBytes().
+        std::string fullLoadSkipped;
         // What the file said about itself, for the Open dialog.
         std::string metadataSummary;        // "OME-TIFF · 2 channels · voxel 0.032 µm"
         bool dimsFromMetadata = false;      // c/t/z came from OME/ImageJ/zarr metadata
@@ -100,6 +103,14 @@ namespace sirius::app {
     // pixels (`readAll` is ignored). Throws like openDataset.
     DatasetMeta probeDataset(const std::string& path, const OpenOptions& options);
     OpenResult openDataset(const std::string& path, const OpenOptions& options = {});
+
+    // The largest dataset, decoded to float32, that a "Full load" still reads
+    // into RAM: half the machine's physical memory, or $SIRIUS_FULL_LOAD_MAX_BYTES.
+    // Full load is the default, and a 26 GB folder became 31 GB of float32 on
+    // every open, whatever the machine; past this limit openDataset serves the
+    // dataset lazily instead and says so in OpenResult::fullLoadSkipped.
+    // 0 = the platform does not say how much memory there is: no limit.
+    std::uint64_t fullLoadLimitBytes();
 
     // Formats the build can open, as file-dialog filters and extensions.
     std::vector<std::string> readableExtensions();

@@ -29,6 +29,7 @@
 #include <QImage>
 #include <QRect>
 
+#include "core/byte_budget_lru.hpp"
 #include "core/operation.hpp"
 #include "core/workbench.hpp"
 
@@ -45,6 +46,9 @@ namespace sirius::app {
         // Bytes of one (c, t) volume kept for the re-slices; above it the panes
         // that need a whole volume report "too large" instead of reading it.
         static constexpr std::size_t kVolumeCacheLimit = std::size_t{3} << 30;   // 3 GiB
+        // The projections of the time points already played, least recently
+        // shown dropped first (64 frames of one 2048 x 2048 channel).
+        static constexpr std::size_t kMipCacheLimit = std::size_t{1} << 30;      // 1 GiB
 
         void setOutput(std::shared_ptr<const StepOutput> out);
         std::shared_ptr<const StepOutput> output() const noexcept { return out_; }
@@ -86,9 +90,12 @@ namespace sirius::app {
                                  TooLarge };
         VolumeState volumeState(Index c, Index t);
         // The loader's result: the volume (null for an in-memory output), its
-        // projection and its exact range.
+        // projection and its exact range. `shownT` is the time point on
+        // screen when `t` is another one (play reading ahead): its volumes are
+        // kept, and the read-ahead volume is kept beside them only while both
+        // fit in kVolumeCacheLimit. -1: `t` is the one shown.
         void installVolume(Index c, Index t, std::shared_ptr<Buffer<float>> volume,
-                           std::shared_ptr<Buffer<float>> mip, float lo, float hi);
+                           std::shared_ptr<Buffer<float>> mip, float lo, float hi, Index shownT = -1);
         bool volumeTooLarge() const noexcept;
         std::optional<float> valueAt(Index c, Index t, Index z, Index y, Index x);
         void dropVolumeCaches();
@@ -139,9 +146,13 @@ namespace sirius::app {
         // computed inline: a few milliseconds, not worth a thread hop.
         static constexpr Index kInlineProjectVoxels = Index{8} << 20;
         // Keep at most one time point of the heavy (c, t) volumes (the 3 GiB
-        // cap). MIPs and ranges are a few tens of MB for a whole movie: play
-        // must not throw them away or every frame re-projects 10^8 voxels.
-        void evictOtherTimePoints(Index t);
+        // cap). Play must not throw the projections away or every frame
+        // re-projects 10^8 voxels, but a projection is 16 MB at 2048 x 2048, so
+        // they are kept up to kMipCacheLimit rather than for the whole movie
+        // (two channels, 500 frames: 32 GB). The ranges are a few bytes each
+        // and all stay.
+        void evictOtherTimePoints(Index t, Index alsoKeep = -1);
+        void storeMip(const Key& key, std::shared_ptr<Buffer<float>> mip);
 
         std::shared_ptr<const StepOutput> out_;
         DatasetMeta meta_;
@@ -150,6 +161,7 @@ namespace sirius::app {
         // Shared so a loader thread can hold a volume the model has evicted.
         std::map<Key, std::shared_ptr<Buffer<float>>> volumes_;   // lazy sources only
         std::map<Key, std::shared_ptr<Buffer<float>>> mips_;
+        mutable ByteBudgetLru<Key> mipBudget_{kMipCacheLimit};   // touched by mipIfReady
         struct Range {
             float lo = 0.0f, hi = 1.0f;
         };

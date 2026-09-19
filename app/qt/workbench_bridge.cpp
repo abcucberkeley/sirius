@@ -43,7 +43,7 @@ namespace sirius::app {
     WorkbenchBridge::~WorkbenchBridge() {
         wb_.removeObserver(relay_.get());
         if (job_) job_->cancel();
-        taskCancel_.store(true);
+        taskCancel_.store(true);   // a load in flight stops at its next progress call and installs nothing
         // The dispatcher's queued jobs finish on the worker thread before it
         // quits, so nothing touches the workbench after this returns.
         QMetaObject::invokeMethod(dispatcher_, [d = dispatcher_] { delete d; }, Qt::BlockingQueuedConnection);
@@ -142,6 +142,7 @@ namespace sirius::app {
             std::lock_guard<std::mutex> g(taskMutex_);
             taskMessage_.clear();
             taskError_.clear();
+            taskCompletion_ = nullptr;
         }
         taskLabel_ = label;
         progressTimer_.start();
@@ -174,9 +175,20 @@ namespace sirius::app {
 
     void WorkbenchBridge::onTaskFinished() {
         std::string error;
+        std::function<void()> completion;
         {
             std::lock_guard<std::mutex> g(taskMutex_);
             error = taskError_;
+            completion.swap(taskCompletion_);
+        }
+        // The GUI-thread half of the task, unless it failed or was cancelled
+        // (a cancelled load must not replace the dataset on screen).
+        if (completion && error.empty() && !taskCancel_.load()) {
+            try {
+                completion();
+            } catch (const std::exception& e) {
+                if (!isCancellation(e)) error = e.what();
+            }
         }
         taskActive_.store(false);
         if (!job_) progressTimer_.stop();
@@ -206,20 +218,13 @@ namespace sirius::app {
             OpenResult opened = sirius::app::openDataset(path, o);
             if (cancelled()) throw CancelledError{};
             o.progress = {};
+            // The dataset is installed on the GUI thread, from onTaskFinished.
+            // This thread used to wait for that (BlockingQueuedConnection)
+            // while ~WorkbenchBridge, on the GUI thread, waits for this one:
+            // closing the window as a load finished hung the application.
             auto result = std::make_shared<OpenResult>(std::move(opened));
-            std::exception_ptr ep;
-            QMetaObject::invokeMethod(
-                this,
-                [this, result, path, o, &ep]() {
-                    try {
-                        if (taskCancel_.load()) throw CancelledError{};
-                        wb_.adoptDataset(std::move(*result), path, o);
-                    } catch (...) {
-                        ep = std::current_exception();
-                    }
-                },
-                Qt::BlockingQueuedConnection);
-            if (ep) std::rethrow_exception(ep);
+            std::lock_guard<std::mutex> g(taskMutex_);
+            taskCompletion_ = [this, result, path, o] { wb_.adoptDataset(std::move(*result), path, o); };
         });
     }
 

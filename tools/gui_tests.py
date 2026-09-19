@@ -449,6 +449,76 @@ def test_files_named_on_the_command_line_open(app: Path, tmp: Path) -> None:
     check("sim" in kinds, f"the pipeline file did not open: steps {kinds}")
 
 
+def test_quitting_while_a_dataset_loads_does_not_hang(app: Path, tmp: Path) -> None:
+    # The load decodes on a worker thread and used to hand the dataset to the
+    # GUI thread with a blocking call, while the closing window's bridge waited
+    # for that worker: quitting in the first moments of a load hung for ever.
+    for quit_after in ("0", "5", "20"):
+        try:
+            run(app, ["--dataset", str(RAW), "--quit-after", quit_after], timeout=30)
+        except Failure as e:
+            if str(e).startswith("timed out"):
+                raise Failure(f"quitting {quit_after} ms into a load hung the application") from None
+            raise
+
+
+def test_a_full_load_past_the_memory_limit_opens_lazily(app: Path, tmp: Path) -> None:
+    # Every open used to force a full load, whatever was chosen and however
+    # large the data. A dataset over the limit (half the machine's memory; here
+    # set to almost nothing) opens lazily and the log says why.
+    args = ["--dataset", str(RAW), "--tool", '{"name":"get_log","args":{}}', "--settle", "900", "--quit-after", "6000"]
+    out = run(app, args, env={"SIRIUS_FULL_LOAD_MAX_BYTES": "1024"})
+    check("Full load skipped" in out, "a dataset over the full-load limit was not reported as opened lazily")
+    out = run(app, args)
+    check("Full load skipped" not in out, "a small dataset was refused its full load")
+
+
+def test_opening_a_folder_writes_nothing_into_it_unasked(app: Path, tmp: Path) -> None:
+    # The folder dialog wrote its sirius-dataset.toml beside the TIFFs whenever
+    # that folder was writable -- on a cluster, into source data -- without
+    # asking. Open now asks where the file should go; nobody answers here (the
+    # screenshot closes the question), so nothing may be written.
+    try:
+        import numpy as np  # noqa: PLC0415 - optional, like Pillow above
+        import tifffile  # noqa: PLC0415
+    except ImportError:
+        raise Skip("needs numpy and tifffile to write the folder") from None
+    folder = tmp / "plain-folder"
+    folder.mkdir()
+    for t in range(2):
+        # minisblack: three planes of one channel (tifffile would call 3 x 8 x 8 RGB)
+        tifffile.imwrite(folder / f"img_t{t:03d}.tif", np.full((3, 8, 8), t, dtype=np.float32), photometric="minisblack")
+    env = isolated_settings(tmp, "folder")
+    conf = settings_file(env)
+    conf.parent.mkdir(parents=True, exist_ok=True)
+    # the pattern the dialog offers: the last one that opened a folder
+    conf.write_text('[folderDataset]\nlastPattern="img_t(?P<t>\\\\d+)\\\\.tif"\nlastPositions=0\n')
+    shot = tmp / "folder.png"
+    out = run(
+        app,
+        [
+            "--dataset",
+            str(folder),
+            "--key",
+            "Open folder dataset=Space",
+            "--screenshot",
+            str(shot),
+            "--settle",
+            "1500",
+            "--quit-after",
+            "8000",
+        ],
+        env=env,
+    )
+    focused(out, "Open folder dataset=Space")
+    written = sorted(p.name for p in folder.iterdir() if not p.name.endswith(".tif"))
+    check(not written, f"opening the folder wrote {written} into it without asking")
+    # the question is the modal one ("-dialog"), the folder dialog under it "-dialog-2"
+    asked = (tmp / "folder-dialog.png").is_file() and (tmp / "folder-dialog-2.png").is_file()
+    check(asked, "no question was on screen after Open (nothing asked where the sidecar goes)")
+    check("asks where to keep it" in out, "Open did not get as far as asking where the sidecar goes")
+
+
 def test_an_invalid_step_says_so_in_the_error_colour(app: Path, tmp: Path) -> None:
     # A step whose parameters do not validate shows why in its row, in the
     # error colour. A universal "* { color }" rule in the style sheet used to
@@ -928,6 +998,9 @@ SCENARIOS = [
     test_the_wheel_zooms_about_the_cursor_in_compare,
     test_a_dropped_file_opens,
     test_files_named_on_the_command_line_open,
+    test_quitting_while_a_dataset_loads_does_not_hang,
+    test_a_full_load_past_the_memory_limit_opens_lazily,
+    test_opening_a_folder_writes_nothing_into_it_unasked,
     test_an_invalid_step_says_so_in_the_error_colour,
     test_a_run_that_fails_in_the_worker_ends_a_headless_run,
     test_the_tracks_tab_follows_a_track,

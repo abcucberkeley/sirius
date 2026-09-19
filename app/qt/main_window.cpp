@@ -522,6 +522,10 @@ namespace sirius::app {
             QObject::connect(gpuCombo, qOverload<int>(&QComboBox::currentIndexChanged), self, [this] {
                 const int id = gpuCombo->currentData().toInt();
                 if (!cudaAvailable()) return;
+                // choosing a GPU is choosing to run on it; say so when that
+                // changes the backend, which it used to do without a word
+                if (wb().backend() != Backend::Cuda)
+                    wb().logLine("Backend: CUDA (a GPU was chosen; Process ▸ Backend switches back).");
                 wb().setBackend(Backend::Cuda);
                 wb().setCudaDevice(id);
             });
@@ -1023,8 +1027,12 @@ namespace sirius::app {
             openWith(dialog.path(), dialog.options());
         }
 
+        // `options.readAll` is the caller's: the Open dialog's "Read as", or a
+        // full load where nothing was asked (a drop, a folder with a manifest,
+        // the command line). It used to be forced on here, so choosing Lazy did
+        // nothing; a full load that would not fit is refused by openDataset
+        // itself (fullLoadLimitBytes) and the dataset opens lazily.
         void openWith(const QString& path, OpenOptions options) {
-            options.readAll = true;
             if (bridge.running() || !wb().canEdit()) {
                 QMessageBox::information(self, QStringLiteral("Open dataset"),
                                          QStringLiteral("A run is in progress: cancel it (Esc) or wait before opening a dataset."));
@@ -1725,21 +1733,23 @@ namespace sirius::app {
                 return;
             }
         }
-        if (impl_->bridge.running()) {
+        // A task (a dataset loading, an export) counts as much as a run: the
+        // close used to look at runs only, so it went ahead under a load.
+        const bool run = impl_->bridge.running(), task = impl_->bridge.taskRunning();
+        if (run || task) {
             // Unattended (--screenshot, --quit-after, scripting): there is
             // nobody to answer, and a modal question here would hold the
             // application open for ever.
-            if (impl_->unattended) {
-                impl_->bridge.cancelRun();
-            } else {
-                const auto answer = QMessageBox::question(this, QStringLiteral("Quit"),
-                                                          QStringLiteral("A run is in progress. Cancel it and quit?"));
-                if (answer != QMessageBox::Yes) {
+            if (!impl_->unattended) {
+                const QString what = run ? QStringLiteral("A run is in progress. Cancel it and quit?")
+                                         : QStringLiteral("%1 is still in progress. Cancel it and quit?").arg(impl_->bridge.taskLabel());
+                if (QMessageBox::question(this, QStringLiteral("Quit"), what) != QMessageBox::Yes) {
                     event->ignore();
                     return;
                 }
-                impl_->bridge.cancelRun();
             }
+            if (run) impl_->bridge.cancelRun();
+            if (task) impl_->bridge.cancelTask();
         }
         // Not while the diagnostics cover the viewer: that would save a
         // hidden central widget as the layout to open with.

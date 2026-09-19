@@ -356,9 +356,12 @@ namespace sirius::app {
                     captureNote = buf;
                 }
 
+                // The diagnostics describe one volume, fixed up front: (c 0,
+                // t 0). With "All GPUs" every volume that started before the
+                // first one finished captured its band spectra -- gigabytes each,
+                // at once -- and the panel showed whichever finished first.
                 double seconds = 0.0;
                 bool plansReused = false;
-                bool first = true;
                 std::mutex firstMu;
                 forEachVolumeOnGpus(input.meta, ctx, [&](Index c, Index t, Device volDevice) {
                     Buffer<float> raw = input.readVolume(c, t);
@@ -368,12 +371,8 @@ namespace sirius::app {
                     std::lock_guard<std::mutex> g(*sessionLocks[static_cast<std::size_t>(slot)]);
                     ReconSession& session = *sessions[static_cast<std::size_t>(slot)];
                     session.setRaw(std::move(rawD), input.meta.name);
-                    bool captureThis = false;
-                    {
-                        std::lock_guard<std::mutex> f(firstMu);
-                        captureThis = first && capture;
-                    }
-                    session.setCaptureDiagnostics(captureThis);
+                    const bool diagnosed = c == 0 && t == 0;
+                    session.setCaptureDiagnostics(diagnosed && capture);
                     ReconResult r = session.reconstruct(volDevice.isCuda() ? volDevice : device, PlanRigor::Measure,
                                                         [&ctx] { return ctx.isCancelled(); });
                     ctx.throwIfCancelled();
@@ -386,10 +385,9 @@ namespace sirius::app {
                         throw std::runtime_error("SIM: unexpected output shape " + r.volume.shape().toString());
                     convert(r.volume, result->volume(c, t));
                     ctx.throwIfCancelled();
-                    std::lock_guard<std::mutex> f(firstMu);
-                    if (first) {
+                    if (diagnosed) {
+                        std::lock_guard<std::mutex> f(firstMu);
                         out.diagnostics = diagnostics(input, raw, r, p, nz, *result, params, captureNote);
-                        first = false;
                     }
                 });
                 out.array = result;

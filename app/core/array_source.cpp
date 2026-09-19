@@ -5,6 +5,7 @@
 #include <cctype>
 #include <cmath>
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
 #include <exception>
 #include <filesystem>
@@ -19,6 +20,18 @@
 
 #ifdef _OPENMP
 #include <omp.h>
+#endif
+
+#ifdef _WIN32
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#include <windows.h>
+#else
+#include <unistd.h>
 #endif
 
 #include <sirius/device.hpp>
@@ -1082,6 +1095,24 @@ namespace sirius::app {
 
     DatasetMeta probeDataset(const std::string& path, const OpenOptions& options) { return probeWith(path, &options); }
 
+    std::uint64_t fullLoadLimitBytes() {
+        if (const char* env = std::getenv("SIRIUS_FULL_LOAD_MAX_BYTES"); env && *env) {
+            char* end = nullptr;
+            const unsigned long long v = std::strtoull(env, &end, 10);
+            if (end && *end == '\0') return static_cast<std::uint64_t>(v);
+        }
+        std::uint64_t physical = 0;
+#ifdef _WIN32
+        MEMORYSTATUSEX status;
+        status.dwLength = sizeof status;
+        if (::GlobalMemoryStatusEx(&status)) physical = static_cast<std::uint64_t>(status.ullTotalPhys);
+#elif defined(_SC_PHYS_PAGES) && defined(_SC_PAGESIZE)
+        const long pages = ::sysconf(_SC_PHYS_PAGES), page = ::sysconf(_SC_PAGESIZE);
+        if (pages > 0 && page > 0) physical = static_cast<std::uint64_t>(pages) * static_cast<std::uint64_t>(page);
+#endif
+        return physical / 2;
+    }
+
     OpenResult openDataset(const std::string& path, const OpenOptions& options) {
         std::error_code ec;
         if (!fs::exists(path, ec)) throw std::runtime_error("no such file or directory: " + path);
@@ -1109,6 +1140,20 @@ namespace sirius::app {
             r.dimsFromMetadata = p.dimsFromMetadata;
         }
         if (options.readAll) {
+            const std::uint64_t limit = fullLoadLimitBytes(), bytes = r.source->meta().dims.bytes();
+            if (limit > 0 && bytes > limit) {
+                auto gib = [](std::uint64_t b) {
+                    std::ostringstream o;
+                    o.setf(std::ios::fixed);
+                    o.precision(1);
+                    o << static_cast<double>(b) / (1024.0 * 1024.0 * 1024.0) << " GiB";
+                    return o.str();
+                };
+                r.fullLoadSkipped = r.source->meta().shapeString() + " is " + gib(bytes) + " as float32, over the " +
+                                    gib(limit) + " full-load limit: planes are read on demand instead";
+            }
+        }
+        if (options.readAll && r.fullLoadSkipped.empty()) {
             DatasetMeta meta = r.source->meta();
             std::shared_ptr<Array5> all;
             try {

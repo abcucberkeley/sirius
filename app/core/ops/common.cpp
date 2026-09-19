@@ -58,19 +58,27 @@ namespace sirius::app {
 #endif
         for (Index i = 0; i < total; ++i) {
             if (ctx.isCancelled()) continue;
+            {
+                // one volume failed: the rest of a long movie is not worth
+                // running only to throw its exception away at the end
+                std::lock_guard<std::mutex> g(epMu);
+                if (ep) continue;
+            }
             const Index t = i / C, c = i % C;
+            // Everything that can throw stays inside the try (the progress
+            // report included): an exception leaving an OpenMP loop body ends
+            // the process.
             try {
                 fn(c, t, Device::cuda(static_cast<int>(i % nDev)));
+                const Index n = done.fetch_add(1) + 1;
+                std::lock_guard<std::mutex> g(progressMu);
+                char msg[64];
+                std::snprintf(msg, sizeof msg, "c %lld · t %lld", static_cast<long long>(c), static_cast<long long>(t));
+                ctx.report(static_cast<double>(n) / static_cast<double>(total), msg);
             } catch (...) {
                 std::lock_guard<std::mutex> g(epMu);
                 if (!ep) ep = std::current_exception();
             }
-            const Index n = done.fetch_add(1) + 1;
-            std::lock_guard<std::mutex> g(progressMu);
-            char msg[64];
-            std::snprintf(msg, sizeof msg, "c %lld · t %lld", static_cast<long long>(c),
-                          static_cast<long long>(t));
-            ctx.report(static_cast<double>(n) / static_cast<double>(total), msg);
         }
         ctx.throwIfCancelled();
         if (ep) std::rethrow_exception(ep);

@@ -243,12 +243,19 @@ int main(int argc, char** argv) {
     // get_state after an --action reported the state before it, which is not
     // what anyone writing the line intends and made the widgets hard to test.
     // QCommandLineParser does not keep the order, so it is read back off argv.
-    auto letTheWindowCatchUp = [] {
+    auto letTheWindowCatchUp = [&bridge] {
         // let the window react (repaint, refresh) between steps, as it would
         // between a user's actions
         QCoreApplication::processEvents(QEventLoop::AllEvents, 200);
         QCoreApplication::sendPostedEvents();
         QCoreApplication::processEvents(QEventLoop::AllEvents, 200);
+        // A dataset opens on a worker thread and is installed when that task
+        // ends: the next scripted step waits for it, as a user would for the
+        // progress bar, rather than find no dataset yet.
+        const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(600);
+        while (bridge.taskRunning() && std::chrono::steady_clock::now() < deadline)
+            QCoreApplication::processEvents(QEventLoop::AllEvents | QEventLoop::WaitForMoreEvents, 50);
+        QCoreApplication::processEvents(QEventLoop::AllEvents, 50);
     };
     auto runTool = [&](const QString& call) {
         const QJsonObject j = QJsonDocument::fromJson(call.toUtf8()).object();
@@ -309,6 +316,7 @@ int main(int argc, char** argv) {
         letTheWindowCatchUp();
     };
     auto script = [&] {
+        letTheWindowCatchUp();   // a --dataset still loading
         const QStringList argv = QCoreApplication::arguments();
         for (int i = 1; i < argv.size(); ++i) {
             QString name = argv[i];
@@ -380,12 +388,17 @@ int main(int argc, char** argv) {
                 QFileInfo fi(path);
                 modal->grab().save(fi.path() + QLatin1Char('/') + fi.completeBaseName() + QStringLiteral("-dialog.") + fi.suffix());
             }
-                // tool windows and non-modal dialogs (the plugin manager) beside it too
+                // tool windows and non-modal dialogs (the plugin manager) beside it too.
+                // A dialog under a modal question is "-dialog-2": it used to be saved
+                // as "-dialog" as well, over the picture of the question itself.
+            int dialogs = QApplication::activeModalWidget() ? 1 : 0;
             for (QWidget* top : QApplication::topLevelWidgets())
                 if (top != &window && top->isVisible() && top->isWindow() && !qobject_cast<QMenu*>(top) &&
                     top != QApplication::activeModalWidget() && (top->windowType() == Qt::Tool || qobject_cast<QDialog*>(top))) {
                     QFileInfo fi(path);
-                    const QString tag = top->windowType() == Qt::Tool ? QStringLiteral("-tool.") : QStringLiteral("-dialog.");
+                    QString tag = QStringLiteral("-tool.");
+                    if (top->windowType() != Qt::Tool)
+                        tag = ++dialogs == 1 ? QStringLiteral("-dialog.") : QStringLiteral("-dialog-%1.").arg(dialogs);
                     top->grab().save(fi.path() + QLatin1Char('/') + fi.completeBaseName() + tag + fi.suffix());
                 }
             while (QWidget* modal = QApplication::activeModalWidget()) modal->close();   // let exec() return
@@ -396,7 +409,8 @@ int main(int argc, char** argv) {
             app.quit();
         };
         grabWhenIdle = [&window, &bridge, &grabWhenIdle, grab, settle, deadline] {
-            if (bridge.running() && std::chrono::steady_clock::now() < deadline) {
+            // a run, or a dataset still loading: the picture waits for either
+            if ((bridge.running() || bridge.taskRunning()) && std::chrono::steady_clock::now() < deadline) {
                 QTimer::singleShot(settle, &window, grabWhenIdle);
                 return;
             }

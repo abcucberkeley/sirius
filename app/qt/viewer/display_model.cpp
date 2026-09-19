@@ -46,6 +46,7 @@ namespace sirius::app {
         meta_ = out_ ? out_->meta : DatasetMeta{};
         volumes_.clear();
         mips_.clear();
+        mipBudget_.clear();
         ranges_.clear();
         planes_.clear();
         tooLarge_ = false;
@@ -158,12 +159,20 @@ namespace sirius::app {
 
     const float* DisplayModel::mipIfReady(Index c, Index t) const {
         auto it = mips_.find(Key{c, t});
-        return it != mips_.end() ? it->second->data() : nullptr;
+        if (it == mips_.end()) return nullptr;
+        mipBudget_.touch(it->first);
+        return it->second->data();
     }
 
-    void DisplayModel::evictOtherTimePoints(Index t) {
+    void DisplayModel::storeMip(const Key& key, std::shared_ptr<Buffer<float>> mip) {
+        const std::size_t bytes = static_cast<std::size_t>(mip->size()) * sizeof(float);
+        mips_[key] = std::move(mip);
+        for (const Key& old : mipBudget_.put(key, bytes)) mips_.erase(old);
+    }
+
+    void DisplayModel::evictOtherTimePoints(Index t, Index alsoKeep) {
         for (auto vit = volumes_.begin(); vit != volumes_.end();)
-            vit = vit->first.t != t ? volumes_.erase(vit) : std::next(vit);
+            vit = vit->first.t != t && vit->first.t != alsoKeep ? volumes_.erase(vit) : std::next(vit);
     }
 
     DisplayModel::VolumeState DisplayModel::volumeState(Index c, Index t) {
@@ -208,7 +217,7 @@ namespace sirius::app {
         }
         for (Index i = 0; i < n; ++i)
             if (!std::isfinite(m->data()[i])) m->data()[i] = lo;
-        mips_[key] = std::move(m);
+        storeMip(key, std::move(m));
         // the same pass gives the exact range the full-range window wants
         ranges_[key] = Range{lo, hi};
         if (windowMode_ == WindowMode::Full) windows_.erase(c);
@@ -216,17 +225,26 @@ namespace sirius::app {
     }
 
     void DisplayModel::installVolume(Index c, Index t, std::shared_ptr<Buffer<float>> volume,
-                                     std::shared_ptr<Buffer<float>> mip, float lo, float hi) {
+                                     std::shared_ptr<Buffer<float>> mip, float lo, float hi, Index shownT) {
         if (!valid()) return;
         const Dims5& d = meta_.dims;
         if (c < 0 || c >= d.c || t < 0 || t >= d.t) return;
         const Key key{c, t};
-        if (volume) {
+        if (volume && shownT >= 0 && shownT != t) {
+            // Read ahead of the frame on screen. It used to be dropped on
+            // arrival, so a lazy source read every frame of a movie twice;
+            // it stays now, unless the two time points together are too much.
+            evictOtherTimePoints(t, shownT);
+            std::size_t held = static_cast<std::size_t>(volume->size()) * sizeof(float);
+            for (const auto& kv : volumes_)
+                if (!(kv.first.c == c && kv.first.t == t)) held += static_cast<std::size_t>(kv.second->size()) * sizeof(float);
+            if (held <= kVolumeCacheLimit) volumes_[key] = std::move(volume);
+        } else if (volume) {
             evictOtherTimePoints(t);
             volumes_[key] = std::move(volume);
             tooLarge_ = false;
         }
-        if (mip) mips_[key] = std::move(mip);
+        if (mip) storeMip(key, std::move(mip));
         if (hi > lo) {
             ranges_[key] = Range{lo, hi};
             // the full-range window was standing in on samples until now
@@ -247,6 +265,7 @@ namespace sirius::app {
     void DisplayModel::dropVolumeCaches() {
         volumes_.clear();
         mips_.clear();
+        mipBudget_.clear();
         ranges_.clear();
         planes_.clear();
     }

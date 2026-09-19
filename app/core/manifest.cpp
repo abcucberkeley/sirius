@@ -230,10 +230,15 @@ namespace sirius::app {
     }
 
     fs::path DatasetManifest::filesRoot(const fs::path& loadedFrom) const {
-        if (!filesFolder.empty()) return fs::path(filesFolder);
         std::error_code ec;
-        if (fs::is_directory(loadedFrom, ec)) return loadedFrom;
-        return loadedFrom.parent_path();
+        const fs::path home = fs::is_directory(loadedFrom, ec) ? loadedFrom : loadedFrom.parent_path();
+        if (filesFolder.empty()) return home;
+        // A relative files_folder is relative to the manifest, as the paths of
+        // a pipeline file are to it; it used to resolve against the working
+        // directory, so the same sidecar worked or not by where the application
+        // was started.
+        const fs::path root(filesFolder);
+        return root.is_absolute() ? root : (home / root).lexically_normal();
     }
 
     Index DatasetManifest::channelIndex(const std::string& channel) const noexcept {
@@ -546,6 +551,17 @@ namespace sirius::app {
             const char* n = ent->d_name;
             if (n[0] == '.') continue;   // ".", ".." and resource forks
             if (!isTiffName(fs::path(n))) continue;
+            // Names only, no stat per file: that is what made a folder of ten
+            // thousand files on NFS take minutes. The entry's own type is free
+            // where the filesystem gives one, and rules out a directory named
+            // like a TIFF; a link or an unknown type costs one stat.
+#ifdef DT_DIR
+            if (ent->d_type == DT_DIR) continue;
+            if (ent->d_type == DT_LNK || ent->d_type == DT_UNKNOWN) {
+                std::error_code ec;
+                if (!fs::is_regular_file(folder / n, ec)) continue;   // a dangling link, a link to a folder
+            }
+#endif
             names.emplace_back(n);
         }
         ::closedir(dir);

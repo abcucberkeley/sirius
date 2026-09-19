@@ -261,12 +261,19 @@ namespace sirius::app {
                 // does not have, and every reader of a volume ran past it.
                 out.meta = opened.meta;
                 annotate(params, out.meta);
-                if (options.readAll) {
+                // A full load past the memory limit (fullLoadLimitBytes) was
+                // opened lazily instead; reading it all here would undo that.
+                const bool inMemory = options.readAll && opened.fullLoadSkipped.empty();
+                if (inMemory) {
                     // openDataset already materialized when readAll is set;
                     // this is free on a MemorySource and a fallback otherwise.
                     out.array = opened.source->readAll(options.progress);
                 }
-                out.note = joinSummary({out.meta.format, out.meta.shapeString(), options.readAll ? "in memory" : "lazy", tileSummary(out.meta)});
+                out.note = joinSummary({out.meta.format, out.meta.shapeString(),
+                                        inMemory          ? "in memory"
+                                        : options.readAll ? "lazy (too large for a full load)"
+                                                          : "lazy",
+                                        tileSummary(out.meta)});
                 out.ranOn = Backend::Cpu;
                 ctx.report(1.0, "");
                 return out;

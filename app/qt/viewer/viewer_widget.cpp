@@ -214,9 +214,14 @@ namespace sirius::app {
         // of them, or a factor change, re-renders.
         QRect xyRegion, xzRegion, yzRegion, cmpRegion, cmpLeftRegion;
         // One image pixel per this many voxels, from the finer of the two
-        // pane axes (XZ / YZ are anisotropic because z is stretched).
-        static int paneFactor(const SlicePane::View& v) {
-            const double p = std::min(v.zx, v.zy);
+        // pane axes: the one with more screen pixels per voxel, which on XZ /
+        // YZ is z, stretched by the voxel aspect. The factor applies to both
+        // axes, so taking it from the coarser one (std::min, as this did)
+        // dropped z planes that had a screen pixel each: at 0.15 / 0.75 um,
+        // zoomed out, four planes of five.
+        static int paneFactor(const SlicePane::View& v) { return paneFactorFor(v.zx, v.zy); }
+        static int paneFactorFor(double zx, double zy) {
+            const double p = std::max(zx, zy);
             return std::max(1, static_cast<int>(std::floor(1.0 / std::max(p, 1e-6))));
         }
         // The voxels a pane shows now (no margin), for containment checks.
@@ -974,10 +979,13 @@ namespace sirius::app {
                   v.micros, v.volume ? "read" : "in memory");
         std::shared_ptr<Buffer<float>> vol = v.volume;
         // A late lazy read must not evict the time point on screen; its MIP
-        // is still worth keeping for the next loop of play.
-        if (target == &model && v.t != curT()) vol.reset();
-        if (target == &rawModel && v.t != compareT()) vol.reset();
-        target->installVolume(v.c, v.t, std::move(vol), v.mip, v.lo, v.hi);
+        // is still worth keeping for the next loop of play. The exception is
+        // the frame play asked for ahead of time: dropping that one made play
+        // read every frame of a lazy source twice.
+        const Index shown = target == &model ? curT() : compareT();
+        const bool readAhead = target == &model && playTimer.isActive() && nt() > 1 && v.t == (shown + 1) % nt();
+        if (v.t != shown && !readAhead) vol.reset();
+        target->installVolume(v.c, v.t, std::move(vol), v.mip, v.lo, v.hi, v.t == shown ? Index{-1} : shown);
         // Cache MIPs for every t (play loops). Only the current frame needs a
         // redraw; an older job that finished late is still worth keeping.
         if ((target == &model && v.t == curT()) || (target == &rawModel && v.t == compareT())) {

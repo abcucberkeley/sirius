@@ -107,6 +107,10 @@ namespace sirius::app {
         std::string taskMessage_;
         std::string taskError_;
         QString taskLabel_;
+        // What a finished task leaves for the GUI thread to do, run from
+        // onTaskFinished (openDatasetAsync: install the decoded dataset).
+        // Guarded by taskMutex_.
+        std::function<void()> taskCompletion_;
     };
 
 } // namespace sirius::app

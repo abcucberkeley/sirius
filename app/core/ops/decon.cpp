@@ -79,20 +79,23 @@ namespace sirius::app {
                 options.stopRelativeChange = params.getDouble("stop_rel_change", 0.0);
                 if (ctx.backend == Backend::Cuda && ctx.device.isCuda() && cudaAvailable()) options.device = ctx.device;
 
+                // The diagnostics describe one volume, and which one is fixed
+                // up front: (c 0, t 0). With "All GPUs" several volumes run at
+                // once, and "whichever is first" gave a residual panel whose
+                // input plane came from one volume (the last to start) and whose
+                // result from another (the first to finish).
                 DeconvolutionResult firstResult;
-                bool first = true;
                 bool gpu = false;
                 double seconds = 0.0;
                 std::mutex firstMu;
                 std::vector<float> inputMid;   // middle plane of the first volume, for the residual panel
                 forEachVolumeOnGpus(meta, ctx, [&](Index c, Index t, Device volDevice) {
                     Buffer<float> vol = input.readVolume(c, t);
-                    {
+                    const bool diagnosed = c == 0 && t == 0;
+                    if (diagnosed) {
                         std::lock_guard<std::mutex> g(firstMu);
-                        if (first) {
-                            inputMid.assign(vol.data() + (meta.dims.z / 2) * meta.dims.planeSize(),
-                                            vol.data() + (meta.dims.z / 2 + 1) * meta.dims.planeSize());
-                        }
+                        inputMid.assign(vol.data() + (meta.dims.z / 2) * meta.dims.planeSize(),
+                                        vol.data() + (meta.dims.z / 2 + 1) * meta.dims.planeSize());
                     }
                     DeconvolutionOptions o = options;
                     if (volDevice.isCuda()) o.device = volDevice;
@@ -121,10 +124,7 @@ namespace sirius::app {
                     std::lock_guard<std::mutex> g(firstMu);
                     seconds += dt;
                     gpu = gpu || r.ranOnGpu;
-                    if (first) {
-                        firstResult = std::move(r);
-                        first = false;
-                    }
+                    if (diagnosed) firstResult = std::move(r);
                 });
                 out.array = result;
                 out.ranOn = gpu ? Backend::Cuda : Backend::Cpu;

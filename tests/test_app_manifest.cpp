@@ -16,6 +16,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
+#include <cstdlib>
 #include <filesystem>
 #include <fstream>
 #include <stdexcept>
@@ -587,6 +588,51 @@ TEST_CASE("a manifest saved outside the TIFF folder still opens the files", "[ap
     REQUIRE(opened.source);
     CHECK(opened.source->tileCount() == 4);
     CHECK(opened.meta.dims == probed.dims);
+
+    SECTION("a relative files_folder is relative to the manifest, not to the working directory") {
+        DatasetManifest rel = loaded;
+        rel.filesFolder = std::filesystem::relative(folder.path, sidecar.path.parent_path()).string();
+        REQUIRE(std::filesystem::path(rel.filesFolder).is_relative());
+        CHECK(rel.filesRoot(sidecar.path) == (sidecar.path.parent_path() / rel.filesFolder).lexically_normal());
+        CHECK(std::filesystem::equivalent(rel.filesRoot(sidecar.path), folder.path));
+    }
+}
+
+TEST_CASE("A full load past the memory limit opens the dataset lazily and says why", "[app][manifest][io]") {
+    // Full load is the default, and it used to be forced on every open: a
+    // 26 GB folder became 31 GB of float32 whatever the machine had.
+    const TempFolder folder;
+    writeTileFolder(folder.path);
+    manifestFromFolder(folder.path, tileRule()).save(folder.path);
+    struct Env {
+        explicit Env(const char* value) { set(value); }
+        ~Env() { set(nullptr); }
+        static void set(const char* value) {
+#ifdef _WIN32
+            _putenv_s("SIRIUS_FULL_LOAD_MAX_BYTES", value ? value : "");
+#else
+            if (value) ::setenv("SIRIUS_FULL_LOAD_MAX_BYTES", value, 1);
+            else ::unsetenv("SIRIUS_FULL_LOAD_MAX_BYTES");
+#endif
+        }
+    };
+    OpenOptions options;
+    options.readAll = true;
+    {
+        const Env limit("1024");   // far below the 2 x 2 x planes x tile x tile floats of the folder
+        CHECK(fullLoadLimitBytes() == 1024);
+        const OpenResult lazy = openDataset(folder.str, options);
+        REQUIRE(lazy.source);
+        CHECK_FALSE(lazy.source->inMemory());
+        CHECK_THAT(lazy.fullLoadSkipped, Catch::Matchers::ContainsSubstring("full-load limit"));
+        // still readable, plane by plane
+        std::vector<float> plane(static_cast<std::size_t>(kTile * kTile));
+        lazy.source->readPlane(0, 0, 0, plane.data());
+    }
+    CHECK(fullLoadLimitBytes() != 1024);   // the machine's own again: half its memory, or 0 where unknown
+    const OpenResult full = openDataset(folder.str, options);
+    CHECK(full.source->inMemory());
+    CHECK(full.fullLoadSkipped.empty());
 }
 
 // --- stitching the tile set ------------------------------------------------------

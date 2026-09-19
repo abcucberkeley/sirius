@@ -466,6 +466,7 @@ namespace sirius::app {
         pipeline_.at(0).params = std::move(loadParams);
         installDataset(opened.source, opened.meta, "opened " + opened.meta.format);
         logLine("Opened " + path + " · " + datasetMeta_.shapeString() + " · " + opened.metadataSummary);
+        if (!opened.fullLoadSkipped.empty()) logLine("Full load skipped: " + opened.fullLoadSkipped + ".");
         session_.record("dataset", {{"path", path},
                                     {"dims", datasetMeta_.dims.toString()},
                                     {"voxel_um", {datasetMeta_.voxelUm[0], datasetMeta_.voxelUm[1], datasetMeta_.voxelUm[2]}},

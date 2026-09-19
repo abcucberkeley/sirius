@@ -122,6 +122,9 @@ namespace sirius::app {
         QColor chipColor(const ChannelInfo& ch) { return QColor(fromStd(ch.hexColor())); }
 
         constexpr auto kLastManifestDirKey = "folderDataset/lastManifestDir";
+        // where a new sidecar goes when nothing was chosen: "data" (beside the
+        // TIFFs), "cache" (with the application's files), unset = ask
+        constexpr auto kSidecarPlaceKey = "folderDataset/sidecarPlace";
         constexpr auto kLastPatternKey = "folderDataset/lastPattern";
         constexpr auto kLastPositionsKey = "folderDataset/lastPositions";
         constexpr auto kLastOverlapKey = "folderDataset/lastOverlap";
@@ -525,6 +528,7 @@ namespace sirius::app {
         impl_->save = new QPushButton(QStringLiteral("Open"), this);
         widgets::setButtonClass(impl_->save, "primary");
         impl_->save->setDefault(true);
+        impl_->save->setAccessibleName(QStringLiteral("Open folder dataset"));   // also how tools/gui_tests.py finds it
         impl_->save->setEnabled(false);
         impl_->save->setToolTip(QStringLiteral("Open the folder as a dataset. Remembers this filename pattern for next time."));
         buttons->addWidget(cancel);
@@ -927,12 +931,12 @@ namespace sirius::app {
         tileMap->setTiles(std::move(pts), mode == FilenameRule::Positions::GridIndex, note);
     }
 
-    // Build the mapping from the rule and open it. A sidecar is written next
-    // to the TIFFs when that folder is writable; otherwise a local cache with
-    // files_folder. An already-valid loaded manifest is opened as-is.
+    // Build the mapping from the rule and open it. The sidecar goes where the
+    // Manifest field says; beside the TIFFs only once the user has agreed to
+    // that, else (or when that folder is not writable) into a local cache
+    // with files_folder. An already-valid loaded manifest is opened as-is.
     void FolderDatasetDialog::Impl::saveAndOpen() {
         const std::filesystem::path folderPath(toStd(folder));
-        rememberPatternFor(folder, pattern->text(), positions->currentIndex(), overlap->value());
         QString destText = manifestPath->text().trimmed();
         if (destText.isEmpty()) destText = folder + QLatin1Char('/') + QLatin1String(DatasetManifest::kFileName);
         std::filesystem::path dest(toStd(destText));
@@ -955,6 +959,7 @@ namespace sirius::app {
                                          QStringLiteral("Another task is still running: cancel it or wait, then open the dataset."));
                     return;
                 }
+                rememberPatternFor(folder, pattern->text(), positions->currentIndex(), overlap->value());
                 q->accept();
                 return;
             }
@@ -968,6 +973,49 @@ namespace sirius::app {
             QMessageBox::warning(q, QStringLiteral("Open folder as dataset"),
                                  QStringLiteral("The files do not form a dataset:\n%1").arg(QString::fromUtf8(e.what())));
             return;
+        }
+        // Nothing is written into a folder, or over a file, the user has not
+        // agreed to. The sidecar used to go beside the TIFFs whenever that
+        // folder was writable, which on a cluster is source data that merely
+        // has group write permission, and over an existing manifest -- a
+        // hand-edited one included -- without a word.
+        if (std::filesystem::exists(dest, ec)) {
+            if (QMessageBox::question(q, QStringLiteral("Open folder as dataset"),
+                                      QStringLiteral("%1 exists.\n\nReplace it with the mapping built from this pattern?")
+                                          .arg(fromStd(dest.string())),
+                                      QMessageBox::Yes | QMessageBox::Cancel, QMessageBox::Cancel) != QMessageBox::Yes)
+                return;
+        } else if (canonicalPath(dest.parent_path()) == canonicalPath(folderPath)) {
+            QSettings settings;
+            QString where = settings.value(QLatin1String(kSidecarPlaceKey)).toString();   // "data" | "cache" | ""
+            if (where != QLatin1String("data") && where != QLatin1String("cache")) {
+                bridge.wb().logLine("Open folder: " + toStd(folder) + " has no " + DatasetManifest::kFileName +
+                                    " yet; the application asks where to keep it.");
+                qInfo("folder dataset: the application asks where to keep it");   // what tools/gui_tests.py waits for
+                QMessageBox box(q);
+                box.setIcon(QMessageBox::Question);
+                box.setWindowTitle(QStringLiteral("Open folder as dataset"));
+                box.setText(QStringLiteral("Write %1 into the data folder?").arg(QLatin1String(DatasetManifest::kFileName)));
+                box.setInformativeText(
+                    QStringLiteral("%1\n\nBeside the files, the folder opens directly from then on, for everyone who uses it. "
+                                   "Kept with this application's own files instead, nothing is added to the data folder, and "
+                                   "this dialog remembers the pattern for it.")
+                        .arg(folder));
+                QPushButton* cache = box.addButton(QStringLiteral("Keep it with the application"), QMessageBox::AcceptRole);
+                QPushButton* data = box.addButton(QStringLiteral("Write into the data folder"), QMessageBox::ActionRole);
+                box.addButton(QMessageBox::Cancel);
+                box.setDefaultButton(cache);
+                auto* remember = new QCheckBox(QStringLiteral("Do the same for other folders"), &box);
+                box.setCheckBox(remember);
+                box.exec();
+                if (box.clickedButton() != cache && box.clickedButton() != data) return;
+                where = box.clickedButton() == data ? QStringLiteral("data") : QStringLiteral("cache");
+                if (remember->isChecked()) settings.setValue(QLatin1String(kSidecarPlaceKey), where);
+            }
+            if (where == QLatin1String("cache")) {
+                dest = std::filesystem::path(toStd(cachedManifestPath(folder)));
+                manifestPath->setText(fromStd(dest.string()));
+            }
         }
         auto writeManifest = [&](const std::filesystem::path& path) {
             if (canonicalPath(path.parent_path()) != canonicalPath(folderPath))
@@ -1006,6 +1054,8 @@ namespace sirius::app {
                                  QStringLiteral("The mapping is ready but another task is still running: cancel it or wait, then open the dataset."));
             return;
         }
+        // only a pattern that opened something is worth offering again
+        rememberPatternFor(folder, pattern->text(), positions->currentIndex(), overlap->value());
         q->accept();
     }
 
