@@ -654,6 +654,41 @@ namespace sirius::app {
             }
         }
 
+        // The foundation step's model is a bundle, and a bundle is picked from
+        // the registry rather than found on disk: what distinguishes two .ltb
+        // files is inside them (task, voxel size, the thresholds they were
+        // validated at), and a file dialog shows none of it.
+        void buildFoundation(const Step& step, const OpInfo& info, const DatasetMeta& input, QVBoxLayout* into) {
+            std::vector<std::string> done;
+            for (const ParamSpec& s : info.params) {
+                if (s.type != ParamType::Path || s.advanced) continue;
+                auto* row = new QWidget(body);
+                auto* rl = new QHBoxLayout(row);
+                rl->setContentsMargins(0, 0, 0, 0);
+                rl->setSpacing(6);
+                QWidget* pathEditor = editor(s, step.params, input, row);
+                auto* pick = new QPushButton(QStringLiteral("Bundles…"), row);
+                widgets::setButtonClass(pick, "secondary small");
+                pick->setToolTip(QStringLiteral("Choose from the bundles in the registry, with what each was trained "
+                                                "for and calibrated at"));
+                rl->addWidget(pathEditor, 1);
+                rl->addWidget(pick);
+                const std::string key = s.key;
+                QObject::connect(pick, &QPushButton::clicked, panel, [this, key, pathEditor] {
+                    ModelHubDialog dialog(bridge, panel);
+                    dialog.showBundles();
+                    if (dialog.exec() != QDialog::Accepted || dialog.chosenModel().isEmpty()) return;
+                    const QString chosen = dialog.chosenModel();
+                    if (auto* edit = pathEditor->findChild<QLineEdit*>()) edit->setText(chosen);
+                    setParam(key, toStd(chosen), false);
+                });
+                into->addWidget(field(fromStd(s.label), row, body));
+                done.push_back(s.key);
+                break;
+            }
+            buildGeneric(info.params, step.params, input, into, false, done);
+        }
+
         void buildSeg(const Step& step, const OpInfo& info, const DatasetMeta& input, QVBoxLayout* into) {
             std::vector<std::string> done;
             for (const ParamSpec& s : info.params)
@@ -998,6 +1033,7 @@ namespace sirius::app {
             else if (st->kind == "einsum") buildEinsum(*st, info, input, bodyLayout);
             else if (st->kind == "sim") buildSim(*st, info, input, bodyLayout);
             else if (st->kind == "seg") buildSeg(*st, info, input, bodyLayout);
+            else if (st->kind == "foundation") buildFoundation(*st, info, input, bodyLayout);
             else if (st->kind == "merge") buildMerge(*st, info, input, bodyLayout);
             else if (st->kind == "contrast") buildContrast(*st, info, input, bodyLayout);
             else buildGeneric(info.params, st->params, input, bodyLayout, false);

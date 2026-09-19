@@ -1180,11 +1180,32 @@ namespace sirius::app {
 
         void modelHub() {
             ModelHubDialog dialog(bridge, self);
+            // On the tab that matches the step in hand: with a foundation step
+            // selected the menu means "which bundle", and the other tabs offer
+            // files that step cannot run.
+            const int selected = wb().selectedIndex();
+            if (selected >= 0 && selected < wb().pipeline().size() && wb().pipeline().at(selected).kind == "foundation")
+                dialog.showBundles();
             if (dialog.exec() != QDialog::Accepted || dialog.chosenModel().isEmpty()) return;
-            const int i = segmentationStepOrNew();
+            const QString chosen = dialog.chosenModel();
+            // A bundle is the foundation step's model, not the segmentation
+            // step's: the same dialog offers both, and putting a .ltb in a
+            // Torch step would fail later with a message about TorchScript
+            // rather than here with one about the step.
+            const int i = chosen.endsWith(QLatin1String(".ltb"), Qt::CaseInsensitive) ? stepOrNew("foundation")
+                                                                                      : segmentationStepOrNew();
             if (i < 0) return;
-            wb().setStepParam(i, "model", toStd(dialog.chosenModel()));
+            wb().setStepParam(i, "model", toStd(chosen));
             wb().select(i);
+        }
+
+        // The last step of this kind, or a new one at the end.
+        int stepOrNew(const std::string& kind) {
+            const Pipeline& p = wb().pipeline();
+            for (int i = p.size() - 1; i >= 0; --i)
+                if (p.at(i).kind == kind) return i;
+            if (!findOperation(kind)) return -1;
+            return p.indexOf(wb().addStep(kind));
         }
 
         // A folder with a manifest opens directly; otherwise the pattern

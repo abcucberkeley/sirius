@@ -35,6 +35,25 @@ worker needs the `latents` package. If it is not importable the step says so
 and names the environment variable (`SIRIUS_LATENTS_PATH`) that points at a
 checkout.
 
+## Choosing one: the registry
+
+**Bundles…** beside the Model field lists the bundles in a registry directory
+with what each one is for: its task, the voxel size it was calibrated at, the
+peak threshold it was validated with, its channels and its notes. Two `.ltb`
+files differ in what is inside them, which a file dialog cannot show, so this
+is the way to pick one.
+
+The listing is made by the **worker**, not by the application, so on a cluster
+the registry is a directory on the cluster and need not exist on the machine
+the window is on. Set it once in the dialog and it is remembered;
+`SIRIUS_BUNDLE_REGISTRY` sets the default for a shared installation, so that
+everyone starts pointed at the same directory.
+
+A bundle whose manifest cannot be read is still listed, with its fields shown
+as `?`. It can still be chosen, but this step's Threshold and Min. separation
+then have no validated values to fall back on, so leaving them at zero is no
+longer safe.
+
 ## Parameters
 
 | Parameter | Explanation |

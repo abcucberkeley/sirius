@@ -1,10 +1,11 @@
 #ifndef SIRIUS_APP_MODEL_HUB_DIALOG_HPP
 #define SIRIUS_APP_MODEL_HUB_DIALOG_HPP
 
-// Segmentation models: search Hugging Face, download a TorchScript / ONNX
-// file into the local model cache, or pick a model family the worker's
-// Python packages provide (Cellpose, micro-SAM). The chosen model spec is
-// what the Segmentation step's "model" parameter accepts.
+// Models for the steps that need one: search Hugging Face, download a
+// TorchScript / ONNX file into the local model cache, pick a model family the
+// worker's Python packages provide (Cellpose, micro-SAM), or choose a
+// foundation bundle (.ltb) from a registry directory. The chosen model spec is
+// what the step's "model" parameter accepts.
 
 #include <QDialog>
 #include <QString>
@@ -19,9 +20,13 @@ namespace sirius::app {
         explicit ModelHubDialog(WorkbenchBridge& bridge, QWidget* parent = nullptr);
         ~ModelHubDialog() override;
 
-        // Model spec to put into a segmentation step ("/path/model.pt",
-        // "hf:repo/name:file.onnx", "cellpose:cyto3", "microsam:vit_b_lm"); empty when cancelled.
+        // Model spec to put into a step ("/path/model.pt", "hf:repo/name:file.onnx",
+        // "cellpose:cyto3", "microsam:vit_b_lm", "/path/model.ltb"); empty when cancelled.
         QString chosenModel() const;
+
+        // Open on the registry of foundation bundles, for a step whose model is
+        // a .ltb: the other tabs offer files such a step cannot use.
+        void showBundles();
 
     private:
         struct Impl;

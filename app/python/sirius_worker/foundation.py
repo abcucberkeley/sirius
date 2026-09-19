@@ -31,10 +31,12 @@ is not installed.
 from __future__ import annotations
 
 import copy
+import json
 import os
 import sys
 import threading
-from typing import Any, Callable, Dict, Optional, Sequence, Tuple
+import zipfile
+from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
 
@@ -164,6 +166,107 @@ def model_info(path: str) -> Dict[str, Any]:
         "notes": man.notes,
         "tasks": _tasks(man),
     }
+
+
+def manifest_of(path: str) -> Dict[str, Any]:
+    """A bundle's manifest without its weights.
+
+    `model_info` answers the same questions by loading the bundle, which for a
+    directory listing would mean reading every file on disk, and the worker
+    keeps one bundle resident so listing would also evict whatever is loaded.
+    A bundle is a zip, so the manifest can be read on its own. Returns {} when
+    it cannot be, which is not an error here: the listing still names the file
+    and the application can ask `model_info` about the one the user picks.
+    """
+    try:
+        with zipfile.ZipFile(path) as z:
+            names = z.namelist()
+            want = [n for n in names if os.path.basename(n).lower() in ("manifest.json", "meta.json")]
+            # else the shallowest .json in the archive
+            if not want:
+                want = sorted((n for n in names if n.lower().endswith(".json")), key=lambda n: (n.count("/"), n))
+            for name in want:
+                try:
+                    got = json.loads(z.read(name))
+                except (ValueError, OSError):
+                    continue
+                # Some other .json in the archive is not a manifest, and showing
+                # its numbers as calibration would be worse than showing none:
+                # a bundle listed with a voxel size it was not trained at reads
+                # as fact. Require something only a manifest has.
+                if isinstance(got, dict) and any(k in got for k in ("task", "peak_threshold", "voxel_size", "patch")):
+                    return got
+    except (zipfile.BadZipFile, OSError):
+        return {}
+    return {}
+
+
+# A manifest is written elsewhere, by a version of latents this worker does not
+# choose. So every field is read defensively: a bundle whose manifest says
+# something unexpected is listed with that field blank, rather than taking the
+# whole directory listing down and leaving the user with a dialog that says the
+# registry is unreadable.
+def _text(man: Dict[str, Any], key: str) -> str:
+    got = man.get(key)
+    return got if isinstance(got, str) else ""
+
+
+def _number(man: Dict[str, Any], key: str) -> Optional[float]:
+    got = man.get(key)
+    return float(got) if isinstance(got, (int, float)) and not isinstance(got, bool) else None
+
+
+def _numbers(man: Dict[str, Any], key: str) -> List[float]:
+    got = man.get(key)
+    if not isinstance(got, (list, tuple)):
+        return []
+    return [float(v) for v in got if isinstance(v, (int, float)) and not isinstance(v, bool)]
+
+
+def list_bundles(directory: str) -> List[Dict[str, Any]]:
+    """Every .ltb in `directory`, with what its manifest says about it.
+
+    The application shows this as the list a user picks a model from, so a
+    bundle whose manifest cannot be read is still listed, with `manifest`
+    empty: a file that is there and unreadable is something the user needs to
+    see, not something to hide. Sorted by name so the list does not reorder
+    itself between calls. Not recursive: a registry is a directory of bundles,
+    and walking a filesystem the worker shares with a cluster is not something
+    to do behind a dialog opening.
+    """
+    if not directory:
+        raise ValueError("no registry directory given")
+    if not os.path.isdir(directory):
+        raise NotADirectoryError(f"not a directory: {directory}")
+    out: List[Dict[str, Any]] = []
+    with os.scandir(directory) as entries:
+        for e in sorted(entries, key=lambda e: e.name.lower()):
+            if not e.is_file() or not e.name.lower().endswith(".ltb"):
+                continue
+            try:
+                stat = e.stat()
+                size, mtime = int(stat.st_size), float(stat.st_mtime)
+            except OSError:
+                size, mtime = 0, 0.0
+            man = manifest_of(e.path)
+            out.append({
+                "path": os.path.abspath(e.path),
+                "file": e.name,
+                "name": _text(man, "name") or os.path.splitext(e.name)[0],
+                "task": _text(man, "task"),
+                "encoder": man.get("encoder") if isinstance(man.get("encoder"), dict) else {},
+                "patch": _numbers(man, "patch"),
+                "crop": _numbers(man, "crop"),
+                "voxel_um": _numbers(man, "voxel_size") or _numbers(man, "voxel_um"),
+                "peak_threshold": _number(man, "peak_threshold"),
+                "min_separation_um": _number(man, "min_separation_um"),
+                "channels": man.get("channels") if isinstance(man.get("channels"), list) else None,
+                "notes": _text(man, "notes"),
+                "size_bytes": size,
+                "mtime": mtime,
+                "manifest": bool(man),
+            })
+    return out
 
 
 def _as_ctzyx(a: np.ndarray) -> np.ndarray:
