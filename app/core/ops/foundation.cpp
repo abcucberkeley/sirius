@@ -24,6 +24,7 @@
 #include <chrono>
 #include <cstdio>
 #include <filesystem>
+#include <system_error>
 #include <vector>
 
 namespace sirius::app {
@@ -106,8 +107,13 @@ namespace sirius::app {
                 const std::string model = p.getString("model");
                 if (model.empty())
                     v.errors.push_back("Choose a model bundle (.ltb).");
-                else if (!std::filesystem::exists(model))
-                    v.errors.push_back("Model bundle not found: " + model);
+                else if (std::error_code ec; !std::filesystem::exists(model, ec))
+                    // A warning, not an error: the bundle is opened by the worker,
+                    // and on the HPC backend (a bundle picked from a cluster
+                    // registry) it lives on a filesystem this machine cannot see.
+                    // A worker that cannot find it either says so when it runs.
+                    v.warnings.push_back("Model bundle not found on this machine: " + model +
+                                         " (fine when the worker runs where the bundle is)");
                 if (in.rgb)
                     v.errors.push_back("The model needs intensity channels, not an RGB merge.");
                 if (std::string(taskKey(p.getString("task", kSegment))) == "track" && in.dims.t < 2)
