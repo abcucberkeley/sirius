@@ -886,21 +886,25 @@ namespace sirius::app {
                         if (ep) continue;
                     }
                     const Index t = i / C, c = i % C;
+                    // Everything that can throw stays inside the try: the
+                    // progress callback is how a load is cancelled (it throws),
+                    // and an exception leaving an OpenMP loop body ends the
+                    // process. The per-file progress call used to sit after it.
                     try {
                         readTileVolume(tile, c, t, out->plane(c, t, 0), [&](double f, const std::string& m) {
                             if (!progress) return;
                             std::lock_guard<std::mutex> g(progressMu);
                             progress((static_cast<double>(done.load()) + f) / static_cast<double>(total), m);
                         });
+                        const Index n = done.fetch_add(1) + 1;
+                        if (progress) {
+                            std::lock_guard<std::mutex> g(progressMu);
+                            progress(static_cast<double>(n) / static_cast<double>(total),
+                                     "reading " + fs::path(pathOf(tile, c, t)).filename().string());
+                        }
                     } catch (...) {
                         std::lock_guard<std::mutex> g(epMu);
                         if (!ep) ep = std::current_exception();
-                    }
-                    const Index n = done.fetch_add(1) + 1;
-                    if (progress) {
-                        std::lock_guard<std::mutex> g(progressMu);
-                        progress(static_cast<double>(n) / static_cast<double>(total),
-                                 "reading " + fs::path(pathOf(tile, c, t)).filename().string());
                     }
                 }
                 if (ep) std::rethrow_exception(ep);

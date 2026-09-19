@@ -124,7 +124,7 @@ def _manifest(path: str):
     manifest_of = getattr(getattr(deploy, "Bundle", None), "manifest_of", None)
     if manifest_of is not None:
         return manifest_of(str(path))
-    import torch                                          # a latents older than format 2
+    import torch  # a latents older than format 2
 
     try:
         ck = torch.load(str(path), map_location="cpu", weights_only=False, mmap=True)

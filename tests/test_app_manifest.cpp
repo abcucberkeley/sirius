@@ -18,6 +18,7 @@
 #include <cstdint>
 #include <filesystem>
 #include <fstream>
+#include <stdexcept>
 #include <string>
 #include <vector>
 
@@ -515,6 +516,22 @@ TEST_CASE("A folder with a manifest opens as one tiled dataset", "[app][manifest
         OpenResult full = openDataset(folder.str, options);
         CHECK(full.source->inMemory());
         CHECK(full.meta.tiles.size() == 4);
+    }
+    SECTION("a progress callback that throws ends the read with its exception, not the process") {
+        // Cancelling a load throws from the progress callback. Thrown from
+        // the per-file call, which sat outside the try in the OpenMP loop, it
+        // terminated the application.
+        struct Cancelled : std::runtime_error {
+            using std::runtime_error::runtime_error;
+        };
+        OpenResult whole = openDataset(folder.str, OpenOptions{});
+        int calls = 0;
+        CHECK_THROWS_AS(whole.source->readAll([&calls](double fraction, const std::string&) {
+            ++calls;
+            if (fraction >= 0.25) throw Cancelled("cancelled");   // the first completed file of four
+        }),
+                        Cancelled);
+        CHECK(calls > 0);
     }
     SECTION("an incomplete manifest is refused") {
         DatasetManifest m = DatasetManifest::load(folder.path);

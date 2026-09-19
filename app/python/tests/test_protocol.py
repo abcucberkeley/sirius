@@ -498,6 +498,20 @@ class TestRequestDevice(unittest.TestCase):
         self.assertEqual(server.request_device(None), "cuda")
         self.assertEqual(server.request_device("cuda:1"), "cuda:1")
 
+    def test_the_command_line_takes_the_gpu_the_application_names(self):
+        # The application starts its worker with --device cuda:N once a GPU is
+        # chosen; argparse's choices took only auto / cuda / cpu, so the worker
+        # exited with a usage error and every Python step on the CUDA backend failed.
+        import argparse  # noqa: PLC0415
+
+        from sirius_worker.__main__ import _device  # noqa: PLC0415
+
+        for text, expected in (("auto", "auto"), ("cpu", "cpu"), ("CUDA", "cuda"), ("cuda:0", "cuda:0"), ("cuda:3", "cuda:3")):
+            self.assertEqual(_device(text), expected)
+        for bad in ("gpu", "cuda:", "cuda:x", "cuda:-1", "cpu:0", ""):
+            with self.assertRaises(argparse.ArgumentTypeError, msg=bad):
+                _device(bad)
+
     @unittest.skipUnless(HAVE_TORCH, "torch not importable")
     def test_a_cpu_request_runs_on_the_cpu_of_a_cuda_worker(self):
         tmp = tempfile.TemporaryDirectory()

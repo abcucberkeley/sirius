@@ -23,6 +23,19 @@ import signal
 import sys
 
 
+def _device(text: str) -> str:
+    """--device: auto, cpu, cuda or cuda:N. The application names the GPU it was
+    told to use ("cuda:1"); with only the three bare words accepted, a worker
+    started on the CUDA backend exited at once with a usage error."""
+    value = text.strip().lower()
+    if value in ("auto", "cpu", "cuda"):
+        return value
+    kind, _, index = value.partition(":")
+    if kind == "cuda" and index.isdigit():
+        return value
+    raise argparse.ArgumentTypeError(f"{text!r} is not auto, cpu, cuda or cuda:N")
+
+
 def main(argv=None) -> int:
     parser = argparse.ArgumentParser(prog="sirius_worker", description="SIRIUS compute worker")
     parser.add_argument("--host", default="127.0.0.1",
@@ -30,8 +43,8 @@ def main(argv=None) -> int:
     parser.add_argument("--port", type=int, default=0, help="TCP port; 0 picks a free port")
     parser.add_argument("--token", default=os.environ.get("SIRIUS_TOKEN", ""),
                         help="shared secret the client must present (default: $SIRIUS_TOKEN)")
-    parser.add_argument("--device", default="auto", choices=["auto", "cuda", "cpu"],
-                        help="where models run; auto = cuda when torch sees a GPU")
+    parser.add_argument("--device", default="auto", type=_device,
+                        help="where models run: auto (cuda when torch sees a GPU), cpu, cuda, or cuda:N for one GPU")
     # Package installation (the `install` method: pip / conda in this
     # interpreter) is a privileged operation, so it is opt-in. The desktop
     # application passes this for the worker it starts on the user's own
