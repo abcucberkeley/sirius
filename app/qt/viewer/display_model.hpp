@@ -57,7 +57,8 @@ namespace sirius::app {
         // --- windows ---------------------------------------------------------
         // Auto: robust percentiles (0.1 / 99.9) of a few sampled planes;
         // Full: the (c, t) volume's minimum and maximum, nothing clipped.
-        enum class WindowMode { Auto, Full };
+        enum class WindowMode { Auto,
+                                Full };
         DisplayWindow window(Index c, Index t);
         void setWindow(Index c, DisplayWindow w);   // an explicit window (live previews)
         void setWindowMode(WindowMode m);
@@ -80,7 +81,9 @@ namespace sirius::app {
         // (c, t) right now. Wanted asks the caller to have a ViewerLoader
         // produce it; a cheap projection of an in-memory volume is done here
         // and reports Ready.
-        enum class VolumeState { Ready, Wanted, TooLarge };
+        enum class VolumeState { Ready,
+                                 Wanted,
+                                 TooLarge };
         VolumeState volumeState(Index c, Index t);
         // The loader's result: the volume (null for an in-memory output), its
         // projection and its exact range.
@@ -147,7 +150,9 @@ namespace sirius::app {
         // Shared so a loader thread can hold a volume the model has evicted.
         std::map<Key, std::shared_ptr<Buffer<float>>> volumes_;   // lazy sources only
         std::map<Key, std::shared_ptr<Buffer<float>>> mips_;
-        struct Range { float lo = 0.0f, hi = 1.0f; };
+        struct Range {
+            float lo = 0.0f, hi = 1.0f;
+        };
         std::map<Key, Range> ranges_;                     // exact, from the loader
         bool tooLarge_ = false;
         // one cached plane per channel for lazy sources without a cached volume

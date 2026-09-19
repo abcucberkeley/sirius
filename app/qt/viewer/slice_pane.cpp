@@ -29,10 +29,14 @@ namespace sirius::app {
         setCursor(Qt::CrossCursor);
         // reachable from the keyboard: tab to a pane, then walk the crosshair
         setFocusPolicy(Qt::StrongFocus);
-        static const struct { Kind kind; const char* h; const char* v; const char* d; const char* name; } axes[] = {
-            {Kind::XY, "x", "y", "z", "XY view"},   {Kind::YZ, "z", "y", "x", "YZ view"},
-            {Kind::XZ, "x", "z", "y", "XZ view"},   {Kind::MIP, "x", "y", "z", "Z maximum projection"},
-            {Kind::Compare, "x", "y", "z", "Compare view"}};
+        static const struct {
+            Kind kind;
+            const char* h;
+            const char* v;
+            const char* d;
+            const char* name;
+        } axes[] = {
+            {Kind::XY, "x", "y", "z", "XY view"}, {Kind::YZ, "z", "y", "x", "YZ view"}, {Kind::XZ, "x", "z", "y", "XZ view"}, {Kind::MIP, "x", "y", "z", "Z maximum projection"}, {Kind::Compare, "x", "y", "z", "Compare view"}};
         for (const auto& a : axes)
             if (a.kind == kind_) {
                 setAxisNames(QString::fromLatin1(a.h), QString::fromLatin1(a.v), QString::fromLatin1(a.d));
@@ -94,9 +98,18 @@ namespace sirius::app {
         return v.x() >= 0.0 && v.y() >= 0.0 && v.x() < static_cast<double>(cols_) && v.y() < static_cast<double>(rows_);
     }
 
-    void SlicePane::setTitle(const QString& t) { title_ = t; update(); }
-    void SlicePane::setHint(const QString& h) { hint_ = h; update(); }
-    void SlicePane::setScaleBar(double um) { umPerVoxel_ = um; update(); }
+    void SlicePane::setTitle(const QString& t) {
+        title_ = t;
+        update();
+    }
+    void SlicePane::setHint(const QString& h) {
+        hint_ = h;
+        update();
+    }
+    void SlicePane::setScaleBar(double um) {
+        umPerVoxel_ = um;
+        update();
+    }
 
     void SlicePane::setCrosshair(const QPointF& voxel, bool visible, bool locked) {
         cross_ = voxel;
@@ -125,7 +138,10 @@ namespace sirius::app {
         if (!same) update();
     }
 
-    void SlicePane::setMessage(const QString& text) { message_ = text; update(); }
+    void SlicePane::setMessage(const QString& text) {
+        message_ = text;
+        update();
+    }
 
     // --- painting ----------------------------------------------------------------
 
@@ -215,8 +231,7 @@ namespace sirius::app {
             const QString head = cut < 0 ? title_ : title_.left(cut);
             drawOverlayText(p, QPointF(viewer::kOverlayInset, viewer::kOverlayTop), head, true);
             if (cut >= 0)
-                drawOverlayText(p, QPointF(viewer::kOverlayInset + fm.horizontalAdvance(head) + viewer::kOverlayGap,
-                                           viewer::kOverlayTop),
+                drawOverlayText(p, QPointF(viewer::kOverlayInset + fm.horizontalAdvance(head) + viewer::kOverlayGap, viewer::kOverlayTop),
                                 title_.mid(cut + 2), false, 0.7);
         }
         if (umPerVoxel_ > 0.0 && hasContent()) {

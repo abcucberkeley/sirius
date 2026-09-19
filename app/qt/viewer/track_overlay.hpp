@@ -36,7 +36,9 @@ namespace sirius::app {
 
     // Which plane a pane shows, as columns and rows: XY (and the z projection)
     // is (x, y), XZ is (x, z), YZ is (z, y).
-    enum class TrackPlane { XY, XZ, YZ };
+    enum class TrackPlane { XY,
+                            XZ,
+                            YZ };
 
     // The paths as seen in `plane`. `only` (non-zero) builds that track alone.
     QVector<TrackPath> trackPaths(const TrackIndex& index, TrackPlane plane, std::uint32_t only = 0);

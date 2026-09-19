@@ -312,8 +312,8 @@ namespace sirius::app {
             for (int i = 0; i < 256; ++i) {
                 const int gi = cp.lut ? (*cp.lut)[static_cast<std::size_t>(i)] : i;
                 tables[k][static_cast<std::size_t>(i)] = (static_cast<std::uint32_t>((gi * cp.tint[0]) >> 8) << 16) |
-                                                        (static_cast<std::uint32_t>((gi * cp.tint[1]) >> 8) << 8) |
-                                                        static_cast<std::uint32_t>((gi * cp.tint[2]) >> 8);
+                                                         (static_cast<std::uint32_t>((gi * cp.tint[1]) >> 8) << 8) |
+                                                         static_cast<std::uint32_t>((gi * cp.tint[2]) >> 8);
             }
         }
         std::vector<std::uint32_t> acc(static_cast<std::size_t>(w) * 3);

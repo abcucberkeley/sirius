@@ -548,8 +548,7 @@ namespace sirius::app {
             impl_->runPreview();
         };
         connect(presetMenu, &QMenu::triggered, this, [applyPreset](QAction* a) {
-            if (a) applyPreset(a->data().toInt());
-        }, Qt::QueuedConnection);
+            if (a) applyPreset(a->data().toInt()); }, Qt::QueuedConnection);
         connect(browseManifest, &QPushButton::clicked, this, [this] {
             const QString dest = impl_->manifestPath->text().trimmed();
             const QFileInfo destInfo(dest);
@@ -681,7 +680,9 @@ namespace sirius::app {
             anyGrid = anyGrid || t.gridIndex[1] != 0 || t.gridIndex[2] != 0;
             anyPos = anyPos || t.positionUm[1] != 0.0 || t.positionUm[2] != 0.0;
         }
-        positions->setCurrentIndex(m.tiles.size() <= 1 ? 0 : anyGrid ? 1 : anyPos ? 2 : 0);
+        positions->setCurrentIndex(m.tiles.size() <= 1 ? 0 : anyGrid ? 1
+                                                         : anyPos    ? 2
+                                                                     : 0);
         overlap->setEnabled(positions->currentIndex() == 1);
         if (!m.pattern.empty()) {
             pattern->setText(fromStd(m.pattern));

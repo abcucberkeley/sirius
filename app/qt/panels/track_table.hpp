@@ -32,7 +32,15 @@ namespace sirius::app {
     class TrackTableModel : public QAbstractTableModel {
         Q_OBJECT
     public:
-        enum Column { Id, Frames, Present, Gaps, Speed, Net, Parent, Children, ColumnCount };
+        enum Column { Id,
+                      Frames,
+                      Present,
+                      Gaps,
+                      Speed,
+                      Net,
+                      Parent,
+                      Children,
+                      ColumnCount };
 
         explicit TrackTableModel(QObject* parent = nullptr);
         void setTracks(std::vector<TrackSummary> tracks);

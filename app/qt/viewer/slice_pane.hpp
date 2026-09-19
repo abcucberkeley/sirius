@@ -30,7 +30,11 @@ namespace sirius::app {
     class SlicePane : public QWidget {
         Q_OBJECT
     public:
-        enum class Kind { XY, YZ, XZ, MIP, Compare };
+        enum class Kind { XY,
+                          YZ,
+                          XZ,
+                          MIP,
+                          Compare };
 
         // Screen pixels per voxel along the columns / rows, and where voxel
         // (0, 0) sits on screen.
@@ -49,7 +53,10 @@ namespace sirius::app {
         void setContent(const QImage& img, int factor, Index cols, Index rows, const QPoint& origin = QPoint(0, 0));
         QPoint origin() const noexcept { return origin_; }
         // The grid alone (fitView needs it before the first content arrives).
-        void setGrid(Index cols, Index rows) { cols_ = cols; rows_ = rows; }
+        void setGrid(Index cols, Index rows) {
+            cols_ = cols;
+            rows_ = rows;
+        }
         void clearContent();
         bool hasContent() const noexcept { return !image_.isNull(); }
         Index cols() const noexcept { return cols_; }
@@ -73,7 +80,8 @@ namespace sirius::app {
         // (1..3 points: mark, distance, angle) and ROI boxes. Pending ones
         // (still being drawn) are painted lighter.
         struct Annotation {
-            enum class Kind { Measure, Roi };
+            enum class Kind { Measure,
+                              Roi };
             Kind kind = Kind::Measure;
             QVector<QPointF> points;
             QRectF rect;
@@ -89,7 +97,10 @@ namespace sirius::app {
         // What this pane's axes are called, for the accessible description
         // and the key navigation ("XY", "z" ...).
         void setAxisNames(const QString& horizontal, const QString& vertical, const QString& depth);
-        void setSmooth(bool smooth) { smooth_ = smooth; update(); }
+        void setSmooth(bool smooth) {
+            smooth_ = smooth;
+            update();
+        }
         QPointF lastMouse() const noexcept { return mouse_; }
 
     signals:

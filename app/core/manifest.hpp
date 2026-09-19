@@ -72,7 +72,9 @@ namespace sirius::app {
     // Unmatched files are ignored and reported.
     struct FilenameRule {
         std::string pattern;
-        enum class Positions { None, GridIndex, Microns };
+        enum class Positions { None,
+                               GridIndex,
+                               Microns };
         Positions positions = Positions::GridIndex;
         double overlapFraction = 0.10;       // GridIndex: neighbouring tiles overlap by this fraction
         std::array<double, 3> voxelUm{0.1, 0.1, 0.2};

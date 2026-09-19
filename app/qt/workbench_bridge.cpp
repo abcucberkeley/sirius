@@ -117,9 +117,9 @@ namespace sirius::app {
         // error for the window to show. RunJob knows it was cancelled from the
         // CancelledError it caught, so nobody has to read the message.
         const bool cancelled = job->finished() && job->wasCancelled();
-        const QString error = cancelled            ? QString()
-                              : job->finished()    ? fromStd(job->error())
-                                                   : QStringLiteral("the run did not finish");
+        const QString error = cancelled         ? QString()
+                              : job->finished() ? fromStd(job->error())
+                                                : QStringLiteral("the run did not finish");
         wb_.finishRun(job);
         emit runFinished(ok, error);
     }
@@ -197,7 +197,7 @@ namespace sirius::app {
         }
         options.progress = {};
         return startTask(QStringLiteral("Loading dataset"), [this, path, options](const TaskProgress& progress,
-                                                                                 const TaskCancelled& cancelled) {
+                                                                                  const TaskCancelled& cancelled) {
             OpenOptions o = options;
             o.progress = [&](double f, const std::string& m) {
                 if (cancelled()) throw CancelledError{};

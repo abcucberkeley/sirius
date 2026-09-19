@@ -25,7 +25,9 @@ namespace {
 
     // Write a tiled TIFF directly via libtiff to exercise the tiled reader code path.
     // The sirius write API only produces scanline TIFFs, so we need raw libtiff here.
-    struct TiffDeleter { void operator()(TIFF* t) const { TIFFClose(t); } };
+    struct TiffDeleter {
+        void operator()(TIFF* t) const { TIFFClose(t); }
+    };
     using TiffPtr = std::unique_ptr<TIFF, TiffDeleter>;
 
     void writeTiledTiffRaw(const std::string& path, const Image<float>& img,
@@ -36,15 +38,15 @@ namespace {
         const auto rows = static_cast<uint32_t>(img.dimension(0));
         const auto cols = static_cast<uint32_t>(img.dimension(1));
 
-        TIFFSetField(tif.get(), TIFFTAG_IMAGEWIDTH,      cols);
-        TIFFSetField(tif.get(), TIFFTAG_IMAGELENGTH,     rows);
-        TIFFSetField(tif.get(), TIFFTAG_BITSPERSAMPLE,   32);
+        TIFFSetField(tif.get(), TIFFTAG_IMAGEWIDTH, cols);
+        TIFFSetField(tif.get(), TIFFTAG_IMAGELENGTH, rows);
+        TIFFSetField(tif.get(), TIFFTAG_BITSPERSAMPLE, 32);
         TIFFSetField(tif.get(), TIFFTAG_SAMPLESPERPIXEL, 1);
-        TIFFSetField(tif.get(), TIFFTAG_SAMPLEFORMAT,    SAMPLEFORMAT_IEEEFP);
-        TIFFSetField(tif.get(), TIFFTAG_PHOTOMETRIC,     PHOTOMETRIC_MINISBLACK);
-        TIFFSetField(tif.get(), TIFFTAG_PLANARCONFIG,    PLANARCONFIG_CONTIG);
-        TIFFSetField(tif.get(), TIFFTAG_TILEWIDTH,       tileW);
-        TIFFSetField(tif.get(), TIFFTAG_TILELENGTH,      tileH);
+        TIFFSetField(tif.get(), TIFFTAG_SAMPLEFORMAT, SAMPLEFORMAT_IEEEFP);
+        TIFFSetField(tif.get(), TIFFTAG_PHOTOMETRIC, PHOTOMETRIC_MINISBLACK);
+        TIFFSetField(tif.get(), TIFFTAG_PLANARCONFIG, PLANARCONFIG_CONTIG);
+        TIFFSetField(tif.get(), TIFFTAG_TILEWIDTH, tileW);
+        TIFFSetField(tif.get(), TIFFTAG_TILELENGTH, tileH);
 
         std::vector<float> tile(static_cast<size_t>(tileW) * tileH, 0.0f);
         for (uint32_t r = 0; r < rows; r += tileH) {
@@ -58,7 +60,7 @@ namespace {
             }
         }
     }
-}
+} // namespace
 
 // RAII helper - deletes a file when it goes out of scope
 struct TempFile {
@@ -138,8 +140,7 @@ TEST_CASE("Single image round-trip - all compression modes", "[tiff][io]") {
     auto compression = GENERATE(
         TiffCompression::None,
         TiffCompression::Lzw,
-        TiffCompression::Deflate
-    );
+        TiffCompression::Deflate);
     INFO("Compression: " << static_cast<int>(compression));
 
     TempFile f(uniqueTempPath(".tiff"));
@@ -158,23 +159,22 @@ TEST_CASE("Single image round-trip - all supported pixel types", "[tiff][io]") {
     SECTION("uint8") {
         TempFile f(uniqueTempPath(".tiff"));
         Image<uint8_t> img(16, 16);
-        asMatrix(img) <<
-               0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15,
-               255, 254, 253, 252, 251, 250, 249, 248, 247, 246, 245, 244, 243, 242, 241, 240,
-               100, 101, 102, 103, 104, 105, 106, 107, 108, 109, 110, 111, 112, 113, 114, 115,
-               200, 201, 202, 203, 204, 205, 206, 207, 208, 209, 210, 211, 212, 213, 214, 215,
-               10, 20, 30, 40, 50, 60, 70, 80, 90, 100, 110, 120, 130, 140, 150, 160,
-               5, 15, 25, 35, 45, 55, 65, 75, 85, 95, 105, 115, 125, 135, 145, 155,
-               1, 3, 5, 7, 9, 11, 13, 15, 17, 19, 21, 23, 25, 27, 29, 31,
-               2, 4, 6, 8, 10, 12, 14, 16, 18, 20, 22, 24, 26, 28, 30, 32,
-               50, 51, 52, 53, 54, 55, 56, 57, 58, 59, 60, 61, 62, 63, 64, 65,
-               150, 151, 152, 153, 154, 155, 156, 157, 158, 159, 160, 161, 162, 163, 164, 165,
-               70, 71, 72, 73, 74, 75, 76, 77, 78, 79, 80, 81, 82, 83, 84, 85,
-               170, 171, 172, 173, 174, 175, 176, 177, 178, 179, 180, 181, 182, 183, 184, 185,
-               90, 91, 92, 93, 94, 95, 96, 97, 98, 99, 100, 101, 102, 103, 104, 105,
-               190, 191, 192, 193, 194, 195, 196, 197, 198, 199, 200, 201, 202, 203, 204, 205,
-               110, 111, 112, 113, 114, 115, 116, 117, 118, 119, 120, 121, 122, 123, 124, 125,
-               210, 211, 212, 213, 214, 215, 216, 217, 218, 219, 220, 221, 222, 223, 224, 225;
+        asMatrix(img) << 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15,
+            255, 254, 253, 252, 251, 250, 249, 248, 247, 246, 245, 244, 243, 242, 241, 240,
+            100, 101, 102, 103, 104, 105, 106, 107, 108, 109, 110, 111, 112, 113, 114, 115,
+            200, 201, 202, 203, 204, 205, 206, 207, 208, 209, 210, 211, 212, 213, 214, 215,
+            10, 20, 30, 40, 50, 60, 70, 80, 90, 100, 110, 120, 130, 140, 150, 160,
+            5, 15, 25, 35, 45, 55, 65, 75, 85, 95, 105, 115, 125, 135, 145, 155,
+            1, 3, 5, 7, 9, 11, 13, 15, 17, 19, 21, 23, 25, 27, 29, 31,
+            2, 4, 6, 8, 10, 12, 14, 16, 18, 20, 22, 24, 26, 28, 30, 32,
+            50, 51, 52, 53, 54, 55, 56, 57, 58, 59, 60, 61, 62, 63, 64, 65,
+            150, 151, 152, 153, 154, 155, 156, 157, 158, 159, 160, 161, 162, 163, 164, 165,
+            70, 71, 72, 73, 74, 75, 76, 77, 78, 79, 80, 81, 82, 83, 84, 85,
+            170, 171, 172, 173, 174, 175, 176, 177, 178, 179, 180, 181, 182, 183, 184, 185,
+            90, 91, 92, 93, 94, 95, 96, 97, 98, 99, 100, 101, 102, 103, 104, 105,
+            190, 191, 192, 193, 194, 195, 196, 197, 198, 199, 200, 201, 202, 203, 204, 205,
+            110, 111, 112, 113, 114, 115, 116, 117, 118, 119, 120, 121, 122, 123, 124, 125,
+            210, 211, 212, 213, 214, 215, 216, 217, 218, 219, 220, 221, 222, 223, 224, 225;
         writeTiff(f.path, img);
         auto loaded = readTiff<uint8_t>(f.path);
         REQUIRE(asMatrix(loaded) == asMatrix(img));
@@ -184,7 +184,9 @@ TEST_CASE("Single image round-trip - all supported pixel types", "[tiff][io]") {
         TempFile f(uniqueTempPath(".tiff"));
         Image<uint16_t> img(8, 8);
         img.setZero();
-        img(0, 0) = 0; img(0, 1) = 1000; img(0, 2) = 65535;
+        img(0, 0) = 0;
+        img(0, 1) = 1000;
+        img(0, 2) = 65535;
         writeTiff(f.path, img);
         auto loaded = readTiff<uint16_t>(f.path);
         REQUIRE(asMatrix(loaded) == asMatrix(img));
@@ -245,15 +247,13 @@ TEST_CASE("Image dimensions are preserved exactly", "[tiff][io]") {
     // non-square, non-power-of-two dimensions; {512, 128} exercises multiple
     // full strips (rowsPerStrip=32 for 128-col uint16); {33, 128} exercises a
     // partial last strip (2 strips: 32 full rows + 1 partial row)
-    auto [r, c] = GENERATE(table<int, int>({
-        {1, 1},
-        {1, 100},
-        {100, 1},
-        {17, 31},
-        {256, 256},
-        {512, 128},
-        {33, 128}
-    }));
+    auto [r, c] = GENERATE(table<int, int>({{1, 1},
+                                            {1, 100},
+                                            {100, 1},
+                                            {17, 31},
+                                            {256, 256},
+                                            {512, 128},
+                                            {33, 128}}));
     INFO("Dimensions: " << r << "x" << c);
 
     TempFile f(uniqueTempPath(".tiff"));
@@ -294,8 +294,7 @@ TEST_CASE("Stack round-trip - compression modes", "[tiff][io][stack]") {
     auto compression = GENERATE(
         TiffCompression::None,
         TiffCompression::Lzw,
-        TiffCompression::Deflate
-    );
+        TiffCompression::Deflate);
     INFO("Compression: " << static_cast<int>(compression));
 
     TempFile f(uniqueTempPath(".tiff"));
@@ -338,7 +337,9 @@ TEST_CASE("Single image round-trip - signed and wider integer types", "[tiff][io
         TempFile f(uniqueTempPath(".tiff"));
         Image<int8_t> img(8, 8);
         img.setZero();
-        img(0, 0) = -128; img(0, 1) = 0; img(0, 2) = 127;
+        img(0, 0) = -128;
+        img(0, 1) = 0;
+        img(0, 2) = 127;
         writeTiff(f.path, img);
         auto loaded = readTiff<int8_t>(f.path);
         REQUIRE(asMatrix(loaded) == asMatrix(img));
@@ -348,7 +349,9 @@ TEST_CASE("Single image round-trip - signed and wider integer types", "[tiff][io
         TempFile f(uniqueTempPath(".tiff"));
         Image<int16_t> img(8, 8);
         img.setZero();
-        img(0, 0) = -32768; img(0, 1) = 0; img(0, 2) = 32767;
+        img(0, 0) = -32768;
+        img(0, 1) = 0;
+        img(0, 2) = 32767;
         writeTiff(f.path, img);
         auto loaded = readTiff<int16_t>(f.path);
         REQUIRE(asMatrix(loaded) == asMatrix(img));
@@ -358,7 +361,9 @@ TEST_CASE("Single image round-trip - signed and wider integer types", "[tiff][io
         TempFile f(uniqueTempPath(".tiff"));
         Image<uint32_t> img(8, 8);
         img.setZero();
-        img(0, 0) = 0; img(0, 1) = 65536; img(0, 2) = 0xFFFF'FFFFu;
+        img(0, 0) = 0;
+        img(0, 1) = 65536;
+        img(0, 2) = 0xFFFF'FFFFu;
         writeTiff(f.path, img);
         auto loaded = readTiff<uint32_t>(f.path);
         REQUIRE(asMatrix(loaded) == asMatrix(img));
@@ -368,7 +373,9 @@ TEST_CASE("Single image round-trip - signed and wider integer types", "[tiff][io
         TempFile f(uniqueTempPath(".tiff"));
         Image<int32_t> img(8, 8);
         img.setZero();
-        img(0, 0) = -2'147'483'647 - 1; img(0, 1) = 0; img(0, 2) = 2'147'483'647;
+        img(0, 0) = -2'147'483'647 - 1;
+        img(0, 1) = 0;
+        img(0, 2) = 2'147'483'647;
         writeTiff(f.path, img);
         auto loaded = readTiff<int32_t>(f.path);
         REQUIRE(asMatrix(loaded) == asMatrix(img));
@@ -422,10 +429,10 @@ TEST_CASE("Tiled TIFF round-trip - tile-aligned dimensions", "[tiff][io][tiled]"
 TEST_CASE("Tiled TIFF round-trip - non-tile-aligned dimensions (edge clamping)", "[tiff][io][tiled]") {
     // 50x50 with 16x16 tiles: right and bottom edge tiles are partially filled
     auto [rows, cols] = GENERATE(table<int, int>({
-        {50,  50},   // partial tiles on both axes
-        {1,   100},  // single row
+        {50, 50},   // partial tiles on both axes
+        {1, 100},  // single row
         {100, 1},    // single column
-        {17,  31},   // irregular, non-power-of-two
+        {17, 31},   // irregular, non-power-of-two
     }));
     INFO("Image " << rows << "x" << cols);
 
@@ -452,20 +459,20 @@ namespace {
         TiffPtr tif(TIFFOpen(path.c_str(), "w"));
         if (!tif) throw std::runtime_error("Failed to create TIFF: " + path);
         for (int page = 0; page < 2; ++page) {
-            TIFFSetField(tif.get(), TIFFTAG_IMAGEWIDTH,      4);
-            TIFFSetField(tif.get(), TIFFTAG_IMAGELENGTH,     4);
-            TIFFSetField(tif.get(), TIFFTAG_BITSPERSAMPLE,   16); // half-float: unsupported
+            TIFFSetField(tif.get(), TIFFTAG_IMAGEWIDTH, 4);
+            TIFFSetField(tif.get(), TIFFTAG_IMAGELENGTH, 4);
+            TIFFSetField(tif.get(), TIFFTAG_BITSPERSAMPLE, 16); // half-float: unsupported
             TIFFSetField(tif.get(), TIFFTAG_SAMPLESPERPIXEL, 1);
-            TIFFSetField(tif.get(), TIFFTAG_SAMPLEFORMAT,    SAMPLEFORMAT_IEEEFP);
-            TIFFSetField(tif.get(), TIFFTAG_PHOTOMETRIC,     PHOTOMETRIC_MINISBLACK);
-            TIFFSetField(tif.get(), TIFFTAG_PLANARCONFIG,    PLANARCONFIG_CONTIG);
+            TIFFSetField(tif.get(), TIFFTAG_SAMPLEFORMAT, SAMPLEFORMAT_IEEEFP);
+            TIFFSetField(tif.get(), TIFFTAG_PHOTOMETRIC, PHOTOMETRIC_MINISBLACK);
+            TIFFSetField(tif.get(), TIFFTAG_PLANARCONFIG, PLANARCONFIG_CONTIG);
             std::vector<uint16_t> row(4, 0);
             for (uint32_t r = 0; r < 4; ++r)
                 TIFFWriteScanline(tif.get(), row.data(), r);
             TIFFWriteDirectory(tif.get());
         }
     }
-}
+} // namespace
 
 TEST_CASE("readTiffStackAny dispatches to the correct type", "[tiff][io][stack][any]") {
     SECTION("uint8") {
@@ -567,10 +574,10 @@ TEST_CASE("readTiffStackAny dispatches to the correct type", "[tiff][io][stack][
 
 TEST_CASE("readTiffStackAny preserves dimensions", "[tiff][io][stack][any]") {
     auto [depth, rows, cols] = GENERATE(table<int, int, int>({
-        {1,  1,   1},
-        {5,  16,  16},
-        {3,  17,  31},
-        {2,  128, 64},
+        {1, 1, 1},
+        {5, 16, 16},
+        {3, 17, 31},
+        {2, 128, 64},
     }));
     INFO("Dimensions: " << depth << "x" << rows << "x" << cols);
 

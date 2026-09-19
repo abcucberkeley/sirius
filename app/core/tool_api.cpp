@@ -358,8 +358,7 @@ namespace sirius::app {
                  if (rows.size() > limit) rows.resize(limit);
                  json list = json::array();
                  for (const TrackSummary& r : rows)
-                     list.push_back({{"id", r.id}, {"first", r.first}, {"last", r.last}, {"frames", r.frames}, {"gaps", r.gaps},
-                                     {"um_per_frame", r.umPerFrame}, {"net_um", r.netUm}, {"parent", r.parent}, {"children", r.children}});
+                     list.push_back({{"id", r.id}, {"first", r.first}, {"last", r.last}, {"frames", r.frames}, {"gaps", r.gaps}, {"um_per_frame", r.umPerFrame}, {"net_um", r.netUm}, {"parent", r.parent}, {"children", r.children}});
                  return json{{"total", total}, {"with_gaps", gapped}, {"divisions", divisions}, {"tracks", list}};
              }});
         add({"focus_track",

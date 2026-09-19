@@ -46,7 +46,10 @@ namespace sirius::app {
         // middle of voxel 3 only after the half-voxel shift.
         constexpr double kVoxelCentre = 0.5;
 
-        enum class Style { Past, PastGap, Future, FutureGap };
+        enum class Style { Past,
+                           PastGap,
+                           Future,
+                           FutureGap };
     } // namespace
 
     QVector<TrackPath> trackPaths(const TrackIndex& index, TrackPlane plane, std::uint32_t only) {
