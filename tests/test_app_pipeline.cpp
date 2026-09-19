@@ -2622,10 +2622,15 @@ TEST_CASE("All-GPUs device index round-robins volumes", "[app][pipeline][cuda]")
     StepContext ctx;
     ctx.backend = Backend::Cuda;
     ctx.device = Device::cuda(Workbench::kAllCudaDevices);
-    if (!cudaAvailable() || cudaDeviceCount() < 2) {
+    if (!cudaAvailable() || cudaDeviceCount() < 1) {
         CHECK_FALSE(ctx.allCudaDevices());
         return;
     }
+    // One GPU counts: "all" is then that one, and every volume lands on it. The
+    // test used to expect false below two devices, which is not what the code
+    // does (nor should: the choice must work on a laptop), so it failed on every
+    // single-GPU machine -- and passed on the four-GPU node it was written on and
+    // on CI, which has none.
     REQUIRE(ctx.allCudaDevices());
     const int n = cudaDeviceCount();
     CHECK(ctx.deviceForVolume(0, 0, 2).index == 0);
