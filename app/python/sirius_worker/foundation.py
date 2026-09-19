@@ -111,7 +111,18 @@ def _manifest(path: str):
         for key, bundle in _BUNDLES.items():
             if key[:2] == file_key:
                 return bundle.m
-    import torch
+    # Ask latents for the manifest rather than torch.load-ing the file here.
+    # Since latents bundle format 2 (2026-09-13) an .ltb is a plain zip with
+    # manifest.json at its root and the weights beside it, which torch.load
+    # rejects outright ("file in archive is not in a subdirectory"); the
+    # previous code retried the same call without mmap and raised, so
+    # model_info failed on every current bundle while run() -- which goes
+    # through Bundle.load -- kept working. Bundle.manifest_of reads the JSON
+    # member without touching a weight and still understands a version-1 file.
+    manifest_of = getattr(getattr(deploy, "Bundle", None), "manifest_of", None)
+    if manifest_of is not None:
+        return manifest_of(str(path))
+    import torch                                          # a latents older than format 2
 
     try:
         ck = torch.load(str(path), map_location="cpu", weights_only=False, mmap=True)
