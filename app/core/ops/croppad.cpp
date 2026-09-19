@@ -108,6 +108,13 @@ namespace sirius::app {
                     // the table ends on the frame the input's was on
                     if (input.labels->statsT() >= 0 && input.labels->statsT() < meta.dims.t - 1)
                         labels->recomputeStats(input.labels->statsT());
+                    // cropping keeps the ids, so tracks stay tracks (a track
+                    // wholly outside the box is simply gone from the index)
+                    if (input.labels->tracked()) {
+                        labels->setTracked(true);
+                        labels->setLineage(input.labels->lineage());
+                        labels->indexTracks();
+                    }
                     out.labels = labels;
                 }
                 out.ranOn = Backend::Cpu;

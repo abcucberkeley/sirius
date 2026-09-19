@@ -18,6 +18,7 @@
 #include <numeric>
 
 #include "core/tracking.hpp"
+#include "core/tracks.hpp"
 
 namespace sirius::app {
 
@@ -161,6 +162,7 @@ namespace sirius::app {
                 // segmentation's own numbering, and a delete or a merge that
                 // took the id in every frame would take unrelated objects.
                 labels->setTracked(relabel);
+                if (relabel) labels->indexTracks();
                 out.labels = labels;
                 out.ranOn = Backend::Cpu;
                 out.diagnostics = trackDiagnostics(linked, byFrame, meta, summary(p, meta));
@@ -220,6 +222,8 @@ namespace sirius::app {
                     for (LabelStats& s : labels->stats()) s.cls = "track";
                 }
                 labels->setTracked(true);   // one id, one object, every frame
+                labels->setLineage(lineageFromJson(r.result.value("lineage", nlohmann::json::object())));
+                labels->indexTracks();
                 out.labels = labels;
                 out.ranOn = ctx.backend;
                 out.seconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();

@@ -21,6 +21,7 @@
 #include <array>
 #include <cstdint>
 #include <functional>
+#include <map>
 #include <memory>
 #include <optional>
 #include <string>
@@ -32,6 +33,11 @@
 #include "core/array.hpp"
 
 namespace sirius::app {
+
+    class TrackIndex;   // core/tracks.hpp
+
+    // {child track id: parent track id}; divisions only.
+    using Lineage = std::map<std::uint32_t, std::uint32_t>;
 
     struct LabelStats {
         std::uint32_t id = 0;
@@ -103,12 +109,30 @@ namespace sirius::app {
         bool tracked() const noexcept { return tracked_; }
         void setTracked(bool on) noexcept { tracked_ = on; }
 
-        // The mutable accessors detach a shared copy first (see the header note).
+        // --- tracks (tracked volumes) --------------------------------------
+        // Which track divided from which, as the tracker reported it. Kept
+        // beside the voxels rather than in them: an edit leaves it as it was,
+        // and core/tracks.hpp ignores entries whose ids are gone.
+        const Lineage& lineage() const noexcept { return lineage_; }
+        void setLineage(Lineage lineage) { lineage_ = std::move(lineage); }
+        // Where every id is in every frame (core/tracks.hpp). Null until
+        // indexTracks() builds it -- one pass over the voxels, what a tracking
+        // step does once its labels are written -- and from then on kept
+        // current by every edit and apply(), at the cost of the voxels they
+        // change. A write through volume() / plane() drops it (null again).
+        void indexTracks();
+        std::shared_ptr<const TrackIndex> tracks() const noexcept { return tracks_; }
+
+        // All of them check their coordinates (std::out_of_range): a pointer
+        // computed from a bad t or z points into someone else's memory.
+        // The mutable accessors detach a shared copy first (see the header note),
+        // and drop the track index: the edits below keep it current, a raw
+        // write cannot (call indexTracks() again when the ids still name tracks).
         std::uint32_t* volume(Index t);                          // (z, y, x)
-        const std::uint32_t* volume(Index t) const noexcept;
+        const std::uint32_t* volume(Index t) const;
         std::uint32_t* plane(Index t, Index z);
-        const std::uint32_t* plane(Index t, Index z) const noexcept;
-        std::uint32_t at(Index t, Index z, Index y, Index x) const noexcept;
+        const std::uint32_t* plane(Index t, Index z) const;
+        std::uint32_t at(Index t, Index z, Index y, Index x) const;
         BufferView<const std::uint32_t> view() const noexcept { return data_->view(); }
 
         // Highest id handed out so far: monotonic, so ids never collide with
@@ -199,6 +223,8 @@ namespace sirius::app {
         using AnnotationTable = std::unordered_map<std::uint32_t, LabelAnnotation>;
 
         void detach();                       // own the voxels before writing
+        std::uint32_t* writable(Index t);    // volume(t) for the edits, which keep the track index themselves
+        LabelDiff indexed(LabelDiff diff);   // an edit's diff, after bringing the track index up to date
         LabelStats* mutableStatsOf(std::uint32_t id) noexcept;
         // Puts the annotations of `rows` aside for frame `t` (and the track).
         void saveAnnotations(Index t, const std::vector<const LabelStats*>& rows);
@@ -221,6 +247,8 @@ namespace sirius::app {
         std::uint64_t generation_ = 0;
         bool edited_ = false;
         bool tracked_ = false;
+        Lineage lineage_;
+        std::shared_ptr<TrackIndex> tracks_;            // shared by share() until an edit
     };
 
     using LabelsPtr = std::shared_ptr<const LabelVolume>;

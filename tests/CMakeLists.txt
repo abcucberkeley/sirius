@@ -55,6 +55,7 @@ if(SIRIUS_ENABLE_APP)
         test_app_core.cpp
         test_app_labels.cpp
         test_app_tracking.cpp
+        test_app_tracks.cpp
         test_app_training.cpp
         test_app_pipeline.cpp
         test_app_ops.cpp

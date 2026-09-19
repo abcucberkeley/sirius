@@ -16,9 +16,10 @@
 //
 // Tracking is returned the way this application represents a track: one label
 // id naming the same object at every time point, with `tracked` set. The
-// lineage the model produces is reported as a division count, since
-// LabelVolume has no parent/child structure to put it in.
+// lineage the model produces rides beside the labels (LabelVolume::lineage)
+// for the track review; the diagnostics still give the model's own count.
 #include "core/ops/builtin.hpp"
+#include "core/tracks.hpp"
 
 #include <algorithm>
 #include <chrono>
@@ -230,7 +231,13 @@ namespace sirius::app {
                 }
                 const std::string className = task == "track" ? "track" : p.getString("class_name", "object");
                 for (LabelStats& s : labels->stats()) s.cls = className;
-                if (task == "track") labels->setTracked(true);
+                if (task == "track") {
+                    // the lineage the model reports, kept for the track review
+                    // instead of being reduced to a count
+                    labels->setTracked(true);
+                    labels->setLineage(lineageFromJson(r.result.value("lineage", nlohmann::json::object())));
+                    labels->indexTracks();
+                }
 
                 out.labels = labels;
                 out.ranOn = ctx.backend;

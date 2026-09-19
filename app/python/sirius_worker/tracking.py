@@ -155,11 +155,13 @@ def run_btrack(labels: np.ndarray, voxel_um: Tuple[float, float, float], params:
     kept = 0
     lengths = []
     parents = set()
+    renumbered = {}   # btrack's track id -> the label id it is written as
     for track in tracks:
         frames = list(track.t)
         if len(frames) < min_length:
             continue
         kept += 1
+        renumbered[track.ID] = kept
         lengths.append(len(frames))
         parent = getattr(track, "parent", None)
         if parent is not None and parent != track.ID:
@@ -189,8 +191,16 @@ def run_btrack(labels: np.ndarray, voxel_um: Tuple[float, float, float], params:
                 src = int(labels[t, zi, yi, xi])
             if src:
                 out[t][labels[t] == src] = kept
+    # The lineage in the ids the labels now carry, {child: parent}, for the
+    # application's track review. A mother dropped as too short takes its
+    # daughters' link with it: there is no label left to point at.
+    lineage = {}
+    for track in tracks:
+        parent = getattr(track, "parent", None)
+        if track.ID in renumbered and parent is not None and parent != track.ID and parent in renumbered:
+            lineage[str(renumbered[track.ID])] = int(renumbered[parent])
     if progress:
         progress(1.0, f"{kept} tracks")
     return out, {"tracks": kept, "objects": len(objects), "divisions": len(parents),
                  "mean_length": float(np.mean(lengths)) if lengths else 0.0,
-                 "longest": int(max(lengths)) if lengths else 0}
+                 "longest": int(max(lengths)) if lengths else 0, "lineage": lineage}

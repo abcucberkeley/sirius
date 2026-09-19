@@ -157,6 +157,7 @@ namespace sirius::app {
                 }
                 out.array = result;
                 if (labels && alignTime && labels->statsT() >= 0) labels->recomputeStats(labels->statsT());   // the boxes moved
+                if (labels && labels->tracked() && !labels->tracks()) labels->indexTracks();   // the same tracks, moved
                 out.labels = labels;
                 out.ranOn = Backend::Cpu;
                 out.diagnostics = diagnostics(p, meta, results, pairNames, refVol, firstAligned);

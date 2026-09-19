@@ -116,6 +116,15 @@ namespace sirius::app {
         update();
     }
 
+    void SlicePane::setTracks(std::shared_ptr<const QVector<TrackPath>> paths, const TrackPaintOptions& options) {
+        const bool same = paths == tracks_ && options.t == trackOptions_.t && options.selected == trackOptions_.selected &&
+                          options.tail == trackOptions_.tail && options.future == trackOptions_.future &&
+                          options.depth == trackOptions_.depth && options.depthRange == trackOptions_.depthRange;
+        tracks_ = std::move(paths);
+        trackOptions_ = options;
+        if (!same) update();
+    }
+
     void SlicePane::setMessage(const QString& text) { message_ = text; update(); }
 
     // --- painting ----------------------------------------------------------------
@@ -141,6 +150,9 @@ namespace sirius::app {
         }
 
         p.setRenderHint(QPainter::Antialiasing, true);
+
+        if (tracks_ && hasContent())
+            paintTrackPaths(p, *tracks_, trackOptions_, [this](const QPointF& v) { return toScreen(v); }, QRectF(rect()));
 
         // annotations (ROI boxes dashed, measurements in accent) sit under the crosshair
         if (hasContent()) {

@@ -37,6 +37,7 @@
 #include "core/operation.hpp"
 #include "core/pipeline.hpp"
 #include "core/rpc.hpp"
+#include "core/tracks.hpp"
 
 namespace sirius::app {
 
@@ -85,6 +86,10 @@ namespace sirius::app {
         double labelOpacity = 0.45;
         std::uint32_t selectedLabel = 0;
         bool soloLabel = false;                 // draw only the selected label (slices and 3D)
+        // Tracked labels: each track's centroid path over the slices, and
+        // whether the crosshair stays on the selected track as t changes.
+        bool trajectories = true;
+        bool followTrack = false;
         // The ortho panes scale z by the voxel aspect, so what is on screen is
         // physically proportioned -- which is what you want of a result and not
         // what you want when checking the grid a reconstruction was built on.
@@ -311,6 +316,16 @@ namespace sirius::app {
         void focusLabel(std::uint32_t id);
         bool centreOnLabel(std::uint32_t id);   // crosshair and z to its bounding box centre; false when unknown
 
+        // --- tracks (tracked labels, core/tracks.hpp) ----------------------
+        // One row per track of the viewed labels; empty when they are not
+        // tracked. Distances in microns from the viewed output's voxel size.
+        std::vector<TrackSummary> viewedTrackSummaries() const;
+        // Select a track and bring it into view: the time point moves to the
+        // nearest one the track exists in, crosshair and z onto its centroid.
+        // False when the viewed labels have no such track.
+        bool focusTrack(std::uint32_t id);
+        void setFollowTrack(bool on);
+
         // --- outputs ---------------------------------------------------------
         // Last computed output of step `index` (fresh or stale), or null.
         std::shared_ptr<const StepOutput> output(int index) const;
@@ -439,6 +454,7 @@ namespace sirius::app {
         // The statistics describe one time point: bring them to the one on
         // screen (a time series after tracking keeps its ids across t).
         void syncLabelStats();
+        bool followSelectedTrack();              // crosshair and z onto the selected track at t; false when it is not there
         // Undo / redo of a label edit: applies `diff` to the labels of step
         // `id` if they are still the volume the edit was made on, else a
         // logged no-op (the step was re-run or removed since).

@@ -23,6 +23,7 @@ import json
 import os
 import re
 import shutil
+import struct
 import subprocess
 import sys
 import tempfile
@@ -515,6 +516,109 @@ def test_a_run_that_fails_in_the_worker_ends_a_headless_run(app: Path, tmp: Path
     check(shot.is_file(), "no screenshot: the run ended without the grab")
 
 
+def write_moving_blobs(path: Path) -> None:
+    """A (t, z, y, x) = (6, 4, 48, 48) uint16 ImageJ hyperstack: three bright
+    cubes stepping two pixels a frame, the third missed in frame 3. Pure Python,
+    so the scenario needs nothing installed; it is small enough to be quick."""
+    t_, z_, y_, x_ = 6, 4, 48, 48
+    starts = [(8, 8, 0), (30, 10, 1), (20, 34, -1)]  # y, x, direction along y
+    pages = []
+    for t in range(t_):
+        for z in range(z_):
+            plane = bytearray(struct.pack("<H", 100) * (y_ * x_))
+            if 1 <= z <= 2:
+                for k, (y0, x0, dy) in enumerate(starts):
+                    if k == 2 and t == 3:
+                        continue
+                    cy, cx = y0 + dy * 2 * t, x0 + 2 * t
+                    for yy in range(cy - 2, cy + 3):
+                        for xx in range(cx - 2, cx + 3):
+                            struct.pack_into("<H", plane, 2 * (yy * x_ + xx), 3000)
+            pages.append(bytes(plane))
+    desc = f"ImageJ=1.11a\nimages={t_ * z_}\nframes={t_}\nslices={z_}\nhyperstack=true\n\0".encode()
+    out = bytearray(b"II*\0" + struct.pack("<I", 0))
+    link = 4
+    for i, page in enumerate(pages):
+        data = len(out)
+        out += page
+        tags = [(256, 4, 1, x_), (257, 4, 1, y_), (258, 3, 1, 16), (259, 3, 1, 1), (262, 3, 1, 1)]
+        if i == 0:
+            text = len(out)
+            out += desc + (b"\0" if len(desc) % 2 else b"")
+            tags.append((270, 2, len(desc), text))
+        tags += [(273, 4, 1, data), (277, 3, 1, 1), (278, 4, 1, y_), (279, 4, 1, len(page))]
+        ifd = len(out)
+        struct.pack_into("<I", out, link, ifd)
+        out += struct.pack("<H", len(tags)) + b"".join(struct.pack("<HHII", *tag) for tag in tags)
+        link = len(out)
+        out += struct.pack("<I", 0)
+    path.write_bytes(bytes(out))
+
+
+def test_the_tracks_tab_follows_a_track(app: Path, tmp: Path) -> None:
+    # Every dataset in tests/data is one time point, so nothing else here ever
+    # produced tracked labels: the Tracks tab, the trajectories and follow mode
+    # were never drawn by a headless run. Segment and track a synthetic clip
+    # with the built-in tracker (no worker), then drive the table with a key.
+    clip = tmp / "blobs.tif"
+    write_moving_blobs(clip)
+    pipeline = tmp / "tracks.sirius.toml"
+    pipeline.write_text(
+        "version = 1\n\n"
+        '[[steps]]\nkind = "load"\nname = "Load"\n[steps.params]\n'
+        f'path = "{clip.as_posix()}"\nvoxel_x = 0.2\nvoxel_y = 0.2\nvoxel_z = 0.5\n\n'
+        '[[steps]]\nkind = "classic"\nname = "Segment"\n[steps.params]\nsigma = 0.0\n\n'
+        '[[steps]]\nkind = "track"\nname = "Track"\n[steps.params]\nmax_distance = 1.5\n'
+    )
+    shot = tmp / "tracks.png"
+    out = run(
+        app,
+        [
+            "--pipeline",
+            str(pipeline),
+            "--tool",
+            '{"name":"run","args":{}}',
+            "--tool",
+            '{"name":"view_step","args":{"step":3}}',
+            "--tool",
+            '{"name":"select_step","args":{"step":3}}',
+            "--tool",
+            '{"name":"list_tracks","args":{}}',
+            "--tool",
+            '{"name":"focus_track","args":{"id":1}}',
+            "--tool",
+            '{"name":"set_view","args":{"t":4,"follow_track":true}}',
+            "--tool",
+            '{"name":"get_state","args":{}}',
+            "--key",
+            "trackTable=Down",
+            "--tool",
+            '{"name":"get_state","args":{}}',
+            "--screenshot",
+            str(shot),
+            "--settle",
+            "900",
+            "--quit-after",
+            "20000",
+        ],
+    )
+    results = tool_results(out)
+    ran = only(results, "run")
+    check(ran.get("ok") is True, f"the pipeline did not run: {ran}")
+    tracks = only(results, "list_tracks")
+    check(tracks.get("total") == 3, f"expected 3 tracks, got {tracks}")
+    check(tracks.get("with_gaps") == 1, f"the track missed in frame 3 should show one gap: {tracks}")
+    check(only(results, "focus_track").get("ok") is True, "focus_track found no track 1")
+    before, after = results["get_state"][-2:]
+    check(
+        before["view"]["selected_label"] == 1 and before["view"]["follow_track"],
+        f"track 1 not selected and followed: {before['view']}",
+    )
+    focused(out, "trackTable=Down")
+    check(after["view"]["selected_label"] not in (0, 1), f"Down in the Tracks table chose no other track: {after['view']}")
+    image_is_not_blank(shot)
+
+
 def test_menu_actions_reach_the_view(app: Path, tmp: Path) -> None:
     out = run(
         app,
@@ -771,6 +875,7 @@ SCENARIOS = [
     test_files_named_on_the_command_line_open,
     test_an_invalid_step_says_so_in_the_error_colour,
     test_a_run_that_fails_in_the_worker_ends_a_headless_run,
+    test_the_tracks_tab_follows_a_track,
     test_menu_actions_reach_the_view,
     test_a_preset_fills_the_fields,
     test_a_token_the_secret_store_refuses_stays_in_the_settings,
