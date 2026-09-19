@@ -120,7 +120,7 @@ namespace {
 TEST_CASE("the built-in operations are registered with complete metadata", "[app][ops]") {
     const char* kinds[] = {"load", "sim", "decon", "volrec", "einsum", "maxproj", "meant", "contrast", "flatfield",
                            "bleach", "deskew", "croppad", "resample", "merge", "stitch", "register", "seg",
-                           "threshold", "cleanup"};
+                           "foundation", "threshold", "cleanup"};
     for (const char* kind : kinds) {
         INFO(kind);
         const Operation* op = findOperation(kind);
@@ -143,7 +143,7 @@ TEST_CASE("the built-in operations are registered with complete metadata", "[app
     std::size_t builtins = 0;
     for (const Operation* op : allOperations())
         if (op->kind().rfind("test_", 0) != 0 && !op->info().plugin) ++builtins;   // nor plugins the worker tests load
-    CHECK(builtins == 22);
+    CHECK(builtins == 23);
 
     SECTION("menu groups follow the design's order and exclude Load") {
         const auto groups = operationGroups();

@@ -17,12 +17,15 @@
 #include <filesystem>
 #include <fstream>
 #include <limits>
+#include <mutex>
 #include <thread>
 
 #include "core/app_paths.hpp"
 #include "core/cancel.hpp"
 #include "core/errors.hpp"
+#include "core/ops/builtin.hpp"
 #include "core/rpc.hpp"
+#include "temp_path.hpp"
 
 using namespace sirius;
 using namespace sirius::app;
@@ -41,6 +44,8 @@ namespace {
         // field at all, as a worker predating the handshake does.
         int protocolVersion = rpc::kProtocolVersion;
         std::atomic<int> sawClientVersion{-1};   // the version the client sent in its hello
+        std::mutex sentMutex;
+        json foundationParams;   // what the last "foundation" run was sent
 
         explicit ScriptedWorker(std::unique_ptr<rpc::Transport> transport, std::string token = {}, bool slowRun = false,
                                 int version = rpc::kProtocolVersion)
@@ -72,7 +77,7 @@ namespace {
                             send({{"id", id}, {"type", "error"}, {"message", "bad token"}});
                             continue;
                         }
-                        json caps = {{"version", "test"}, {"methods", {"run:torch_segment", "model_info"}}, {"cuda", false}, {"device", "cpu"}, {"hostname", "loop"}};
+                        json caps = {{"version", "test"}, {"methods", {"run:torch_segment", "run:foundation", "model_info"}}, {"cuda", false}, {"device", "cpu"}, {"hostname", "loop"}};
                         if (protocolVersion >= 0) caps["protocol_version"] = protocolVersion;
                         send({{"id", id}, {"type", "result"}, {"result", caps}});
                     } else if (method == "cancel") {
@@ -95,6 +100,32 @@ namespace {
                                 auto c = rpc::decodeFrame(buf);
                                 if (!c) t->receive(buf, std::chrono::milliseconds(25));
                             }
+                            continue;
+                        }
+                        if (kind == "foundation") {
+                            // the foundation model's reply: (t, z, y, x) uint32
+                            // labels holding two one-voxel objects per frame,
+                            // which is what a Detect run returns, a confidence
+                            // map, and the facts the step reports
+                            {
+                                std::lock_guard<std::mutex> lock(sentMutex);
+                                foundationParams = h["params"].value("params", json::object());
+                            }
+                            const std::vector<Index> s = m->tensors.at(0).shape;   // (c, t, z, y, x)
+                            const Index volume = s.at(2) * s.at(3) * s.at(4);
+                            std::vector<std::uint32_t> labels(static_cast<std::size_t>(s[1] * volume), 0u);
+                            std::vector<float> confidence(labels.size(), 0.9f);
+                            for (Index t = 0; t < s[1]; ++t) {
+                                labels[static_cast<std::size_t>(t * volume + (s[3] + 1) * s[4] + 1)] = 1u;   // (1, 1, 1)
+                                labels[static_cast<std::size_t>((t + 1) * volume - 1)] = 2u;   // the last voxel
+                            }
+                            const std::vector<Index> shape{s[1], s[2], s[3], s[4]};
+                            rpc::TensorRef l{"labels", "uint32", shape, labels.data(), labels.size() * sizeof(std::uint32_t)};
+                            rpc::TensorRef c{"confidence", "float32", shape, confidence.data(), confidence.size() * sizeof(float)};
+                            send({{"id", id},
+                                  {"type", "result"},
+                                  {"result", {{"model", "stub"}, {"threshold", 0.5}, {"min_separation_um", 1.0}, {"objects", 2 * s[1]}, {"tracks", 2}, {"divisions", 1}}}},
+                                 {l, c});
                             continue;
                         }
                         REQUIRE(m->tensors.size() == 1);
@@ -333,6 +364,82 @@ TEST_CASE("A worker that ignores a cancel is given up after the grace period", "
     CHECK(std::chrono::steady_clock::now() - t0 < std::chrono::seconds(5));
     CHECK_FALSE(rw.isOpen());   // the connection is done: nothing waits on it any more
     canceller.join();
+}
+
+TEST_CASE("the foundation step keeps the labels the worker returns and reports its run", "[app][rpc][foundation]") {
+    registerBuiltinOperations();
+    auto [client, server] = rpc::loopbackPair();
+    ScriptedWorker worker(std::move(server));
+    RemoteWorker rw(std::move(client));
+    test::TempFile bundle("foundation", ".ltb");
+    { std::ofstream(bundle.path) << "stub"; }
+
+    const Dims5 dims{1, 2, 4, 8, 8};
+    auto array = std::make_shared<Array5>(Array5::zeros(dims));
+    DatasetMeta meta;
+    meta.dims = dims;
+    meta.voxelUm = {0.15, 0.15, 0.75};
+    meta.normalizeChannels();
+    const Operation& op = requireOperation("foundation");
+    ParamSet p = op.defaults();
+    p.set("model", bundle.str);
+    StepContext ctx;
+    ctx.remote = &rw;
+    const auto sent = [&worker] {
+        std::lock_guard<std::mutex> lock(worker.sentMutex);
+        return worker.foundationParams;
+    };
+
+    SECTION("Detect with a Min. voxels keeps its one-voxel objects") {
+        // the step used to run its own size filter after the worker's, on
+        // every task but Track: a detection is one voxel, so all were removed
+        p.set("task", std::string("Detect centroids"));
+        p.set("min_voxels", std::int64_t{5});
+        const StepOutput out = op.run(StepInput{meta, array, nullptr, nullptr}, p, ctx);
+        REQUIRE(out.labels);
+        CHECK(out.labels->at(0, 1, 1, 1) == 1u);
+        CHECK(out.labels->at(1, 3, 7, 7) == 2u);
+        CHECK(out.labels->stats().size() >= 2);
+        // the note carries the summary: it was read after the diagnostics were moved from
+        CHECK_THAT(out.note, Catch::Matchers::ContainsSubstring("detect · 2 labels"));
+        CHECK_THAT(out.diagnostics.summary, Catch::Matchers::ContainsSubstring("2 labels"));
+        const json params = sent();
+        CHECK(params.value("task", "") == "detect");
+        // (x, y, z), the application's order; the worker turns it into latents' (z, y, x)
+        CHECK(params["voxel_um"] == json::array({0.15, 0.15, 0.75}));
+        CHECK_FALSE(params.contains("tile"));   // all zero: the bundle's own
+    }
+    SECTION("Segment keeps small objects as the worker sent them") {
+        p.set("min_voxels", std::int64_t{5});
+        const StepOutput out = op.run(StepInput{meta, array, nullptr, nullptr}, p, ctx);
+        REQUIRE(out.labels);
+        CHECK(out.labels->at(1, 1, 1, 1) == 1u);
+        CHECK(sent().value("min_voxels", 0) == 5);   // the worker applies it
+    }
+    SECTION("a tracking run is tracked and its division count says it is approximate") {
+        p.set("task", std::string("Track over time"));
+        const StepOutput out = op.run(StepInput{meta, array, nullptr, nullptr}, p, ctx);
+        REQUIRE(out.labels);
+        CHECK(out.labels->tracked());
+        CHECK_THAT(out.note, Catch::Matchers::ContainsSubstring("2 tracks"));
+        CHECK(std::any_of(out.diagnostics.facts.begin(), out.diagnostics.facts.end(),
+                          [](const DiagnosticFact& f) { return f.key == "Divisions (approx.)" && f.value == "1"; }));
+    }
+    SECTION("a tile with some extents given is sent, zero meaning the bundle's on that axis") {
+        p.set("tile", std::vector<double>{0, 32, 32});
+        (void)op.run(StepInput{meta, array, nullptr, nullptr}, p, ctx);
+        CHECK(sent()["tile"] == json::array({0, 32, 32}));
+    }
+    SECTION("Min. voxels is shown for Segment only") {
+        const auto spec = std::find_if(op.info().params.begin(), op.info().params.end(),
+                                       [](const ParamSpec& s) { return s.key == "min_voxels"; });
+        REQUIRE(spec != op.info().params.end());
+        CHECK(spec->visibleFor(p));
+        p.set("task", std::string("Detect centroids"));
+        CHECK_FALSE(spec->visibleFor(p));
+        p.set("task", std::string("Track over time"));
+        CHECK_FALSE(spec->visibleFor(p));
+    }
 }
 
 TEST_CASE("connectTcp reports an unreachable port", "[app][rpc]") {

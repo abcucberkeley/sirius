@@ -26,6 +26,7 @@ namespace sirius::app {
             &makeStitchOperation,
             &makeRegisterOperation,
             // Segment
+            &makeFoundationOperation,
             &makeTorchSegmentationOperation,
             &makeThresholdOperation,
             &makeClassicalSegmentationOperation,
