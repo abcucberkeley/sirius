@@ -53,6 +53,22 @@ namespace sirius::app {
         if (isCancelled()) throw CancelledError{};
     }
 
+    bool StepContext::allCudaDevices() const noexcept {
+        return backend == Backend::Cuda && device.isCuda() && device.index < 0 && cudaAvailable() &&
+               cudaDeviceCount() > 0;
+    }
+
+    Device StepContext::deviceForVolume(Index c, Index t, Index nChannels) const {
+        if (backend != Backend::Cuda || !cudaAvailable()) return Device::cpu();
+        const int n = cudaDeviceCount();
+        if (n <= 0) return Device::cpu();
+        if (device.isCuda() && device.index >= 0) return Device::cuda(std::min(device.index, n - 1));
+        if (!allCudaDevices()) return Device::cpu();
+        const Index stride = std::max<Index>(1, nChannels);
+        const Index i = t * stride + c;
+        return Device::cuda(static_cast<int>(i % n));
+    }
+
     // --- StepInput --------------------------------------------------------------
 
     ArrayPtr StepInput::materialize(const std::function<void(double, const std::string&)>& progress) const {

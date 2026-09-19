@@ -202,16 +202,23 @@ namespace sirius::app {
         // here, never on the GUI thread.
         ViewerLoader loader;
         quint64 volumeKey = 0;          // the reduction the 3D view is waiting for
-        QString sliceNotice;            // "Loading…" for the panes that need a volume
+        QString sliceNotice;            // "Loading 37%" for the panes that need a volume
+        bool loadActive = false;        // volume decode in flight; drives the status bar
         // (output, c, t) reads that threw: not asked for again until the
         // displayed output changes.
         std::set<std::tuple<const StepOutput*, Index, Index>> failedVolumes;
         int displayIndex = -1;
         QImage xyImg, xzImg, yzImg, mipImg, cmpLeftImg, cmpRightImg;
-        int xyFactor = 1, mipFactor = 1, cmpFactor = 1, cmpLeftFactor = 1;
-        // Rendered voxel regions of the XY-like panes: the visible part plus
-        // a margin. Panning out of them, or a factor change, re-renders.
-        QRect xyRegion, cmpRegion, cmpLeftRegion;
+        int xyFactor = 1, xzFactor = 1, yzFactor = 1, mipFactor = 1, cmpFactor = 1, cmpLeftFactor = 1;
+        // Rendered voxel regions: the visible part plus a margin. Panning out
+        // of them, or a factor change, re-renders.
+        QRect xyRegion, xzRegion, yzRegion, cmpRegion, cmpLeftRegion;
+        // One image pixel per this many voxels, from the finer of the two
+        // pane axes (XZ / YZ are anisotropic because z is stretched).
+        static int paneFactor(const SlicePane::View& v) {
+            const double p = std::min(v.zx, v.zy);
+            return std::max(1, static_cast<int>(std::floor(1.0 / std::max(p, 1e-6))));
+        }
         // The voxels a pane shows now (no margin), for containment checks.
         static QRect visibleVoxels(const SlicePane* pane, Index cols, Index rows) {
             const QPointF a = pane->toVoxel(QPointF(0, 0));
@@ -338,8 +345,13 @@ namespace sirius::app {
         // Asks the loader for whatever (c, t) volumes the visible channels
         // still need; the aggregate state of those channels.
         DisplayModel::VolumeState ensureVolumes(DisplayModel& m, Index t);
+        // Visible channels: volume is in RAM (slices can draw), MIP is cached.
+        void volumeReadiness(const DisplayModel& m, Index t, bool& haveVol, bool& haveMip) const;
         void onVolumeReady(const ViewerLoader::Volume& v);
         void onReductionReady(const ViewerLoader::Reduction& r);
+        void onVolumeProgress(double fraction, const QString& message);
+        void beginLoad();
+        void endLoad();
         bool canPaint() const { return wb.canEdit(); }
         // Compare's own plane when View ▸ Sync Z / T is off.
         Index compareZ() const;
@@ -741,7 +753,11 @@ namespace sirius::app {
             zoomAround(std::pow(kWheelZoomBase, steps), s);
         });
         QObject::connect(xy, &SlicePane::hovered, q, [this](QPointF v) { hover(SlicePane::Kind::XY, v); });
-        QObject::connect(xy, &SlicePane::resized, q, [this] { layoutPanes(); dirty.xy = true; scheduleUpdate(); });
+        QObject::connect(xy, &SlicePane::resized, q, [this] {
+            layoutPanes();
+            dirty.xy = dirty.xz = dirty.yz = true;
+            scheduleUpdate();
+        });
 
         // YZ / XZ: probe moves the crosshair (and z); navigate pans along the shared axis
         QObject::connect(yz, &SlicePane::pressed, q, [this](QPointF v, Qt::MouseButton b, Qt::KeyboardModifiers) {
@@ -758,7 +774,7 @@ namespace sirius::app {
             zoomAround(std::pow(kWheelZoomBase, steps), QPointF(xy->width() / 2.0, s.y()));
         });
         QObject::connect(yz, &SlicePane::hovered, q, [this](QPointF v) { hover(SlicePane::Kind::YZ, v); });
-        QObject::connect(yz, &SlicePane::resized, q, [this] { layoutPanes(); });
+        QObject::connect(yz, &SlicePane::resized, q, [this] { layoutPanes(); dirty.yz = true; scheduleUpdate(); });
 
         QObject::connect(xz, &SlicePane::pressed, q, [this](QPointF v, Qt::MouseButton b, Qt::KeyboardModifiers) {
             if (b == Qt::LeftButton && probe() && model.valid())
@@ -774,7 +790,7 @@ namespace sirius::app {
             zoomAround(std::pow(kWheelZoomBase, steps), QPointF(s.x(), xy->height() / 2.0));
         });
         QObject::connect(xz, &SlicePane::hovered, q, [this](QPointF v) { hover(SlicePane::Kind::XZ, v); });
-        QObject::connect(xz, &SlicePane::resized, q, [this] { layoutPanes(); });
+        QObject::connect(xz, &SlicePane::resized, q, [this] { layoutPanes(); dirty.xz = true; scheduleUpdate(); });
         QObject::connect(mip, &SlicePane::resized, q, [this] { layoutPanes(); dirty.mip = true; scheduleUpdate(); });
         QObject::connect(mip, &SlicePane::pressed, q, [this](QPointF v, Qt::MouseButton b, Qt::KeyboardModifiers) {
             if (b == Qt::LeftButton && probe() && model.valid())
@@ -899,6 +915,8 @@ namespace sirius::app {
                          [this](const ViewerLoader::Volume& v) { onVolumeReady(v); });
         QObject::connect(&loader, &ViewerLoader::reductionReady, q,
                          [this](const ViewerLoader::Reduction& r) { onReductionReady(r); });
+        QObject::connect(&loader, &ViewerLoader::volumeProgress, q,
+                         [this](double f, const QString& msg) { onVolumeProgress(f, msg); });
     }
 
     // --- asynchronous volumes ------------------------------------------------------
@@ -913,7 +931,7 @@ namespace sirius::app {
                 case DisplayModel::VolumeState::Wanted:
                     if (failedVolumes.count({m.output().get(), c, t})) break;
                     wanted = true;
-                    loader.prepare(m.output(), c, t);
+                    if (loader.prepare(m.output(), c, t) && !m.output()->array) beginLoad();
                     break;
                 case DisplayModel::VolumeState::TooLarge: tooLarge = true; break;
             }
@@ -922,28 +940,75 @@ namespace sirius::app {
         return wanted ? DisplayModel::VolumeState::Wanted : DisplayModel::VolumeState::Ready;
     }
 
+    void ViewerWidget::Impl::volumeReadiness(const DisplayModel& m, Index t, bool& haveVol, bool& haveMip) const {
+        haveVol = haveMip = true;
+        if (!m.valid()) {
+            haveVol = haveMip = false;
+            return;
+        }
+        for (Index c = 0; c < m.dims().c; ++c) {
+            if (!vs().channelOn(c)) continue;
+            if (!m.volumeIfReady(c, t)) haveVol = false;
+            if (!m.mipIfReady(c, t)) haveMip = false;
+        }
+    }
+
     void ViewerWidget::Impl::onVolumeReady(const ViewerLoader::Volume& v) {
         DisplayModel* target = nullptr;
         if (v.out == model.output()) target = &model;
         else if (v.out == rawModel.output()) target = &rawModel;
-        if (!target) return;                                  // the viewer moved on: drop it
-        if (target == &model && v.t != curT()) return;        // a time point ago: drop it too
+        if (!target) {
+            if (!loader.busy()) endLoad();
+            return;                                  // the viewer moved on: drop it
+        }
         if (!v.ok) {
             failedVolumes.insert({v.out.get(), v.c, v.t});
             sliceNotice = QStringLiteral("could not read the volume");
             refreshHints();
             wb.logLine("Viewer: " + toStd(v.error));
+            if (!loader.busy()) endLoad();
             return;
         }
         if (ScopedTrace::enabled())
             qInfo("view volume c%lld t%lld ready in %lld us (%s)", static_cast<long long>(v.c), static_cast<long long>(v.t),
                   v.micros, v.volume ? "read" : "in memory");
-        target->installVolume(v.c, v.t, v.volume, v.mip, v.lo, v.hi);
-        // A new exact range can move the display window, so nothing is
-        // spared; applyDirty clears the loading notice once every visible
-        // channel has arrived.
-        dirty = Dirty{};
-        scheduleUpdate();
+        std::shared_ptr<Buffer<float>> vol = v.volume;
+        // A late lazy read must not evict the time point on screen; its MIP
+        // is still worth keeping for the next loop of play.
+        if (target == &model && v.t != curT()) vol.reset();
+        if (target == &rawModel && v.t != compareT()) vol.reset();
+        target->installVolume(v.c, v.t, std::move(vol), v.mip, v.lo, v.hi);
+        // Cache MIPs for every t (play loops). Only the current frame needs a
+        // redraw; an older job that finished late is still worth keeping.
+        if ((target == &model && v.t == curT()) || (target == &rawModel && v.t == compareT())) {
+            dirty = Dirty{};
+            scheduleUpdate();
+        }
+        if (!loader.busy()) endLoad();
+    }
+
+    void ViewerWidget::Impl::onVolumeProgress(double fraction, const QString& message) {
+        if (!loadActive) beginLoad();
+        QString tail = message;
+        if (tail.startsWith(QLatin1String("reading "))) tail = tail.mid(8);
+        sliceNotice = QStringLiteral("Loading %1%").arg(static_cast<int>(std::clamp(fraction, 0.0, 1.0) * 100.0 + 0.5));
+        if (!tail.isEmpty()) sliceNotice += QStringLiteral(" · ") + tail;
+        refreshHints();
+        if (volume) volume->setPreparing(sliceNotice);
+        emit q->loadProgress(fraction, sliceNotice);
+    }
+
+    void ViewerWidget::Impl::beginLoad() {
+        if (loadActive) return;
+        loadActive = true;
+        if (sliceNotice.isEmpty()) sliceNotice = QStringLiteral("Loading…");
+        emit q->loadStarted();
+    }
+
+    void ViewerWidget::Impl::endLoad() {
+        if (!loadActive) return;
+        loadActive = false;
+        emit q->loadFinished();
     }
 
     void ViewerWidget::Impl::onReductionReady(const ViewerLoader::Reduction& r) {
@@ -981,6 +1046,7 @@ namespace sirius::app {
             if (changed) {
                 // results for the old output are no longer wanted
                 loader.cancelAll();
+                endLoad();
                 volumeKey = 0;
                 sliceNotice.clear();
                 failedVolumes.clear();
@@ -1224,8 +1290,11 @@ namespace sirius::app {
             xz->setMessage(QStringLiteral("volume too large for re-slicing"));
             mip->setMessage(QStringLiteral("volume too large"));
         } else {
-            // "Loading…" while the loader reads the volume these three need
-            for (SlicePane* p : {yz, xz, mip}) p->setMessage(sliceNotice);
+            bool haveVol = false, haveMip = false;
+            volumeReadiness(model, curT(), haveVol, haveMip);
+            xz->setMessage(haveVol ? QString() : sliceNotice);
+            yz->setMessage(haveVol ? QString() : sliceNotice);
+            mip->setMessage(haveMip ? QString() : sliceNotice);
         }
         xy->setHint(hint);
         cmpRight->setHint(hint);
@@ -1265,7 +1334,8 @@ namespace sirius::app {
         } else {
             if (s.t != prev.t) dirty = Dirty{};
             if (s.z != prev.z) dirty.xy = dirty.cmp = true;
-            if (s.cx != prev.cx || s.cy != prev.cy) dirty.xz = dirty.yz = true;
+            if (s.cx != prev.cx) dirty.yz = true;
+            if (s.cy != prev.cy) dirty.xz = true;
             if (s.channelVisible != prev.channelVisible) dirty = Dirty{};
             if (s.labels != prev.labels || s.labelOpacity != prev.labelOpacity || s.selectedLabel != prev.selectedLabel ||
                 s.soloLabel != prev.soloLabel)
@@ -1312,6 +1382,7 @@ namespace sirius::app {
         xy->setView(v);
         const Index cz = curZ();
         // YZ: rows y follow XY, cols z at the physical aspect, centred on z when wider than the pane
+        yz->setGrid(nz(), ny());
         {
             SlicePane::View w;
             w.zy = v.zy;
@@ -1321,6 +1392,7 @@ namespace sirius::app {
             w.ox = ez <= yz->width() ? (yz->width() - ez) / 2.0 : yz->width() / 2.0 - (cz + 0.5) * w.zx;
             yz->setView(w);
         }
+        xz->setGrid(nx(), nz());
         {
             SlicePane::View w;
             w.zx = v.zx;
@@ -1382,12 +1454,32 @@ namespace sirius::app {
             mipFactor = mipWant;
             dirty.mip = true;
         }
+        const int xzWant = paneFactor(xz->view());
+        if (xzWant != xzFactor) {
+            xzFactor = xzWant;
+            dirty.xz = true;
+        }
+        const int yzWant = paneFactor(yz->view());
+        if (yzWant != yzFactor) {
+            yzFactor = yzWant;
+            dirty.yz = true;
+        }
         xy->setSmooth(v.zx * xyFactor * xy->devicePixelRatioF() < 1.0);
+        xz->setSmooth(std::min(xz->view().zx, xz->view().zy) * xzFactor * xz->devicePixelRatioF() < 1.0);
+        yz->setSmooth(std::min(yz->view().zx, yz->view().zy) * yzFactor * yz->devicePixelRatioF() < 1.0);
         cmpRight->setSmooth(cmpRight->view().zx * cmpFactor * cmpRight->devicePixelRatioF() < 1.0);
         cmpLeft->setSmooth(cmpLeft->view().zx * cmpLeftFactor * cmpLeft->devicePixelRatioF() < 1.0);
         // the view moved out of what was rendered (pan / zoom / resize): render again
         if (!dirty.xy && xy->hasContent() && !xyRegion.isEmpty() && !xyRegion.contains(visibleVoxels(xy, nx(), ny()))) {
             dirty.xy = true;
+            scheduleUpdate();
+        }
+        if (!dirty.xz && xz->hasContent() && !xzRegion.isEmpty() && !xzRegion.contains(visibleVoxels(xz, nx(), nz()))) {
+            dirty.xz = true;
+            scheduleUpdate();
+        }
+        if (!dirty.yz && yz->hasContent() && !yzRegion.isEmpty() && !yzRegion.contains(visibleVoxels(yz, nz(), ny()))) {
+            dirty.yz = true;
             scheduleUpdate();
         }
         if (!dirty.cmp && s.mode == ViewMode::Compare && cmpRight->hasContent() && !cmpRegion.isEmpty() &&
@@ -1464,24 +1556,27 @@ namespace sirius::app {
             into = clock.nsecsElapsed() / 1000;
             clock.restart();
         };
-        // The XZ / YZ re-slices and the MIP corner need a whole (c, t)
-        // volume: ask for what is missing and say so, rather than reading
-        // gigabytes on this thread.
+        // XZ / YZ need the (c, t) volume in RAM; the MIP corner also needs a
+        // z-projection. Play used to wait for the projection (a full pass over
+        // ~10^8 voxels) before drawing the slices, so the movie stuttered.
         const bool needsVolume = s.mode == ViewMode::Ortho;
+        bool haveVol = false, haveMip = false;
         if (needsVolume) {
+            volumeReadiness(model, t, haveVol, haveMip);
             const DisplayModel::VolumeState vstate = ensureVolumes(model, t);
-            const QString notice = vstate == DisplayModel::VolumeState::Wanted ? QStringLiteral("Loading…") : QString();
+            const QString notice = !haveVol && vstate == DisplayModel::VolumeState::Wanted
+                                       ? (sliceNotice.isEmpty() ? QStringLiteral("Loading…") : sliceNotice)
+                                       : QString();
             if (notice != sliceNotice) {
                 sliceNotice = notice;
                 if (ScopedTrace::enabled())
-                    qInfo("view slices %s", notice.isEmpty() ? "have their volume" : "waiting for the volume (Loading...)");
+                    qInfo("view slices %s", haveVol ? (haveMip ? "ready" : "have volume, MIP pending")
+                                                    : "waiting for the volume (Loading...)");
                 refreshHints();
             }
-            if (vstate != DisplayModel::VolumeState::Ready) {
-                // keep whatever the panes already show and try again when the
-                // volume lands (onVolumeReady re-schedules)
-                dirty.xz = dirty.yz = dirty.mip = false;
-            }
+            if (!haveVol) dirty.xz = dirty.yz = false;
+            if (!haveMip) dirty.mip = false;
+            if (playTimer.isActive() && nt() > 1) ensureVolumes(model, (t + 1) % nt());
         }
         if (s.mode == ViewMode::Ortho) {
             if (dirty.xy) {
@@ -1505,25 +1600,37 @@ namespace sirius::app {
             if (dirty.xz) {
                 qint64 r = 0, o = 0, c = 0;
                 clock.start();
-                model.renderXZ(t, curY(), s, xzImg);
+                xzRegion = renderRegion(xz, xzFactor, nx(), nz());
+                model.renderXZ(t, curY(), s, xzFactor, xzImg, xzRegion);
                 lap(r);
-                if (s.labels) model.overlayLabelsXZ(t, curY(), s, xzImg);
+                if (s.labels) model.overlayLabelsXZ(t, curY(), xzFactor, s, xzImg, xzRegion);
                 lap(o);
-                xz->setContent(xzImg, 1, nx(), nz());
+                xz->setContent(xzImg, xzFactor, nx(), nz(), xzRegion.topLeft());
                 lap(c);
-                if (trace) qInfo("view xz %dx%d: render %lld us · labels %lld us · content %lld us", xzImg.width(), xzImg.height(), r, o, c);
+                if (trace) {
+                    const QRect vis = visibleVoxels(xz, nx(), nz());
+                    qInfo("view xz %dx%d f%d at %d,%d (visible %d,%d %dx%d · pane %dx%d · zx %.3f zy %.3f): render %lld us · labels %lld us · content %lld us",
+                          xzImg.width(), xzImg.height(), xzFactor, xzRegion.x(), xzRegion.y(), vis.x(), vis.y(), vis.width(), vis.height(),
+                          xz->width(), xz->height(), xz->view().zx, xz->view().zy, r, o, c);
+                }
                 dirty.xz = false;
             }
             if (dirty.yz) {
                 qint64 r = 0, o = 0, c = 0;
                 clock.start();
-                model.renderYZ(t, curX(), s, yzImg);
+                yzRegion = renderRegion(yz, yzFactor, nz(), ny());
+                model.renderYZ(t, curX(), s, yzFactor, yzImg, yzRegion);
                 lap(r);
-                if (s.labels) model.overlayLabelsYZ(t, curX(), s, yzImg);
+                if (s.labels) model.overlayLabelsYZ(t, curX(), yzFactor, s, yzImg, yzRegion);
                 lap(o);
-                yz->setContent(yzImg, 1, nz(), ny());
+                yz->setContent(yzImg, yzFactor, nz(), ny(), yzRegion.topLeft());
                 lap(c);
-                if (trace) qInfo("view yz %dx%d: render %lld us · labels %lld us · content %lld us", yzImg.width(), yzImg.height(), r, o, c);
+                if (trace) {
+                    const QRect vis = visibleVoxels(yz, nz(), ny());
+                    qInfo("view yz %dx%d f%d at %d,%d (visible %d,%d %dx%d · pane %dx%d · zx %.3f zy %.3f): render %lld us · labels %lld us · content %lld us",
+                          yzImg.width(), yzImg.height(), yzFactor, yzRegion.x(), yzRegion.y(), vis.x(), vis.y(), vis.width(), vis.height(),
+                          yz->width(), yz->height(), yz->view().zx, yz->view().zy, r, o, c);
+                }
                 dirty.yz = false;
             }
             if (dirty.mip) {
@@ -1630,7 +1737,7 @@ namespace sirius::app {
             return;
         }
         if (vstate == DisplayModel::VolumeState::Wanted) {
-            volume->setPreparing(QStringLiteral("Loading volume…"));
+            volume->setPreparing(sliceNotice.isEmpty() ? QStringLiteral("Loading volume…") : sliceNotice);
             return;   // the textures already up stay up until the new ones land
         }
         // The reduction to <= 256 texels per axis is a pass over every voxel:

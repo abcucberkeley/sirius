@@ -161,6 +161,17 @@ namespace sirius {
 
     TiffInfo inspectTiff(const std::string& path);
 
+    // Width, height and page count without walking every IFD's tags. Used when
+    // describing a folder of stacks: a full inspectTiff of every file would
+    // open hundreds of multi-page TIFFs just to confirm they match.
+    struct TiffStackShape {
+        std::uint32_t width = 0;
+        std::uint32_t height = 0;
+        std::size_t pages = 0;
+        PixelType pixelType = PixelType::UInt8;
+    };
+    TiffStackShape inspectTiffShape(const std::string& path);
+
     // Rectangle inside an image, in pixels. width/height of 0 extend to the edge.
     struct Region {
         std::uint32_t x = 0;
@@ -180,6 +191,13 @@ namespace sirius {
         // nvCOMP missing for Deflate, ...) decode with libtiff and upload
         // instead of throwing.
         bool allowCpuFallback = true;
+        // libtiff page loop: 0 = size the OpenMP team from the work (about
+        // one thread per MiB), 1 = one handle, pages in file order. Folder
+        // datasets use 1 so many files stream in parallel without seeking
+        // around each stack.
+        int maxThreads = 0;
+        // 0..1 over pages. Called from the decode threads; keep it cheap.
+        std::function<void(double)> progress;
     };
 
     // --- TiffFile ---------------------------------------------------------

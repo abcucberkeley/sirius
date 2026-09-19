@@ -17,6 +17,9 @@
 #include <sstream>
 #include <stdexcept>
 #include <tuple>
+#ifndef _WIN32
+#include <dirent.h>
+#endif
 
 #include <nlohmann/json.hpp>
 #include <toml++/toml.hpp>
@@ -226,6 +229,13 @@ namespace sirius::app {
         return p.is_absolute() ? p : folder / p;
     }
 
+    fs::path DatasetManifest::filesRoot(const fs::path& loadedFrom) const {
+        if (!filesFolder.empty()) return fs::path(filesFolder);
+        std::error_code ec;
+        if (fs::is_directory(loadedFrom, ec)) return loadedFrom;
+        return loadedFrom.parent_path();
+    }
+
     Index DatasetManifest::channelIndex(const std::string& channel) const noexcept {
         for (std::size_t i = 0; i < channels.size(); ++i)
             if (channels[i].label == channel) return static_cast<Index>(i);
@@ -263,6 +273,7 @@ namespace sirius::app {
         j["frame_interval_s"] = frameIntervalS;
         j["acquisition"] = acquisition;
         j["pattern"] = pattern;
+        if (!filesFolder.empty()) j["files_folder"] = filesFolder;
         j["sim"] = json{{"present", sim.present}, {"ndirs", sim.ndirs}, {"nphases", sim.nphases}, {"fast_si", sim.fastSi}};
         j["channels"] = json::array();
         for (const ChannelInfo& c : channels) j["channels"].push_back(channelToJson(c));
@@ -282,6 +293,7 @@ namespace sirius::app {
         m.frameIntervalS = numberField(j, "frame_interval_s", 0.0);
         m.acquisition = stringField(j, "acquisition");
         m.pattern = stringField(j, "pattern");
+        m.filesFolder = stringField(j, "files_folder");
         if (j.contains("sim") && j["sim"].is_object()) {
             const json& s = j["sim"];
             m.sim.present = s.value("present", false);
@@ -513,15 +525,31 @@ namespace sirius::app {
     } // namespace
 
     // naturalLess above is what puts "f2" before "f10".
+    // Names only: QDir and directory_entry::is_regular_file stat every entry.
+    // On NFS / Vast, readdir reports DT_UNKNOWN, so a Files filter skips the
+    // TIFFs unless each one is stated — and stating hundreds of 300 MB stacks
+    // hangs the GUI. Extension of the name is enough here.
     std::vector<std::string> tiffNamesInOrder(const fs::path& folder) {
         std::vector<std::string> names;
+#ifdef _WIN32
         std::error_code ec;
         for (const fs::directory_entry& e : fs::directory_iterator(folder, ec)) {
             if (!e.is_regular_file(ec) || !isTiffName(e.path())) continue;
             const std::string name = e.path().filename().string();
-            if (!name.empty() && name.front() == '.') continue;   // resource forks and the like
+            if (!name.empty() && name.front() == '.') continue;
             names.push_back(name);
         }
+#else
+        DIR* dir = ::opendir(folder.string().c_str());
+        if (!dir) return names;
+        while (const dirent* ent = ::readdir(dir)) {
+            const char* n = ent->d_name;
+            if (n[0] == '.') continue;   // ".", ".." and resource forks
+            if (!isTiffName(fs::path(n))) continue;
+            names.emplace_back(n);
+        }
+        ::closedir(dir);
+#endif
         std::sort(names.begin(), names.end(), naturalLess);
         return names;
     }
@@ -546,10 +574,7 @@ namespace sirius::app {
     DatasetManifest manifestFromFolder(const fs::path& folder, const FilenameRule& rule, std::vector<std::string>* unmatched) {
         std::error_code ec;
         if (!fs::is_directory(folder, ec)) throw std::runtime_error("not a folder: " + folder.string());
-        std::vector<std::string> names;
-        for (const fs::directory_entry& e : fs::directory_iterator(folder, ec))
-            if (e.is_regular_file(ec) && isTiffName(e.path())) names.push_back(e.path().filename().string());
-        std::sort(names.begin(), names.end(), naturalLess);
+        std::vector<std::string> names = tiffNamesInOrder(folder);
 
         if (unmatched) unmatched->clear();
         std::vector<MatchedFile> matched;
@@ -619,25 +644,29 @@ namespace sirius::app {
             if (firstOfTile.emplace(f.tile, &f).second) tileNames.push_back(f.tile);
         std::sort(tileNames.begin(), tileNames.end(), naturalLess);
 
-        // every file must have the shape of the first one: the dataset has
-        // one (z, y, x) for all tiles, channels and time points
+        // Shape of the dataset: one (z, y, x) for every tile, channel and time
+        // point. Probe the first file of each tile — a diSPIM / AOLLS folder is
+        // hundreds of 800-page stacks, and inspectTiff of every file walks every
+        // IFD of every file (and used to get the process killed).
         std::uint32_t width = 0, height = 0;
         std::size_t pages = 0;
         std::string firstFile;
-        for (const MatchedFile& f : matched) {
-            const TiffInfo info = inspectTiff((folder / f.name).string());
-            if (info.pageCount() == 0) throw std::runtime_error(f.name + ": the TIFF has no pages");
+        auto probeShape = [&](const MatchedFile& f) {
+            const TiffStackShape info = inspectTiffShape((folder / f.name).string());
+            if (info.pages == 0) throw std::runtime_error(f.name + ": the TIFF has no pages");
             if (firstFile.empty()) {
-                width = info.width();
-                height = info.height();
-                pages = info.pageCount();
+                width = info.width;
+                height = info.height;
+                pages = info.pages;
                 firstFile = f.name;
-                continue;
+                return;
             }
-            if (info.width() != width || info.height() != height || info.pageCount() != pages)
-                throw std::runtime_error("tile shape mismatch: " + f.name + " is " + sizeText(info.width(), info.height(), info.pageCount()) +
+            if (info.width != width || info.height != height || info.pages != pages)
+                throw std::runtime_error("tile shape mismatch: " + f.name + " is " + sizeText(info.width, info.height, info.pages) +
                                          ", " + firstFile + " is " + sizeText(width, height, pages));
-        }
+        };
+        if (!matched.empty()) probeShape(matched.front());
+        for (const std::string& name : tileNames) probeShape(*firstOfTile[name]);
 
         std::vector<double> xs, ys, zs;   // Microns: for the grid ranks
         if (rule.positions == FilenameRule::Positions::Microns) {

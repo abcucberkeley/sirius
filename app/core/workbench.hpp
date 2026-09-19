@@ -234,6 +234,9 @@ namespace sirius::app {
 
         // --- dataset ---------------------------------------------------------
         void openDataset(const std::string& path, const OpenOptions& options = {});
+        // Install an already-opened result as the dataset. The GUI decodes on
+        // the worker thread, then calls this on the GUI thread.
+        void adoptDataset(OpenResult opened, const std::string& path, const OpenOptions& options = {});
 
         // --- session recording ------------------------------------------------
         // Writes what the user does to a JSON-lines file: the dataset, every
@@ -350,6 +353,9 @@ namespace sirius::app {
         // --- running ---------------------------------------------------------
         Backend backend() const noexcept { return backend_; }
         void setBackend(Backend b);
+        // CUDA ordinal, or kAllCudaDevices (-1) to round-robin every volume
+        // across all visible GPUs.
+        static constexpr int kAllCudaDevices = -1;
         int cudaDevice() const noexcept { return cudaDevice_; }
         void setCudaDevice(int index);
         const RemoteConfig& remoteConfig() const noexcept { return remote_; }
@@ -441,6 +447,7 @@ namespace sirius::app {
         // Open `path` with `options`; the Load step's parameters become
         // `loadParams` with the options written into them.
         void openDatasetAs(const std::string& path, const OpenOptions& options, ParamSet loadParams);
+        void installOpened(OpenResult opened, const std::string& path, const OpenOptions& options, ParamSet loadParams);
         // Seeds the executor with loadOutput_ when the Load step's parameters
         // are still the ones it was opened with (otherwise the step re-runs).
         void seedLoadOutput();

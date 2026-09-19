@@ -446,9 +446,18 @@ namespace sirius::app {
         openDatasetAs(path, options, op ? op->defaults() : ParamSet{});
     }
 
+    void Workbench::adoptDataset(OpenResult opened, const std::string& path, const OpenOptions& options) {
+        const Operation* op = findOperation("load");
+        installOpened(std::move(opened), path, options, op ? op->defaults() : ParamSet{});
+    }
+
     void Workbench::openDatasetAs(const std::string& path, const OpenOptions& options, ParamSet loadParams) {
         if (refuseIfRunning("open a dataset")) throw std::runtime_error("A run is in progress: cancel it or wait before opening a dataset.");
-        OpenResult opened = sirius::app::openDataset(path, options);   // throws with a message
+        installOpened(sirius::app::openDataset(path, options), path, options, std::move(loadParams));
+    }
+
+    void Workbench::installOpened(OpenResult opened, const std::string& path, const OpenOptions& options, ParamSet loadParams) {
+        if (refuseIfRunning("open a dataset")) throw std::runtime_error("A run is in progress: cancel it or wait before opening a dataset.");
         applyOpenOptions(loadParams, path, options, opened.meta);
         if (const Operation* op = findOperation("load")) {
             loadParams.applyDefaults(op->info().params);
@@ -1221,7 +1230,11 @@ namespace sirius::app {
     }
 
     void Workbench::setCudaDevice(int index) {
-        cudaDevice_ = std::max(0, index);
+        if (index < 0) cudaDevice_ = kAllCudaDevices;
+        else {
+            const int n = cudaDeviceCount();
+            cudaDevice_ = n > 0 ? std::min(index, n - 1) : 0;
+        }
         notify(&Observer::backendChanged);
     }
 
@@ -1303,7 +1316,11 @@ namespace sirius::app {
         job->target_ = target;
         job->executor_ = &executor_;
         job->ctx_.backend = backend_;
-        job->ctx_.device = (backend_ == Backend::Cuda && cudaAvailable()) ? Device::cuda(cudaDevice_) : Device::cpu();
+        if (backend_ == Backend::Cuda && cudaAvailable()) {
+            job->ctx_.device = Device::cuda(cudaDevice_);   // -1: every visible GPU
+        } else {
+            job->ctx_.device = Device::cpu();
+        }
         job->ctx_.scratchDir = executor_.scratchDir();
         job->ctx_.hubToken = hubToken_ ? hubToken_() : std::string();
         // The worker itself is obtained by execute(), on the run's thread.
@@ -1316,7 +1333,11 @@ namespace sirius::app {
             return nullptr;
         }
         activeRun_ = job;
-        logLine("Run to step " + Step::number(target) + " on " + toString(backend_));
+        if (backend_ == Backend::Cuda && cudaDevice_ == kAllCudaDevices && cudaAvailable())
+            logLine("Run to step " + Step::number(target) + " on CUDA · all " +
+                    std::to_string(cudaDeviceCount()) + " GPUs");
+        else
+            logLine("Run to step " + Step::number(target) + " on " + toString(backend_));
         notify(&Observer::runStateChanged);
         return job;
     }

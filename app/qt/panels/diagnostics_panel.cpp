@@ -339,8 +339,8 @@ namespace sirius::app {
                 const ViewState& vs = bridge_.wb().viewState();
                 // Label edits are refused while a run is active, painting
                 // included: the tools say so instead of doing nothing.
-                const bool editable = bridge_.wb().canEdit();
-                const QString frozen = QStringLiteral("Not while a run is in progress — cancel it (Esc) or wait");
+                const bool editable = bridge_.wb().canEdit() && !bridge_.taskRunning();
+                const QString frozen = QStringLiteral("Not while a run or load is in progress — cancel it (Esc) or wait");
                 for (GlyphButton* b : tools_) b->setEnabled(editable);
                 brush_->setEnabled(editable);
                 paint3d_->setEnabled(editable);
@@ -536,8 +536,8 @@ namespace sirius::app {
 
             void act(const QString& link, std::uint32_t id) {
                 Workbench& wb = bridge_.wb();
-                if (!wb.canEdit()) {
-                    wb.logLine("Label edits are refused while a run is in progress.");
+                if (!wb.canEdit() || bridge_.taskRunning()) {
+                    wb.logLine("Label edits are refused while a run or load is in progress.");
                     return;
                 }
                 if (link == QLatin1String("delete")) {
@@ -889,6 +889,8 @@ namespace sirius::app {
         connect(&bridge, &WorkbenchBridge::runFinished, this, [this](bool, const QString&) { impl_->refresh(); });
         // What the cleanup tools may do depends on the run state.
         connect(&bridge, &WorkbenchBridge::runStateChanged, this, [this] { impl_->refresh(); });
+        connect(&bridge, &WorkbenchBridge::taskStarted, this, [this] { impl_->refresh(); });
+        connect(&bridge, &WorkbenchBridge::taskFinished, this, [this] { impl_->refresh(); });
         d.updateModes();
         d.refresh();
     }

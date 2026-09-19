@@ -162,13 +162,8 @@ namespace sirius::app {
     }
 
     void DisplayModel::evictOtherTimePoints(Index t) {
-        // keep at most the volumes of one time point per channel
         for (auto vit = volumes_.begin(); vit != volumes_.end();)
             vit = vit->first.t != t ? volumes_.erase(vit) : std::next(vit);
-        for (auto mit = mips_.begin(); mit != mips_.end();)
-            mit = mit->first.t != t ? mips_.erase(mit) : std::next(mit);
-        for (auto rit = ranges_.begin(); rit != ranges_.end();)
-            rit = rit->first.t != t ? ranges_.erase(rit) : std::next(rit);
     }
 
     DisplayModel::VolumeState DisplayModel::volumeState(Index c, Index t) {
@@ -213,7 +208,6 @@ namespace sirius::app {
         }
         for (Index i = 0; i < n; ++i)
             if (!std::isfinite(m->data()[i])) m->data()[i] = lo;
-        evictOtherTimePoints(t);
         mips_[key] = std::move(m);
         // the same pass gives the exact range the full-range window wants
         ranges_[key] = Range{lo, hi};
@@ -226,9 +220,9 @@ namespace sirius::app {
         if (!valid()) return;
         const Dims5& d = meta_.dims;
         if (c < 0 || c >= d.c || t < 0 || t >= d.t) return;
-        evictOtherTimePoints(t);
         const Key key{c, t};
         if (volume) {
+            evictOtherTimePoints(t);
             volumes_[key] = std::move(volume);
             tooLarge_ = false;
         }
@@ -398,45 +392,41 @@ namespace sirius::app {
         blend(std::move(chans), r.height(), r.width(), factor, img);
     }
 
-    void DisplayModel::renderXZ(Index t, Index y, const ViewState& vs, QImage& img) {
+    void DisplayModel::renderXZ(Index t, Index y, const ViewState& vs, int factor, QImage& img, const QRect& region) {
         const Dims5& d = meta_.dims;
+        const QRect r = planeRegion(region, d.x, d.z);
         std::vector<ChannelPlane> chans = visibleChannels(vs, t);
         Index k = 0;
         y = std::clamp<Index>(y, 0, d.y - 1);
         for (Index c = 0; c < d.c; ++c) {
             if (!vs.channelOn(c)) continue;
             const float* v = volumeIfReady(c, t);
-            chans[static_cast<std::size_t>(k)].data = v ? v + y * d.x : nullptr;
+            chans[static_cast<std::size_t>(k)].data =
+                v ? v + y * d.x + static_cast<Index>(r.y()) * (d.y * d.x) + r.x() : nullptr;
             chans[static_cast<std::size_t>(k)].rowStride = d.y * d.x;   // next z
+            chans[static_cast<std::size_t>(k)].colStride = 1;
             ++k;
         }
-        blend(std::move(chans), d.z, d.x, 1, img);
+        blend(std::move(chans), r.height(), r.width(), factor, img);
     }
 
-    void DisplayModel::renderYZ(Index t, Index x, const ViewState& vs, QImage& img) {
+    void DisplayModel::renderYZ(Index t, Index x, const ViewState& vs, int factor, QImage& img, const QRect& region) {
         const Dims5& d = meta_.dims;
+        const QRect r = planeRegion(region, d.z, d.y);
         std::vector<ChannelPlane> chans = visibleChannels(vs, t);
         x = std::clamp<Index>(x, 0, d.x - 1);
-        // gather the column of every visible channel into (c, y, z) scratch
-        sliceScratch_.resize(chans.size() * static_cast<std::size_t>(d.y * d.z) + 1);
         Index k = 0;
         for (Index c = 0; c < d.c; ++c) {
             if (!vs.channelOn(c)) continue;
             const float* v = volumeIfReady(c, t);
-            float* dst = sliceScratch_.data() + k * d.y * d.z;
-            if (v) {
-                for (Index z = 0; z < d.z; ++z) {
-                    const float* src = v + z * d.y * d.x + x;
-                    for (Index yy = 0; yy < d.y; ++yy) dst[yy * d.z + z] = src[yy * d.x];
-                }
-                chans[static_cast<std::size_t>(k)].data = dst;
-            } else {
-                chans[static_cast<std::size_t>(k)].data = nullptr;
-            }
-            chans[static_cast<std::size_t>(k)].rowStride = d.z;
+            // (row y, col z) at fixed x: next y is +X, next z is +Y·X.
+            chans[static_cast<std::size_t>(k)].data =
+                v ? v + x + static_cast<Index>(r.y()) * d.x + static_cast<Index>(r.x()) * (d.y * d.x) : nullptr;
+            chans[static_cast<std::size_t>(k)].rowStride = d.x;
+            chans[static_cast<std::size_t>(k)].colStride = d.y * d.x;
             ++k;
         }
-        blend(std::move(chans), d.y, d.z, 1, img);
+        blend(std::move(chans), r.height(), r.width(), factor, img);
     }
 
     void DisplayModel::renderMIP(Index t, const ViewState& vs, int factor, QImage& img) {
@@ -511,19 +501,22 @@ namespace sirius::app {
                 static_cast<float>(vs.labelOpacity), vs.selectedLabel, vs.soloLabel ? vs.selectedLabel : 0u, img);
     }
 
-    void DisplayModel::overlayLabelsXZ(Index t, Index y, const ViewState& vs, QImage& img) {
+    void DisplayModel::overlayLabelsXZ(Index t, Index y, int factor, const ViewState& vs, QImage& img, const QRect& region) {
         const LabelVolume* L = labels();
         if (!L || t >= L->t() || y >= L->y()) return;
-        overlay(L->volume(t) + y * L->x(), L->z(), L->x(), L->y() * L->x(), 1, 1,
-                static_cast<float>(vs.labelOpacity), vs.selectedLabel, vs.soloLabel ? vs.selectedLabel : 0u, img);
+        const QRect r = planeRegion(region, L->x(), L->z());
+        overlay(L->volume(t) + y * L->x() + static_cast<Index>(r.y()) * (L->y() * L->x()) + r.x(), r.height(), r.width(),
+                L->y() * L->x(), 1, factor, static_cast<float>(vs.labelOpacity), vs.selectedLabel,
+                vs.soloLabel ? vs.selectedLabel : 0u, img);
     }
 
-    void DisplayModel::overlayLabelsYZ(Index t, Index x, const ViewState& vs, QImage& img) {
+    void DisplayModel::overlayLabelsYZ(Index t, Index x, int factor, const ViewState& vs, QImage& img, const QRect& region) {
         const LabelVolume* L = labels();
         if (!L || t >= L->t() || x >= L->x()) return;
-        // rows y, cols z: element (y, z) = volume[(z * Y + y) * X + x]
-        overlay(L->volume(t) + x, L->y(), L->z(), L->x(), L->y() * L->x(), 1,
-                static_cast<float>(vs.labelOpacity), vs.selectedLabel, vs.soloLabel ? vs.selectedLabel : 0u, img);
+        const QRect r = planeRegion(region, L->z(), L->y());
+        overlay(L->volume(t) + x + static_cast<Index>(r.y()) * L->x() + static_cast<Index>(r.x()) * (L->y() * L->x()),
+                r.height(), r.width(), L->x(), L->y() * L->x(), factor, static_cast<float>(vs.labelOpacity),
+                vs.selectedLabel, vs.soloLabel ? vs.selectedLabel : 0u, img);
     }
 
 } // namespace sirius::app

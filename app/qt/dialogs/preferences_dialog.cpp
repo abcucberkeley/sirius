@@ -160,11 +160,20 @@ namespace sirius::app {
         impl_->device = new QComboBox(compute);
         const int n = cudaDeviceCount();
         for (int i = 0; i < n; ++i) impl_->device->addItem(deviceLabel(i), i);
+        if (n > 1)
+            impl_->device->addItem(QStringLiteral("All GPUs (%1) · round-robin volumes").arg(n),
+                                   Workbench::kAllCudaDevices);
         if (n == 0) {
             impl_->device->addItem(QStringLiteral("no CUDA device"), 0);
             impl_->device->setEnabled(false);
         }
-        impl_->device->setCurrentIndex(std::max(0, std::min(wb.cudaDevice(), n - 1)));
+        {
+            const int want = wb.cudaDevice();
+            int idx = 0;
+            for (int i = 0; i < impl_->device->count(); ++i)
+                if (impl_->device->itemData(i).toInt() == want) idx = i;
+            impl_->device->setCurrentIndex(idx);
+        }
         auto* g = new QGridLayout();
         g->setHorizontalSpacing(10);
         g->addWidget(field(QStringLiteral("Default backend"), impl_->backend, compute), 0, 0);

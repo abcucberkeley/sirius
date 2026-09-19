@@ -2,8 +2,16 @@
 #include "core/ops/builtin.hpp"
 
 #include <algorithm>
+#include <atomic>
 #include <cmath>
 #include <cstdio>
+#include <exception>
+#include <mutex>
+#include <vector>
+
+#ifdef _OPENMP
+#include <omp.h>
+#endif
 
 #include "core/array_source.hpp"
 
@@ -26,6 +34,46 @@ namespace sirius::app {
                 fn(c, t);
                 ++done;
             }
+        ctx.report(1.0, "");
+    }
+
+    void forEachVolumeOnGpus(const DatasetMeta& meta, const StepContext& ctx,
+                             const std::function<void(Index c, Index t, Device device)>& fn) {
+        const Index C = std::max<Index>(1, meta.dims.c);
+        const Index T = std::max<Index>(1, meta.dims.t);
+        const Index total = C * T;
+        const int nDev = cudaDeviceCount();
+        const bool parallel = ctx.allCudaDevices() && nDev > 1 && total > 1;
+        if (!parallel) {
+            forEachVolume(meta, ctx, [&](Index c, Index t) { fn(c, t, ctx.deviceForVolume(c, t, C)); });
+            return;
+        }
+
+        std::atomic<Index> done{0};
+        std::mutex progressMu;
+        std::exception_ptr ep;
+        std::mutex epMu;
+#ifdef _OPENMP
+#pragma omp parallel for num_threads(nDev) schedule(dynamic)
+#endif
+        for (Index i = 0; i < total; ++i) {
+            if (ctx.isCancelled()) continue;
+            const Index t = i / C, c = i % C;
+            try {
+                fn(c, t, Device::cuda(static_cast<int>(i % nDev)));
+            } catch (...) {
+                std::lock_guard<std::mutex> g(epMu);
+                if (!ep) ep = std::current_exception();
+            }
+            const Index n = done.fetch_add(1) + 1;
+            std::lock_guard<std::mutex> g(progressMu);
+            char msg[64];
+            std::snprintf(msg, sizeof msg, "c %lld · t %lld", static_cast<long long>(c),
+                          static_cast<long long>(t));
+            ctx.report(static_cast<double>(n) / static_cast<double>(total), msg);
+        }
+        ctx.throwIfCancelled();
+        if (ep) std::rethrow_exception(ep);
         ctx.report(1.0, "");
     }
 

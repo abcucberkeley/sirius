@@ -1,18 +1,27 @@
 #include "core/array_source.hpp"
 
 #include <algorithm>
+#include <atomic>
 #include <cctype>
 #include <cmath>
 #include <cstdint>
 #include <cstring>
+#include <exception>
 #include <filesystem>
+#include <fstream>
 #include <list>
 #include <map>
 #include <mutex>
+#include <new>
 #include <sstream>
 #include <stdexcept>
 #include <unordered_map>
 
+#ifdef _OPENMP
+#include <omp.h>
+#endif
+
+#include <sirius/device.hpp>
 #include <sirius/tiff_io.hpp>
 #include <sirius/zarr_io.hpp>
 
@@ -88,15 +97,39 @@ namespace sirius::app {
         return std::filesystem::is_directory(path, ec) && std::filesystem::exists(std::filesystem::path(path) / "sirius-dataset.toml", ec);
     }
 
-    void ArraySource::readTileVolume(Index tile, Index c, Index t, float* out) const {
-        if (tile != currentTile())
-            throw std::out_of_range("this dataset serves one tile at a time; select tile " + std::to_string(tile) + " first");
-        readVolume(c, t, out);
+    bool isDatasetManifestFile(const std::string& path) {
+        std::error_code ec;
+        const fs::path p(path);
+        if (!fs::is_regular_file(p, ec)) return false;
+        const std::string name = p.filename().string();
+        if (name == DatasetManifest::kFileName) return true;
+        if (p.extension() != ".toml") return false;
+        // pipelines are ".sirius.toml"; don't steal them
+        if (name.size() >= 12 && name.compare(name.size() - 12, 12, ".sirius.toml") == 0) return false;
+        std::ifstream in(p);
+        if (!in) return false;
+        std::string line;
+        for (int n = 0; n < 40 && std::getline(in, line); ++n)
+            if (line.find("sirius-dataset") != std::string::npos) return true;
+        return false;
     }
 
-    void ArraySource::readVolume(Index c, Index t, float* out) const {
+    bool isManifestDataset(const std::string& path) { return isFolderDataset(path) || isDatasetManifestFile(path); }
+
+    void ArraySource::readTileVolume(Index tile, Index c, Index t, float* out, const ProgressFn& progress) const {
+        if (tile != currentTile())
+            throw std::out_of_range("this dataset serves one tile at a time; select tile " + std::to_string(tile) + " first");
+        readVolume(c, t, out, progress);
+    }
+
+    void ArraySource::readVolume(Index c, Index t, float* out, const ProgressFn& progress) const {
         const Dims5& d = dims();
-        for (Index z = 0; z < d.z; ++z) readPlane(c, t, z, out + z * d.planeSize());
+        const Index step = std::max<Index>(1, d.z / 50);
+        for (Index z = 0; z < d.z; ++z) {
+            readPlane(c, t, z, out + z * d.planeSize());
+            if (progress && (z + 1 == d.z || (z + 1) % step == 0))
+                progress(static_cast<double>(z + 1) / static_cast<double>(d.z), "reading");
+        }
     }
 
     std::shared_ptr<Array5> ArraySource::readAll(const ProgressFn& progress) const {
@@ -106,7 +139,9 @@ namespace sirius::app {
         Index done = 0;
         for (Index c = 0; c < d.c; ++c)
             for (Index t = 0; t < d.t; ++t) {
-                readVolume(c, t, out->plane(c, t, 0));
+                readVolume(c, t, out->plane(c, t, 0), [&](double f, const std::string& m) {
+                    if (progress) progress((static_cast<double>(done) + f) / static_cast<double>(total), m);
+                });
                 ++done;
                 if (progress) progress(static_cast<double>(done) / static_cast<double>(total), "reading");
             }
@@ -126,9 +161,10 @@ namespace sirius::app {
         std::memcpy(out, array_->plane(c, t, z), static_cast<std::size_t>(array_->dims().planeSize()) * sizeof(float));
     }
 
-    void MemorySource::readVolume(Index c, Index t, float* out) const {
+    void MemorySource::readVolume(Index c, Index t, float* out, const ProgressFn& progress) const {
         std::memcpy(out, array_->plane(c, t, 0),
                     static_cast<std::size_t>(array_->dims().z * array_->dims().planeSize()) * sizeof(float));
+        if (progress) progress(1.0, "in memory");
     }
 
     std::shared_ptr<Array5> MemorySource::readAll(const ProgressFn& progress) const {
@@ -136,6 +172,8 @@ namespace sirius::app {
         // Shared ownership of the const array: callers never mutate a source's data.
         return std::const_pointer_cast<Array5>(array_);
     }
+
+    Index MemorySource::currentTile() const noexcept { return meta_.tileIndex; }
 
     // --- TIFF metadata ---------------------------------------------------------------
 
@@ -414,23 +452,34 @@ namespace sirius::app {
                 }
             }
 
-            void readVolume(Index c, Index t, float* out) const override {
+            void readVolume(Index c, Index t, float* out, const ProgressFn& progress) const override {
                 const Dims5& d = meta_.dims;
                 check(c, t, 0);
+                TiffReadOptions opts;
+                if (progress) {
+                    const std::string name = fs::path(file_.path()).filename().string();
+                    opts.progress = [progress, name](double f) { progress(f, "reading " + name); };
+                }
                 if (zFastest_) {
                     // the z planes of one (c, t) are consecutive pages
                     const Index first = order_.planeOf(c, t, 0);
-                    Buffer<float> vol = file_.readPages<float>(static_cast<std::size_t>(first), static_cast<std::size_t>(d.z));
+                    Buffer<float> vol =
+                        file_.readPages<float>(static_cast<std::size_t>(first), static_cast<std::size_t>(d.z), opts);
                     std::memcpy(out, vol.data(), static_cast<std::size_t>(d.z * d.planeSize()) * sizeof(float));
                     return;
                 }
-                ArraySource::readVolume(c, t, out);
+                ArraySource::readVolume(c, t, out, progress);
             }
 
             std::shared_ptr<Array5> readAll(const ProgressFn& progress) const override {
                 const Dims5& d = meta_.dims;
+                TiffReadOptions opts;
+                if (progress) {
+                    const std::string name = fs::path(file_.path()).filename().string();
+                    opts.progress = [progress, name](double f) { progress(f, "reading " + name); };
+                }
                 if (progress) progress(0.0, "reading " + fs::path(file_.path()).filename().string());
-                Buffer<float> stack = file_.readStack<float>();
+                Buffer<float> stack = file_.readStack<float>(opts);
                 if (contiguousStack_) {
                     auto out = std::make_shared<Array5>(Array5::fromBuffer(std::move(stack), d));
                     if (progress) progress(1.0, "read");
@@ -768,6 +817,8 @@ namespace sirius::app {
         // One TIFF stack per (tile, channel, t), mapped by the manifest. Files
         // open on demand and a handful stay open, because a viewer scrubbing z
         // hits the same file again and again; pages convert to float32.
+        // A full load streams several files at once (page-sequential per file)
+        // rather than seeking around one stack with many threads.
         class FolderArraySource final : public ArraySource {
         public:
             FolderArraySource(fs::path folder, const DatasetManifest& manifest, DatasetMeta meta)
@@ -795,38 +846,92 @@ namespace sirius::app {
                 check(c, t, z);
                 const std::string& path = pathOf(meta_.tileIndex, c, t);
                 std::shared_ptr<TiffFile> file = open(path);
-                Buffer<float> plane = file->readPages<float>(static_cast<std::size_t>(z), 1);
+                TiffReadOptions opts;
+                opts.maxThreads = 1;
+                Buffer<float> plane = file->readPages<float>(static_cast<std::size_t>(z), 1, opts);
                 copyOut(plane, meta_.dims.planeSize(), out, path);
             }
 
-            void readVolume(Index c, Index t, float* out) const override { readTileVolume(meta_.tileIndex, c, t, out); }
+            void readVolume(Index c, Index t, float* out, const ProgressFn& progress) const override {
+                readTileVolume(meta_.tileIndex, c, t, out, progress);
+            }
 
-            void readTileVolume(Index tile, Index c, Index t, float* out) const override {
+            void readTileVolume(Index tile, Index c, Index t, float* out, const ProgressFn& progress) const override {
                 checkTile(tile);
                 check(c, t, 0);
                 const std::string& path = pathOf(tile, c, t);
                 std::shared_ptr<TiffFile> file = open(path);
-                Buffer<float> volume = file->readStack<float>();
-                copyOut(volume, meta_.dims.z * meta_.dims.planeSize(), out, path);
+                decodeStack(file, path, out, progress);
             }
 
             std::shared_ptr<Array5> readAll(const ProgressFn& progress) const override {
                 const Dims5& d = meta_.dims;
                 auto out = std::make_shared<Array5>(d);
-                const double total = static_cast<double>(std::max<Index>(1, d.c * d.t));
-                Index done = 0;
-                for (Index c = 0; c < d.c; ++c)
-                    for (Index t = 0; t < d.t; ++t) {
-                        if (progress) progress(done / total, "reading " + fs::path(pathOf(meta_.tileIndex, c, t)).filename().string());
-                        readTileVolume(meta_.tileIndex, c, t, out->plane(c, t, 0));
-                        ++done;
+                const Index C = std::max<Index>(1, d.c);
+                const Index T = std::max<Index>(1, d.t);
+                const Index total = C * T;
+                const Index tile = meta_.tileIndex;
+                std::atomic<Index> done{0};
+                std::mutex progressMu;
+                std::exception_ptr ep;
+                std::mutex epMu;
+                int nThreads = static_cast<int>(std::min(total, static_cast<Index>(kMaxParallelFiles)));
+#ifdef _OPENMP
+                nThreads = std::min(nThreads, std::max(1, omp_get_max_threads()));
+#pragma omp parallel for num_threads(nThreads) schedule(dynamic) if (nThreads > 1)
+#endif
+                for (Index i = 0; i < total; ++i) {
+                    {
+                        std::lock_guard<std::mutex> g(epMu);
+                        if (ep) continue;
                     }
+                    const Index t = i / C, c = i % C;
+                    try {
+                        readTileVolume(tile, c, t, out->plane(c, t, 0), [&](double f, const std::string& m) {
+                            if (!progress) return;
+                            std::lock_guard<std::mutex> g(progressMu);
+                            progress((static_cast<double>(done.load()) + f) / static_cast<double>(total), m);
+                        });
+                    } catch (...) {
+                        std::lock_guard<std::mutex> g(epMu);
+                        if (!ep) ep = std::current_exception();
+                    }
+                    const Index n = done.fetch_add(1) + 1;
+                    if (progress) {
+                        std::lock_guard<std::mutex> g(progressMu);
+                        progress(static_cast<double>(n) / static_cast<double>(total),
+                                 "reading " + fs::path(pathOf(tile, c, t)).filename().string());
+                    }
+                }
+                if (ep) std::rethrow_exception(ep);
                 if (progress) progress(1.0, "read");
                 return out;
             }
 
         private:
             static constexpr std::size_t kOpenFiles = 8;
+            static constexpr Index kMaxParallelFiles = 8;
+
+            // Pages in file order, one libtiff handle: many files can stream
+            // at once without seeking around each stack (Vast / NFS).
+            void decodeStack(const std::shared_ptr<TiffFile>& file, const std::string& path, float* out,
+                             const ProgressFn& progress = {}) const {
+                const TiffInfo& info = file->info();
+                const Dims5& d = meta_.dims;
+                if (info.pageCount() != static_cast<std::size_t>(d.z) ||
+                    info.width() != static_cast<std::uint32_t>(d.x) || info.height() != static_cast<std::uint32_t>(d.y))
+                    throw std::runtime_error(path + ": expected " + d.toString() + ", the file is " +
+                                             std::to_string(info.pageCount()) + " x " + std::to_string(info.height()) +
+                                             " x " + std::to_string(info.width()));
+                TiffReadOptions opts;
+                opts.maxThreads = 1;
+                if (progress) {
+                    const std::string name = fs::path(path).filename().string();
+                    opts.progress = [progress, name](double f) { progress(f, "reading " + name); };
+                }
+                BufferView<float> dst(out, Shape{d.z, d.y, d.x}, Device::cpu());
+                file->decode<float>(info.pages, Region{}, dst, opts);
+            }
 
             std::size_t slot(Index tile, Index c, Index t) const noexcept {
                 const Dims5& d = meta_.dims;
@@ -879,6 +984,7 @@ namespace sirius::app {
         };
 
         struct FolderProbe {
+            fs::path folder;   // TIFF directory (may differ from the manifest file)
             DatasetManifest manifest;
             DatasetMeta meta;
             std::string summary;
@@ -889,11 +995,14 @@ namespace sirius::app {
         }
 
         // Load and validate the manifest; dims from the manifest plus one probed
-        // file of the tile being opened.
-        FolderProbe probeFolder(const fs::path& folder, const OpenOptions* options) {
+        // file of the tile being opened. `path` is the TIFF folder or the toml.
+        FolderProbe probeFolder(const fs::path& path, const OpenOptions* options) {
             FolderProbe p;
-            p.manifest = DatasetManifest::load(folder / DatasetManifest::kFileName);
-            const std::vector<std::string> problems = p.manifest.validate(folder);
+            std::error_code ec;
+            const fs::path manifestPath = fs::is_directory(path, ec) ? path / DatasetManifest::kFileName : path;
+            p.manifest = DatasetManifest::load(manifestPath);
+            p.folder = p.manifest.filesRoot(manifestPath);
+            const std::vector<std::string> problems = p.manifest.validate(p.folder);
             if (!problems.empty()) {
                 std::string msg = DatasetManifest::kFileName + std::string(": ") + problems.front();
                 if (problems.size() > 1) msg += " (+" + std::to_string(problems.size() - 1) + " more)";
@@ -905,21 +1014,20 @@ namespace sirius::app {
                 throw std::out_of_range("tile " + std::to_string(tile) + ": the dataset has " + plural(m.tiles.size(), "tile"));
             const ManifestFile* first = m.file(tile, 0, 0);   // validate() guarantees it
             if (!first) throw std::runtime_error("no file for the first channel and time point of tile " + m.tiles[static_cast<std::size_t>(tile)].name);
-            const TiffInfo info = inspectTiff(manifestFilePath(folder, *first).string());
+            const TiffInfo info = inspectTiff(manifestFilePath(p.folder, *first).string());
             if (info.pageCount() == 0) throw std::runtime_error(first->path + ": the TIFF has no pages");
 
             DatasetMeta& meta = p.meta;
-            fs::path named = folder;
+            fs::path named = p.folder;
             if (named.filename().empty()) named = named.parent_path();
             meta.name = m.name.empty() ? named.filename().string() : m.name;
-            meta.sourcePath = folder.string();
+            meta.sourcePath = path.string();
             meta.format = "folder";
             meta.dims = Dims5{static_cast<Index>(m.channels.size()), m.timePoints(), static_cast<Index>(info.pageCount()),
                               static_cast<Index>(info.height()), static_cast<Index>(info.width())};
             meta.sourceType = info.pixelType();
-            std::error_code ec;
             for (const ManifestFile& f : m.files) {
-                const std::uintmax_t size = fs::file_size(manifestFilePath(folder, f), ec);
+                const std::uintmax_t size = fs::file_size(manifestFilePath(p.folder, f), ec);
                 if (!ec) meta.bytesOnDisk += static_cast<std::uint64_t>(size);
             }
             // an override of 0 keeps the manifest's size for that axis
@@ -957,7 +1065,7 @@ namespace sirius::app {
         DatasetMeta probeWith(const std::string& path, const OpenOptions* options) {
             std::error_code ec;
             if (!fs::exists(path, ec)) throw std::runtime_error("no such file or directory: " + path);
-            if (isFolderDataset(path)) return probeFolder(path, options).meta;
+            if (isManifestDataset(path)) return probeFolder(path, options).meta;
             if (fs::is_directory(path, ec)) {
                 if (!isZarrStore(path)) throw std::runtime_error("not a zarr / N5 store: " + path);
                 return probeZarr(path, options).meta;
@@ -974,9 +1082,9 @@ namespace sirius::app {
         std::error_code ec;
         if (!fs::exists(path, ec)) throw std::runtime_error("no such file or directory: " + path);
         OpenResult r;
-        if (isFolderDataset(path)) {
+        if (isManifestDataset(path)) {
             FolderProbe p = probeFolder(path, &options);
-            r.source = std::make_shared<FolderArraySource>(path, p.manifest, p.meta);
+            r.source = std::make_shared<FolderArraySource>(p.folder, p.manifest, p.meta);
             r.metadataSummary = p.summary;
             r.dimsFromMetadata = true;
         } else if (fs::is_directory(path, ec)) {
@@ -998,7 +1106,13 @@ namespace sirius::app {
         }
         if (options.readAll) {
             DatasetMeta meta = r.source->meta();
-            std::shared_ptr<Array5> all = r.source->readAll();
+            std::shared_ptr<Array5> all;
+            try {
+                all = r.source->readAll(options.progress);
+            } catch (const std::bad_alloc&) {
+                throw std::runtime_error("not enough RAM to load " + path + " as " + meta.shapeString() + " float32 (" +
+                                         std::to_string(meta.dims.bytes() / (1024ull * 1024ull)) + " MiB)");
+            }
             r.source = std::make_shared<MemorySource>(all, meta);
         }
         r.meta = r.source->meta();

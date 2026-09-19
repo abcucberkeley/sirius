@@ -15,6 +15,7 @@
 
 #include <nlohmann/json.hpp>
 
+#include <sirius/device.hpp>
 #include <sirius/tiff_io.hpp>
 
 #include "core/array_source.hpp"
@@ -2615,4 +2616,24 @@ TEST_CASE("On tracked labels a split travels along the track", "[app][workbench]
     for (Index t = 0; t < 3; ++t) CHECK(labels->at(t, cz, cy, cx + 4) == 1);
     wb.redo();
     for (Index t = 0; t < 3; ++t) CHECK(labels->at(t, cz, cy, cx + 4) == part);
+}
+
+TEST_CASE("All-GPUs device index round-robins volumes", "[app][pipeline][cuda]") {
+    StepContext ctx;
+    ctx.backend = Backend::Cuda;
+    ctx.device = Device::cuda(Workbench::kAllCudaDevices);
+    if (!cudaAvailable() || cudaDeviceCount() < 2) {
+        CHECK_FALSE(ctx.allCudaDevices());
+        return;
+    }
+    REQUIRE(ctx.allCudaDevices());
+    const int n = cudaDeviceCount();
+    CHECK(ctx.deviceForVolume(0, 0, 2).index == 0);
+    CHECK(ctx.deviceForVolume(1, 0, 2).index == 1 % n);
+    CHECK(ctx.deviceForVolume(0, 1, 2).index == 2 % n);
+    Workbench wb(std::filesystem::temp_directory_path() / "sirius-all-gpu-test");
+    wb.setCudaDevice(Workbench::kAllCudaDevices);
+    CHECK(wb.cudaDevice() == Workbench::kAllCudaDevices);
+    wb.setCudaDevice(0);
+    CHECK(wb.cudaDevice() == 0);
 }

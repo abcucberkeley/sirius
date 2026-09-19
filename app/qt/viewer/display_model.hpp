@@ -97,14 +97,14 @@ namespace sirius::app {
         // `region` (voxels, empty = the whole plane) limits the render to the
         // part of the plane on screen: the cost follows the window, not the data.
         void renderXY(Index t, Index z, const ViewState& vs, int factor, QImage& img, const QRect& region = QRect());
-        void renderXZ(Index t, Index y, const ViewState& vs, QImage& img);   // rows z, cols x
-        void renderYZ(Index t, Index x, const ViewState& vs, QImage& img);   // rows y, cols z
+        void renderXZ(Index t, Index y, const ViewState& vs, int factor, QImage& img, const QRect& region = QRect());   // rows z, cols x
+        void renderYZ(Index t, Index x, const ViewState& vs, int factor, QImage& img, const QRect& region = QRect());   // rows y, cols z
         void renderMIP(Index t, const ViewState& vs, int factor, QImage& img);
 
         // Label overlay on an image produced by the matching renderer.
         void overlayLabelsXY(Index t, Index z, int factor, const ViewState& vs, QImage& img, const QRect& region = QRect());
-        void overlayLabelsXZ(Index t, Index y, const ViewState& vs, QImage& img);
-        void overlayLabelsYZ(Index t, Index x, const ViewState& vs, QImage& img);
+        void overlayLabelsXZ(Index t, Index y, int factor, const ViewState& vs, QImage& img, const QRect& region = QRect());
+        void overlayLabelsYZ(Index t, Index x, int factor, const ViewState& vs, QImage& img, const QRect& region = QRect());
 
     private:
         struct Key {
@@ -135,6 +135,9 @@ namespace sirius::app {
         // A projection of an in-memory volume up to this many voxels is
         // computed inline: a few milliseconds, not worth a thread hop.
         static constexpr Index kInlineProjectVoxels = Index{8} << 20;
+        // Keep at most one time point of the heavy (c, t) volumes (the 3 GiB
+        // cap). MIPs and ranges are a few tens of MB for a whole movie: play
+        // must not throw them away or every frame re-projects 10^8 voxels.
         void evictOtherTimePoints(Index t);
 
         std::shared_ptr<const StepOutput> out_;
@@ -149,7 +152,6 @@ namespace sirius::app {
         bool tooLarge_ = false;
         // one cached plane per channel for lazy sources without a cached volume
         std::map<Index, std::pair<PlaneKey, Buffer<float>>> planes_;
-        std::vector<float> sliceScratch_;                 // YZ column gather
         std::vector<std::uint32_t> labelScratch_;
     };
 

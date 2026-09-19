@@ -54,6 +54,10 @@ namespace sirius::app {
         bool taskRunning() const noexcept { return taskActive_.load(); }
         QString taskLabel() const { return taskLabel_; }
 
+        // Decode on the worker thread, then install the dataset on the GUI
+        // thread. False when a run or another task is already active.
+        bool openDatasetAsync(const std::string& path, OpenOptions options);
+
     signals:
         void datasetChanged();
         void pipelineChanged();

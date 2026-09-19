@@ -7,6 +7,8 @@
 #include <cmath>
 #include <cstdio>
 #include <filesystem>
+#include <mutex>
+#include <vector>
 
 #include <sirius/deconvolution.hpp>
 #include <sirius/tiff_io.hpp>
@@ -81,14 +83,19 @@ namespace sirius::app {
                 bool first = true;
                 bool gpu = false;
                 double seconds = 0.0;
+                std::mutex firstMu;
                 std::vector<float> inputMid;   // middle plane of the first volume, for the residual panel
-                forEachVolume(meta, ctx, [&](Index c, Index t) {
+                forEachVolumeOnGpus(meta, ctx, [&](Index c, Index t, Device volDevice) {
                     Buffer<float> vol = input.readVolume(c, t);
-                    if (first) {
-                        inputMid.assign(vol.data() + (meta.dims.z / 2) * meta.dims.planeSize(),
-                                        vol.data() + (meta.dims.z / 2 + 1) * meta.dims.planeSize());
+                    {
+                        std::lock_guard<std::mutex> g(firstMu);
+                        if (first) {
+                            inputMid.assign(vol.data() + (meta.dims.z / 2) * meta.dims.planeSize(),
+                                            vol.data() + (meta.dims.z / 2 + 1) * meta.dims.planeSize());
+                        }
                     }
                     DeconvolutionOptions o = options;
+                    if (volDevice.isCuda()) o.device = volDevice;
                     const Index total = meta.dims.c * meta.dims.t;
                     const Index done = t * meta.dims.c + c;
                     // onIteration reports progress only: a false return there is
@@ -108,10 +115,12 @@ namespace sirius::app {
                     o.cancelled = [&ctx] { return ctx.isCancelled(); };
                     const auto t0 = std::chrono::steady_clock::now();
                     DeconvolutionResult r = richardsonLucy(vol.view(), psf.view(), o);
-                    seconds += std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+                    const double dt = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
                     ctx.throwIfCancelled();
-                    gpu = gpu || r.ranOnGpu;
                     copy(vol, result->volume(c, t));
+                    std::lock_guard<std::mutex> g(firstMu);
+                    seconds += dt;
+                    gpu = gpu || r.ranOnGpu;
                     if (first) {
                         firstResult = std::move(r);
                         first = false;

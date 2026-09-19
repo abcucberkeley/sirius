@@ -21,8 +21,8 @@
             "Lazy (chunk on demand)",
             "Full load to RAM"
           ],
-          "default": "Lazy (chunk on demand)",
-          "help": "Lazy reads planes on demand; full load reads everything once.",
+          "default": "Full load to RAM",
+          "help": "Full load reads everything once into RAM (the default); lazy reads planes on demand.",
           "key": "read_as",
           "label": "Read as",
           "read_only": false,

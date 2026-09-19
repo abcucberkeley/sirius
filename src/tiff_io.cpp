@@ -10,6 +10,8 @@
 #include <cstdio>
 #include <cstring>
 #include <exception>
+#include <functional>
+#include <mutex>
 #include <stdexcept>
 #include <type_traits>
 #include <vector>
@@ -61,12 +63,15 @@ namespace sirius {
 
         // Per-handle warning filter (libtiff >= 4.5). Microscopy TIFFs routinely
         // carry private tags libtiff does not know (ImageJ 50838/50839, OME, ...);
-        // the resulting "Unknown field" warnings are expected and would otherwise
-        // be printed once per page per reader thread. Anything else falls through
-        // to libtiff's global warning handler, so real warnings stay visible.
+        // LabVIEW / ScanImage stacks also write ImageDescription with an embedded
+        // NUL and unsorted IFD tags. Those warnings fire once per page and would
+        // drown a multi-file open. Anything else falls through to libtiff's
+        // global warning handler, so real warnings stay visible.
         int warningFilter(TIFF*, void*, const char*, const char* fmt, va_list) {
-            if (fmt && std::strstr(fmt, "Unknown field with tag")) return 1;   // handled
-            return 0;                                                          // let the global handler print it
+            if (fmt && std::strstr(fmt, "Unknown field with tag")) return 1;
+            if (fmt && std::strstr(fmt, "contains null byte in value")) return 1;
+            if (fmt && std::strstr(fmt, "tags are not sorted")) return 1;
+            return 0;
         }
 
         struct OpenOptionsDeleter {
@@ -590,6 +595,19 @@ namespace sirius {
         return info;
     }
 
+    TiffStackShape inspectTiffShape(const std::string& path) {
+        auto tif = openTiff(path, "r");
+        const TiffImageInfo first = readImageInfo(tif.get());
+        TiffStackShape s;
+        s.width = first.width;
+        s.height = first.height;
+        s.pixelType = first.pixelType;
+        // Directory count only (next-IFD links), not every tag of every page.
+        const tdir_t n = TIFFNumberOfDirectories(tif.get());
+        s.pages = n > 0 ? static_cast<std::size_t>(n) : 1;
+        return s;
+    }
+
     // --- type-erased conversion ------------------------------------------------
 
     namespace detail {
@@ -659,6 +677,8 @@ namespace sirius {
 
             std::exception_ptr ex;
             std::atomic<bool> failed{false};
+            std::atomic<std::ptrdiff_t> done{0};
+            std::mutex progressMu;
 
             // Every thread of the team used to open the file -- and parse its
             // first directory, which can carry megabytes of ImageJ / OME
@@ -670,8 +690,15 @@ namespace sirius {
             // 96x128 decode in 0.25 ms on one thread (Release, 32 cores).
             constexpr std::size_t kBytesPerThread = std::size_t{1} << 20;
             const std::size_t work = decodedBytesPerPage(g, r) * static_cast<std::size_t>(n);
-            const std::ptrdiff_t wanted = std::min<std::ptrdiff_t>(n, static_cast<std::ptrdiff_t>(work / kBytesPerThread));
-            const int threads = static_cast<int>(std::clamp<std::ptrdiff_t>(wanted, 1, omp_get_max_threads()));
+            int threads = 1;
+            if (job.maxThreads == 1) {
+                threads = 1;
+            } else {
+                const std::ptrdiff_t wanted =
+                    std::min<std::ptrdiff_t>(n, static_cast<std::ptrdiff_t>(work / kBytesPerThread));
+                threads = static_cast<int>(std::clamp<std::ptrdiff_t>(wanted, 1, omp_get_max_threads()));
+                if (job.maxThreads > 1) threads = std::min(threads, job.maxThreads);
+            }
 #pragma omp parallel num_threads(threads) if (threads > 1)
             {
                 TiffPtr localTif;
@@ -696,6 +723,14 @@ namespace sirius {
                                           static_cast<Index>(pixels), Device::cpu(), Stream::null());
                         } else {
                             readRegionRaw(localTif.get(), g, r, out, scratch);
+                        }
+                        const auto nDone = done.fetch_add(1, std::memory_order_relaxed) + 1;
+                        if (job.progress) {
+                            const std::ptrdiff_t step = std::max<std::ptrdiff_t>(1, n / 50);
+                            if (nDone == n || nDone % step == 0) {
+                                std::lock_guard<std::mutex> lock(progressMu);
+                                job.progress(static_cast<double>(nDone) / static_cast<double>(n));
+                            }
                         }
                     } catch (...) {
 #pragma omp critical
@@ -736,7 +771,10 @@ namespace sirius {
             }
             requireDevice(device);
             std::string reason;
-            if (detail::decodeWithNvTiff(impl, job, dst, device, stream, reason)) return;
+            if (detail::decodeWithNvTiff(impl, job, dst, device, stream, reason)) {
+                if (job.progress) job.progress(1.0);
+                return;
+            }
             if (!opts.allowCpuFallback)
                 throw std::runtime_error("GPU decode of " + impl.path + " is not possible: " + reason +
                                          " (TiffReadOptions::allowCpuFallback is off)");
@@ -757,6 +795,13 @@ namespace sirius {
                                                       ifds.begin() + static_cast<std::ptrdiff_t>(first + count));
                 detail::DecodeJob sub = job;
                 sub.ifds = &part;
+                sub.progress = {};
+                if (job.progress) {
+                    sub.progress = [&job, first, count, n](double f) {
+                        job.progress((static_cast<double>(first) + f * static_cast<double>(count)) /
+                                     static_cast<double>(n));
+                    };
+                }
                 detail::decodeWithLibtiff(impl.path, sub, staging.data());
                 detail::copyBytes(staging.data(), Device::cpu(), static_cast<std::uint8_t*>(dst) + first * pageBytes,
                                   device, count * pageBytes, stream);
@@ -835,6 +880,8 @@ namespace sirius {
         job.geometry = &g;
         job.region = r;
         job.dstType = pixelTypeOf<T>();
+        job.maxThreads = opts.maxThreads;
+        job.progress = opts.progress;
         decodeInto(*impl_, job, dst.data(), dst.device(), opts, stream);
     }
 

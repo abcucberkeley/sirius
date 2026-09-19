@@ -9,6 +9,8 @@
 
 #include <algorithm>
 #include <chrono>
+#include <cstdio>
+#include <exception>
 #include <filesystem>
 #include <functional>
 #include <optional>
@@ -46,6 +48,8 @@
 #include "qt/secret_store.hpp"
 #include "qt/theme.hpp"
 #include "qt/workbench_bridge.hpp"
+
+#include <sirius/device.hpp>
 
 int main(int argc, char** argv) {
     QApplication app(argc, argv);
@@ -112,11 +116,28 @@ int main(int argc, char** argv) {
                                          QStringLiteral("dir"));
     const QCommandLineOption settleOpt(QStringLiteral("settle"), QStringLiteral("Milliseconds to wait before the screenshot (default 600)"),
                                        QStringLiteral("ms"));
+    const QCommandLineOption listCudaOpt(QStringLiteral("list-cuda"),
+                                         QStringLiteral("Print visible CUDA devices and exit"));
     parser.addOptions({datasetOpt, pipelineOpt, runOpt, screenshotOpt, quitAfterOpt, toolOpt, actionOpt, keyOpt, askOpt,
-                       settleOpt, strokeOpt, wheelOpt, dropOpt, recordOpt, settingsOpt});
+                       settleOpt, strokeOpt, wheelOpt, dropOpt, recordOpt, settingsOpt, listCudaOpt});
     parser.addPositionalArgument(QStringLiteral("files"), QStringLiteral("Datasets or pipeline files to open, as though dropped on the window"),
                                  QStringLiteral("[files...]"));
     parser.process(app);
+    if (parser.isSet(listCudaOpt)) {
+        const int n = sirius::cudaDeviceCount();
+        std::printf("cuda devices: %d\n", n);
+        for (int i = 0; i < n; ++i) {
+            try {
+                const auto p = sirius::deviceProperties(sirius::Device::cuda(i));
+                std::printf("  %d: %s  %.1f GB  sm_%d%d\n", i, p.name.c_str(),
+                            static_cast<double>(p.totalMemoryBytes) / (1024.0 * 1024.0 * 1024.0), p.computeMajor,
+                            p.computeMinor);
+            } catch (const std::exception& e) {
+                std::printf("  %d: (%s)\n", i, e.what());
+            }
+        }
+        return n > 0 ? 0 : 1;
+    }
     const QStringList files = parser.positionalArguments();
     const bool filesHavePipeline = std::any_of(files.begin(), files.end(), [](const QString& f) { return f.endsWith(QStringLiteral(".toml"), Qt::CaseInsensitive); });
 
@@ -166,6 +187,13 @@ int main(int argc, char** argv) {
     QObject::connect(&launcher, &sirius::app::WorkerLauncher::logged, &bridge,
                      [&workbench](const QString& line) { workbench.logLine("worker: " + sirius::app::toStd(line)); });
     workbench.setLocalWorkerLauncher([&launcher] { return launcher.connect(); });
+    auto syncWorkerDevice = [&] {
+        if (workbench.backend() != sirius::app::Backend::Cuda) launcher.setDevice(QStringLiteral("cpu"));
+        else if (workbench.cudaDevice() < 0) launcher.setDevice(QStringLiteral("cuda"));
+        else launcher.setDevice(QStringLiteral("cuda:%1").arg(workbench.cudaDevice()));
+    };
+    syncWorkerDevice();
+    QObject::connect(&bridge, &sirius::app::WorkbenchBridge::backendChanged, &bridge, syncWorkerDevice);
     // a gated model's token goes with the request that downloads it
     workbench.setHubTokenProvider([] { return sirius::app::toStd(sirius::app::secrets::read(QStringLiteral("hub/token")).trimmed()); });
     sirius::app::MainWindow window(bridge);

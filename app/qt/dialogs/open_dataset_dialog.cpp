@@ -10,7 +10,6 @@
 #include <QDialogButtonBox>
 #include <QDir>
 #include <QDoubleSpinBox>
-#include <QFileDialog>
 #include <QFileInfo>
 #include <QGridLayout>
 #include <QHeaderView>
@@ -25,6 +24,7 @@
 
 #include "core/manifest.hpp"
 #include "qt/dialogs/folder_dataset_dialog.hpp"
+#include "qt/fast_file_dialog.hpp"
 #include "qt/qt_strings.hpp"
 #include "qt/theme.hpp"
 #include "qt/widgets/controls.hpp"
@@ -39,20 +39,13 @@ namespace sirius::app {
         constexpr int kMaxRecent = 12;
 
         // TIFF files directly in a folder (what a manifest would describe).
-        int tiffCount(const QString& folder) {
-            int n = 0;
-            for (const QString& e : QDir(folder).entryList(QDir::Files | QDir::NoDotAndDotDot)) {
-                const QString l = e.toLower();
-                if (l.endsWith(QLatin1String(".tif")) || l.endsWith(QLatin1String(".tiff"))) ++n;
-            }
-            return n;
-        }
+        int tiffCount(const QString& folder) { return static_cast<int>(tiffNamesInOrder(toStd(folder)).size()); }
 
         QString fileFilter() {
             QStringList exts;
             for (const std::string& e : readableExtensions()) exts << QStringLiteral("*") + fromStd(e);
             if (exts.isEmpty()) exts << QStringLiteral("*.tif") << QStringLiteral("*.tiff");
-            return QStringLiteral("Datasets (%1);;All files (*)").arg(exts.join(QLatin1Char(' ')));
+            return QStringLiteral("Datasets (%1);;SIRIUS dataset (*.toml);;All files (*)").arg(exts.join(QLatin1Char(' ')));
         }
     } // namespace
 
@@ -223,6 +216,7 @@ namespace sirius::app {
         impl_->readAs = new QComboBox(this);
         impl_->readAs->addItem(QStringLiteral("Lazy (planes on demand)"));
         impl_->readAs->addItem(QStringLiteral("Full load to RAM"));
+        impl_->readAs->setCurrentIndex(1);
         readRow->addWidget(impl_->readAs, 1);
         root->addLayout(readRow);
 
@@ -278,16 +272,22 @@ namespace sirius::app {
         connect(impl_->oneStack, &QPushButton::clicked, this, [this] { openAsOneStack(); });
         connect(browse, &QPushButton::clicked, this, [this] {
             const QString start = impl_->path->text().isEmpty() ? QString() : QFileInfo(impl_->path->text()).absolutePath();
-            const QString f = QFileDialog::getOpenFileName(this, QStringLiteral("Open dataset"), start, fileFilter());
+            const QString f = getOpenFileNameFast(this, QStringLiteral("Open dataset"), start, fileFilter());
             if (!f.isEmpty()) impl_->path->setText(f);
         });
         connect(browseDir, &QPushButton::clicked, this, [this] {
-            const QString d = QFileDialog::getExistingDirectory(this, QStringLiteral("Open zarr / N5 store"));
+            const QString d = getExistingDirectoryFast(this, QStringLiteral("Open zarr / N5 store"), QString());
             if (!d.isEmpty()) impl_->path->setText(d);
         });
         connect(browseFolder, &QPushButton::clicked, this, [this] {
-            const QString start = impl_->path->text().isEmpty() ? QString() : QFileInfo(impl_->path->text()).absolutePath();
-            const QString d = QFileDialog::getExistingDirectory(this, QStringLiteral("Open folder of TIFF files"), start);
+            QString start = impl_->path->text();
+            if (!start.isEmpty()) {
+                const QFileInfo fi(start);
+                // Parent of a TIFF folder: listing the folder itself stats
+                // every stack on Vast/NFS and freezes the picker.
+                start = fi.isDir() ? fi.absolutePath() : QFileInfo(fi.absolutePath()).absolutePath();
+            }
+            const QString d = getExistingDirectoryFast(this, QStringLiteral("Open folder of TIFF files"), start);
             if (d.isEmpty()) return;
             if (isFolderDataset(toStd(d)) || !impl_->bridge) {
                 impl_->path->setText(d);   // the probe reports the manifest, or its absence
@@ -399,7 +399,12 @@ namespace sirius::app {
             manifest.save(manifestPath);
             OpenOptions options;
             options.tile = 0;
-            impl_->bridge->wb().openDataset(toStd(folder), options);
+            options.readAll = true;
+            if (!impl_->bridge->openDatasetAsync(toStd(folder), options)) {
+                QMessageBox::warning(this, QStringLiteral("Open as one stack"),
+                                     QStringLiteral("Another task is still running: cancel it or wait."));
+                return;
+            }
         } catch (const std::exception& e) {
             QMessageBox::warning(this, QStringLiteral("Open as one stack"), QString::fromUtf8(e.what()));
             return;
@@ -426,7 +431,7 @@ namespace sirius::app {
             impl_->open->setEnabled(false);
             return;
         }
-        const bool folder = QFileInfo(p).isDir() && isFolderDataset(toStd(p));
+        const bool folder = isManifestDataset(toStd(p));
         if (!folder && QFileInfo(p).isDir()) {
             // a folder of TIFFs without a manifest is not yet a dataset
             const int tiffs = tiffCount(p);

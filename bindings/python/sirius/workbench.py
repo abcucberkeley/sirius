@@ -3724,7 +3724,7 @@ def step_foundation(a: np.ndarray, params: Dict[str, Any], meta: Dict[str, Any],
 # dataset loader, not a run_step kind).
 _LOAD = StepSpec(
     "load",
-    {"path": "", "read_as": "Lazy (chunk on demand)", "tile": 0, "page_order": "czt", "c": 0, "t": 0, "z": 0,
+    {"path": "", "read_as": "Full load to RAM", "tile": 0, "page_order": "czt", "c": 0, "t": 0, "z": 0,
      "voxel_x": 0.0, "voxel_y": 0.0, "voxel_z": 0.0, "sim_ndirs": 0, "sim_nphases": 0, "sim_fast": False,
      "sheet_angle": 0.0},
     choices={"read_as": ("Lazy (chunk on demand)", "Full load to RAM")},
