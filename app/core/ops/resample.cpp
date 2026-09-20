@@ -1,4 +1,5 @@
 // Resample: a new voxel size per axis (0 keeps the axis).
+#include "core/ops/common.hpp"
 #include "core/ops/builtin.hpp"
 
 #include <algorithm>

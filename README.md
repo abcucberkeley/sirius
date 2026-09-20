@@ -4,7 +4,8 @@ Cross-platform SIM reconstruction tool that runs on the CPU, GPU and HPC.
 ## Development guide
 
 Branch model, presets, how to run the tests, formatting and the commit style:
-[CONTRIBUTING.md](CONTRIBUTING.md).
+[CONTRIBUTING.md](CONTRIBUTING.md); how the code is laid out, in
+[docs/architecture.md](docs/architecture.md).
 
 Fiona
 ```

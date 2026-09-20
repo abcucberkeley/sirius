@@ -1,5 +1,6 @@
 // Label cleanup: drops small and border-touching objects, relabels densely
 // and re-flags the rest for review. The intensities pass through.
+#include "core/ops/common.hpp"
 #include "core/ops/builtin.hpp"
 
 #include <algorithm>

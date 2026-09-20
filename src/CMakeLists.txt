@@ -10,11 +10,14 @@
 
 include(Units)
 
-# sirius_lib_unit(<name> [HEADERS ...] [SOURCES ...] [CUDA_SOURCES ...] [DEPENDS ...] [LINK ...] [PUBLIC_LINK ...])
+# sirius_lib_unit(<name> [HEADERS ...] [SOURCES ...] [CUDA_SOURCES ...] [NVTIFF_SOURCES ...]
+#                 [DEPENDS ...] [LINK ...] [CUDA_LINK ...] [NVTIFF_LINK ...] [PUBLIC_LINK ...])
 # HEADERS are relative to include/ (public) or src/ (internal, the ones with no
-# sirius/ prefix). CUDA_SOURCES (and CUDA_LINK) count only in a CUDA build.
+# sirius/ prefix). CUDA_SOURCES / CUDA_LINK count only in a CUDA build, and
+# NVTIFF_SOURCES / NVTIFF_LINK only when nvTIFF is on top of that.
 function(sirius_lib_unit name)
-    cmake_parse_arguments(PARSE_ARGV 1 L "" "" "HEADERS;SOURCES;CUDA_SOURCES;DEPENDS;LINK;CUDA_LINK;PUBLIC_LINK")
+    cmake_parse_arguments(PARSE_ARGV 1 L "" ""
+        "HEADERS;SOURCES;CUDA_SOURCES;NVTIFF_SOURCES;DEPENDS;LINK;CUDA_LINK;NVTIFF_LINK;PUBLIC_LINK")
     set(headers "")
     foreach(h IN LISTS L_HEADERS)
         if(h MATCHES "^sirius/")
@@ -26,6 +29,10 @@ function(sirius_lib_unit name)
     if(SIRIUS_ENABLE_CUDA)
         list(APPEND L_SOURCES ${L_CUDA_SOURCES})
         list(APPEND L_LINK ${L_CUDA_LINK})
+        if(SIRIUS_ENABLE_NVTIFF)
+            list(APPEND L_SOURCES ${L_NVTIFF_SOURCES})
+            list(APPEND L_LINK ${L_NVTIFF_LINK})
+        endif()
     endif()
     sirius_add_unit(lib ${name}
         HEADERS ${headers}
@@ -96,6 +103,7 @@ sirius_lib_unit(fft_common
     HEADERS sirius/fft_common.hpp fftw_internal.hpp cufft_check.hpp cuda/fft_kernels.hpp
     SOURCES fft_common.cpp
     CUDA_SOURCES cuda/fft_kernels.cu
+    DEPENDS device   # cufft_check.hpp reports through CudaError
     LINK ${SIRIUS_FFTW_TARGETS}
     CUDA_LINK CUDA::cudart_static)
 
@@ -120,14 +128,12 @@ sirius_lib_unit(real_fft
 sirius_lib_unit(tiff_io
     HEADERS sirius/tiff_io.hpp tiff_internal.hpp
     SOURCES tiff_io.cpp
+    NVTIFF_SOURCES tiff_nvtiff.cpp
     DEPENDS buffer device pixel_type downsample errors
-    LINK TIFF::TIFF)
-if(SIRIUS_ENABLE_CUDA AND SIRIUS_ENABLE_NVTIFF)
-    target_sources(sirius_lib_tiff_io PRIVATE tiff_nvtiff.cpp)
-    target_link_libraries(sirius_lib_tiff_io PRIVATE CUDA::cudart_static nvtiff::nvtiff)
-    if(SIRIUS_ENABLE_NVCOMP)
-        target_link_libraries(sirius_lib_tiff_io PRIVATE sirius_nvcomp_runtime)
-    endif()
+    LINK TIFF::TIFF
+    NVTIFF_LINK CUDA::cudart_static nvtiff::nvtiff)
+if(SIRIUS_ENABLE_CUDA AND SIRIUS_ENABLE_NVTIFF AND SIRIUS_ENABLE_NVCOMP)
+    target_link_libraries(sirius_lib_tiff_io PRIVATE sirius_nvcomp_runtime)
 endif()
 
 sirius_lib_unit(zarr_io

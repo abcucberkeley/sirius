@@ -726,7 +726,7 @@ namespace sirius::app {
         return diff;
     }
 
-    void LabelVolume::indexTracks() { tracks_ = std::make_shared<TrackIndex>(*this); }
+    void LabelVolume::indexTracks() { tracks_ = std::make_shared<TrackIndex>(frames()); }
 
     std::shared_ptr<LabelVolume> LabelVolume::clone() const {
         auto c = share();

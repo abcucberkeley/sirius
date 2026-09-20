@@ -1,6 +1,8 @@
 // Contrast: linear rescale between two percentiles of the intensity
 // histogram, then a gamma, per channel. The histograms it shows are also
 // available as a live preview before the step runs.
+#include "core/ops/common.hpp"
+#include "core/ops/contrast.hpp"
 #include "core/ops/builtin.hpp"
 
 #include <algorithm>

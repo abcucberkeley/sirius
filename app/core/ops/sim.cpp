@@ -4,6 +4,8 @@
 // the OTF between volumes). Diagnostics are the spectra the design's
 // "Raw spectrum / Separated bands / Wiener-filtered bands / Result spectrum"
 // tabs show, plus the fitted pattern table.
+#include "core/ops/common.hpp"
+#include "core/ops/sim_params.hpp"
 #include "core/ops/builtin.hpp"
 
 #include <algorithm>

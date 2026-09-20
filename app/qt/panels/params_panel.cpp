@@ -34,7 +34,8 @@
 
 #include "qt/qt_strings.hpp"
 #include "qt/shortcuts.hpp"
-#include "core/ops/builtin.hpp"
+#include "core/ops/common.hpp"
+#include "core/ops/contrast.hpp"
 #include "qt/dialogs/model_hub_dialog.hpp"
 #include "qt/theme.hpp"
 #include "qt/widgets/controls.hpp"

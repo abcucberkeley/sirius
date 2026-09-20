@@ -2,6 +2,7 @@
 // ray-cast the stack through a transfer function; the rendering parameters
 // (method, step size, opacity knee, isosurface level) travel in the output
 // meta's diagnostics facts for the viewer.
+#include "core/ops/common.hpp"
 #include "core/ops/builtin.hpp"
 
 #include <algorithm>

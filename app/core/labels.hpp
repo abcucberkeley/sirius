@@ -31,13 +31,11 @@
 #include <sirius/buffer.hpp>
 
 #include "core/array.hpp"
+#include "core/label_frames.hpp"   // Lineage, LabelDiff, LabelFrames
 
 namespace sirius::app {
 
     class TrackIndex;   // core/tracks.hpp
-
-    // {child track id: parent track id}; divisions only.
-    using Lineage = std::map<std::uint32_t, std::uint32_t>;
 
     struct LabelStats {
         std::uint32_t id = 0;
@@ -61,17 +59,6 @@ namespace sirius::app {
         std::string cls = "object";
         double confidence = 1.0;
         bool reviewed = false;
-    };
-
-    // Voxel diff of one edit: linear indices into one (z, y, x) volume of
-    // time point t, with the values before and after.
-    struct LabelDiff {
-        Index t = 0;
-        std::vector<Index> indices;
-        std::vector<std::uint32_t> before;
-        std::vector<std::uint32_t> after;
-
-        bool empty() const noexcept { return indices.empty(); }
     };
 
     struct LabelFlagRules {
@@ -134,6 +121,8 @@ namespace sirius::app {
         const std::uint32_t* plane(Index t, Index z) const;
         std::uint32_t at(Index t, Index z, Index y, Index x) const;
         BufferView<const std::uint32_t> view() const noexcept { return data_->view(); }
+        // The voxels as the track index reads them; invalidated by the next write.
+        LabelFrames frames() const noexcept { return {data_->data(), t_, z_, y_, x_}; }
 
         // Highest id handed out so far: monotonic, so ids never collide with
         // labels that an undo may bring back. After a dense relabel

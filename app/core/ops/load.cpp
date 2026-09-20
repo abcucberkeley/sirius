@@ -2,6 +2,8 @@
 // lazily (planes on demand), and lets the user override what the file's
 // metadata did not say: page order, voxel size, the raw SIM layout, the
 // light-sheet angle.
+#include "core/ops/common.hpp"
+#include "core/ops/load.hpp"
 #include "core/ops/builtin.hpp"
 
 #include <algorithm>

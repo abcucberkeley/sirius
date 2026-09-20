@@ -1,5 +1,6 @@
 // Deconvolve: Richardson-Lucy (optionally TV-regularised) per (c, t) volume
 // with a measured PSF TIFF or a theoretical Gaussian PSF.
+#include "core/ops/common.hpp"
 #include "core/ops/builtin.hpp"
 
 #include <algorithm>

@@ -1,6 +1,7 @@
 // Einsum reduce and its two presets (Max projection, Mean over time): reduce
 // the array along any set of axes with sum / mean / max / min, leaving the
 // reduced axes at length 1 so the axis semantics never move.
+#include "core/ops/common.hpp"
 #include "core/ops/builtin.hpp"
 
 #include <algorithm>

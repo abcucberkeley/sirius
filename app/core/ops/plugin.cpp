@@ -13,7 +13,6 @@
 #include "core/array_source.hpp"
 #include "core/executor.hpp"
 #include "core/help_pages.hpp"
-#include "core/ops/builtin.hpp"
 
 namespace sirius::app {
 

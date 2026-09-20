@@ -1,6 +1,6 @@
 # What every change to dev has to survive.
 #
-#   lint          formatting, ruff, version agreement          (~2 min)
+#   lint          formatting, ruff, versions, unit graph        (~2 min)
 #   cpp-tests     the library, GCC, warnings are errors        (~10 min)
 #   app-tests     the workbench + a headless run, with worker  (~15 min)
 #   python-tests  the wheel, the binding tests, worker tests   (~15 min)
@@ -15,7 +15,9 @@ name: Dev tests
 
 on:
   push:
-    branches: [dev]
+    # ci/** so a branch can be put through all of this before it reaches dev
+    # (GitHub runs the workflow file of the branch that was pushed).
+    branches: [dev, 'ci/**']
   pull_request:
     branches: [dev, main]
   workflow_dispatch:
@@ -64,6 +66,12 @@ jobs:
 
       - name: Version agreement (CMake, pyproject, sirius_worker)
         run: python tools/check_versions.py
+
+      # The unit graph the build declares is the whole truth about who may use
+      # what, so an #include that reaches past it fails here rather than in
+      # somebody's unit test weeks later.
+      - name: Unit dependencies (includes agree with the build graph)
+        run: python tools/check_units.py
 
       # The base to diff against: the PR's merge base on a pull_request, the
       # branch's previous head on a push. A first push (all-zero "before") or

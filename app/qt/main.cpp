@@ -38,6 +38,7 @@
 #include "core/app_paths.hpp"
 #include "core/help_pages.hpp"
 #include "core/operation.hpp"
+#include "core/ops/builtin.hpp"
 #include "core/tool_api.hpp"
 #include "core/workbench.hpp"
 #include "qt/dialogs/preferences_dialog.hpp"

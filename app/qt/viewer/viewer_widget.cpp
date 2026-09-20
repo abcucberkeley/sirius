@@ -33,7 +33,7 @@
 #include <sirius/constants.hpp>
 
 #include "core/array_source.hpp"
-#include "core/ops/builtin.hpp"
+#include "core/ops/contrast.hpp"
 #include "core/tracks.hpp"
 #include "qt/qt_strings.hpp"
 #include "qt/theme.hpp"

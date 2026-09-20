@@ -15,7 +15,8 @@
 #include <vector>
 
 #include "core/labels.hpp"
-#include "core/ops/builtin.hpp"
+#include "core/ops/common.hpp"
+#include "core/ops/segment_common.hpp"
 
 using namespace sirius;
 using namespace sirius::app;

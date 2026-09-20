@@ -11,8 +11,9 @@
 #include <stdexcept>
 
 #include "core/cancel.hpp"
-#include "core/ops/builtin.hpp"
+#include "core/ops/load.hpp"
 #include "core/ops/plugin.hpp"
+#include "core/ops/builtin.hpp"
 
 namespace sirius::app {
 

@@ -4,6 +4,8 @@
 // threshold, clean the mask (binary opening, hole filling) and split it into
 // instances by connected components or a distance watershed. Everything is
 // per plane in (y, x) except the instance step, which is 3D.
+#include "core/ops/common.hpp"
+#include "core/ops/segment_common.hpp"
 #include "core/ops/builtin.hpp"
 
 #include <algorithm>

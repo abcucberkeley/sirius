@@ -22,11 +22,12 @@
 #include <nlohmann/json.hpp>
 
 #include "core/array_source.hpp"
-#include "core/ops/builtin.hpp"
 #include "core/labels.hpp"
 #include "core/tool_api.hpp"
 #include "core/tracks.hpp"
 #include "core/workbench.hpp"
+
+#include "core/ops/builtin.hpp"
 
 using namespace sirius;
 using namespace sirius::app;
@@ -131,7 +132,7 @@ TEST_CASE("TrackIndex follows each id through time", "[app][tracks]") {
     cube(labels, 3, 2, 2, 12, 10, 2);
     labels.setTracked(true);
 
-    const TrackIndex index(labels);
+    const TrackIndex index(labels.frames());
     CHECK(index.frames() == 4);
     CHECK_FALSE(index.empty());
     CHECK(index.ids() == std::vector<std::uint32_t>{1, 2});
@@ -159,7 +160,7 @@ TEST_CASE("TrackIndex follows each id through time", "[app][tracks]") {
     }
 
     SECTION("an empty volume indexes to nothing") {
-        const TrackIndex none(LabelVolume{});
+        const TrackIndex none(LabelVolume{}.frames());
         CHECK(none.frames() == 0);
         CHECK(none.empty());
         CHECK(none.ids().empty());
@@ -175,11 +176,11 @@ TEST_CASE("TrackIndex stays equal to a rescan through every edit and its undo", 
         cube(labels, t, 3, 3, 14, 2, 3);
     }
     labels.setTracked(true);
-    TrackIndex index(labels);
+    TrackIndex index(labels.frames());
     std::vector<LabelDiff> done;
     const auto edit = [&](LabelDiff diff) {
         index.apply(diff);
-        requireSame(index, TrackIndex(labels));
+        requireSame(index, TrackIndex(labels.frames()));
         done.push_back(std::move(diff));
     };
 
@@ -196,14 +197,14 @@ TEST_CASE("TrackIndex stays equal to a rescan through every edit and its undo", 
         for (auto it = done.rbegin(); it != done.rend(); ++it) {
             labels.apply(*it, false);
             index.apply(*it, false);
-            requireSame(index, TrackIndex(labels));
+            requireSame(index, TrackIndex(labels.frames()));
         }
         // and redo
         for (const LabelDiff& d : done) {
             labels.apply(d, true);
             index.apply(d, true);
         }
-        requireSame(index, TrackIndex(labels));
+        requireSame(index, TrackIndex(labels.frames()));
     }
 
     SECTION("a stroke that crosses its own path is counted once") {
@@ -222,19 +223,19 @@ TEST_CASE("TrackIndex stays equal to a rescan through every edit and its undo", 
         std::sort(sorted.begin(), sorted.end());
         REQUIRE(std::adjacent_find(sorted.begin(), sorted.end()) != sorted.end());
         index.apply(stroke);
-        requireSame(index, TrackIndex(labels));
+        requireSame(index, TrackIndex(labels.frames()));
         labels.apply(stroke, false);
         index.apply(stroke, false);
-        requireSame(index, TrackIndex(labels));
+        requireSame(index, TrackIndex(labels.frames()));
         CHECK(index.points(9).empty());
     }
 
     SECTION("rescanFrame recounts writes that bypass the edits") {
         cube(labels, 2, 5, 0, 0, 15, 3);
-        index.rescanFrame(labels, 2);
-        requireSame(index, TrackIndex(labels));
-        CHECK_THROWS(index.rescanFrame(labels, 3));
-        CHECK_THROWS(index.rescanFrame(LabelVolume(3, 6, 20, 21), 0));
+        index.rescanFrame(labels.frames(), 2);
+        requireSame(index, TrackIndex(labels.frames()));
+        CHECK_THROWS(index.rescanFrame(labels.frames(), 3));
+        CHECK_THROWS(index.rescanFrame(LabelVolume(3, 6, 20, 21).frames(), 0));
     }
 
     SECTION("malformed diffs are refused") {
@@ -261,7 +262,7 @@ TEST_CASE("summarizeTracks reports extent, gaps and motion in microns", "[app][t
     // track 3: a single frame
     cube(labels, 4, 3, 5, 12, 12, 3);
 
-    const TrackIndex index(labels);
+    const TrackIndex index(labels.frames());
     const std::array<double, 3> voxelUm{0.75, 0.15, 0.15};   // anisotropic, a real case
     const std::vector<TrackSummary> rows = summarizeTracks(index, {}, voxelUm);
     REQUIRE(rows.size() == 3);
@@ -292,7 +293,7 @@ TEST_CASE("summarizeTracks reports extent, gaps and motion in microns", "[app][t
     CHECK(c.umPerFrame == 0.0);
     CHECK(c.meanVoxels == 27.0);
 
-    CHECK(summarizeTracks(TrackIndex(LabelVolume{}), {}, kIsotropic).empty());
+    CHECK(summarizeTracks(TrackIndex(LabelVolume{}.frames()), {}, kIsotropic).empty());
 }
 
 TEST_CASE("summarizeTracks attaches lineage only between tracks that exist", "[app][tracks]") {
@@ -302,7 +303,7 @@ TEST_CASE("summarizeTracks attaches lineage only between tracks that exist", "[a
     cube(labels, 2, 2, 0, 2, 2, 2);    // daughters
     cube(labels, 2, 3, 0, 10, 10, 2);
     cube(labels, 2, 4, 0, 13, 0, 2);   // unrelated
-    const TrackIndex index(labels);
+    const TrackIndex index(labels.frames());
 
     SECTION("a division: one parent, two children") {
         const std::vector<TrackSummary> rows = summarizeTracks(index, {{2, 1}, {3, 1}}, kIsotropic);
@@ -323,7 +324,7 @@ TEST_CASE("summarizeTracks attaches lineage only between tracks that exist", "[a
         LabelVolume clip(labels);
         cube(clip, 2, 1, 0, 6, 6, 2);
         cube(clip, 2, 5, 0, 6, 10, 2);
-        const std::vector<TrackSummary> rows = summarizeTracks(TrackIndex(clip), lineageFromJson(nlohmann::json{{"1", 1}, {"5", 1}}), kIsotropic);
+        const std::vector<TrackSummary> rows = summarizeTracks(TrackIndex(clip.frames()), lineageFromJson(nlohmann::json{{"1", 1}, {"5", 1}}), kIsotropic);
         REQUIRE(rows.size() == 5);
         CHECK(rows[0].children == std::vector<std::uint32_t>{5});
         CHECK(rows[0].parent == 0);
@@ -336,7 +337,7 @@ TEST_CASE("summarizeTracks attaches lineage only between tracks that exist", "[a
         for (Index t = 0; t < 4; ++t) cube(clip, t, 1, 0, 6, 6, 2);
         cube(clip, 1, 2, 0, 0, 0, 2);
         cube(clip, 3, 3, 0, 12, 12, 2);
-        const std::vector<TrackSummary> rows = summarizeTracks(TrackIndex(clip), {{2, 1}, {3, 1}}, kIsotropic);
+        const std::vector<TrackSummary> rows = summarizeTracks(TrackIndex(clip.frames()), {{2, 1}, {3, 1}}, kIsotropic);
         REQUIRE(rows.size() == 3);
         CHECK(rows[0].divisions == 2);
         CHECK(countDivisions(rows) == 2);
@@ -356,7 +357,7 @@ TEST_CASE("summarizeTracks attaches lineage only between tracks that exist", "[a
 
     SECTION("deleting a daughter leaves the mother with one child, not a division") {
         LabelVolume edited(labels);
-        TrackIndex live(edited);
+        TrackIndex live(edited.frames());
         live.apply(edited.remove(2, 3));
         const std::vector<TrackSummary> rows = summarizeTracks(live, {{2, 1}, {3, 1}}, kIsotropic);
         REQUIRE(rows.size() == 3);
@@ -451,7 +452,7 @@ TEST_CASE("The workbench reviews tracks: summaries, focus, follow, and edits kep
         wb.endPaintStroke();
         const TrackIndex& index = *wb.viewedLabels()->tracks();
         CHECK(index.pointAt(3, 1).has_value());
-        requireSame(index, TrackIndex(*wb.viewedLabels()));
+        requireSame(index, TrackIndex(wb.viewedLabels()->frames()));
     }
 
     SECTION("the assistant's tools list and focus tracks") {
@@ -499,7 +500,7 @@ TEST_CASE("A raw write drops the track index; the edits keep it", "[app][tracks]
 
     labels.apply(labels.paint(0, 1, 5, 5, 1.0, 0, 2), false);   // edits and apply keep it
     REQUIRE(labels.tracks());
-    requireSame(*labels.tracks(), TrackIndex(labels));
+    requireSame(*labels.tracks(), TrackIndex(labels.frames()));
 
     labels.volume(1)[0] = 7;   // a write the index cannot see
     CHECK_FALSE(labels.tracks());
@@ -550,7 +551,7 @@ TEST_CASE("Operations that rewrite tracked labels leave no stale tracks", "[app]
         REQUIRE(out.labels);
         CHECK(out.labels->tracked());
         REQUIRE(out.labels->tracks());
-        requireSame(*out.labels->tracks(), TrackIndex(*out.labels));
+        requireSame(*out.labels->tracks(), TrackIndex(out.labels->frames()));
         CHECK(out.labels->tracks()->ids() == std::vector<std::uint32_t>{1, 2});   // 5 and 9, the speck gone
         CHECK(out.labels->tracks()->points(1).size() == 3);
         CHECK(out.labels->lineage() == Lineage{{2, 1}});
@@ -565,7 +566,7 @@ TEST_CASE("Operations that rewrite tracked labels leave no stale tracks", "[app]
         REQUIRE(out.labels);
         CHECK(out.labels->tracked());
         REQUIRE(out.labels->tracks());
-        requireSame(*out.labels->tracks(), TrackIndex(*out.labels));
+        requireSame(*out.labels->tracks(), TrackIndex(out.labels->frames()));
         CHECK_FALSE(out.labels->tracks()->pointAt(12, 1).has_value());
         CHECK(out.labels->lineage() == Lineage{{9, 5}});
     }
@@ -575,7 +576,7 @@ TEST_CASE("Operations that rewrite tracked labels leave no stale tracks", "[app]
         REQUIRE(out.labels);
         CHECK(out.labels->tracked());
         REQUIRE(out.labels->tracks());
-        requireSame(*out.labels->tracks(), TrackIndex(*out.labels));
+        requireSame(*out.labels->tracks(), TrackIndex(out.labels->frames()));
         CHECK(out.labels->lineage() == Lineage{{9, 5}});
     }
 }

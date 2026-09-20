@@ -1,4 +1,5 @@
 // Crop / pad: a (z, y, x) box, possibly extending past the input (fill).
+#include "core/ops/common.hpp"
 #include "core/ops/builtin.hpp"
 
 #include <algorithm>

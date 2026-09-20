@@ -1,5 +1,7 @@
 #include "qt/viewer/track_overlay.hpp"
 
+#include "core/labels.hpp"   // labelColor
+
 #include <algorithm>
 #include <cmath>
 #include <limits>

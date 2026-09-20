@@ -18,7 +18,11 @@
 // id naming the same object at every time point, with `tracked` set. The
 // lineage the model produces rides beside the labels (LabelVolume::lineage)
 // for the track review; the diagnostics still give the model's own count.
+#include "core/ops/common.hpp"
 #include "core/ops/builtin.hpp"
+#include "core/rpc.hpp"
+
+#include <nlohmann/json.hpp>
 #include "core/tracks.hpp"
 
 #include <algorithm>

@@ -1,5 +1,7 @@
 #include "qt/panels/track_table.hpp"
 
+#include "core/labels.hpp"   // labelColor
+
 #include <QApplication>
 #include <QCheckBox>
 #include <QHBoxLayout>

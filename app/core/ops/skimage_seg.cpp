@@ -8,7 +8,11 @@
 // walker, an edge-driven active contour, two superpixel over-segmentations and
 // a compactness-constrained watershed. They run in the Python worker, which
 // hands back instance labels the way a Torch model does.
+#include "core/ops/common.hpp"
 #include "core/ops/builtin.hpp"
+#include "core/rpc.hpp"
+
+#include <nlohmann/json.hpp>
 
 #include <chrono>
 

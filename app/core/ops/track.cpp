@@ -8,7 +8,11 @@
 // assignment between track ends and track starts. The labels are rewritten so
 // one object keeps one id for its whole life, which is what makes the label
 // colours, the solo view and the review table follow it.
+#include "core/ops/common.hpp"
 #include "core/ops/builtin.hpp"
+#include "core/rpc.hpp"
+
+#include <nlohmann/json.hpp>
 
 #include <algorithm>
 #include <chrono>

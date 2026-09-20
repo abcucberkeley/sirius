@@ -11,7 +11,7 @@
 // index and a lineage map into one row per track; it touches only the index,
 // so it is cheap enough to redo after every edit.
 //
-// Lineage (core/labels.hpp) is kept beside the labels as {child id: parent id}, the form the
+// Lineage (core/label_frames.hpp) is kept beside the labels as {child id: parent id}, the form the
 // model and btrack return it in. Nothing here assumes it is complete or even
 // consistent: ids that no longer exist in the labels (deleted, merged away)
 // are ignored rather than reported, and a cycle cannot hang anything because
@@ -29,7 +29,7 @@
 
 #include <nlohmann/json_fwd.hpp>
 
-#include "core/labels.hpp"
+#include "core/label_frames.hpp"
 
 namespace sirius::app {
 
@@ -43,8 +43,9 @@ namespace sirius::app {
     class TrackIndex {
     public:
         TrackIndex() = default;
-        // One pass over every frame of `labels` (frames in parallel).
-        explicit TrackIndex(const LabelVolume& labels);
+        // One pass over every frame of `labels` (frames in parallel):
+        // TrackIndex(volume.frames()).
+        explicit TrackIndex(const LabelFrames& labels);
 
         Index frames() const noexcept { return static_cast<Index>(frames_.size()); }
         bool empty() const noexcept;
@@ -55,7 +56,7 @@ namespace sirius::app {
         void apply(const LabelDiff& diff, bool forward = true);
         // Recounts one frame from the voxels: for writes that bypass the edits
         // (an operation filling LabelVolume::volume directly).
-        void rescanFrame(const LabelVolume& labels, Index t);
+        void rescanFrame(const LabelFrames& labels, Index t);
 
         // Every id present in at least one frame, ascending.
         std::vector<std::uint32_t> ids() const;
@@ -75,7 +76,7 @@ namespace sirius::app {
             Index n = 0;
         };
         using Frame = std::unordered_map<std::uint32_t, Sum>;
-        static void countFrame(const LabelVolume& labels, Index t, Frame& out);
+        static void countFrame(const LabelFrames& labels, Index t, Frame& out);
         static TrackPoint pointOf(Index t, const Sum& s);
         void move(Frame& frame, Index linear, std::uint32_t from, std::uint32_t to);
 

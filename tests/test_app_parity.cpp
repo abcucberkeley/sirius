@@ -34,6 +34,7 @@
 #include <sirius/tiff_io.hpp>
 
 #include "core/operation.hpp"
+
 #include "core/ops/builtin.hpp"
 
 using namespace sirius;

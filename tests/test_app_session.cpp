@@ -1,23 +1,21 @@
-// Tests of the GUI's Qt-free model (app/core): display mapping, parameter
-// format detection, fit summary and the ReconSession, including an
-// end-to-end reconstruction of the bundled test data through the session
-// and the reconstructor/upload caching it promises.
+// The reconstruction session the workbench drives: parameter files, the fit
+// summary it reports, an end-to-end reconstruction of the bundled test data
+// with the plan and upload caching it promises, and the volume and spectrum
+// helpers the viewer's overlays are drawn from.
 
 #include <catch2/catch_test_macros.hpp>
 #include <catch2/matchers/catch_matchers_floating_point.hpp>
 
 #include <algorithm>
 #include <cmath>
+#include <complex>
 #include <filesystem>
 #include <fstream>
-#include <complex>
 #include <limits>
 #include <random>
 #include <string>
 #include <vector>
 
-#include "core/display_mapping.hpp"
-#include "core/array.hpp"
 #include "core/session.hpp"
 #include "core/volume_ops.hpp"
 
@@ -52,65 +50,6 @@ namespace {
 
 } // namespace
 
-// --- display mapping -----------------------------------------------------
-
-TEST_CASE("minMaxRange ignores NaN and reports empty input as invalid", "[app][display]") {
-    const double v[] = {3.0, std::numeric_limits<double>::quiet_NaN(), -1.5, 7.25};
-    const DisplayRange r = minMaxRange(v, 4);
-    CHECK(r.lo == -1.5);
-    CHECK(r.hi == 7.25);
-    CHECK(r.valid());
-
-    CHECK_FALSE(minMaxRange(v, 0).valid());
-    const double nan = std::numeric_limits<double>::quiet_NaN();
-    CHECK_FALSE(minMaxRange(&nan, 1).valid());
-}
-
-TEST_CASE("percentileRange clips outliers and falls back to min/max on a constant", "[app][display]") {
-    std::vector<double> v(1000);
-    for (std::size_t i = 0; i < v.size(); ++i) v[i] = static_cast<double>(i);   // 0..999
-    v[0] = -1e9;    // one cold and one hot pixel
-    v[999] = 1e9;
-
-    const DisplayRange r = percentileRange(v.data(), static_cast<Index>(v.size()), 0.01, 0.99);
-    CHECK(r.lo > 0.0);
-    CHECK(r.lo < 20.0);
-    CHECK(r.hi > 980.0);
-    CHECK(r.hi < 999.0);
-
-    SECTION("subsampling keeps the estimate bounded and close") {
-        const DisplayRange sub = percentileRange(v.data(), static_cast<Index>(v.size()), 0.01, 0.99, 100);
-        CHECK(sub.valid());
-        CHECK(sub.lo > -1e8);
-        CHECK(sub.hi < 1e8);
-    }
-    SECTION("degenerate window widens to min/max") {
-        std::vector<double> flat(50, 4.0);
-        flat[10] = 9.0;
-        const DisplayRange f = percentileRange(flat.data(), 50, 0.1, 0.9);
-        CHECK(f.lo == 4.0);
-        CHECK(f.hi == 9.0);
-    }
-}
-
-TEST_CASE("mapToGray8 clamps, rounds and zeroes NaN", "[app][display]") {
-    const double src[] = {-10.0, 0.0, 0.5, 1.0, 20.0, std::numeric_limits<double>::quiet_NaN()};
-    std::uint8_t dst[6];
-    mapToGray8(src, 6, DisplayRange{0.0, 1.0}, dst);
-    CHECK(dst[0] == 0);
-    CHECK(dst[1] == 0);
-    CHECK(dst[2] == 128);   // round(127.5)
-    CHECK(dst[3] == 255);
-    CHECK(dst[4] == 255);
-    CHECK(dst[5] == 0);
-
-    SECTION("an invalid range maps everything to black") {
-        mapToGray8(src, 6, DisplayRange{1.0, 1.0}, dst);
-        for (std::uint8_t g : dst) CHECK(g == 0);
-    }
-}
-
-// --- parameter files -----------------------------------------------------
 
 TEST_CASE("detectParameterFormat distinguishes TOML from legacy configs", "[app][params]") {
     const TempFile toml(".toml", "ndirs = 3\n");
@@ -142,8 +81,6 @@ TEST_CASE("loadParametersAuto reads the bundled legacy config and a TOML round t
     CHECK_THAT(again.linespacing_um, WithinRel(legacy.linespacing_um, 1e-12));
 }
 
-// --- fit summary ---------------------------------------------------------
-
 TEST_CASE("summarizeFit converts k0 to spacing and angle", "[app][fit]") {
     SimFit fit;
     fit.k0 = {{2.0, 0.0}, {0.0, -4.0}, {0.0, 0.0}};
@@ -164,8 +101,6 @@ TEST_CASE("summarizeFit converts k0 to spacing and angle", "[app][fit]") {
     CHECK(rows[2].spacingUm == 0.0);   // zero vector: no division by zero
     CHECK(rows[2].ampMagnitude.empty());
 }
-
-// --- session -------------------------------------------------------------
 
 TEST_CASE("ReconSession validates its inputs before reconstructing", "[app][session]") {
     ReconSession s;
@@ -279,7 +214,49 @@ TEST_CASE("ReconSession reconstructs on the GPU and returns a host volume", "[ap
     CHECK(diff / peak < 1e-6);
 }
 
-// --- volume helpers ------------------------------------------------------
+
+TEST_CASE("ReconSession falls back to the ideal OTF and captures diagnostics", "[app][session][ideal]") {
+    ReconSession s;
+    s.setParameters(testParameters());
+    CHECK(s.usesIdealOtf());
+    s.loadRaw((kData / "raw.tif").string());
+    CHECK(s.validate().empty());   // no OTF file is not an error any more
+
+    // the OTF shown to the user is the ideal 3D one for this 9-plane stack
+    auto otf = s.otf();
+    REQUIRE(otf);
+    CHECK(otf->data().dimension(0) == 3);
+    CHECK(otf->data().dimension(2) > 1);
+    CHECK(s.otf() == otf);   // cached until the setup changes
+    s.setParameters(testParameters());
+    CHECK(s.otf() != otf);
+
+    s.setCaptureDiagnostics(true);
+    ReconResult r = s.reconstruct(Device::cpu(), PlanRigor::Estimate);
+    CHECK(r.idealOtf);
+    REQUIRE(r.volume.shape() == Shape{9, 128, 128});
+    REQUIRE(r.diagnostics.captured);
+    CHECK(r.diagnostics.separated.shape() == Shape{3 * 5 * 9, 64, 33});
+    CHECK(r.diagnostics.filtered.shape() == Shape{3 * 5 * 9, 64, 33});
+    for (Index i = 0; i < r.volume.size(); ++i) REQUIRE(std::isfinite(r.volume.data()[i]));
+
+    // the captured bands feed the viewer's band volumes
+    const Buffer<double> band = bandMagnitudeVolume(r.diagnostics, r.diagnostics.separated, 0, 0, BandSide::ReOnly);
+    REQUIRE(band.shape() == Shape{9, 64, 64});
+    const Buffer<double> side = bandMagnitudeVolume(r.diagnostics, r.diagnostics.filtered, 2, 1, BandSide::Minus);
+    REQUIRE(side.shape() == Shape{9, 64, 64});
+    REQUIRE_THROWS_AS(bandMagnitudeVolume(r.diagnostics, r.diagnostics.separated, 3, 0, BandSide::ReOnly),
+                      std::out_of_range);
+
+    // a measured OTF path switches back and the next run reports it
+    s.setOtfPath((kData / "otf.tif").string());
+    CHECK_FALSE(s.usesIdealOtf());
+    s.setCaptureDiagnostics(false);
+    ReconResult m = s.reconstruct(Device::cpu(), PlanRigor::Estimate);
+    CHECK_FALSE(m.idealOtf);
+    CHECK_FALSE(m.diagnostics.captured);
+    CHECK_FALSE(m.plansReused);
+}
 
 namespace {
     Buffer<double> rampVolume(Index nz, Index ny, Index nx) {
@@ -431,59 +408,4 @@ TEST_CASE("otfDisplayVolume renders a centered OTF whose peak is the DC voxel", 
     // outside the support the OTF is zero: the corner voxel
     CHECK_THAT(d[0], WithinAbs(0.0, 1e-9));
     REQUIRE_THROWS_AS(otfDisplayVolume(otf, 7, p, 64, 48, 1), std::out_of_range);
-}
-
-// --- session without an OTF file ------------------------------------------
-
-TEST_CASE("ReconSession falls back to the ideal OTF and captures diagnostics", "[app][session][ideal]") {
-    ReconSession s;
-    s.setParameters(testParameters());
-    CHECK(s.usesIdealOtf());
-    s.loadRaw((kData / "raw.tif").string());
-    CHECK(s.validate().empty());   // no OTF file is not an error any more
-
-    // the OTF shown to the user is the ideal 3D one for this 9-plane stack
-    auto otf = s.otf();
-    REQUIRE(otf);
-    CHECK(otf->data().dimension(0) == 3);
-    CHECK(otf->data().dimension(2) > 1);
-    CHECK(s.otf() == otf);   // cached until the setup changes
-    s.setParameters(testParameters());
-    CHECK(s.otf() != otf);
-
-    s.setCaptureDiagnostics(true);
-    ReconResult r = s.reconstruct(Device::cpu(), PlanRigor::Estimate);
-    CHECK(r.idealOtf);
-    REQUIRE(r.volume.shape() == Shape{9, 128, 128});
-    REQUIRE(r.diagnostics.captured);
-    CHECK(r.diagnostics.separated.shape() == Shape{3 * 5 * 9, 64, 33});
-    CHECK(r.diagnostics.filtered.shape() == Shape{3 * 5 * 9, 64, 33});
-    for (Index i = 0; i < r.volume.size(); ++i) REQUIRE(std::isfinite(r.volume.data()[i]));
-
-    // the captured bands feed the viewer's band volumes
-    const Buffer<double> band = bandMagnitudeVolume(r.diagnostics, r.diagnostics.separated, 0, 0, BandSide::ReOnly);
-    REQUIRE(band.shape() == Shape{9, 64, 64});
-    const Buffer<double> side = bandMagnitudeVolume(r.diagnostics, r.diagnostics.filtered, 2, 1, BandSide::Minus);
-    REQUIRE(side.shape() == Shape{9, 64, 64});
-    REQUIRE_THROWS_AS(bandMagnitudeVolume(r.diagnostics, r.diagnostics.separated, 3, 0, BandSide::ReOnly),
-                      std::out_of_range);
-
-    // a measured OTF path switches back and the next run reports it
-    s.setOtfPath((kData / "otf.tif").string());
-    CHECK_FALSE(s.usesIdealOtf());
-    s.setCaptureDiagnostics(false);
-    ReconResult m = s.reconstruct(Device::cpu(), PlanRigor::Estimate);
-    CHECK_FALSE(m.idealOtf);
-    CHECK_FALSE(m.diagnostics.captured);
-    CHECK_FALSE(m.plansReused);
-}
-
-TEST_CASE("Dims5::planeIndex refuses a plane outside the extents", "[app][array]") {
-    using namespace sirius::app;
-    const Dims5 d{2, 3, 4, 5, 6};
-    CHECK(d.planeIndex(1, 2, 3) == d.planes() - 1);
-    CHECK(d.planeIndex(0, 0, 0) == 0);
-    CHECK_THROWS_AS(d.planeIndex(2, 0, 0), std::out_of_range);
-    CHECK_THROWS_AS(d.planeIndex(0, 3, 0), std::out_of_range);
-    CHECK_THROWS_AS(d.planeIndex(0, 0, -1), std::out_of_range);
 }

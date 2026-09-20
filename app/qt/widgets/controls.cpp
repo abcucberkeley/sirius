@@ -17,7 +17,7 @@
 #include <QStyle>
 #include <QToolTip>
 
-#include "core/ops/builtin.hpp"
+#include "core/ops/common.hpp"
 #include "qt/qt_strings.hpp"
 #include "qt/theme.hpp"
 

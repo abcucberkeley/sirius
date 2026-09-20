@@ -44,12 +44,21 @@ are not touching the zarr paths. Options live in `cmake/ProjectOptions.cmake`.
 ## Testing
 
 `ctest --preset <name>` runs the Catch2 suites in `tests/` (the library, and
-the app's Qt-free core when the app is enabled). Individual cases:
+the app's Qt-free core when the app is enabled). There is one test binary per
+unit -- `test_tiff_io`, `test_registration`, `test_app_labels` -- linking that
+unit and its dependencies and nothing else (docs/architecture.md), plus
+`sirius_tests`, which holds all of them over the archives for running across
+units by tag:
 
 ```sh
-./build/linux-gcc-dev/tests/sirius_tests "[tiff]"      # by tag
-./build/linux-gcc-dev/tests/sirius_tests --list-tests
+ctest --preset linux-gcc-dev -L lib.tiff_io            # one unit's cases
+cmake --build build/linux-gcc-dev --target test_tiff_io && \
+    ./build/linux-gcc-dev/tests/test_tiff_io --list-tests
+./build/linux-gcc-dev/tests/sirius_tests "[tiff]"      # by tag, across units
 ```
+
+`python3 tools/check_units.py` checks that the `#include` lines still agree
+with the unit graph the build declares; the lint job runs it.
 
 Cases skip rather than fail when what they need is absent — no GPU, no
 TensorStore, no `SIRIUS_PYTHON`. Set `SIRIUS_PYTHON` to an interpreter with

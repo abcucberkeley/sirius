@@ -1,5 +1,6 @@
 // Merge channels: map every channel to a display colour and blend them into
 // one RGB image (additive, screen or max) in 0..1.
+#include "core/ops/common.hpp"
 #include "core/ops/builtin.hpp"
 
 #include <algorithm>

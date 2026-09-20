@@ -1,5 +1,5 @@
 // Helpers shared by the operation implementations.
-#include "core/ops/builtin.hpp"
+#include "core/ops/common.hpp"
 
 #include <algorithm>
 #include <atomic>
@@ -14,6 +14,8 @@
 #endif
 
 #include "core/array_source.hpp"
+
+#include <sirius/image_ops.hpp>   // histogram
 
 namespace sirius::app {
 
@@ -191,6 +193,40 @@ namespace sirius::app {
         d.facts.push_back({"Reviewed", std::to_string(labels.reviewedCount()) + " / " +
                                            std::to_string(labels.stats().size())});
         return d;
+    }
+
+    float otsuThreshold(const float* v, Index n) {
+        // over the finite values: an infinite end has no bins to split
+        float mn = std::numeric_limits<float>::infinity(), mx = -mn;
+        for (Index i = 0; i < n; ++i) {
+            if (!std::isfinite(v[i])) continue;
+            mn = std::min(mn, v[i]);
+            mx = std::max(mx, v[i]);
+        }
+        if (!(mx > mn)) return mn;
+        constexpr int bins = 256;
+        const std::vector<double> h = histogram(v, n, bins, mn, mx);
+        double total = 0.0, sumAll = 0.0;
+        for (int i = 0; i < bins; ++i) {
+            total += h[static_cast<std::size_t>(i)];
+            sumAll += i * h[static_cast<std::size_t>(i)];
+        }
+        double wB = 0.0, sumB = 0.0, best = -1.0;
+        int bestBin = 0;
+        for (int i = 0; i < bins; ++i) {
+            wB += h[static_cast<std::size_t>(i)];
+            if (wB == 0.0) continue;
+            const double wF = total - wB;
+            if (wF == 0.0) break;
+            sumB += i * h[static_cast<std::size_t>(i)];
+            const double mB = sumB / wB, mF = (sumAll - sumB) / wF;
+            const double between = wB * wF * (mB - mF) * (mB - mF);
+            if (between > best) {
+                best = between;
+                bestBin = i;
+            }
+        }
+        return mn + (mx - mn) * static_cast<float>(bestBin + 1) / bins;
     }
 
 } // namespace sirius::app

@@ -1,8 +1,9 @@
 // Registers every built-in operation. Each operation file exposes a factory
 // declared in ops/builtin.hpp; this file is the only place that lists them.
-#include "core/ops/builtin.hpp"
 
 #include <mutex>
+
+#include "core/ops/builtin.hpp"
 
 namespace sirius::app {
 

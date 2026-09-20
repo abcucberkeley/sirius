@@ -1,5 +1,6 @@
 // Bleach correction: scale every frame (time point, or plane) of a channel
 // so its total intensity matches the first frame or the mean.
+#include "core/ops/common.hpp"
 #include "core/ops/builtin.hpp"
 
 #include <sirius/image_ops.hpp>

@@ -33,13 +33,14 @@
 #include <QTimer>
 #include <QVBoxLayout>
 
-#include "core/ops/builtin.hpp"
 #include "qt/panels/diagnostic_cells.hpp"
 #include "qt/panels/track_table.hpp"
 #include "qt/qt_strings.hpp"
 #include "qt/theme.hpp"
 #include "qt/trace.hpp"
 #include "qt/widgets/controls.hpp"
+
+#include "core/ops/builtin.hpp"
 
 namespace sirius::app {
 

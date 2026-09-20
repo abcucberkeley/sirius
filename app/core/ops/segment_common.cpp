@@ -1,6 +1,6 @@
 // Post-processing shared by the segmentation steps: probabilities / an
 // intensity threshold -> mask -> instances -> statistics and review flags.
-#include "core/ops/builtin.hpp"
+#include "core/ops/segment_common.hpp"
 
 #include <algorithm>
 #include <cmath>

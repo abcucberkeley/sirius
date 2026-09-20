@@ -19,6 +19,7 @@
 #include <nlohmann/json.hpp>
 
 #include "core/operation.hpp"
+#include "core/ops/schema.hpp"
 #include "core/ops/builtin.hpp"
 
 using namespace sirius::app;

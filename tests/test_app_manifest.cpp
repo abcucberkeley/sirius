@@ -30,10 +30,11 @@
 #include "core/array_source.hpp"
 #include "core/executor.hpp"
 #include "core/manifest.hpp"
-#include "core/ops/builtin.hpp"
 #include "core/pipeline.hpp"
 
 #include "temp_path.hpp"
+
+#include "core/ops/builtin.hpp"
 
 using namespace sirius;
 using namespace sirius::app;

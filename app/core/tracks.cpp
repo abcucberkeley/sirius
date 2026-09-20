@@ -12,10 +12,10 @@ namespace sirius::app {
 
     // --- TrackIndex -----------------------------------------------------------------
 
-    TrackIndex::TrackIndex(const LabelVolume& labels)
-        : frames_(static_cast<std::size_t>(std::max<Index>(0, labels.t()))), y_(labels.y()), x_(labels.x()) {
+    TrackIndex::TrackIndex(const LabelFrames& labels)
+        : frames_(static_cast<std::size_t>(std::max<Index>(0, labels.t))), y_(labels.y), x_(labels.x) {
         if (labels.empty()) return;
-        const Index n = labels.t();
+        const Index n = labels.t;
 #pragma omp parallel for schedule(dynamic)
         for (Index t = 0; t < n; ++t) countFrame(labels, t, frames_[static_cast<std::size_t>(t)]);
     }
@@ -24,10 +24,10 @@ namespace sirius::app {
         return std::all_of(frames_.begin(), frames_.end(), [](const Frame& f) { return f.empty(); });
     }
 
-    void TrackIndex::countFrame(const LabelVolume& labels, Index t, Frame& out) {
+    void TrackIndex::countFrame(const LabelFrames& labels, Index t, Frame& out) {
         out.clear();
-        const Index z = labels.z(), y = labels.y(), x = labels.x();
-        const std::uint32_t* v = labels.volume(t);
+        const Index z = labels.z, y = labels.y, x = labels.x;
+        const std::uint32_t* v = labels.frame(t);
         for (Index iz = 0; iz < z; ++iz)
             for (Index iy = 0; iy < y; ++iy) {
                 const std::uint32_t* row = v + (iz * y + iy) * x;
@@ -49,9 +49,9 @@ namespace sirius::app {
             }
     }
 
-    void TrackIndex::rescanFrame(const LabelVolume& labels, Index t) {
-        if (t < 0 || t >= labels.t()) throw std::out_of_range("TrackIndex::rescanFrame: t out of range");
-        if (labels.t() != frames() || labels.y() != y_ || labels.x() != x_)
+    void TrackIndex::rescanFrame(const LabelFrames& labels, Index t) {
+        if (t < 0 || t >= labels.t) throw std::out_of_range("TrackIndex::rescanFrame: t out of range");
+        if (labels.t != frames() || labels.y != y_ || labels.x != x_)
             throw std::invalid_argument("TrackIndex::rescanFrame: the labels are not the ones indexed");
         countFrame(labels, t, frames_[static_cast<std::size_t>(t)]);
     }

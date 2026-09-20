@@ -1,6 +1,7 @@
 // Register: masked translation registration (sirius/registration.hpp) of one
 // channel onto another, or of every time point onto a reference, applied as
 // an integer-voxel shift.
+#include "core/ops/common.hpp"
 #include "core/ops/builtin.hpp"
 
 #include <algorithm>

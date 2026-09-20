@@ -25,7 +25,7 @@
 #include <QTableWidget>
 #include <QThread>
 
-#include "core/ops/builtin.hpp"
+#include "core/ops/torch_model.hpp"
 #include "qt/qt_strings.hpp"
 #include "qt/secret_store.hpp"
 #include "qt/theme.hpp"

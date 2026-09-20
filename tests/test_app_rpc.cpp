@@ -25,6 +25,9 @@
 #include "core/errors.hpp"
 #include "core/ops/builtin.hpp"
 #include "core/rpc.hpp"
+
+#include <nlohmann/json.hpp>
+
 #include "temp_path.hpp"
 
 using namespace sirius;
@@ -541,7 +544,6 @@ TEST_CASE("the bundled Python worker answers hello and runs a numpy step", "[app
 
 #ifndef _WIN32
 #include "core/help_pages.hpp"
-#include "core/ops/builtin.hpp"
 #include "core/ops/plugin.hpp"
 #include "core/array_source.hpp"
 
@@ -759,7 +761,6 @@ TEST_CASE("rpc tensor descriptors must hold non-negative integers", "[app][rpc]"
 
 #include "core/array_source.hpp"
 #include "core/help_pages.hpp"
-#include "core/ops/builtin.hpp"
 #include "core/ops/plugin.hpp"
 #include "core/pipeline.hpp"
 #include "core/workbench.hpp"

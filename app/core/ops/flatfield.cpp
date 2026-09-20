@@ -1,6 +1,7 @@
 // Flat-field: (I - dark) / (flat - dark), normalised so the mean stays put.
 // One flat (and dark) image, or one page per channel when the file has as
 // many pages as the input has channels.
+#include "core/ops/common.hpp"
 #include "core/ops/builtin.hpp"
 
 #include <cmath>

@@ -1,5 +1,6 @@
 // Deskew + rotate: shear the light-sheet stack by the stage step and,
 // optionally, rotate so z is normal to the coverslip on an isotropic grid.
+#include "core/ops/common.hpp"
 #include "core/ops/builtin.hpp"
 
 #include <cmath>
