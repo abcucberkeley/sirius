@@ -20,12 +20,12 @@ namespace sirius {
     // The default is 1 thread to avoid oversubscription surprises; applications can
     // raise this before planning.
     void setFFTWThreadCount(int nthreads);
-    int  getFFTWThreadCount();
+    int getFFTWThreadCount();
 
     // Allocate/free buffers with FFTW's alignment. Useful for Python-owned output
     // arrays so execute_safe() can avoid allocation+copy fallbacks.
     void* fftwAlignedMalloc(std::size_t bytes);
-    void  fftwAlignedFree(void* p) noexcept;
+    void fftwAlignedFree(void* p) noexcept;
 
 } // namespace sirius
 

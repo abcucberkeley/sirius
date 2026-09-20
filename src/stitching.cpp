@@ -44,7 +44,8 @@ namespace sirius {
                 case 3: return {s[0], s[1], s[2]};
                 default:
                     throw std::invalid_argument(std::string(what) + ": expected a rank-2 or rank-3 view, "
-                                                "got rank " + std::to_string(s.rank()));
+                                                                    "got rank " +
+                                                std::to_string(s.rank()));
             }
         }
 
@@ -55,7 +56,7 @@ namespace sirius {
         Buffer<T> cropBlock(const T* src, const Ext& srcExtent, const Ext& origin, const Ext& extent) {
             Buffer<T> out(Shape{extent[0], extent[1], extent[2]});
             const Index rows = extent[0] * extent[1];
-            #pragma omp parallel for schedule(static)
+#pragma omp parallel for schedule(static)
             for (Index r = 0; r < rows; ++r) {
                 const Index z = r / extent[1];
                 const Index y = r % extent[1];
@@ -70,7 +71,7 @@ namespace sirius {
         Buffer<std::uint8_t> thresholdMask(const Buffer<T>& block, double level) {
             Buffer<std::uint8_t> mask(block.shape());
             const Index n = block.size();
-            #pragma omp parallel for schedule(static)
+#pragma omp parallel for schedule(static)
             for (Index i = 0; i < n; ++i)
                 mask.data()[i] = static_cast<double>(block.data()[i]) > level ? 1 : 0;
             return mask;
@@ -134,7 +135,7 @@ namespace sirius {
         }
         const Index smaller = std::min(product(fe), product(me));
         if (static_cast<double>(product(overlapExtent)) < options.minOverlapFraction *
-                                                          static_cast<double>(smaller))
+                                                              static_cast<double>(smaller))
             return match;
 
         // Grow the fixed side by the search radius so the true displacement is
@@ -268,7 +269,11 @@ namespace sirius {
                     Ext& origin, Ext& extent) {
         if (tileShapes.size() != positions.size())
             throw std::invalid_argument("tileCanvas: one position per tile is required");
-        if (tileShapes.empty()) { origin = {0, 0, 0}; extent = {0, 0, 0}; return; }
+        if (tileShapes.empty()) {
+            origin = {0, 0, 0};
+            extent = {0, 0, 0};
+            return;
+        }
 
         Ext lo{}, hi{};
         for (int a = 0; a < 3; ++a) {
@@ -331,7 +336,7 @@ namespace sirius {
 
             const T* src = tiles[t].data();
             const Index rows = (end[0] - begin[0]) * (end[1] - begin[1]);
-            #pragma omp parallel for schedule(static)
+#pragma omp parallel for schedule(static)
             for (Index r = 0; r < rows; ++r) {
                 const Index z = begin[0] + r / (end[1] - begin[1]);
                 const Index y = begin[1] + r % (end[1] - begin[1]);
@@ -339,7 +344,7 @@ namespace sirius {
                 const Index outRow = ((z + place[0]) * canvasExtent[1] + y + place[1]) * canvasExtent[2] +
                                      place[2];
                 const double planeWeight = feather ? rz[static_cast<std::size_t>(z)] *
-                                                     ry[static_cast<std::size_t>(y)]
+                                                         ry[static_cast<std::size_t>(y)]
                                                    : 1.0;
                 for (Index x = begin[2]; x < end[2]; ++x) {
                     const double v = static_cast<double>(in[x]);
@@ -364,7 +369,7 @@ namespace sirius {
 
         Buffer<T> out(Shape{canvasExtent[0], canvasExtent[1], canvasExtent[2]});
         const bool normalize = !maximum && options.blend != BlendMode::Overwrite;
-        #pragma omp parallel for schedule(static)
+#pragma omp parallel for schedule(static)
         for (Index i = 0; i < canvasVoxels; ++i) {
             const auto u = static_cast<std::size_t>(i);
             const double w = weight[u];
@@ -392,7 +397,7 @@ namespace sirius {
         // An exception must not leave the parallel region, so carry the first
         // one out and rethrow it afterwards.
         std::exception_ptr failure;
-        #pragma omp parallel for schedule(dynamic)
+#pragma omp parallel for schedule(dynamic)
         for (Index c = 0; c < count; ++c) {
             const std::size_t i = candidates[static_cast<std::size_t>(c)].first;
             const std::size_t j = candidates[static_cast<std::size_t>(c)].second;
@@ -403,7 +408,7 @@ namespace sirius {
                 m.moving = j;
                 measured[static_cast<std::size_t>(c)] = m;
             } catch (...) {
-                #pragma omp critical(sirius_stitch_failure)
+#pragma omp critical(sirius_stitch_failure)
                 {
                     if (!failure) failure = std::current_exception();
                 }
@@ -455,14 +460,14 @@ namespace sirius {
         return fused;
     }
 
-#define SIRIUS_INSTANTIATE_STITCHING(T)                                                                  \
-    template TileMatch registerTilePair<T>(BufferView<const T>, Pos, BufferView<const T>, Pos,           \
-                                           const StitchOptions&);                                        \
-    template Buffer<T> fuseTiles<T>(const std::vector<BufferView<const T>>&, const std::vector<Pos>&,    \
-                                    Ext, Ext, const StitchOptions&);                                     \
-    template StitchLayout planStitch<T>(const std::vector<BufferView<const T>>&,                          \
-                                        const std::vector<Pos>&, const StitchOptions&);                  \
-    template Buffer<T> stitchTiffTiles<T>(const std::vector<StitchTile>&, const StitchOptions&,          \
+#define SIRIUS_INSTANTIATE_STITCHING(T)                                                               \
+    template TileMatch registerTilePair<T>(BufferView<const T>, Pos, BufferView<const T>, Pos,        \
+                                           const StitchOptions&);                                     \
+    template Buffer<T> fuseTiles<T>(const std::vector<BufferView<const T>>&, const std::vector<Pos>&, \
+                                    Ext, Ext, const StitchOptions&);                                  \
+    template StitchLayout planStitch<T>(const std::vector<BufferView<const T>>&,                      \
+                                        const std::vector<Pos>&, const StitchOptions&);               \
+    template Buffer<T> stitchTiffTiles<T>(const std::vector<StitchTile>&, const StitchOptions&,       \
                                           StitchLayout*, const std::string&, TiffCompression);
 
     SIRIUS_INSTANTIATE_STITCHING(double)

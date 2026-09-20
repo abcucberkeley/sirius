@@ -51,8 +51,8 @@ namespace {
         switch (t) {
             case PixelType::Float64: return f(double{});
             case PixelType::Float32: return f(float{});
-            case PixelType::UInt16:  return f(std::uint16_t{});
-            case PixelType::UInt8:   return f(std::uint8_t{});
+            case PixelType::UInt16: return f(std::uint16_t{});
+            case PixelType::UInt8: return f(std::uint8_t{});
             default: break;
         }
         throw std::invalid_argument("unsupported pixel type for registration");
@@ -85,7 +85,7 @@ void bind_registration(nb::module_& m) {
           "Smallest 2/3/5/7-smooth size at least n, the padding masked correlation uses.");
 
     nb::class_<MaskedNccOptions>(m, "MaskedNccOptions",
-            "Filters and planning options for masked normalized cross-correlation.")
+                                 "Filters and planning options for masked normalized cross-correlation.")
         .def(nb::init<>())
         .def_rw("required_overlap_voxels", &MaskedNccOptions::requiredOverlapVoxels)
         .def_rw("required_overlap_fraction", &MaskedNccOptions::requiredOverlapFraction)
@@ -95,7 +95,7 @@ void bind_registration(nb::module_& m) {
         .def_rw("rigor", &MaskedNccOptions::rigor);
 
     nb::class_<TranslationResult>(m, "TranslationResult",
-            "Displacement of the moving image relative to the fixed one, in (z, y, x) voxels.")
+                                  "Displacement of the moving image relative to the fixed one, in (z, y, x) voxels.")
         .def_ro("shift", &TranslationResult::shift)
         .def_ro("integer_shift", &TranslationResult::integerShift)
         .def_ro("correlation", &TranslationResult::correlation)
@@ -108,9 +108,7 @@ void bind_registration(nb::module_& m) {
                    ", valid=" + (r.valid ? "True" : "False") + ")";
         });
 
-    m.def("masked_ncc",
-          [](HostArray fixed, HostArray moving, std::optional<MaskArray> fixedMask,
-             std::optional<MaskArray> movingMask, const MaskedNccOptions& options) {
+    m.def("masked_ncc", [](HostArray fixed, HostArray moving, std::optional<MaskArray> fixedMask, std::optional<MaskArray> movingMask, const MaskedNccOptions& options) {
               const PixelType t = registrationDtype(fixed, "fixed");
               if (registrationDtype(moving, "moving") != t)
                   throw std::invalid_argument("fixed and moving must have the same dtype");
@@ -125,17 +123,11 @@ void bind_registration(nb::module_& m) {
                   result = maskedNormalizedCrossCorrelation<T>(f, g, fm, gm, options);
               });
               return nb::make_tuple(numpyFrom(std::move(result.correlation)),
-                                    numpyFrom(std::move(result.overlap)));
-          },
-          nb::arg("fixed"), nb::arg("moving"), nb::arg("fixed_mask") = nb::none(),
-          nb::arg("moving_mask") = nb::none(), nb::arg("options") = MaskedNccOptions{},
-          "Masked normalized cross-correlation (Padfield 2012).\n\n"
-          "Returns (correlation, overlap), both of shape fixed.shape + moving.shape - 1.\n"
-          "Index i along an axis is the displacement i - (moving.shape - 1).");
+                                    numpyFrom(std::move(result.overlap))); }, nb::arg("fixed"), nb::arg("moving"), nb::arg("fixed_mask") = nb::none(), nb::arg("moving_mask") = nb::none(), nb::arg("options") = MaskedNccOptions{}, "Masked normalized cross-correlation (Padfield 2012).\n\n"
+                                                                                                                                                                                                                                                                                                                                    "Returns (correlation, overlap), both of shape fixed.shape + moving.shape - 1.\n"
+                                                                                                                                                                                                                                                                                                                                    "Index i along an axis is the displacement i - (moving.shape - 1).");
 
-    m.def("register_translation_masked",
-          [](HostArray fixed, HostArray moving, std::optional<MaskArray> fixedMask,
-             std::optional<MaskArray> movingMask, const MaskedNccOptions& options) {
+    m.def("register_translation_masked", [](HostArray fixed, HostArray moving, std::optional<MaskArray> fixedMask, std::optional<MaskArray> movingMask, const MaskedNccOptions& options) {
               const PixelType t = registrationDtype(fixed, "fixed");
               if (registrationDtype(moving, "moving") != t)
                   throw std::invalid_argument("fixed and moving must have the same dtype");
@@ -149,11 +141,7 @@ void bind_registration(nb::module_& m) {
                   nb::gil_scoped_release release;
                   out = registerTranslationMasked<T>(f, g, fm, gm, options);
               });
-              return out;
-          },
-          nb::arg("fixed"), nb::arg("moving"), nb::arg("fixed_mask") = nb::none(),
-          nb::arg("moving_mask") = nb::none(), nb::arg("options") = MaskedNccOptions{},
-          "Displacement of `moving` relative to `fixed`: moving[p] matches fixed[p + shift].");
+              return out; }, nb::arg("fixed"), nb::arg("moving"), nb::arg("fixed_mask") = nb::none(), nb::arg("moving_mask") = nb::none(), nb::arg("options") = MaskedNccOptions{}, "Displacement of `moving` relative to `fixed`: moving[p] matches fixed[p + shift].");
 
     // --- stitching ---------------------------------------------------------
 
@@ -199,9 +187,7 @@ void bind_registration(nb::module_& m) {
         .def_ro("canvas_origin", &StitchLayout::canvasOrigin)
         .def_ro("canvas_extent", &StitchLayout::canvasExtent);
 
-    m.def("register_tile_pair",
-          [](HostArray fixed, std::array<double, 3> fixedPosition, HostArray moving,
-             std::array<double, 3> movingPosition, const StitchOptions& options) {
+    m.def("register_tile_pair", [](HostArray fixed, std::array<double, 3> fixedPosition, HostArray moving, std::array<double, 3> movingPosition, const StitchOptions& options) {
               const PixelType t = registrationDtype(fixed, "fixed");
               if (registrationDtype(moving, "moving") != t)
                   throw std::invalid_argument("fixed and moving must have the same dtype");
@@ -213,19 +199,13 @@ void bind_registration(nb::module_& m) {
                   nb::gil_scoped_release release;
                   out = registerTilePair<T>(f, fixedPosition, g, movingPosition, options);
               });
-              return out;
-          },
-          nb::arg("fixed"), nb::arg("fixed_position"), nb::arg("moving"), nb::arg("moving_position"),
-          nb::arg("options") = StitchOptions{},
-          "Measure the displacement between two tiles placed at their nominal origins.");
+              return out; }, nb::arg("fixed"), nb::arg("fixed_position"), nb::arg("moving"), nb::arg("moving_position"), nb::arg("options") = StitchOptions{}, "Measure the displacement between two tiles placed at their nominal origins.");
 
     m.def("optimize_tile_positions", &optimizeTilePositions, nb::arg("nominal"), nb::arg("matches"),
           nb::arg("nominal_weight") = 1e-3, nb::arg("anchor") = std::size_t(0),
           "Tile origins that best explain every accepted match.");
 
-    m.def("plan_stitch",
-          [](nb::sequence tiles, std::vector<std::array<double, 3>> positions,
-             const StitchOptions& options) {
+    m.def("plan_stitch", [](nb::sequence tiles, std::vector<std::array<double, 3>> positions, const StitchOptions& options) {
               std::vector<HostArray> arrays;
               for (nb::handle h : tiles) arrays.push_back(nb::cast<HostArray>(h));
               if (arrays.empty()) throw std::invalid_argument("plan_stitch: no tiles given");
@@ -243,15 +223,9 @@ void bind_registration(nb::module_& m) {
                   nb::gil_scoped_release release;
                   layout = planStitch<T>(views, positions, options);
               });
-              return layout;
-          },
-          nb::arg("tiles"), nb::arg("positions"), nb::arg("options") = StitchOptions{},
-          "Register every overlapping pair and solve for the tile origins.");
+              return layout; }, nb::arg("tiles"), nb::arg("positions"), nb::arg("options") = StitchOptions{}, "Register every overlapping pair and solve for the tile origins.");
 
-    m.def("fuse_tiles",
-          [](nb::sequence tiles, std::vector<std::array<double, 3>> positions,
-             std::array<Index, 3> canvasOrigin, std::array<Index, 3> canvasExtent,
-             const StitchOptions& options) {
+    m.def("fuse_tiles", [](nb::sequence tiles, std::vector<std::array<double, 3>> positions, std::array<Index, 3> canvasOrigin, std::array<Index, 3> canvasExtent, const StitchOptions& options) {
               std::vector<HostArray> arrays;
               for (nb::handle h : tiles) arrays.push_back(nb::cast<HostArray>(h));
               if (arrays.empty()) throw std::invalid_argument("fuse_tiles: no tiles given");
@@ -273,16 +247,9 @@ void bind_registration(nb::module_& m) {
                   }
                   out = sirius_py::toPython(AnyBuffer(std::move(fused)));
               });
-              return out;
-          },
-          nb::arg("tiles"), nb::arg("positions"), nb::arg("canvas_origin"), nb::arg("canvas_extent"),
-          nb::arg("options") = StitchOptions{},
-          "Blend tiles onto one canvas at the given (rounded) origins.");
+              return out; }, nb::arg("tiles"), nb::arg("positions"), nb::arg("canvas_origin"), nb::arg("canvas_extent"), nb::arg("options") = StitchOptions{}, "Blend tiles onto one canvas at the given (rounded) origins.");
 
-    m.def("stitch_tiff_tiles",
-          [](const std::vector<std::string>& paths,
-             const std::vector<std::array<double, 3>>& positions, const StitchOptions& options,
-             const std::string& outputPath, nb::handle dtype, TiffCompression compression) {
+    m.def("stitch_tiff_tiles", [](const std::vector<std::string>& paths, const std::vector<std::array<double, 3>>& positions, const StitchOptions& options, const std::string& outputPath, nb::handle dtype, TiffCompression compression) {
               if (paths.size() != positions.size())
                   throw std::invalid_argument("stitch_tiff_tiles: one position per tile is required");
               if (paths.empty()) throw std::invalid_argument("stitch_tiff_tiles: no tiles given");
@@ -312,11 +279,6 @@ void bind_registration(nb::module_& m) {
                   }
                   fused = sirius_py::toPython(AnyBuffer(std::move(result)));
               });
-              return nb::make_tuple(fused, layout);
-          },
-          nb::arg("paths"), nb::arg("positions"), nb::arg("options") = StitchOptions{},
-          nb::arg("output_path") = std::string{}, nb::arg("dtype") = nb::none(),
-          nb::arg("compression") = TiffCompression::None,
-          "Read TIFF tiles, stitch them and optionally write the mosaic.\n\n"
-          "Returns (mosaic, layout). Every tile and the canvas are held in memory.");
+              return nb::make_tuple(fused, layout); }, nb::arg("paths"), nb::arg("positions"), nb::arg("options") = StitchOptions{}, nb::arg("output_path") = std::string{}, nb::arg("dtype") = nb::none(), nb::arg("compression") = TiffCompression::None, "Read TIFF tiles, stitch them and optionally write the mosaic.\n\n"
+                                                                                                                                                                                                                                                                                                                                                                                                                                                    "Returns (mosaic, layout). Every tile and the canvas are held in memory.");
 }

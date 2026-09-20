@@ -22,7 +22,10 @@ namespace sirius {
 
     inline Index numel(const Extent5& e) noexcept { return e[0] * e[1] * e[2] * e[3] * e[4]; }
 
-    enum class ReduceOp : std::uint8_t { Sum, Mean, Max, Min };
+    enum class ReduceOp : std::uint8_t { Sum,
+                                         Mean,
+                                         Max,
+                                         Min };
 
     // Reduce `in` over every axis whose `reduce` flag is set (the output keeps
     // those axes with length 1). `out` must hold numel(outExtent) floats where
@@ -31,7 +34,9 @@ namespace sirius {
                     float* out);
     Extent5 reducedExtent(const Extent5& extent, const std::array<bool, 5>& reduce) noexcept;
 
-    enum class Interpolation : std::uint8_t { Nearest, Linear, Cubic };
+    enum class Interpolation : std::uint8_t { Nearest,
+                                              Linear,
+                                              Cubic };
 
     // Affine resampling of a (iz, iy, ix) volume onto a (oz, oy, ox) grid:
     // for every output voxel o = (z, y, x) the input coordinate is

@@ -61,12 +61,12 @@ namespace sirius::detail {
         for (std::size_t k = last; k-- > 1;) lineStride[k - 1] = lineStride[k] * outShape[k];
         const Index lines = last ? lineStride[0] * outShape[0] : Index{1};
 
-        #pragma omp parallel
+#pragma omp parallel
         {
             std::vector<Index> oi(last, 0);   // output multi-index over the outer axes
             std::vector<Index> bi(last, 0);   // input multi-index walking one box's lines
             std::vector<Index> bases;         // input offsets of the box's lines, C order
-            #pragma omp for schedule(static)
+#pragma omp for schedule(static)
             for (Index o = 0; o < lines; ++o) {
                 Index rem = o;
                 for (std::size_t k = 0; k < last; ++k) {

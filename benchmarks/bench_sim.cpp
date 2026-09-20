@@ -28,7 +28,7 @@ namespace {
             return sirius::Device::cuda(std::atoi(text.c_str() + 5));
         throw std::invalid_argument("device must be cpu, cuda, or cuda:N");
     }
-}
+} // namespace
 
 int main(int argc, char** argv) {
     if (argc < 2) {
@@ -53,7 +53,8 @@ int main(int argc, char** argv) {
         const double seconds = bench::time_min([&] {
             auto output = recon.reconstruct(raw);
             bytes = static_cast<std::uint64_t>(output.bytes());
-        }, repeats);
+        },
+                                               repeats);
         bench::report(device.isCuda() ? "sim-cuda" : "sim-cpu", seconds, bytes);
     } catch (const std::exception& e) {
         std::fprintf(stderr, "SIM benchmark failed: %s\n", e.what());

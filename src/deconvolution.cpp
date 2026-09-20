@@ -144,7 +144,7 @@ namespace sirius {
         // --- image: non-negative, extended by edge replication into the padding
         std::vector<double> data(static_cast<std::size_t>(n)), estimate(static_cast<std::size_t>(n));
         const Index oz = (pad.z - img.z) / 2, oy = (pad.y - img.y) / 2, ox = (pad.x - img.x) / 2;
-        #pragma omp parallel for collapse(2) schedule(static)
+#pragma omp parallel for collapse(2) schedule(static)
         for (Index z = 0; z < pad.z; ++z)
             for (Index y = 0; y < pad.y; ++y) {
                 const Index sz = std::clamp<Index>(z - oz, 0, img.z - 1), sy = std::clamp<Index>(y - oy, 0, img.y - 1);
@@ -175,7 +175,7 @@ namespace sirius {
             for (Index i = 0; i < nc; ++i) spec[static_cast<std::size_t>(i)] *= H[static_cast<std::size_t>(i)];
             fft.irfft(spec.data(), work.data(), true);
             // ratio = data / blur
-            #pragma omp parallel for schedule(static)
+#pragma omp parallel for schedule(static)
             for (Index i = 0; i < n; ++i) {
                 const double b = work[static_cast<std::size_t>(i)];
                 work[static_cast<std::size_t>(i)] = data[static_cast<std::size_t>(i)] / (b > eps ? b : eps);
@@ -189,7 +189,7 @@ namespace sirius {
             checkCancelled(options);
             // update, measuring the change over the original region only
             double num = 0.0, den = 0.0;
-            #pragma omp parallel for collapse(2) schedule(static) reduction(+ : num, den)
+#pragma omp parallel for collapse(2) schedule(static) reduction(+ : num, den)
             for (Index z = 0; z < pad.z; ++z)
                 for (Index y = 0; y < pad.y; ++y) {
                     const bool interior = z >= oz && z < oz + img.z && y >= oy && y < oy + img.y;
@@ -203,9 +203,18 @@ namespace sirius {
                             double gz, gy, gx, tz, ty, tx;
                             unitGradient(estimate.data(), pad, z, y, x, gradEps, gz, gy, gx);
                             double div = 0.0;
-                            if (z > 0) { unitGradient(estimate.data(), pad, z - 1, y, x, gradEps, tz, ty, tx); div += gz - tz; }
-                            if (y > 0) { unitGradient(estimate.data(), pad, z, y - 1, x, gradEps, tz, ty, tx); div += gy - ty; }
-                            if (x > 0) { unitGradient(estimate.data(), pad, z, y, x - 1, gradEps, tz, ty, tx); div += gx - tx; }
+                            if (z > 0) {
+                                unitGradient(estimate.data(), pad, z - 1, y, x, gradEps, tz, ty, tx);
+                                div += gz - tz;
+                            }
+                            if (y > 0) {
+                                unitGradient(estimate.data(), pad, z, y - 1, x, gradEps, tz, ty, tx);
+                                div += gy - ty;
+                            }
+                            if (x > 0) {
+                                unitGradient(estimate.data(), pad, z, y, x - 1, gradEps, tz, ty, tx);
+                                div += gx - tx;
+                            }
                             // the prior must stay a positive rescaling
                             factor /= std::max(1.0 - lambda * div, 0.1);
                         }
@@ -235,7 +244,7 @@ namespace sirius {
         // the only place the caller's view is modified, and it is past every
         // check above.
         // --- back to the caller's float view (interior only)
-        #pragma omp parallel for collapse(2) schedule(static)
+#pragma omp parallel for collapse(2) schedule(static)
         for (Index z = 0; z < img.z; ++z)
             for (Index y = 0; y < img.y; ++y) {
                 const double* src = estimate.data() + ((z + oz) * pad.y + (y + oy)) * pad.x + ox;

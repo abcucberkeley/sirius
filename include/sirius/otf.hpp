@@ -17,8 +17,8 @@ namespace sirius {
             : data_(std::move(data)), dkrotf_(dkrotf), dkzotf_(dkzotf) {}
 
         const Eigen::Tensor<std::complex<double>, 3, Eigen::RowMajor>& data() const { return data_; }
-        double dkrotf()  const { return dkrotf_; }
-        double dkzotf()  const { return dkzotf_; }
+        double dkrotf() const { return dkrotf_; }
+        double dkzotf() const { return dkzotf_; }
 
         // Extract one order's (nkr, nzotf) plane as a standalone tensor, ready
         // to pass to resampleOTF. Throws std::out_of_range on an invalid order.
