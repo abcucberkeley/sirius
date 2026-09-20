@@ -85,6 +85,31 @@ TEST_CASE("RealFFT round trip recovers real volume", "[real_fft]") {
     REQUIRE(maxAbsDiff(input, recovered) < 1e-10);
 }
 
+TEST_CASE("RealFFT::irfft leaves the caller's spectrum alone", "[real_fft]") {
+    // The header promises it ("The complex input of irfft is preserved") and
+    // the implementation keeps that promise by copying into scratch, because
+    // FFTW's multi-dimensional c2r overwrites its input. Only the CUDA test
+    // asserted it; this is the CPU half, so the copy cannot be dropped as an
+    // optimisation.
+    //
+    // Rank and rigor are load-bearing: a rank-1 plan built with Estimate may
+    // leave its input alone, so this test would pass with the copy removed and
+    // report that the copy is unnecessary.
+    RealFFT fft({4, 6}, 1, PlanRigor::Measure);
+    auto input = sequentialVolume<double>(1, 4, 6);
+    HalfComplexBand<double> freq(1, 4, 6);
+    TensorXr<double, 3> recovered(1, 4, 6);
+
+    fft.rfft(input, freq.tensor());
+    const std::vector<std::complex<double>> before(freq.data(), freq.data() + freq.size());
+
+    fft.irfft(freq.tensor(), recovered, /*normalize=*/true);
+
+    REQUIRE(maxAbsDiff(input, recovered) < 1e-10);
+    for (Eigen::Index i = 0; i < freq.size(); ++i)
+        REQUIRE(freq.data()[i] == before[static_cast<std::size_t>(i)]);
+}
+
 TEST_CASE("FFTW thread count API validates and stores planner thread count", "[real_fft][threads]") {
     REQUIRE_THROWS_AS(setFFTWThreadCount(0), std::invalid_argument);
     REQUIRE_NOTHROW(setFFTWThreadCount(1));
