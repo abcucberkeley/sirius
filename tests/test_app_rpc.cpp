@@ -204,11 +204,17 @@ TEST_CASE("rpc frames round trip with tensors", "[app][rpc]") {
 // without the caps and the checked arithmetic in decodeFrame, wrap an
 // intermediate and let the decoder index past the end of the buffer.
 TEST_CASE("rpc frames with hostile lengths are refused, not wrapped", "[app][rpc]") {
+    // Little-endian, as rpc.cpp writes and reads them. These built the lengths
+    // the other way round, so every frame below was rejected at the *header*
+    // length -- 8 read as 0x08000000, 128 MiB, over the 64 MiB cap -- and no
+    // section ever reached the check it is named after. CHECK_THROWS was
+    // satisfied either way. The matchers below are what keep that from
+    // happening again: each one names the check it means to exercise.
     auto put32 = [](std::vector<std::byte>& out, std::uint32_t v) {
-        for (int i = 3; i >= 0; --i) out.push_back(static_cast<std::byte>((v >> (8 * i)) & 0xff));
+        for (int i = 0; i < 4; ++i) out.push_back(static_cast<std::byte>((v >> (8 * i)) & 0xff));
     };
     auto put64 = [](std::vector<std::byte>& out, std::uint64_t v) {
-        for (int i = 7; i >= 0; --i) out.push_back(static_cast<std::byte>((v >> (8 * i)) & 0xff));
+        for (int i = 0; i < 8; ++i) out.push_back(static_cast<std::byte>((v >> (8 * i)) & 0xff));
     };
     auto frame = [&](const json& header, std::uint64_t payloadLen) {
         const std::string h = header.dump();
@@ -223,11 +229,17 @@ TEST_CASE("rpc frames with hostile lengths are refused, not wrapped", "[app][rpc
         // 4 + hlen + 8 + plen wraps to a small number for a plen near 2^64,
         // so "is the whole frame here yet" would say yes on a 30-byte buffer.
         std::vector<std::byte> f = frame(json{{"id", 1}}, ~0ull - 16);
-        CHECK_THROWS(rpc::decodeFrame(f));
+        CHECK_THROWS_WITH(rpc::decodeFrame(f), Catch::Matchers::ContainsSubstring("payload of"));
     }
     SECTION("an implausible payload length is rejected before allocation") {
-        std::vector<std::byte> f = frame(json{{"id", 1}}, 1ull << 45);
-        CHECK_THROWS(rpc::decodeFrame(f));
+        // above kMaxPayloadBytes (32 GiB), and nothing has been allocated yet
+        std::vector<std::byte> f = frame(json{{"id", 1}}, 64ull << 30);
+        CHECK_THROWS_WITH(rpc::decodeFrame(f), Catch::Matchers::ContainsSubstring("payload of"));
+    }
+    SECTION("an implausible header length is rejected before the header is read") {
+        std::vector<std::byte> f;
+        put32(f, 128u << 20);   // 128 MiB of JSON, over the 64 MiB cap
+        CHECK_THROWS_WITH(rpc::decodeFrame(f), Catch::Matchers::ContainsSubstring("header of"));
     }
     SECTION("a tensor shape whose product overflows is rejected") {
         const json header{{"id", 1},
@@ -238,13 +250,13 @@ TEST_CASE("rpc frames with hostile lengths are refused, not wrapped", "[app][rpc
                                                         {"nbytes", 4}}})}};
         std::vector<std::byte> f = frame(header, 4);
         for (int i = 0; i < 4; ++i) f.push_back(std::byte{0});
-        CHECK_THROWS(rpc::decodeFrame(f));
+        CHECK_THROWS_WITH(rpc::decodeFrame(f), Catch::Matchers::ContainsSubstring("tensor"));
     }
     SECTION("a framing failure is a ProtocolError, and still a runtime_error") {
         // The typed failure is what lets a caller tell "the connection to the
         // worker broke" from "the step the worker ran failed", which used to
         // mean noticing that one message starts with "rpc: ".
-        std::vector<std::byte> f = frame(json{{"id", 1}}, 1ull << 45);
+        std::vector<std::byte> f = frame(json{{"id", 1}}, 64ull << 30);
         CHECK_THROWS_AS(rpc::decodeFrame(f), ProtocolError);
         CHECK_THROWS_AS(rpc::decodeFrame(f), sirius::SiriusError);
         CHECK_THROWS_AS(rpc::decodeFrame(f), std::runtime_error);
@@ -260,7 +272,7 @@ TEST_CASE("rpc frames with hostile lengths are refused, not wrapped", "[app][rpc
                                                         {"nbytes", 8}}})}};
         std::vector<std::byte> f = frame(header, 4);
         for (int i = 0; i < 4; ++i) f.push_back(std::byte{0});
-        CHECK_THROWS(rpc::decodeFrame(f));
+        CHECK_THROWS_WITH(rpc::decodeFrame(f), Catch::Matchers::ContainsSubstring("tensor"));
     }
 }
 
