@@ -21,36 +21,6 @@
 
 namespace sirius {
 
-    // --- pixel types --------------------------------------------------------
-
-    std::size_t bytesPerPixel(PixelType t) noexcept {
-        switch (t) {
-            case PixelType::UInt8:
-            case PixelType::Int8: return 1;
-            case PixelType::UInt16:
-            case PixelType::Int16: return 2;
-            case PixelType::UInt32:
-            case PixelType::Int32:
-            case PixelType::Float32: return 4;
-            case PixelType::Float64: return 8;
-        }
-        return 0;
-    }
-
-    const char* toString(PixelType t) noexcept {
-        switch (t) {
-            case PixelType::UInt8: return "uint8";
-            case PixelType::Int8: return "int8";
-            case PixelType::UInt16: return "uint16";
-            case PixelType::Int16: return "int16";
-            case PixelType::UInt32: return "uint32";
-            case PixelType::Int32: return "int32";
-            case PixelType::Float32: return "float32";
-            case PixelType::Float64: return "float64";
-        }
-        return "unknown";
-    }
-
     // anon namespace so stuff isnt seen outside the translation unit
     namespace {
 
@@ -388,8 +358,8 @@ namespace sirius {
         template <typename T>
         void downsamplePlane(const T* src, uint32_t rows, uint32_t cols, int f, std::vector<T>& dst,
                              uint32_t& outRows, uint32_t& outCols) {
-            outRows = static_cast<uint32_t>(downsampledExtent(rows, f));
-            outCols = static_cast<uint32_t>(downsampledExtent(cols, f));
+            outRows = static_cast<uint32_t>(detail::downsampledExtent(rows, f));
+            outCols = static_cast<uint32_t>(detail::downsampledExtent(cols, f));
             dst.resize(static_cast<std::size_t>(outRows) * outCols);
             detail::downsampleBoxMean<T>(src, {Index{rows}, Index{cols}}, {f, f}, dst.data());
         }

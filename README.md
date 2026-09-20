@@ -288,7 +288,7 @@ factorization shared by the three axes, anchored on one tile), and a blended
 fusion pass (`Overwrite`, `Average`, `Feather`, `Maximum`).
 
 ```cpp
-#include <sirius/stitching.hpp>
+#include <sirius/stitching_tiff.hpp>   // stitching.hpp + the TIFF convenience below
 
 StitchOptions options;
 options.searchRadius = {2, 64, 64};

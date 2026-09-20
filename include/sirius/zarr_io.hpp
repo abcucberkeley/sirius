@@ -9,7 +9,7 @@
 #include <vector>
 
 #include "sirius/buffer.hpp"
-#include "sirius/tiff_io.hpp"   // PixelType
+#include "sirius/pixel_type.hpp"
 
 // Chunked array stores (zarr v2, zarr v3, N5) through TensorStore. Only
 // compiled with SIRIUS_ENABLE_TENSORSTORE; without it every function throws

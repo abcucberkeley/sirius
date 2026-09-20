@@ -9,7 +9,6 @@
 
 #include "sirius/buffer.hpp"
 #include "sirius/registration.hpp"
-#include "sirius/tiff_io.hpp"
 
 // Mosaic stitching of tiles acquired on a stage.
 //
@@ -150,21 +149,9 @@ namespace sirius {
                             const std::vector<std::array<double, 3>>& nominalPositions,
                             const StitchOptions& options = {});
 
-    // --- TIFF convenience ---------------------------------------------------
-
-    struct StitchTile {
-        std::string path;                        // multi-page TIFF, one tile
-        std::array<double, 3> position{0, 0, 0}; // nominal origin in voxels
-    };
-
-    // Read the tiles, plan the mosaic, fuse it and (when `outputPath` is not
-    // empty) write the result as a TIFF. Every tile and the canvas are held in
-    // memory at once, so this suits mosaics that fit in RAM; for larger ones
-    // drive planStitch/fuseTiles directly over a tile-at-a-time reader.
-    template <typename T>
-    Buffer<T> stitchTiffTiles(const std::vector<StitchTile>& tiles, const StitchOptions& options,
-                              StitchLayout* layout = nullptr, const std::string& outputPath = {},
-                              TiffCompression compression = TiffCompression::None);
+    // stitchTiffTiles (read the tiles from TIFF files, stitch, write the mosaic)
+    // is sirius/stitching_tiff.hpp: the registration and the fusion here work on
+    // memory and need no file format.
 
 } // namespace sirius
 

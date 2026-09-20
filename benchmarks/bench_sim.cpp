@@ -15,6 +15,7 @@
 
 #include <sirius/buffer.hpp>
 #include <sirius/legacy_config.hpp>
+#include <sirius/otf_io.hpp>
 #include <sirius/sim_reconstruction.hpp>
 #include <sirius/tiff_io.hpp>
 

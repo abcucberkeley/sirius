@@ -45,10 +45,8 @@
 
 namespace sirius {
 
-    // Smallest n' >= n that factors into 2, 3, 5 and 7 -- the radices FFTW and
-    // cuFFT have hand-written codelets for. Padding a transform up to such a
-    // size is normally far cheaper than running the next prime length.
-    Index nextFastFFTSize(Index n);
+    // nextFastFFTSize(n), the 2/3/5/7-smooth padding size the correlator uses,
+    // is declared in sirius/fft_common.hpp (included above).
 
     struct MaskedNccOptions {
         // Candidate displacements whose masks overlap in fewer than this many

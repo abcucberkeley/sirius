@@ -16,6 +16,7 @@
 
 #include "sirius/buffer.hpp"
 #include "sirius/device.hpp"
+#include "sirius/pixel_type.hpp"
 
 // TIFF reading and writing for grayscale scientific stacks.
 //
@@ -85,30 +86,6 @@ namespace sirius {
     }
 
     // --- metadata ---------------------------------------------------------
-
-    enum class PixelType : std::uint8_t { UInt8,
-                                          Int8,
-                                          UInt16,
-                                          Int16,
-                                          UInt32,
-                                          Int32,
-                                          Float32,
-                                          Float64 };
-
-    std::size_t bytesPerPixel(PixelType t) noexcept;
-    const char* toString(PixelType t) noexcept;
-
-    template <typename T> constexpr PixelType pixelTypeOf() {
-        if constexpr (std::is_same_v<T, std::uint8_t>) return PixelType::UInt8;
-        else if constexpr (std::is_same_v<T, std::int8_t>) return PixelType::Int8;
-        else if constexpr (std::is_same_v<T, std::uint16_t>) return PixelType::UInt16;
-        else if constexpr (std::is_same_v<T, std::int16_t>) return PixelType::Int16;
-        else if constexpr (std::is_same_v<T, std::uint32_t>) return PixelType::UInt32;
-        else if constexpr (std::is_same_v<T, std::int32_t>) return PixelType::Int32;
-        else if constexpr (std::is_same_v<T, float>) return PixelType::Float32;
-        else if constexpr (std::is_same_v<T, double>) return PixelType::Float64;
-        else static_assert(sizeof(T) == 0, "unsupported pixel type");
-    }
 
     enum class TiffLayout : std::uint8_t { Strips,
                                            Tiles };

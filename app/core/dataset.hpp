@@ -11,7 +11,7 @@
 #include <string>
 #include <vector>
 
-#include <sirius/tiff_io.hpp>
+#include <sirius/pixel_type.hpp>
 
 #include "core/array.hpp"
 

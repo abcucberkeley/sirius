@@ -12,69 +12,11 @@
 #include <vector>
 
 #include "sirius/stitching.hpp"
-#include "sirius/tiff_io.hpp"
-#include "temp_path.hpp"
+#include "stitching_scene.hpp"
 
 using namespace sirius;
+using namespace sirius::test::stitching;
 using Catch::Matchers::WithinAbs;
-
-namespace {
-
-    using Ext = std::array<Index, 3>;
-    using Pos = std::array<double, 3>;
-
-    struct Scene {
-        Ext extent{1, 1, 1};
-        std::vector<float> data;
-
-        Index at(Index z, Index y, Index x) const { return (z * extent[1] + y) * extent[2] + x; }
-        float value(Index z, Index y, Index x) const {
-            return data[static_cast<std::size_t>(at(z, y, x))];
-        }
-    };
-
-    // Smooth-but-textured content: correlation of pure white noise is fine but
-    // this is closer to an image, and every tile sees the same field.
-    Scene makeScene(Ext extent, unsigned seed) {
-        Scene s;
-        s.extent = extent;
-        s.data.resize(static_cast<std::size_t>(extent[0] * extent[1] * extent[2]));
-        std::mt19937 rng(seed);
-        std::uniform_real_distribution<double> phase(0.0, 6.283185307179586);
-        std::uniform_real_distribution<double> noise(-0.05, 0.05);
-        const double p1 = phase(rng), p2 = phase(rng), p3 = phase(rng);
-        for (Index z = 0; z < extent[0]; ++z)
-            for (Index y = 0; y < extent[1]; ++y)
-                for (Index x = 0; x < extent[2]; ++x) {
-                    const double v = std::sin(0.31 * x + p1) * std::cos(0.23 * y + p2) +
-                                     0.6 * std::sin(0.11 * (x + y) + p3) +
-                                     0.4 * std::cos(0.47 * z + 0.19 * x) + noise(rng);
-                    s.data[static_cast<std::size_t>(s.at(z, y, x))] = static_cast<float>(v + 2.0);
-                }
-        return s;
-    }
-
-    struct Tile {
-        Ext extent{};
-        std::vector<float> data;
-        BufferView<const float> view() const {
-            return {data.data(), Shape{extent[0], extent[1], extent[2]}, Device::cpu()};
-        }
-    };
-
-    Tile cut(const Scene& scene, Ext origin, Ext extent) {
-        Tile t;
-        t.extent = extent;
-        t.data.resize(static_cast<std::size_t>(extent[0] * extent[1] * extent[2]));
-        for (Index z = 0; z < extent[0]; ++z)
-            for (Index y = 0; y < extent[1]; ++y)
-                for (Index x = 0; x < extent[2]; ++x)
-                    t.data[static_cast<std::size_t>((z * extent[1] + y) * extent[2] + x)] =
-                        scene.value(z + origin[0], y + origin[1], x + origin[2]);
-        return t;
-    }
-
-} // namespace
 
 TEST_CASE("a tile pair registers back to its true offset", "[stitching]") {
     const Scene scene = makeScene({3, 90, 120}, 5);
@@ -246,43 +188,4 @@ TEST_CASE("a 2x2 mosaic is planned and fused back into the scene", "[stitching]"
     const Buffer<float> fused = fuseTiles<float>(views, layout.positions, layout.canvasOrigin,
                                                  layout.canvasExtent, options);
     CHECK(fused.shape() == Shape{2, layout.canvasExtent[1], layout.canvasExtent[2]});
-}
-
-TEST_CASE("TIFF tiles stitch end to end", "[stitching]") {
-    const Scene scene = makeScene({3, 40, 96}, 31);
-    const Tile left = cut(scene, {0, 0, 0}, {3, 40, 60});
-    const Tile right = cut(scene, {0, 0, 36}, {3, 40, 60});
-
-    sirius::test::TempFile leftFile("stitch_left", ".tif");
-    sirius::test::TempFile rightFile("stitch_right", ".tif");
-    sirius::test::TempFile outFile("stitch_out", ".tif");
-    writeTiffStack<float>(leftFile.str, left.view());
-    writeTiffStack<float>(rightFile.str, right.view());
-
-    StitchOptions options;
-    options.searchRadius = {1, 8, 10};
-    options.blend = BlendMode::Feather;
-
-    StitchLayout layout;
-    const std::vector<StitchTile> inputs{{leftFile.str, {0, 0, 0}}, {rightFile.str, {0, 2, 41}}};
-    const Buffer<float> fused = stitchTiffTiles<float>(inputs, options, &layout, outFile.str);
-
-    REQUIRE(layout.positions.size() == 2);
-    CHECK_THAT(layout.positions[0][2], WithinAbs(0.0, 1e-9));
-    CHECK_THAT(layout.positions[1][1], WithinAbs(0.0, 0.4));
-    CHECK_THAT(layout.positions[1][2], WithinAbs(36.0, 0.4));
-    REQUIRE(fused.shape() == Shape{3, 40, 96});
-
-    double worst = 0.0;
-    for (Index z = 0; z < 3; ++z)
-        for (Index y = 0; y < 40; ++y)
-            for (Index x = 0; x < 96; ++x)
-                worst = std::max(worst, std::abs(static_cast<double>(fused.data()[(z * 40 + y) * 96 + x]) -
-                                                 scene.value(z, y, x)));
-    INFO("largest deviation from the source scene: " << worst);
-    CHECK(worst < 1e-5);
-
-    const auto reread = readTiffStack<float>(outFile.str);
-    CHECK(reread.dimension(0) == 3);
-    CHECK(reread.dimension(2) == 96);
 }

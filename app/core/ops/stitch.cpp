@@ -8,6 +8,7 @@
 //     then applied to every (c, t).
 // Memory: every tile of one (c, t) plus the fused canvas are held at once, so
 // this suits mosaics whose one-channel volume fits in RAM.
+#include "core/ops/common.hpp"
 #include "core/ops/builtin.hpp"
 
 #include <limits>
@@ -19,6 +20,7 @@
 #include <set>
 
 #include <sirius/stitching.hpp>
+#include <sirius/stitching_tiff.hpp>
 
 #include "core/array_source.hpp"
 

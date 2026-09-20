@@ -15,7 +15,8 @@
 #include "sirius/errors.hpp"
 #include "sirius/fft.hpp"
 #include "sirius/legacy_config.hpp"
-#include "sirius/otf.hpp"
+#include "sirius/otf_ideal.hpp"
+#include "sirius/otf_io.hpp"
 #include "sirius/sim_reconstruction.hpp"
 #include "sirius/tiff_io.hpp"
 

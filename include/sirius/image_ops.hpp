@@ -7,7 +7,7 @@
 #include <utility>
 #include <vector>
 
-#include "sirius/buffer.hpp"
+#include "sirius/index.hpp"
 
 // Generic array operations on host float volumes: axis reductions, affine
 // resampling (deskew, rotation, isotropic resampling), crop / pad, intensity

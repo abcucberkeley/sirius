@@ -10,6 +10,7 @@
 
 #include <sirius/registration.hpp>
 #include <sirius/stitching.hpp>
+#include <sirius/stitching_tiff.hpp>
 
 #include <cstdint>
 #include <optional>

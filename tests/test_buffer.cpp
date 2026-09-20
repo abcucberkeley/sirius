@@ -18,7 +18,6 @@
 #include "sirius/buffer.hpp"
 #include "sirius/device.hpp"
 #include "sirius/errors.hpp"
-#include "sirius/tiff_io.hpp"
 
 using namespace sirius;
 
@@ -85,7 +84,7 @@ TEST_CASE("Shape basics", "[buffer][shape]") {
         REQUIRE(Shape{3, 2, 4, 7}.asStack() == Shape{6, 4, 7});
     }
     SECTION("from an Eigen tensor") {
-        ImageStack<float> t(2, 3, 4);
+        Eigen::Tensor<float, 3, Eigen::RowMajor> t(2, 3, 4);
         REQUIRE(Shape(t) == Shape{2, 3, 4});
     }
 }
@@ -260,7 +259,7 @@ TEST_CASE("BufferView slicing and reshaping", "[buffer][view]") {
 }
 
 TEST_CASE("Eigen interop is zero-copy", "[buffer][eigen]") {
-    ImageStack<float> stack(2, 3, 4);
+    Eigen::Tensor<float, 3, Eigen::RowMajor> stack(2, 3, 4);
     for (Eigen::Index i = 0; i < stack.size(); ++i) stack.data()[i] = static_cast<float>(i);
 
     auto view = toView(stack);

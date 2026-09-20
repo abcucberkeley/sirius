@@ -8,6 +8,7 @@
 #include <nanobind/stl/vector.h>
 
 #include <sirius/legacy_config.hpp>
+#include <sirius/otf_io.hpp>
 #include <sirius/sim_reconstruction.hpp>
 
 #include <memory>

@@ -56,7 +56,8 @@ namespace sirius {
     class SimReconstructor {
     public:
         // The OTF must be radially averaged with at least norders orders
-        // (see loadOTF below). PlanRigor affects only the FFTW backend.
+        // (loadOTF in sirius/otf_io.hpp, idealOTF in sirius/otf_ideal.hpp).
+        // PlanRigor affects only the FFTW backend.
         SimReconstructor(SIMParameters params, OTFRadiallyAveraged otf,
                          Device device = Device::cpu(), PlanRigor rigor = PlanRigor::Measure);
         ~SimReconstructor();
@@ -120,11 +121,9 @@ namespace sirius {
         std::unique_ptr<Impl> impl_;
     };
 
-    // Load a radially averaged OTF TIFF, deriving its reciprocal-space
-    // sampling from the file dimensions and the acquisition parameters
-    // (dkr = 1/(dx*(nkr-1)*2), dkz = 1/(dz_psf*nzotf)), as cudasirecon's
-    // determine_otf_dimensions does for otfRA files.
-    OTFRadiallyAveraged loadOTF(const std::string& filename, const SIMParameters& p);
+    // loadOTF(filename, SIMParameters) is declared in sirius/otf_io.hpp, beside
+    // the code that implements it. It was declared here, so the OTF code had
+    // to include this header and the two units formed a cycle.
 
 } // namespace sirius
 

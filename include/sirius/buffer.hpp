@@ -16,6 +16,7 @@
 
 #include "sirius/checked_math.hpp"
 #include "sirius/device.hpp"
+#include "sirius/index.hpp"
 
 // A function both the host and the CUDA kernels call (convertScalar below).
 #ifdef __CUDACC__
@@ -73,7 +74,8 @@ namespace sirius {
         }
     } // namespace detail
 
-    using Index = Eigen::Index;   // ptrdiff_t: matches Eigen tensors and dev-side helpers
+    // Index (sirius/index.hpp) is what Eigen tensors and the device-side helpers count in
+    static_assert(std::is_same_v<Index, Eigen::Index>, "sirius::Index must be Eigen::Index");
 
     // --- Shape ------------------------------------------------------------
     // Up to 4 dimensions: e.g. {z, y, x} for a stack, {phase*dir, z, y, x}

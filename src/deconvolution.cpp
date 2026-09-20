@@ -8,8 +8,8 @@
 #include <string>
 #include <vector>
 
+#include "sirius/fft_common.hpp"   // nextFastFFTSize
 #include "sirius/real_fft.hpp"
-#include "sirius/registration.hpp"   // nextFastFFTSize
 
 // Richardson-Lucy with the total-variation prior of Dey et al. (Microsc. Res.
 // Tech. 69, 2006):

@@ -2,6 +2,8 @@
 
 #include <sirius/constants.hpp>
 #include <sirius/legacy_config.hpp>
+#include <sirius/otf_ideal.hpp>
+#include <sirius/otf_io.hpp>
 
 #include <algorithm>
 #include <cctype>

@@ -33,19 +33,16 @@ namespace sirius {
         };
         using FftwBuf = std::unique_ptr<fftw_complex[], FftwFree>;
 
-        // FFTW's planner modifies global state — must be serialized across all instances
-        std::mutex s_planner_mutex;
-        int s_fftw_thread_count = 1;
-        bool s_fftw_threads_initialized = false;
-
-        // FFTW wisdom is global state no needs shared mutex
+        // FFTW's planner modifies global state -- every plan, of this transform
+        // and of RealFFT, is made and destroyed under the one mutex
+        // fft_common.cpp owns. Wisdom is planner state too.
         void loadWisdomImpl(const std::string& path) {
-            std::lock_guard<std::mutex> lock(s_planner_mutex);
+            std::lock_guard<std::mutex> lock(detail::fftwPlannerMutex());
             fftw_import_wisdom_from_filename(path.c_str()); // returns 0 on missing file, silently ok
         }
 
         void saveWisdomImpl(const std::string& path) {
-            std::lock_guard<std::mutex> lock(s_planner_mutex);
+            std::lock_guard<std::mutex> lock(detail::fftwPlannerMutex());
             if (!fftw_export_wisdom_to_filename(path.c_str()))
                 throw std::runtime_error("Failed to save FFTW wisdom to: " + path);
         }
@@ -54,86 +51,10 @@ namespace sirius {
 
     namespace {
         void FFTWPlanDeleter::operator()(fftw_plan plan) const {
-            std::lock_guard<std::mutex> lock(s_planner_mutex);
+            std::lock_guard<std::mutex> lock(detail::fftwPlannerMutex());
             fftw_destroy_plan(plan);
         }
     } // namespace
-
-    namespace detail {
-        std::mutex& fftwPlannerMutex() {
-            return s_planner_mutex;
-        }
-
-        // map plan rigor to fftw flags
-        unsigned int toFFTWFlag(PlanRigor r) {
-            switch (r) {
-                case PlanRigor::Estimate: return FFTW_ESTIMATE;
-                case PlanRigor::Measure: return FFTW_MEASURE;
-                case PlanRigor::Patient: return FFTW_PATIENT;
-                case PlanRigor::Exhaustive: return FFTW_EXHAUSTIVE;
-            }
-            throw std::invalid_argument("Unknown PlanRigor value");
-        }
-
-        int checkedProduct(const std::vector<int>& dims, const char* what) {
-            long long total = 1;
-            for (int d : dims) {
-                if (d <= 0)
-                    throw std::invalid_argument(std::string(what) + " dimensions must be positive");
-                if (total > std::numeric_limits<int>::max() / d)
-                    throw std::overflow_error(std::string(what) + " dimensions overflow int");
-                total *= d;
-            }
-            return static_cast<int>(total);
-        }
-
-        int checkedMultiply(int a, int b, const char* what) {
-            if (a < 0 || b < 0)
-                throw std::invalid_argument(std::string(what) + " size must not be negative");
-            if (b != 0 && a > std::numeric_limits<int>::max() / b)
-                throw std::overflow_error(std::string(what) + " size overflows int");
-            return a * b;
-        }
-
-        // Caller must hold fftwPlannerMutex().
-        void ensureDoubleThreadsInitializedLocked() {
-            if (!s_fftw_threads_initialized) {
-                if (fftw_init_threads() == 0)
-                    throw std::runtime_error("FFTW failed to initialize double-precision threading");
-                s_fftw_threads_initialized = true;
-            }
-            fftw_plan_with_nthreads(s_fftw_thread_count);
-        }
-
-        void* checkedFftwMalloc(std::size_t bytes) {
-            if (bytes == 0) return nullptr;
-            void* p = fftw_malloc(bytes);
-            if (!p) throw std::bad_alloc();
-            return p;
-        }
-    } // namespace detail
-
-    void setFFTWThreadCount(int nthreads) {
-        if (nthreads < 1)
-            throw std::invalid_argument("FFTW thread count must be >= 1");
-
-        std::lock_guard<std::mutex> lock(s_planner_mutex);
-        s_fftw_thread_count = nthreads;
-        detail::ensureDoubleThreadsInitializedLocked();
-    }
-
-    int getFFTWThreadCount() {
-        std::lock_guard<std::mutex> lock(s_planner_mutex);
-        return s_fftw_thread_count;
-    }
-
-    void* fftwAlignedMalloc(std::size_t bytes) {
-        return detail::checkedFftwMalloc(bytes);
-    }
-
-    void fftwAlignedFree(void* p) noexcept {
-        fftw_free(p);
-    }
 
     // --- FFTW backend --------------------------------------------------------
 
@@ -149,7 +70,7 @@ namespace sirius {
                 FftwBuf buf_out(static_cast<fftw_complex*>(detail::checkedFftwMalloc(sizeof(fftw_complex) * full_size_)));
                 alignment_ = fftw_alignment_of(reinterpret_cast<double*>(buf_in.get()));
 
-                std::lock_guard<std::mutex> lock(s_planner_mutex);
+                std::lock_guard<std::mutex> lock(detail::fftwPlannerMutex());
                 detail::ensureDoubleThreadsInitializedLocked();
                 forward_plan_ = plan(buf_in.get(), buf_out.get(), FFTW_FORWARD);
                 inverse_plan_ = plan(buf_in.get(), buf_out.get(), FFTW_BACKWARD);
@@ -190,7 +111,7 @@ namespace sirius {
             }
 
         private:
-            // Caller holds s_planner_mutex. in == out plans an in-place transform.
+            // Caller holds fftwPlannerMutex(). in == out plans an in-place transform.
             PlanPtr plan(fftw_complex* in, fftw_complex* out, int sign) const {
                 return PlanPtr(fftw_plan_many_dft(
                     static_cast<int>(dims_.size()), dims_.data(), howmany_,
@@ -206,7 +127,7 @@ namespace sirius {
                     // Planning with FFTW_MEASURE and up overwrites the array, so
                     // plan on a scratch buffer of the plan's alignment.
                     FftwBuf buf(static_cast<fftw_complex*>(detail::checkedFftwMalloc(sizeof(fftw_complex) * full_size_)));
-                    std::lock_guard<std::mutex> lock(s_planner_mutex);
+                    std::lock_guard<std::mutex> lock(detail::fftwPlannerMutex());
                     detail::ensureDoubleThreadsInitializedLocked();
                     slot = plan(buf.get(), buf.get(), forward ? FFTW_FORWARD : FFTW_BACKWARD);
                     if (!slot) throw std::runtime_error("FFTW failed to create in-place plan.");

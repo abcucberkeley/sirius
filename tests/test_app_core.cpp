@@ -24,7 +24,7 @@
 #include "sirius/constants.hpp"
 #include "sirius/fft.hpp"
 #include "sirius/legacy_config.hpp"
-#include "sirius/otf.hpp"
+#include "sirius/otf_ideal.hpp"
 #include "sirius/real_fft.hpp"
 #include "sirius/tiff_io.hpp"
 

@@ -1,9 +1,10 @@
 #ifndef SIRIUS_CUDA_KERNELS_HPP
 #define SIRIUS_CUDA_KERNELS_HPP
 
-// Device kernels used by the buffer layer and the readers. Declared here with
+// Device kernels of the buffer layer (fill, convert). Declared here with
 // plain C++ types so the callers can be compiled by the host compiler; only
 // kernels.cu needs nvcc. Every function enqueues on `stream` and returns.
+// The transforms' scaling kernels are cuda/fft_kernels.hpp.
 
 #include <cuda_runtime.h>
 
@@ -18,12 +19,6 @@ namespace sirius::cuda {
 
     template <typename From, typename To>
     void convertDevice(const From* src, To* dst, std::size_t n, cudaStream_t stream);
-
-    // Multiply n complex<double> by a real scalar (used by ifft normalization).
-    void scaleComplexDouble(std::complex<double>* p, std::size_t n, double scale, cudaStream_t stream);
-
-    // Multiply n doubles by a scalar (used by irfft normalization).
-    void scaleDouble(double* p, std::size_t n, double scale, cudaStream_t stream);
 
 } // namespace sirius::cuda
 

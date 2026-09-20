@@ -22,6 +22,23 @@ namespace sirius {
     void setFFTWThreadCount(int nthreads);
     int getFFTWThreadCount();
 
+    // Smallest n' >= n that factors into 2, 3, 5 and 7 -- the radices FFTW and
+    // cuFFT have hand-written codelets for. Padding a transform up to such a
+    // size is normally far cheaper than running the next prime length. Here,
+    // inline, rather than in the registration unit where it started: the
+    // deconvolution pads its transforms with it too, and that was its only
+    // reason to link registration. (std::ptrdiff_t is sirius::Index.)
+    inline std::ptrdiff_t nextFastFFTSize(std::ptrdiff_t n) {
+        if (n <= 1) return 1;
+        constexpr std::ptrdiff_t kRadices[] = {2, 3, 5, 7};
+        for (;; ++n) {
+            std::ptrdiff_t m = n;
+            for (std::ptrdiff_t f : kRadices)
+                while (m % f == 0) m /= f;
+            if (m == 1) return n;
+        }
+    }
+
     // Allocate/free buffers with FFTW's alignment. Useful for Python-owned output
     // arrays so execute_safe() can avoid allocation+copy fallbacks.
     void* fftwAlignedMalloc(std::size_t bytes);

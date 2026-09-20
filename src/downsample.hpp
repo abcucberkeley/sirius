@@ -16,9 +16,17 @@
 #include <vector>
 
 #include "sirius/checked_math.hpp"
-#include "sirius/image_ops.hpp"
+#include "sirius/index.hpp"
 
 namespace sirius::detail {
+
+    // Extent of one down-sampled axis: ceil(n / f). The public
+    // sirius::downsampledExtent (image_ops.hpp) is the same expression; this
+    // header sits below image_ops, so it cannot borrow it
+    // (test_image_ops pins the two together).
+    inline Index downsampledExtent(Index n, int f) noexcept {
+        return (n + f - 1) / f;
+    }
 
     // Shape of the down-sampled array: ceil(shape / factor) per axis.
     inline std::vector<Index> downsampledShape(const std::vector<Index>& shape, const std::vector<int>& factors) {

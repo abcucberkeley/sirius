@@ -30,7 +30,7 @@ namespace sirius::detail {
 
     std::unique_ptr<RealFftBackend> makeFftwRealBackend(const std::vector<int>& dims, int howmany,
                                                         PlanRigor rigor);
-    // Defined in fft_cufft.cpp (only compiled with SIRIUS_HAS_CUDA).
+    // Defined in real_fft_cufft.cpp (only compiled with SIRIUS_HAS_CUDA).
     std::unique_ptr<RealFftBackend> makeCufftRealBackend(const std::vector<int>& dims, int howmany,
                                                          Device device);
 

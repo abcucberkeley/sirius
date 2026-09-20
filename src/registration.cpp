@@ -160,17 +160,6 @@ namespace sirius {
 
     } // namespace
 
-    Index nextFastFFTSize(Index n) {
-        if (n <= 1) return 1;
-        static constexpr Index kRadices[] = {2, 3, 5, 7};
-        for (;; ++n) {
-            Index m = n;
-            for (Index f : kRadices)
-                while (m % f == 0) m /= f;
-            if (m == 1) return n;
-        }
-    }
-
     // --- MaskedCorrelator ---------------------------------------------------
 
     struct MaskedCorrelator::Impl {

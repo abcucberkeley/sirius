@@ -432,43 +432,13 @@ namespace sirius {
         return layout;
     }
 
-    // --- TIFF convenience -----------------------------------------------------
-
-    template <typename T>
-    Buffer<T> stitchTiffTiles(const std::vector<StitchTile>& tiles, const StitchOptions& options,
-                              StitchLayout* layout, const std::string& outputPath,
-                              TiffCompression compression) {
-        if (tiles.empty()) throw std::invalid_argument("stitchTiffTiles: no tiles given");
-
-        std::vector<Buffer<T>> data;
-        std::vector<BufferView<const T>> views;
-        std::vector<Pos> nominal;
-        data.reserve(tiles.size());
-        nominal.reserve(tiles.size());
-        for (const StitchTile& t : tiles) {
-            data.push_back(TiffFile(t.path).readStack<T>());
-            nominal.push_back(t.position);
-        }
-        views.reserve(data.size());
-        for (const Buffer<T>& d : data) views.push_back(d.view());
-
-        const StitchLayout plan = planStitch<T>(views, nominal, options);
-        Buffer<T> fused = fuseTiles<T>(views, plan.positions, plan.canvasOrigin, plan.canvasExtent,
-                                       options);
-        if (!outputPath.empty()) writeTiffStack<T>(outputPath, fused.view(), compression);
-        if (layout) *layout = plan;
-        return fused;
-    }
-
 #define SIRIUS_INSTANTIATE_STITCHING(T)                                                               \
     template TileMatch registerTilePair<T>(BufferView<const T>, Pos, BufferView<const T>, Pos,        \
                                            const StitchOptions&);                                     \
     template Buffer<T> fuseTiles<T>(const std::vector<BufferView<const T>>&, const std::vector<Pos>&, \
                                     Ext, Ext, const StitchOptions&);                                  \
     template StitchLayout planStitch<T>(const std::vector<BufferView<const T>>&,                      \
-                                        const std::vector<Pos>&, const StitchOptions&);               \
-    template Buffer<T> stitchTiffTiles<T>(const std::vector<StitchTile>&, const StitchOptions&,       \
-                                          StitchLayout*, const std::string&, TiffCompression);
+                                        const std::vector<Pos>&, const StitchOptions&);
 
     SIRIUS_INSTANTIATE_STITCHING(double)
     SIRIUS_INSTANTIATE_STITCHING(float)
