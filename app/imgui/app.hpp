@@ -72,12 +72,15 @@ namespace sirius::app::gui {
         bool isOpen() const noexcept { return open_; }
         // Bring an already open (non-modal) dialog to the front next frame.
         void raise() { raise_ = true; }
+        // No modal dialog is open over this one: the keys (Enter) are its own.
+        bool onTop() const noexcept { return onTop_; }
 
     private:
         friend class App;
         bool open_ = true;
         bool raise_ = false;
         bool appeared_ = false;
+        bool onTop_ = true;
     };
 
     enum class MessageIcon { None,
@@ -89,6 +92,7 @@ namespace sirius::app::gui {
         bool unattended = false;      // scripting / screenshots: nobody answers a question
         bool visible = true;          // false: the window is never shown (headless grabs)
         int width = 1600, height = 960;
+        bool sizeGiven = false;       // --size: overrides the saved window size and maximized state
     };
 
     class App {
@@ -108,6 +112,8 @@ namespace sirius::app::gui {
         bool frame();
         void requestClose();          // asks about unsaved work first, unless unattended
         void quitNow();               // no questions
+        // The window is closing: the frame loop ends after this frame.
+        bool closing() const;
         // Draw this many frames without waiting for input (animation, results arriving).
         void requestRedraw(int frames = 3);
 

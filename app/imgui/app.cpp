@@ -108,10 +108,70 @@ namespace sirius::app::gui {
             const std::string name = toLower(fileName(path));
             if (endsWith(name, ".sirius.toml")) return DropKind::Pipeline;
             if (isDatasetManifestFile(path)) return DropKind::Dataset;
+            // Any other TOML is a pipeline, as Load pipeline and the command
+            // line take it: a save dialog that completed a bare name gives "x.toml".
+            if (endsWith(name, ".toml")) return DropKind::Pipeline;
             if (endsWith(name, ".py")) return DropKind::Plugin;
             for (const char* ext : {".tif", ".tiff", ".ome.tif", ".ome.tiff", ".zarr", ".n5", ".sir5"})
                 if (endsWith(name, ext)) return DropKind::Dataset;
             return DropKind::None;
+        }
+
+        // --- scale and monitors ------------------------------------------------
+
+        // Where the framebuffer carries the pixel density (Wayland, macOS),
+        // window coordinates are already logical: the content scale must not be
+        // applied to them again. Asked of GLFW itself, so it holds before the
+        // Dear ImGui backend is initialised.
+        bool framebufferCarriesScale() {
+#ifdef __APPLE__
+            return true;
+#else
+            return glfwGetPlatform() == GLFW_PLATFORM_WAYLAND;
+#endif
+        }
+
+        // Window coordinates per design pixel on this monitor, or in this
+        // window: the content scale, or 1 where the framebuffer carries it.
+        float monitorScale(GLFWmonitor* monitor) {
+            float xs = 1.0f, ys = 1.0f;
+            if (monitor && !framebufferCarriesScale()) glfwGetMonitorContentScale(monitor, &xs, &ys);
+            return std::max(xs, 0.5f);
+        }
+
+        float windowScale(GLFWwindow* window) {
+            float xs = 1.0f, ys = 1.0f;
+            if (window && !framebufferCarriesScale()) glfwGetWindowContentScale(window, &xs, &ys);
+            return std::max(xs, 0.5f);
+        }
+
+        // Floating windows are drawn at the main window's scale, so they only
+        // leave it when every monitor has that scale.
+        bool monitorsShareScale() {
+            int count = 0;
+            GLFWmonitor** monitors = glfwGetMonitors(&count);
+            for (int i = 1; i < count; ++i)
+                if (std::abs(monitorScale(monitors[i]) - monitorScale(monitors[0])) > 0.01f) return false;
+            return true;
+        }
+
+        // --- docks -------------------------------------------------------------
+
+        // Whether a dock node is part of the main dockspace, rather than of a
+        // group floating on its own (possibly on another monitor).
+        bool inDockspace(const ImGuiDockNode* node, ImGuiID dockspace) {
+            while (node && node->ParentNode) node = node->ParentNode;
+            return node && node->ID == dockspace;
+        }
+
+        // The docks' sizes are display pixels: scaled with the design pixels,
+        // the side docks keep their design widths on a monitor of another scale.
+        void scaleDockTree(ImGuiDockNode* node, float ratio) {
+            if (!node) return;
+            node->Size = ImVec2(std::round(node->Size.x * ratio), std::round(node->Size.y * ratio));
+            node->SizeRef = ImVec2(std::round(node->SizeRef.x * ratio), std::round(node->SizeRef.y * ratio));
+            scaleDockTree(node->ChildNodes[0], ratio);
+            scaleDockTree(node->ChildNodes[1], ratio);
         }
 
         // --- the boxes --------------------------------------------------------
@@ -143,7 +203,9 @@ namespace sirius::app::gui {
                     o.kind = i + 1 == buttons_.size() ? widgets::ButtonKind::Primary : widgets::ButtonKind::Secondary;
                     o.width = widths[i] / std::max(theme::scale(), 0.01f);
                     o.centered = true;
-                    const bool enter = i + 1 == buttons_.size() &&
+                    // Enter answers the box on top only: a box under a nested one
+                    // would otherwise take it first, as it is drawn first.
+                    const bool enter = onTop() && i + 1 == buttons_.size() &&
                                        (ImGui::IsKeyPressed(ImGuiKey_Enter, false) || ImGui::IsKeyPressed(ImGuiKey_KeypadEnter, false));
                     if (widgets::button((buttons_[i] + "##" + std::to_string(i)).c_str(), o) || enter) {
                         chosen_ = static_cast<int>(i);
@@ -262,7 +324,14 @@ namespace sirius::app::gui {
         int frameDepth = 0;
         std::uint64_t frames = 0;
         bool glfwReady = false, imguiReady = false;
-        bool viewports = false;
+        bool viewports = false;               // the user wants floating windows (ui/floatingWindows)
+        bool viewportsHeldBack = false;       // ... but the monitors' scales differ (updateViewports)
+        // Window coordinates per design pixel where the window is now (monitorScale):
+        // the design pixels' factor, before the user's zoom.
+        float contentScale = 1.0f;
+        // Inside the frame loop's glfwPollEvents: the only place a refresh
+        // callback may draw (not a native dialog's modal loop, not a frame).
+        bool inPoll = false;
 
         std::unique_ptr<Viewer> viewer;
         std::unique_ptr<OpsPanel> ops;
@@ -289,12 +358,23 @@ namespace sirius::app::gui {
         bool layoutBuilt = false;
         bool rebuildLayout = false;
         bool assistantPlaced = false;          // the assistant dock was given its place once
+        // The layout was just rebuilt: the assistant is placed again even though
+        // imgui.ini knows it (a saved arrangement is only kept at start-up).
+        bool forcePlaceAssistant = false;
         ImGuiID dockspace = 0;
         ImGuiID assistantDockTarget = 0;       // the node right of Parameters
         bool diagMaximized = false;
-        bool diagFloating = false;
+        bool diagFloating = false;             // not in the main dockspace (alone, or in a floating group)
         int diagFloatRequest = 0;              // 1 = float, 2 = dock back
-        ImGuiID diagDockId = 0;                // where Diagnostics was docked, to put it back
+        ImGuiID diagDockId = 0;                // where Diagnostics was last docked in the dockspace, to put it back
+        // The panel's collapsed state as the window's size last followed it,
+        // the height it was collapsed to, the height to give back on
+        // expanding, and the height of what sits above the panel's header in
+        // its window (a tab bar, a title bar). diagFitPlace is where the window
+        // was then: its dock node, or 0 on its own.
+        bool diagCollapsed = false;
+        float diagCollapsedH = 0.0f, diagExpandedH = 0.0f, diagInset = 0.0f;
+        ImGuiID diagFitPlace = 0;
         ImVec2 viewerMin{0, 0}, viewerMax{0, 0}, diagMin{0, 0}, diagMax{0, 0};
         bool openAddMenu = false;
 
@@ -346,8 +426,13 @@ namespace sirius::app::gui {
 
         void buildActions();
         void buildDefaultLayout(ImGuiID dockspaceId, ImVec2 size);
+        ImGuiID diagnosticsDockTarget();
+        void followDiagnosticsCollapse();
+        bool fitDiagnosticsToCollapse(bool collapsed);
 
         // --- drawing ---------------------------------------------------------------
+        void drawFrame(bool fromRefresh);
+        void abandonFrame(const std::string& what);
         void drawTitleBar();
         void drawMenu(const std::string& name);
         bool drawMenuItem(Action& a);
@@ -361,6 +446,8 @@ namespace sirius::app::gui {
         bool unsavedWork() { return wb().history().revision() != savedRevision; }
         void finishClose();
         void applyScale();
+        void rescale();
+        void updateViewports();
         void captureScreenshot();
     };
 
@@ -389,7 +476,13 @@ namespace sirius::app::gui {
         separator();
         add("File", "Save pipeline", {ImGuiMod_Ctrl | ImGuiKey_S}, [this] { self.savePipelineTo(wb().pipelinePath()); });
         add("File", "Save pipeline as\xE2\x80\xA6", {ImGuiMod_Ctrl | ImGuiMod_Shift | ImGuiKey_S}, [this] { self.savePipelineTo(std::string()); });
-        add("File", "Load pipeline preset\xE2\x80\xA6", {}, [this] { self.loadPipeline(); });
+        {
+            // It replaces the pipeline: refused while a run or a load holds it,
+            // or a finishing load would install its dataset over the new pipeline.
+            Action& a = add("File", "Load pipeline preset\xE2\x80\xA6", {}, [this] { self.loadPipeline(); });
+            a.enabled = edit;
+            a.frozenByRun = true;
+        }
         separator();
         add("File", "Export result\xE2\x80\xA6", {ImGuiMod_Ctrl | ImGuiMod_Shift | ImGuiKey_E}, [this] { self.exportResultDialog(); }).enabled =
             [this] { return wb().hasDataset() && !busy(); };
@@ -633,12 +726,99 @@ namespace sirius::app::gui {
             node->LocalFlags |= ImGuiDockNodeFlags_NoTabBar | ImGuiDockNodeFlags_NoUndocking | ImGuiDockNodeFlags_NoDockingOverMe;
         ImGui::DockBuilderFinish(id);
         assistantPlaced = false;
+        forcePlaceAssistant = true;
         diagFrontFrames = 3;
+        // The new bottom dock has the design's height: a collapsed panel
+        // collapses it again, and expanding gives back that height.
+        diagCollapsed = false;
+        diagExpandedH = 0.0f;
+    }
+
+    // Where Dock to bottom puts the diagnostics: the dock they were last in,
+    // else the log's, else a new split under the viewer. Only docks of the main
+    // dockspace count: a group floating on its own is not "the bottom".
+    ImGuiID App::Impl::diagnosticsDockTarget() {
+        auto usable = [this](ImGuiID id) {
+            ImGuiDockNode* node = id ? ImGui::DockBuilderGetNode(id) : nullptr;
+            return node && node->IsLeafNode() && inDockspace(node, dockspace);
+        };
+        if (usable(diagDockId)) return diagDockId;
+        if (ImGuiWindow* lw = ImGui::FindWindowByName(kLogWindow); lw && showLog && usable(lw->DockId)) return lw->DockId;
+        ImGuiDockNode* centre = ImGui::DockBuilderGetCentralNode(dockspace);
+        if (!centre) return 0;
+        ImGuiID bottom = 0, rest = 0;
+        ImGui::DockBuilderSplitNode(centre->ID, ImGuiDir_Down, std::clamp(px(theme::kDiagnosticsH) / std::max(centre->Size.y, 1.0f), 0.05f, 0.6f),
+                                    &bottom, &rest);
+        ImGui::DockBuilderFinish(dockspace);
+        return bottom;
+    }
+
+    // Asked before the dockspace is laid out, every frame. The panel collapses
+    // its window while the panel is what the window shows: with the log's tab
+    // in front of it, the shared dock is the log's, at its full height. A
+    // collapsed window is fitted again when what sits above the header
+    // changes (a tab bar comes or goes) and when it moves (floated from the
+    // Window menu, dropped into another dock): a tab bar and a title bar are
+    // the same height, so the header alone does not tell.
+    void App::Impl::followDiagnosticsCollapse() {
+        if (!diagnostics) return;
+        const ImGuiWindow* dw = ImGui::FindWindowByName(kDiagWindow);
+        const bool behindTab = dw && dw->DockIsActive && dw->DockNode && dw->DockNode->VisibleWindow && dw->DockNode->VisibleWindow != dw;
+        const bool collapse = showDiag && diagnostics->isCollapsed() && !behindTab;
+        const float collapsedH = diagInset + theme::snap(px(theme::kDiagnosticsHeaderH));
+        const ImGuiID place = dw && dw->DockIsActive && dw->DockNode ? dw->DockNode->ID : 0;
+        if (collapse != diagCollapsed || (collapse && (std::abs(collapsedH - diagCollapsedH) > 0.5f || place != diagFitPlace)))
+            fitDiagnosticsToCollapse(collapse);
+    }
+
+    // The diagnostics window follows its panel's collapse (Qt's panel set its
+    // maximum height to the header): collapsed, it keeps only the header, and
+    // the viewer takes the room; expanded, it gets its height back. Docked, the
+    // dock node is sized (locked once, as a splitter drag does, so the other
+    // side of the split takes the difference); floating, the window. False
+    // when there is nothing to size (yet): a window between two docks (the
+    // frame a layout is rebuilt), one in a floating group, or a dock side by
+    // side with another; the next frame tries again.
+    bool App::Impl::fitDiagnosticsToCollapse(bool collapsed) {
+        ImGuiWindow* dw = ImGui::FindWindowByName(kDiagWindow);
+        if (!dw) return false;
+        const float collapsedH = diagInset + theme::snap(px(theme::kDiagnosticsHeaderH));
+        auto heightFor = [&](float current) {
+            if (!collapsed) return diagExpandedH > 0.0f ? diagExpandedH : px(theme::kDiagnosticsH);
+            // the height to give back is the expanded one, not a collapsed one fitted again
+            if (!diagCollapsed) diagExpandedH = std::max(current, collapsedH + px(60));
+            return collapsedH;
+        };
+        if (dw->DockIsActive && dw->DockNode && inDockspace(dw->DockNode, dockspace)) {
+            // Only a dock stacked above or below another: in a row, its height is the row's.
+            ImGuiDockNode* node = dw->DockNode;
+            if (!node->ParentNode || node->ParentNode->SplitAxis != ImGuiAxis_Y) return false;
+            node->Size.y = node->SizeRef.y = heightFor(node->Size.y);
+            node->WantLockSizeOnce = true;
+        } else if (!dw->DockIsActive && (dw->DockNode || dw->DockId == 0)) {
+            // On its own. A dock id without a node is a window about to be
+            // docked (or hidden from its dock): its node is sized once it is in.
+            ImGui::SetWindowSize(kDiagWindow, ImVec2(dw->Size.x, heightFor(dw->Size.y)), ImGuiCond_Always);
+        } else {
+            return false;
+        }
+        // The collapsed panel left the dock it had collapsed: what stays there
+        // (the log) gets the height back.
+        const ImGuiID place = dw->DockIsActive && dw->DockNode ? dw->DockNode->ID : 0;
+        if (diagCollapsed && diagFitPlace != 0 && diagFitPlace != place) {
+            ImGuiDockNode* left = ImGui::DockBuilderGetNode(diagFitPlace);
+            if (left && left->IsLeafNode() && inDockspace(left, dockspace) && left->ParentNode && left->ParentNode->SplitAxis == ImGuiAxis_Y) {
+                left->Size.y = left->SizeRef.y = diagExpandedH > 0.0f ? diagExpandedH : px(theme::kDiagnosticsH);
+                left->WantLockSizeOnce = true;
+            }
+        }
+        diagCollapsed = collapsed;
+        diagCollapsedH = collapsedH;
+        diagFitPlace = place;
+        return true;
     }
 
     void App::Impl::applyScale() {
-        float xs = 1.0f, ys = 1.0f;
-        if (window) glfwGetWindowContentScale(window, &xs, &ys);
         float user = static_cast<float>(settings().getDouble("ui/scale", 1.0));
         const std::string env = platform::environment("SIRIUS_UI_SCALE");
         if (!env.empty()) {
@@ -648,8 +828,63 @@ namespace sirius::app::gui {
             }
         }
         if (!(user > 0.0f)) user = 1.0f;
-        theme::setScale(std::max(xs, 0.5f) * user);
+        theme::setScale(contentScale * user);
         theme::applyTheme();
+    }
+
+    // The window moved to a monitor of another scale, or its monitor's scale
+    // changed. GLFW keeps the client area's pixel size (GLFW_SCALE_TO_MONITOR is
+    // off: init() sizes the window itself), so the window and the docks around
+    // the viewer are resized by the ratio of the scales: they keep their design
+    // size on the new monitor, and the window fits its work area.
+    void App::Impl::rescale() {
+        const float next = windowScale(window);
+        const float ratio = next / contentScale;
+        if (std::abs(ratio - 1.0f) > 0.01f) {
+            if (!glfwGetWindowAttrib(window, GLFW_MAXIMIZED) && !glfwGetWindowAttrib(window, GLFW_ICONIFIED) && !glfwGetWindowMonitor(window)) {
+                int x = 0, y = 0, w = 0, h = 0;
+                glfwGetWindowPos(window, &x, &y);
+                glfwGetWindowSize(window, &w, &h);
+                const int cx = x + w / 2, cy = y + h / 2;
+                w = static_cast<int>(std::lround(static_cast<float>(w) * ratio));
+                h = static_cast<int>(std::lround(static_cast<float>(h) * ratio));
+                int count = 0;
+                GLFWmonitor** monitors = glfwGetMonitors(&count);
+                for (int i = 0; i < count; ++i) {
+                    int mx = 0, my = 0, mw = 0, mh = 0;
+                    glfwGetMonitorWorkarea(monitors[i], &mx, &my, &mw, &mh);
+                    if (mw <= 0 || mh <= 0 || cx < mx || cx >= mx + mw || cy < my || cy >= my + mh) continue;
+                    w = std::min(w, mw);
+                    h = std::min(h, mh - 40);   // the title bar is outside the client area
+                    x = std::clamp(x, mx, std::max(mx, mx + mw - w));
+                    y = std::clamp(y, my, std::max(my, my + mh - h));
+                    break;
+                }
+                glfwSetWindowSize(window, std::max(w, 1), std::max(h, 1));
+                glfwSetWindowPos(window, x, y);
+            }
+            if (dockspace) scaleDockTree(ImGui::DockBuilderGetNode(dockspace), ratio);
+            diagExpandedH *= ratio;   // display pixels too
+        }
+        contentScale = next;
+        applyScale();
+    }
+
+    // Floating windows (secondary viewports) are drawn at the main window's
+    // scale: on a monitor of another scale they would come out at half or twice
+    // the size of the rest of the desktop. With monitors of different scales the
+    // panels stay inside the main window. Asked before every frame (as the
+    // backend reads the monitors), so a monitor plugged in later counts too;
+    // Dear ImGui moves the windows when the flag changes.
+    void App::Impl::updateViewports() {
+        const bool held = viewports && !monitorsShareScale();
+        ImGuiIO& io = ImGui::GetIO();
+        if (viewports && !held) io.ConfigFlags |= ImGuiConfigFlags_ViewportsEnable;
+        else io.ConfigFlags &= ~ImGuiConfigFlags_ViewportsEnable;
+        if (held != viewportsHeldBack)
+            wb().logLine(held ? std::string("Floating windows stay inside the main window: the monitors have different display scales.")
+                              : std::string("Floating windows can leave the main window again: the monitors share one display scale."));
+        viewportsHeldBack = held;
     }
 
     void App::Impl::refreshTitle() {
@@ -1023,6 +1258,19 @@ namespace sirius::app::gui {
             layoutBuilt = true;
             rebuildLayout = false;
         }
+        // Before the dockspace is laid out, so a new split or size shows this frame.
+        // Only for a panel that is shown: a target found for a hidden one would
+        // split the viewer's dock again on every frame until it is shown.
+        ImGuiID diagTarget = 0;
+        if (diagFloatRequest == 2 && showDiag) {
+            diagTarget = diagnosticsDockTarget();
+            if (!diagTarget) {
+                // no central node to split: the last resort is the default arrangement
+                rebuildLayout = true;
+                wb().logLine("Layout reset to the default arrangement: the diagnostics had no place to dock back to.");
+            }
+        }
+        followDiagnosticsCollapse();
         ImGui::PushStyleColor(ImGuiCol_WindowBg, theme::kNeutral900);
         ImGui::DockSpaceOverViewport(dockspace, vp, ImGuiDockNodeFlags_AutoHideTabBar | ImGuiDockNodeFlags_NoWindowMenuButton);
         ImGui::PopStyleColor();
@@ -1034,6 +1282,12 @@ namespace sirius::app::gui {
 
         // viewer: the central node
         {
+            // Its node's flags come from the window, every frame: imgui.ini keeps
+            // only some of a node's flags, and without NoDockingOverMe a panel
+            // dropped on the viewer would vanish into its tab-less node.
+            ImGuiWindowClass viewerClass;
+            viewerClass.DockNodeFlagsOverrideSet = ImGuiDockNodeFlags_NoTabBar | ImGuiDockNodeFlags_NoUndocking | ImGuiDockNodeFlags_NoDockingOverMe;
+            ImGui::SetNextWindowClass(&viewerClass);
             ImGui::PushStyleColor(ImGuiCol_WindowBg, theme::kBg);
             if (ImGui::Begin(kViewerWindow, nullptr, panel | ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoBringToFrontOnFocus)) {
                 viewerMin = ImGui::GetWindowPos();
@@ -1062,10 +1316,13 @@ namespace sirius::app::gui {
         }
         if (showAssistant) {
             if (!assistantPlaced) {
-                // right of Parameters, the design's 330 px, the first time it is shown
+                // right of Parameters, the design's 330 px, the first time it is
+                // shown and after the layout was rebuilt
                 assistantPlaced = true;
+                const bool place = forcePlaceAssistant || !ImGui::FindWindowSettingsByID(ImHashStr(kAssistantWindow));
+                forcePlaceAssistant = false;
                 if (ImGuiWindow* pw = ImGui::FindWindowByName(kParamsWindow)) {
-                    if (pw->DockNode && !ImGui::FindWindowSettingsByID(ImHashStr(kAssistantWindow))) {
+                    if (pw->DockNode && place) {
                         ImGuiID target = pw->DockNode->ID, side = 0, rest = 0;
                         const float total = pw->DockNode->Size.x + px(theme::kAssistantW);
                         ImGui::DockBuilderSetNodeSize(target, ImVec2(total, pw->DockNode->Size.y));
@@ -1096,15 +1353,13 @@ namespace sirius::app::gui {
         }
         if (showDiag) {
             if (diagFloatRequest == 1) {
-                if (ImGuiWindow* dw = ImGui::FindWindowByName(kDiagWindow))
-                    if (dw->DockId) diagDockId = dw->DockId;
                 ImGui::SetNextWindowDockID(0, ImGuiCond_Always);
                 ImGui::SetNextWindowSize(ImVec2(std::max(px(480), diagMax.x - diagMin.x), std::max(px(360), diagMax.y - diagMin.y)),
                                          ImGuiCond_Always);
                 ImGui::SetNextWindowPos(ImVec2(diagMin.x + px(40), std::max(vp->WorkPos.y + px(40), diagMin.y - px(160))), ImGuiCond_Always);
                 ImGui::SetNextWindowFocus();
-            } else if (diagFloatRequest == 2 && diagDockId) {
-                ImGui::SetNextWindowDockID(diagDockId, ImGuiCond_Always);
+            } else if (diagFloatRequest == 2 && diagTarget) {
+                ImGui::SetNextWindowDockID(diagTarget, ImGuiCond_Always);
             }
             diagFloatRequest = 0;
             if (focusDiag) ImGui::SetNextWindowFocus();
@@ -1113,10 +1368,20 @@ namespace sirius::app::gui {
             // floating: 2 px ink border
             ImGui::PushStyleColor(ImGuiCol_Border, theme::kText);
             ImGui::PushStyleVar(ImGuiStyleVar_WindowBorderSize, diagFloating ? theme::crispPen(2) : 0.0f);
+            // collapsed to its header, a floating diagnostics window is lower than a panel may otherwise be
+            ImGui::PushStyleVar(ImGuiStyleVar_WindowMinSize, ImVec2(px(120), diagCollapsed ? px(theme::kDiagnosticsHeaderH) : px(60)));
             const bool open = ImGui::Begin(kDiagWindow, &showDiag, panel);
-            ImGui::PopStyleVar();
+            ImGui::PopStyleVar(2);
             ImGui::PopStyleColor();
-            diagFloating = !ImGui::IsWindowDocked();
+            {
+                // Docked means docked in the main dockspace: a group floating on
+                // its own (on another monitor, say) is floating for the maximise
+                // cover and for Dock to bottom. Where it is docked is remembered
+                // on every frame, to dock it back there.
+                ImGuiWindow* dw = ImGui::GetCurrentWindow();
+                diagFloating = !(dw->DockIsActive && dw->DockNode && inDockspace(dw->DockNode, dockspace));
+                if (!diagFloating) diagDockId = dw->DockId;
+            }
             if (toFront) {
                 // selected in its tab bar without taking the keyboard from the viewer
                 if (ImGuiWindow* dw = ImGui::GetCurrentWindow()) {
@@ -1131,19 +1396,26 @@ namespace sirius::app::gui {
             if (open) {
                 diagMin = ImGui::GetWindowPos();
                 diagMax = ImVec2(diagMin.x + ImGui::GetWindowSize().x, diagMin.y + ImGui::GetWindowSize().y);
+                diagInset = ImGui::GetCursorScreenPos().y - diagMin.y;
                 if (!diagMaximized) diagnostics->draw();
             }
             ImGui::End();
         } else {
+            // hidden: a float or dock request made for the panel as it was lapses
             diagMaximized = false;
+            diagFloatRequest = 0;
         }
 
         // Maximised: the diagnostics take the viewer's room until they are
         // restored. The arrangement underneath is left as it is.
         if (diagMaximized && showDiag) {
-            const bool under = !diagFloating && diagMax.x > diagMin.x;
+            // The cover takes the diagnostics' own room as well only when they
+            // are docked right under the viewer; otherwise it keeps to the
+            // viewer, and never spreads over Parameters or another monitor.
+            const bool under = !diagFloating && diagMax.x > diagMin.x && std::abs(diagMin.y - viewerMax.y) <= px(4) &&
+                               diagMin.x < viewerMax.x && diagMax.x > viewerMin.x;
             const ImVec2 min(viewerMin.x, viewerMin.y);
-            const ImVec2 max(std::max(viewerMax.x, under ? diagMax.x : viewerMax.x), std::max(viewerMax.y, under ? diagMax.y : viewerMax.y));
+            const ImVec2 max(viewerMax.x, std::max(viewerMax.y, under ? diagMax.y : viewerMax.y));
             ImGui::SetNextWindowPos(min);
             ImGui::SetNextWindowSize(ImVec2(max.x - min.x, max.y - min.y));
             ImGui::PushStyleColor(ImGuiCol_WindowBg, theme::kBg);
@@ -1188,14 +1460,30 @@ namespace sirius::app::gui {
                                  ImGuiWindowFlags_NoDocking;
         if (!d->resizable()) flags |= ImGuiWindowFlags_NoResize;
         if (size.y <= 0.0f) flags |= ImGuiWindowFlags_AlwaysAutoResize;
-        const float maxH = vp->WorkSize.y - px(40);
+        // The room a dialog may take: the main window's work area while it is
+        // in there (it opens there), the work area of its monitor once it has
+        // a window of its own, so another monitor neither caps it nor shrinks
+        // it with the main window.
+        ImVec2 room(vp->WorkSize.x, vp->WorkSize.y);
+        if (d->appeared_ && (ImGui::GetIO().ConfigFlags & ImGuiConfigFlags_ViewportsEnable)) {
+            const ImGuiPlatformIO& pio = ImGui::GetPlatformIO();
+            if (ImGuiWindow* w = ImGui::FindWindowByName(id.c_str());
+                w && w->Viewport && w->Viewport != vp && w->Viewport->PlatformMonitor >= 0 && w->Viewport->PlatformMonitor < pio.Monitors.Size)
+                room = pio.Monitors[w->Viewport->PlatformMonitor].WorkSize;
+        }
+        const float maxH = std::max(room.y - px(40), px(120));
         if (!d->appeared_) {
             ImGui::SetNextWindowPos(ImVec2(vp->WorkPos.x + vp->WorkSize.x * 0.5f, vp->WorkPos.y + vp->WorkSize.y * 0.5f), ImGuiCond_Appearing,
                                     ImVec2(0.5f, 0.5f));
             if (size.y > 0.0f) ImGui::SetNextWindowSize(ImVec2(px(size.x), std::min(px(size.y), maxH)), ImGuiCond_Appearing);
         }
-        if (size.y <= 0.0f) ImGui::SetNextWindowSizeConstraints(ImVec2(px(size.x), 0.0f), ImVec2(px(size.x), maxH));
-        else if (d->resizable()) ImGui::SetNextWindowSizeConstraints(px(360, 240), ImVec2(vp->WorkSize.x, vp->WorkSize.y));
+        if (size.y <= 0.0f) {
+            ImGui::SetNextWindowSizeConstraints(ImVec2(px(size.x), 0.0f), ImVec2(px(size.x), maxH));
+        } else if (d->resizable()) {
+            // never a minimum above the maximum: the smaller room wins
+            const ImVec2 lo(std::min(px(360), room.x), std::min(px(240), room.y));
+            ImGui::SetNextWindowSizeConstraints(lo, ImVec2(std::max(lo.x, room.x), std::max(lo.y, room.y)));
+        }
         ImGui::PushStyleColor(ImGuiCol_Border, theme::kText);
         ImGui::PushStyleColor(ImGuiCol_WindowBg, theme::kBg);
         ImGui::PushStyleColor(ImGuiCol_PopupBg, theme::kBg);
@@ -1220,8 +1508,20 @@ namespace sirius::app::gui {
         ImGui::PopStyleVar(3);
         ImGui::PopStyleColor(3);
         if (begun) {
-            const bool top = index + 1 == dialogs.size() || !dialogs[index + 1]->modal();
-            if (d->modal() && top && ImGui::IsKeyPressed(ImGuiKey_Escape, false) && !ImGui::IsAnyItemActive() && d->canClose(self)) d->close();
+            // On top: no modal is open over this dialog. Every modal later in
+            // the stack is drawn nested in an earlier modal's popup, whatever
+            // non-modal windows sit between them; a non-modal dialog is under
+            // any modal at all.
+            const auto isModal = [](const std::shared_ptr<Dialog>& x) { return x->modal(); };
+            const bool top = d->modal() ? std::none_of(dialogs.begin() + static_cast<std::ptrdiff_t>(index) + 1, dialogs.end(), isModal)
+                                        : std::none_of(dialogs.begin(), dialogs.end(), isModal);
+            d->onTop_ = top;
+            if (d->modal() && top && ImGui::IsKeyPressed(ImGuiKey_Escape, false) && !ImGui::IsAnyItemActive()) {
+                // Escape dismisses a dropdown or menu the dialog has open (no
+                // keyboard navigation does it for us) before the dialog itself.
+                if (ImGui::IsPopupOpen("", ImGuiPopupFlags_AnyPopupId)) ImGui::ClosePopupToLevel(GImGui->OpenPopupStack.Size - 1, true);
+                else if (d->canClose(self)) d->close();
+            }
             ImGui::PushID(d.get());
             drawDialogBody(*d);
             ImGui::PopID();
@@ -1258,7 +1558,9 @@ namespace sirius::app::gui {
                 if (!plain && io.WantTextInput) continue;
                 if (popup && chord != ImGuiKey_Escape) continue;
                 if (std::find(claimedKeys.begin(), claimedKeys.end(), chord) != claimedKeys.end()) continue;
-                if (!ImGui::IsKeyChordPressed(chord)) continue;
+                // A plain key a widget has taken (Dear ImGui's key ownership: a
+                // focused slider owns the arrows it steps with) stays with it.
+                if (plain ? !ImGui::IsKeyChordPressed(chord, ImGuiInputFlags_None, ImGuiKeyOwner_NoOwner) : !ImGui::IsKeyChordPressed(chord)) continue;
                 if (a.enabled && !a.enabled()) continue;
                 self.defer(a.run);
                 return;   // one key, one action
@@ -1302,21 +1604,30 @@ namespace sirius::app::gui {
     App::~App() {
         Impl& d = *impl_;
         if (d.imguiReady) {
-            settings().set("window/showOperations", d.showOps);
-            settings().set("window/showParameters", d.showParams);
-            settings().set("window/showDiagnostics", d.showDiag);
-            settings().set("window/showLog", d.showLog);
+            // A scripted run (unattended) showed every panel and never the
+            // user's layout: it leaves their panels and geometry alone.
             if (d.window && !d.unattended) {
+                settings().set("window/showOperations", d.showOps);
+                settings().set("window/showParameters", d.showParams);
+                settings().set("window/showDiagnostics", d.showDiag);
+                settings().set("window/showLog", d.showLog);
                 int w = 0, h = 0;
                 glfwGetWindowSize(d.window, &w, &h);
                 const bool maximized = glfwGetWindowAttrib(d.window, GLFW_MAXIMIZED) != 0;
                 settings().set("window/maximized", maximized);
                 if (!maximized && w > 200 && h > 200) {
-                    settings().set("window/width", static_cast<int>(static_cast<float>(w) / theme::scale()));
-                    settings().set("window/height", static_cast<int>(static_cast<float>(h) / theme::scale()));
+                    // Back to design pixels by the factor init() sizes the window
+                    // by (not the user's zoom, or the window would shrink or grow
+                    // every session): that of the monitor it is on now.
+                    const float f = windowScale(d.window);
+                    settings().set("window/width", static_cast<int>(std::lround(static_cast<float>(w) / f)));
+                    settings().set("window/height", static_cast<int>(std::lround(static_cast<float>(h) / f)));
                 }
             }
             settings().save();
+            // The next session opens the panel expanded: its dock gets its
+            // height back before Dear ImGui writes the layout (DestroyContext).
+            if (d.diagCollapsed) d.fitDiagnosticsToCollapse(false);
         }
         bridge_.setWaker(nullptr);
         http::setGuiPoster(nullptr);
@@ -1372,18 +1683,32 @@ namespace sirius::app::gui {
         glfwWindowHintString(GLFW_X11_INSTANCE_NAME, "sirius-app");
 
         // The design's 1600 x 960 at this monitor's scale, inside its work area.
-        float xs = 1.0f, ys = 1.0f;
+        // Where the framebuffer carries the density (Wayland, macOS) the window
+        // is sized in logical units already, and monitorScale is 1.
+        const bool wayland = glfwGetPlatform() == GLFW_PLATFORM_WAYLAND;
+        float scale = 1.0f;
         int mx = 0, my = 0, mw = 0, mh = 0;
         if (GLFWmonitor* monitor = glfwGetPrimaryMonitor()) {
-            glfwGetMonitorContentScale(monitor, &xs, &ys);
+            scale = monitorScale(monitor);
             glfwGetMonitorWorkarea(monitor, &mx, &my, &mw, &mh);
+            if (wayland) {
+                // Wayland gives the work area in the output's pixels: logical units, for the window.
+                float xs = 1.0f, ys = 1.0f;
+                glfwGetMonitorContentScale(monitor, &xs, &ys);
+                if (xs > 0.0f) {
+                    mw = static_cast<int>(std::lround(static_cast<float>(mw) / xs));
+                    mh = static_cast<int>(std::lround(static_cast<float>(mh) / xs));
+                }
+            }
         }
         int dw = options.width, dh = options.height;
-        if (!d.unattended) {
+        // --size wins over the size (and the maximized state) the last session left
+        if (!d.unattended && !options.sizeGiven) {
             dw = std::max(640, settings().getInt("window/width", dw));
             dh = std::max(480, settings().getInt("window/height", dh));
         }
-        int w = static_cast<int>(static_cast<float>(dw) * xs), h = static_cast<int>(static_cast<float>(dh) * xs);
+        int w = static_cast<int>(std::lround(static_cast<float>(dw) * scale));
+        int h = static_cast<int>(std::lround(static_cast<float>(dh) * scale));
         if (mw > 0 && mh > 0 && !d.unattended) {
             w = std::min(w, mw);
             h = std::min(h, mh - 40);   // the title bar is outside the client area
@@ -1413,7 +1738,9 @@ namespace sirius::app::gui {
             if (!images.empty() && glfwGetPlatform() != GLFW_PLATFORM_WAYLAND)
                 glfwSetWindowIcon(d.window, static_cast<int>(images.size()), images.data());
         }
-        if (mw > 0 && mh > 0) glfwSetWindowPos(d.window, mx + std::max(0, (mw - w) / 2), my + std::max(32, (mh - h) / 2));
+        // Wayland has no window positions: the compositor places the window.
+        if (mw > 0 && mh > 0 && !wayland) glfwSetWindowPos(d.window, mx + std::max(0, (mw - w) / 2), my + std::max(32, (mh - h) / 2));
+        d.contentScale = windowScale(d.window);
         glfwMakeContextCurrent(d.window);
         glfwSwapInterval(1);
         if (!gladLoadGL(glfwGetProcAddress)) {
@@ -1436,13 +1763,27 @@ namespace sirius::app::gui {
             app->defer([app, list] { app->dropPaths(list); });
         });
         glfwSetWindowContentScaleCallback(d.window, [](GLFWwindow* win, float, float) {
-            if (auto* app = static_cast<App*>(glfwGetWindowUserPointer(win))) app->defer([app] { app->impl_->applyScale(); });
+            if (auto* app = static_cast<App*>(glfwGetWindowUserPointer(win))) app->defer([app] { app->impl_->rescale(); });
         });
         glfwSetWindowRefreshCallback(d.window, [](GLFWwindow* win) {
-            // the window is being resized or uncovered: draw, rather than
-            // leave a stale frame stretched over it
-            if (auto* app = static_cast<App*>(glfwGetWindowUserPointer(win)))
-                if (app->impl_->frameDepth == 0 && app->impl_->imguiReady) app->frame();
+            // The window is being resized or uncovered while GLFW is in the
+            // frame loop's poll (Windows runs its modal size / move loop in
+            // there): draw, rather than leave a stale frame stretched over it.
+            // Not while a native file dialog's loop runs a deferred action, and
+            // never inside a frame.
+            auto* app = static_cast<App*>(glfwGetWindowUserPointer(win));
+            if (!app) return;
+            Impl& s = *app->impl_;
+            if (!s.imguiReady || !s.inPoll || s.closing || GImGui->WithinFrameScope || glfwGetWindowAttrib(win, GLFW_ICONIFIED)) return;
+            // Nothing may unwind through GLFW and the window procedure: an
+            // error is caught here and its frame finished (abandonFrame).
+            try {
+                s.drawFrame(true);
+            } catch (const std::exception& e) {
+                s.abandonFrame(e.what());
+            } catch (...) {
+                s.abandonFrame("unknown exception");
+            }
         });
 
         IMGUI_CHECKVERSION();
@@ -1451,7 +1792,7 @@ namespace sirius::app::gui {
         ImGuiIO& io = ImGui::GetIO();
         io.ConfigFlags |= ImGuiConfigFlags_DockingEnable;
         d.viewports = !d.unattended && settings().getBool("ui/floatingWindows", true);
-        if (d.viewports) io.ConfigFlags |= ImGuiConfigFlags_ViewportsEnable;
+        d.updateViewports();
         io.ConfigWindowsMoveFromTitleBarOnly = false;
         io.ConfigDockingWithShift = false;
         io.ConfigInputTextCursorBlink = true;
@@ -1514,7 +1855,7 @@ namespace sirius::app::gui {
 
         d.savedRevision = wb().history().revision();
         if (d.visible) {
-            if (!d.unattended && settings().getBool("window/maximized", false)) glfwMaximizeWindow(d.window);
+            if (!d.unattended && !options.sizeGiven && settings().getBool("window/maximized", false)) glfwMaximizeWindow(d.window);
             glfwShowWindow(d.window);
         }
         return true;
@@ -1569,8 +1910,14 @@ namespace sirius::app::gui {
         // results (Bridge::wake) and for what animates.
         const bool animating = d.redrawFrames > 0 || bridge_.running() || bridge_.taskRunning() || (d.viewer && d.viewer->animating()) ||
                                (d.assistant && d.assistant->busy()) || !d.deferred.empty();
+        // The platform layer is told too: a dialog opened by a refresh
+        // callback's frame in here must not poll GLFW when it closes.
+        d.inPoll = true;
+        platform::setWithinEventPoll(true);
         if (animating || d.frameDepth > 1) glfwPollEvents();
         else glfwWaitEventsTimeout(0.25);
+        d.inPoll = false;
+        platform::setWithinEventPoll(false);
         if (d.redrawFrames > 0) --d.redrawFrames;
 
         bridge_.update();
@@ -1590,14 +1937,40 @@ namespace sirius::app::gui {
             --d.frameDepth;
             return false;
         }
+        // A native file dialog that could not be opened (no file chooser
+        // portal, no GTK) returned as though cancelled: say why, once, whatever
+        // opened it (a deferred action, or a button last frame).
+        if (const std::string error = platform::takeDialogError(); !error.empty()) {
+            wb().logLine(error);
+            if (!d.unattended) message("File dialog", error);
+        }
         d.refreshTitle();
 
-        if (glfwGetWindowAttrib(d.window, GLFW_ICONIFIED) != 0 && !d.unattended) {
+        // Minimised with nothing else on screen: nothing to draw. Floating
+        // windows (secondary viewports) stay on screen, and are drawn on.
+        const bool iconified = glfwGetWindowAttrib(d.window, GLFW_ICONIFIED) != 0 && !d.unattended;
+        if (iconified && ImGui::GetPlatformIO().Viewports.Size <= 1) {
             ImGui_ImplGlfw_Sleep(50);
             --d.frameDepth;
             return true;
         }
 
+        d.updateViewports();
+        d.drawFrame(false);
+        ++d.frames;
+        settings().autosave();
+        --d.frameDepth;
+        return !d.closing;
+    }
+
+    // One Dear ImGui frame, rendered and presented. From the refresh callback
+    // (`fromRefresh`: inside glfwPollEvents, during Windows' modal size / move
+    // loop) it only draws: GLFW is not polled from a callback, and what runs
+    // between frames (posted functions, deferred actions), the screenshot and
+    // the settings wait for the frame loop. The floating windows are updated
+    // as in any frame, since Dear ImGui needs that every frame.
+    void App::Impl::drawFrame(bool fromRefresh) {
+        const bool iconified = glfwGetWindowAttrib(window, GLFW_ICONIFIED) != 0 && !unattended;
         ImGui_ImplOpenGL3_NewFrame();
         ImGui_ImplGlfw_NewFrame();
         ImGui::NewFrame();
@@ -1607,67 +1980,92 @@ namespace sirius::app::gui {
         const ImGuiIO& io = ImGui::GetIO();
         if (io.MouseDelta.x != 0.0f || io.MouseDelta.y != 0.0f || io.MouseWheel != 0.0f || ImGui::IsAnyMouseDown() ||
             io.InputQueueCharacters.Size > 0 || ImGui::IsAnyItemActive())
-            d.redrawFrames = std::max(d.redrawFrames, 3);
+            redrawFrames = std::max(redrawFrames, 3);
         for (ImGuiKey k = ImGuiKey_NamedKey_BEGIN; k < ImGuiKey_NamedKey_END; k = static_cast<ImGuiKey>(k + 1))
             if (ImGui::IsKeyDown(k)) {
-                d.redrawFrames = std::max(d.redrawFrames, 3);
+                redrawFrames = std::max(redrawFrames, 3);
                 break;
             }
 
-        d.dialogHadFocus = d.dialogHasFocus;
-        d.dialogHasFocus = false;
-        d.claimedKeys.swap(d.claimingKeys);
-        d.claimingKeys.clear();
-        d.handleShortcuts();
-        d.drawTitleBar();
-        d.drawStatusBar();
-        d.drawDockWindows();
+        dialogHadFocus = dialogHasFocus;
+        dialogHasFocus = false;
+        claimedKeys.swap(claimingKeys);
+        claimingKeys.clear();
+        handleShortcuts();
+        drawTitleBar();
+        drawStatusBar();
+        drawDockWindows();
 
         // dialogs: the modal ones as a stack, the others as windows
-        for (std::size_t i = 0; i < d.dialogs.size(); ++i)
-            if (!d.dialogs[i]->modal()) d.drawDialogs(i);
+        for (std::size_t i = 0; i < dialogs.size(); ++i)
+            if (!dialogs[i]->modal()) drawDialogs(i);
         {
             std::size_t first = 0;
-            while (first < d.dialogs.size() && !d.dialogs[first]->modal()) ++first;
-            d.drawDialogs(first);
+            while (first < dialogs.size() && !dialogs[first]->modal()) ++first;
+            drawDialogs(first);
         }
         {
             std::vector<std::shared_ptr<Dialog>> gone;
-            for (auto it = d.dialogs.begin(); it != d.dialogs.end();) {
+            for (auto it = dialogs.begin(); it != dialogs.end();) {
                 if (!(*it)->isOpen()) {
                     gone.push_back(*it);
-                    it = d.dialogs.erase(it);
+                    it = dialogs.erase(it);
                 } else {
                     ++it;
                 }
             }
             for (auto& g : gone) {
                 // after the frame: the callback may open the next dialog
-                defer([this, g] { g->closed(*this); });
+                self.defer([this, g] { g->closed(self); });
             }
         }
 
         ImGui::Render();
-        int fbw = 0, fbh = 0;
-        glfwGetFramebufferSize(d.window, &fbw, &fbh);
-        glBindFramebuffer(GL_FRAMEBUFFER, 0);
-        glViewport(0, 0, fbw, fbh);
-        const ImVec4 bg = theme::vec(theme::kBg);
-        glClearColor(bg.x, bg.y, bg.z, 1.0f);
-        glClear(GL_COLOR_BUFFER_BIT);
-        ImGui_ImplOpenGL3_RenderDrawData(ImGui::GetDrawData());
+        if (!iconified) {
+            int fbw = 0, fbh = 0;
+            glfwGetFramebufferSize(window, &fbw, &fbh);
+            glBindFramebuffer(GL_FRAMEBUFFER, 0);
+            glViewport(0, 0, fbw, fbh);
+            const ImVec4 bg = theme::vec(theme::kBg);
+            glClearColor(bg.x, bg.y, bg.z, 1.0f);
+            glClear(GL_COLOR_BUFFER_BIT);
+            ImGui_ImplOpenGL3_RenderDrawData(ImGui::GetDrawData());
+        }
         if (ImGui::GetIO().ConfigFlags & ImGuiConfigFlags_ViewportsEnable) {
             GLFWwindow* current = glfwGetCurrentContext();
             ImGui::UpdatePlatformWindows();
-            ImGui::RenderPlatformWindowsDefault();
+            ImGui::RenderPlatformWindowsDefault();   // skips the minimised main viewport
             glfwMakeContextCurrent(current);
         }
-        d.captureScreenshot();
-        glfwSwapBuffers(d.window);
-        ++d.frames;
-        settings().save();
-        --d.frameDepth;
-        return !d.closing;
+        if (iconified) {
+            // the main window's vsynced swap paces the loop; minimised, nothing does
+            ImGui_ImplGlfw_Sleep(16);
+            return;
+        }
+        if (!fromRefresh) captureScreenshot();
+        glfwSwapBuffers(window);
+    }
+
+    // An exception broke off a frame drawn from the refresh callback, where
+    // it must not propagate. The frame is finished here instead: the windows
+    // and stacks it left open are closed the way Dear ImGui's error recovery
+    // does (reported, but not asserted on: the exception is the error), and
+    // the frame is ended and its floating windows updated, so the next
+    // NewFrame finds the state any finished frame leaves.
+    void App::Impl::abandonFrame(const std::string& what) {
+        wb().logLine("Error: " + what);
+        ImGuiContext& g = *GImGui;
+        ImGuiIO& io = ImGui::GetIO();
+        if (g.WithinFrameScope) {
+            const bool asserts = io.ConfigErrorRecoveryEnableAssert;
+            io.ConfigErrorRecoveryEnableAssert = false;
+            ImGui::ErrorRecoveryTryToRecoverState(&g.StackSizesInNewFrame);
+            ImGui::EndFrame();
+            io.ConfigErrorRecoveryEnableAssert = asserts;
+        }
+        if (g.FrameCountEnded == g.FrameCount && g.FrameCountPlatformEnded < g.FrameCount) ImGui::UpdatePlatformWindows();
+        glfwMakeContextCurrent(window);   // a floating window's context may be the one left current
+        redrawFrames = std::max(redrawFrames, 3);
     }
 
     bool App::screenshot(const std::string& path) {
@@ -1684,6 +2082,8 @@ namespace sirius::app::gui {
     }
 
     void App::quitNow() { impl_->finishClose(); }
+
+    bool App::closing() const { return impl_->closing; }
 
     void App::requestClose() {
         Impl& d = *impl_;
@@ -1710,6 +2110,9 @@ namespace sirius::app::gui {
             });
         };
         d.closeAsked = true;
+        // A question needs the window on screen: closed from the taskbar while
+        // minimised, it would otherwise wait unseen and hold every later close.
+        if ((d.unsavedWork() || bridge_.busy()) && glfwGetWindowAttrib(d.window, GLFW_ICONIFIED)) glfwRestoreWindow(d.window);
         // Edits since the last save go with the window: say so first.
         if (d.unsavedWork()) {
             ask("Quit", "The pipeline has unsaved changes, and label edits are only kept by an export. Quit anyway?", {"Yes", "No"},
@@ -1778,9 +2181,19 @@ namespace sirius::app::gui {
     std::vector<std::string> App::recentFiles() { return settings().getStringList("recent/datasets"); }
 
     void App::addRecentFile(const std::string& path) {
+        // One entry per file, however its path was written (a drop, a dialog,
+        // the command line, a list saved by an older version).
+        const std::string key = absolutePath(path);
+        auto same = [&key](const std::string& entry) {
+#ifdef _WIN32
+            return toLower(absolutePath(entry)) == toLower(key);   // Windows paths ignore case
+#else
+            return absolutePath(entry) == key;
+#endif
+        };
         std::vector<std::string> list = recentFiles();
-        list.erase(std::remove(list.begin(), list.end(), path), list.end());
-        list.insert(list.begin(), path);
+        list.erase(std::remove_if(list.begin(), list.end(), same), list.end());
+        list.insert(list.begin(), key);
         if (list.size() > static_cast<std::size_t>(kMaxRecent)) list.resize(static_cast<std::size_t>(kMaxRecent));
         settings().set("recent/datasets", list);
     }
@@ -1842,6 +2255,17 @@ namespace sirius::app::gui {
     }
 
     void App::openPipelinePath(const std::string& path) {
+        // Refused like every other edit while a run or a task holds the
+        // pipeline: a dataset load finishing later would install its dataset
+        // over this pipeline and reset its Load step. This also covers a load
+        // that ended while the file dialog was open.
+        if (bridge_.busy()) {
+            message("Load pipeline",
+                    (bridge_.running() ? std::string("A run") : bridge_.taskLabel()) +
+                        " is still in progress: cancel it (Esc) or wait before loading a pipeline.",
+                    MessageIcon::Info);
+            return;
+        }
         try {
             wb().loadPipeline(path);
             impl_->savedRevision = wb().history().revision();   // a loaded pipeline is a saved one
@@ -1864,6 +2288,13 @@ namespace sirius::app::gui {
             wb().logLine("A run is in progress: cancel it (Esc) or wait before opening " + paths.front() + ".");
             return;
         }
+        // A pipeline or a dataset also waits for a task (a dataset loading),
+        // which would install its result over it; a .py operation does not.
+        auto waitsForTask = [this](const std::string& path) {
+            if (!bridge_.taskRunning()) return false;
+            wb().logLine(bridge_.taskLabel() + " is in progress: cancel it (Esc) or wait before opening " + path + ".");
+            return true;
+        };
         // Several dataset files from one folder at once are what a folder
         // dataset is for, so offer that rather than opening one and dropping
         // the rest.
@@ -1872,6 +2303,7 @@ namespace sirius::app::gui {
                                       return kindOfDrop(p) == DropKind::Dataset && parentPath(p) == folder;
                                   });
         if (manyDatasets) {
+            if (waitsForTask(folder)) return;
             wb().logLine("Dropped " + std::to_string(paths.size()) + " files: opening " + folder + " as a folder dataset.");
             openDatasetPath(folder);
             return;
@@ -1879,13 +2311,17 @@ namespace sirius::app::gui {
         for (const std::string& path : paths) {
             const DropKind kind = kindOfDrop(path);
             switch (kind) {
-                case DropKind::Pipeline: openPipelinePath(path); break;
+                case DropKind::Pipeline:
+                    if (!waitsForTask(path)) openPipelinePath(path);
+                    break;
                 case DropKind::Plugin: pluginManager(path); break;
                 case DropKind::Folder:
-                case DropKind::Dataset: openDatasetPath(path); break;
+                case DropKind::Dataset:
+                    if (!waitsForTask(path)) openDatasetPath(path);
+                    break;
                 case DropKind::None:
                     wb().logLine("Nothing to open in " + path +
-                                 ": expected a TIFF / zarr / N5, a folder, a .sirius.toml or a .py operation.");
+                                 ": expected a TIFF / zarr / N5, a folder, a pipeline .toml or a .py operation.");
                     break;
             }
             // one dataset at a time: a second would replace the first
@@ -1898,7 +2334,7 @@ namespace sirius::app::gui {
         if (path.empty()) {
             path = platform::saveFileDialog("Save pipeline", impl_->lastDir, "pipeline.sirius.toml", {{"SIRIUS pipeline", "toml"}});
             if (path.empty()) return;
-            if (!endsWith(path, ".toml")) path += ".sirius.toml";
+            if (!endsWithNoCase(path, ".toml")) path += ".sirius.toml";
         }
         try {
             wb().savePipeline(path);
@@ -1938,6 +2374,12 @@ namespace sirius::app::gui {
     void App::exportResultDialog() {
         if (!wb().hasDataset()) return;
         showDialog(makeExportDialog(*this, [this](int step, const ExportOptions& chosen) {
+            // A run or a task may have started while the dialog was open (the
+            // assistant, a drop): nothing, not even the sidecar, is written then.
+            if (bridge_.busy()) {
+                message("Export", "A run or task is in progress: cancel it (Esc) or wait, then export again.", MessageIcon::Info);
+                return;
+            }
             ExportOptions options = chosen;
             std::shared_ptr<const StepOutput> out = wb().output(step);
             if (!out) {
@@ -1961,16 +2403,23 @@ namespace sirius::app::gui {
             // The labels are copied first: the task reads them on its thread
             // while the viewer may still paint into the step's volume.
             std::shared_ptr<const LabelVolume> labels = out->labels ? out->labels->clone() : nullptr;
-            bridge_.startTask("Export", [out, labels, options](const Bridge::TaskProgress& progress, const Bridge::TaskCancelled& cancelled) {
-                ArrayPtr array = out->asInput().materialize(progress);
-                exportArray(*array, out->meta, labels.get(), options, progress, cancelled);
-            });
+            const bool started =
+                bridge_.startTask("Export", [out, labels, options](const Bridge::TaskProgress& progress, const Bridge::TaskCancelled& cancelled) {
+                    ArrayPtr array = out->asInput().materialize(progress);
+                    exportArray(*array, out->meta, labels.get(), options, progress, cancelled);
+                });
+            if (!started) message("Export", "The export could not start: another task is running. Cancel it (Esc) or wait, then export again.");
         }));
     }
 
     void App::exportTrainingDialog() {
-        if (!wb().hasDataset() || bridge_.running()) return;
+        if (!wb().hasDataset() || bridge_.busy()) return;
         showDialog(makeTrainingExportDialog(*this, [this](int step, const TrainingExportOptions& chosen) {
+            if (bridge_.busy()) {
+                message("Export training data", "A run or task is in progress: cancel it (Esc) or wait, then export again.",
+                        MessageIcon::Info);
+                return;
+            }
             std::shared_ptr<const StepOutput> out = wb().output(step);
             if (!out || !out->labels || out->labels->empty()) {
                 message("Export training data", "Step " + Step::number(step) + " has no labels. Run a segmentation step first.",
@@ -1986,12 +2435,14 @@ namespace sirius::app::gui {
                                   {"pipeline", wb().pipeline().toJson()}};
             // a copy: the task reads on its thread while the viewer may paint
             std::shared_ptr<const LabelVolume> labels = out->labels->clone();
-            bridge_.startTask("Export training data",
-                              [out, labels, options](const Bridge::TaskProgress& progress, const Bridge::TaskCancelled& cancelled) {
-                                  ArrayPtr array = options.image || options.slices ? out->asInput().materialize(progress) : nullptr;
-                                  const Array5 empty;
-                                  exportTrainingData(array ? *array : empty, out->meta, *labels, options, progress, cancelled);
-                              });
+            const bool started = bridge_.startTask(
+                "Export training data", [out, labels, options](const Bridge::TaskProgress& progress, const Bridge::TaskCancelled& cancelled) {
+                    ArrayPtr array = options.image || options.slices ? out->asInput().materialize(progress) : nullptr;
+                    const Array5 empty;
+                    exportTrainingData(array ? *array : empty, out->meta, *labels, options, progress, cancelled);
+                });
+            if (!started)
+                message("Export training data", "The export could not start: another task is running. Cancel it (Esc) or wait, then export again.");
         }));
     }
 
@@ -2259,10 +2710,9 @@ namespace sirius::app::gui {
     void App::dockDiagnostics() {
         impl_->showDiag = true;
         impl_->diagMaximized = false;
-        if (impl_->diagFloating) {
-            if (impl_->diagDockId) impl_->diagFloatRequest = 2;
-            else impl_->rebuildLayout = true;
-        }
+        // Only the diagnostics move (drawDockWindows finds them a dock): the
+        // rest of the arrangement stays as the user left it.
+        if (impl_->diagFloating) impl_->diagFloatRequest = 2;
         requestRedraw();
     }
 
