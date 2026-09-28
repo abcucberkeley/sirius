@@ -398,15 +398,19 @@ TEST_CASE("Device buffers round-trip through the GPU", "[buffer][cuda]") {
         auto back = toEigen<3>(devF);
         for (Index i = 0; i < host.size(); ++i) REQUIRE(back.data()[i] == hostF.data()[i]);
 
-        // Float -> int8 saturates on both backends (detail::convertScalar):
-        // 0..12287 lands mostly on 127. The device result is compared with the
-        // host conversion element by element, not with a wrapping cast.
+        // Float to a narrower integer saturates, on both backends
+        // (detail::convertScalar): 0..12287 lands mostly on 127. A C++ cast
+        // would wrap 300 to 44, which is a plausible intensity and therefore
+        // the worst possible answer. The device result is compared with the
+        // host conversion element by element, so the contract lives in one
+        // place rather than in a literal here; the explicit cases document it.
         Buffer<std::int8_t> devI8(host.shape(), gpu);
         convert(devF, devI8);
         Buffer<std::int8_t> hostI8(host.shape());
         convert(hostF, hostI8);
         auto backI8 = toEigen<3>(devI8);
         for (Index i = 0; i < host.size(); ++i) REQUIRE(backI8.data()[i] == hostI8.data()[i]);
+        REQUIRE(hostF.data()[300] == 300.0f);
         REQUIRE(backI8.data()[100] == 100);
         REQUIRE(backI8.data()[300] == 127);
 
