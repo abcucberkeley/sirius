@@ -53,6 +53,12 @@ namespace sirius::app::gui::assistant_markdown {
     // Text as typed: line breaks kept, nothing interpreted (the user's bubble).
     Document plain(const std::string& text);
 
+    // True for an http(s) or mailto address. Only such a target becomes a
+    // link: the model writes the targets, and the shell that opens a link
+    // would just as readily start a program, a script on a share or a
+    // protocol handler (file:, ms-msdt:, search-ms:).
+    bool isWebUrl(const std::string& target);
+
     struct Run {
         ImVec2 pos;                // relative to the layout's origin, display pixels
         ImVec2 size;

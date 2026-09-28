@@ -281,6 +281,15 @@ namespace sirius::app::gui {
                 if (onFailed) onFailed(errorMessageOf(raw_, response.message()));
                 return;
             }
+            // A transfer that broke off mid-answer (a reset, the server gone,
+            // the stall timeout) is no reply: its text is cut short and its
+            // last tool call may be too, so nothing of it may run. One that
+            // had already finished stands, since some proxies reset the
+            // connection after [DONE].
+            if (failed && !done_ && acc_.finishReason.empty()) {
+                if (onFailed) onFailed("the answer broke off before it was complete (" + response.message() + ")");
+                return;
+            }
             const json message = acc_.toMessage();
             if (onFinished) onFinished(message);
             return;

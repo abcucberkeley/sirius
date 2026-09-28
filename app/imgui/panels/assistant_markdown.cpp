@@ -145,6 +145,11 @@ namespace sirius::app::gui::assistant_markdown {
                 push(out, label.empty() ? target : label, st);
                 return true;
             }
+            if (!isWebUrl(target)) {
+                // a path or another scheme: its text, not a link to click
+                parseInline(label.empty() ? target : label, st, out);
+                return true;
+            }
             Style link = st;
             link.href = target;
             parseInline(label.empty() ? target : label, link, out);
@@ -537,6 +542,17 @@ namespace sirius::app::gui::assistant_markdown {
 
     } // namespace
 
+    bool isWebUrl(const std::string& target) {
+        const std::string t = toLower(target);
+        if (!startsWith(t, "https://") && !startsWith(t, "http://") && !startsWith(t, "mailto:")) return false;
+        // No address holds a space, a quote or a control character; the
+        // command line that starts the browser could be split at one.
+        return std::none_of(target.begin(), target.end(), [](char c) {
+            const auto u = static_cast<unsigned char>(c);
+            return u <= 0x20 || u == 0x7F || c == '"';
+        });
+    }
+
     Document parse(const std::string& markdownIn) {
         Document doc;
         const std::vector<std::string> lines = splitLines(normalizeMathDelimiters(markdownIn));
@@ -615,8 +631,16 @@ namespace sirius::app::gui::assistant_markdown {
                         if (c) push(b.spans, " \xC2\xB7 ", Style());
                         Style st;
                         st.bold = !header && c == 0;
-                        parseInline(header ? captionCase(cells[c]) : cells[c], st, b.spans);
+                        parseInline(cells[c], st, b.spans);
                     }
+                    // The header is set in capitals once it is parsed, as the
+                    // help pages' CSS does: upper-cased source would turn
+                    // $\phi$ into \PHI, which no symbol is, and change a link's
+                    // target. Math has become its glyphs by now (Greek keeps
+                    // its case), and code keeps what it says.
+                    if (header)
+                        for (Span& s : b.spans)
+                            if (!s.lineBreak && !s.code) s.text = captionCase(s.text);
                     doc.blocks.push_back(std::move(b));
                     header = false;
                 }

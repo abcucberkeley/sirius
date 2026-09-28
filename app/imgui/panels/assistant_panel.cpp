@@ -4,6 +4,7 @@
 #include <chrono>
 #include <cfloat>
 #include <cmath>
+#include <cstdint>
 #include <deque>
 #include <exception>
 #include <functional>
@@ -278,15 +279,55 @@ namespace sirius::app::gui {
             scrollToBottom();
         }
 
-        void onCardLink(const std::string& link, const json& state) {
+        void onCardLink(const ActionRecord& rec) {
             Workbench& wb = app.wb();
+            const std::string& link = rec.link;
+            const json& state = rec.viewState;
             if (link == "undo") {
-                wb.undo();
+                // Undoes the card's own change, or nothing: the newest entry
+                // may be a later call's, or the user's own edit. The history
+                // must stand where the call left it; revisions only grow, so
+                // one below that means the change is undone already.
+                const History& h = wb.history();
+                if (h.revision() != rec.revAfter) {
+                    // A higher number is a later push, which may also follow an
+                    // undo of this change: the history cannot tell which.
+                    wb.logLine("Not undone: " + rec.text +
+                               (h.revision() < rec.revAfter ? " (undone already)"
+                                                            : " (undone already, or changes were made after it: Edit ▸ Undo steps back through them)"));
+                    return;
+                }
+                // every entry the call pushed (an add_step with parameters makes two)
+                while (h.revision() > rec.revBefore) {
+                    // Opening or closing a dataset clears the history but keeps
+                    // its revision, so the change can no longer be undone.
+                    if (!h.canUndo()) {
+                        wb.logLine("Not undone: " + rec.text + " (a dataset was opened or closed since, which clears the undo history)");
+                        break;
+                    }
+                    const std::uint64_t at = h.revision();
+                    wb.undo();
+                    if (h.revision() == at) break;   // refused while a run is on (undo() logs why)
+                }
             } else if (link == "view") {
+                // What ToolApi saved: the step selected or viewed (numbered from
+                // 1), and the view it left. The step is viewed first, since
+                // view() sizes the channel list for it and the saved view then
+                // sets which of them show.
                 if (state.is_object()) {
-                    if (state.contains("select") && state["select"].is_number_integer()) wb.select(state["select"].get<int>());
-                    if (state.contains("view") && state["view"].is_number_integer()) wb.view(state["view"].get<int>());
-                    wb.setViewState(ViewState::fromJson(state, wb.viewState()));
+                    if (state.contains("select_step") && state["select_step"].is_number_integer())
+                        wb.select(state["select_step"].get<int>() - 1);
+                    if (state.contains("view_step") && state["view_step"].is_number_integer()) wb.view(state["view_step"].get<int>() - 1);
+                    if (state.contains("view") && state["view"].is_object()) {
+                        // The card may predate a dataset load or a pipeline
+                        // change: z and t are clamped to the data on screen, as
+                        // set_view does, since label edits index frames by t.
+                        ViewState s = ViewState::fromJson(state["view"], wb.viewState());
+                        const DatasetMeta meta = wb.displayedMeta();
+                        s.z = std::clamp<Index>(s.z, 0, std::max<Index>(meta.dims.z - 1, 0));
+                        s.t = std::clamp<Index>(s.t, 0, std::max<Index>(meta.dims.t - 1, 0));
+                        wb.setViewState(s);
+                    }
                 }
             } else if (link == "log") {
                 app.showLog();
@@ -382,6 +423,9 @@ namespace sirius::app::gui {
         }
 
         void step() {
+            // Once the window is closing no request goes out: neither the chat
+            // nor the question which models Ollama holds.
+            if (app.closing()) return;
             reasoningChars = 0;
             waitingForModel = true;
             setBusy(true);
@@ -493,11 +537,15 @@ namespace sirius::app::gui {
             });
         }
 
-        // False when the user stopped the assistant while the call ran.
+        // False when the user stopped the assistant while the call ran, or
+        // closed the window.
         bool runCall(const PendingCall& call) {
             executing = true;
             executeCall(call);
             executing = false;
+            // A run pumps frames, and the window may have been closed in one
+            // of them: nothing more is asked of the model while the app quits.
+            if (app.closing()) return false;
             if (stopAfterCall) {
                 stopAfterCall = false;
                 finishStop();
@@ -548,6 +596,13 @@ namespace sirius::app::gui {
             ToolApi& api = app.tools();
             if (args.is_discarded() || !args.is_object()) {
                 result = {{"error", "the arguments of this call are not a valid JSON object (was the reply cut off?); nothing was done"}};
+            } else if (mutatingTool(call.name) && app.bridge().taskRunning()) {
+                // A dataset load that finishes installs its dataset with a
+                // fresh Load step and clears the history: a change made while
+                // it runs would be lost, although it was reported as done. The
+                // window refuses edits during any task (an export too), so the
+                // error names the task that is running.
+                result = {{"error", app.bridge().taskLabel() + " is in progress: wait for it to finish before changing anything"}};
             } else {
                 try {
                     result = api.call(call.name, args);
@@ -631,7 +686,7 @@ namespace sirius::app::gui {
             modelText = keep;
             const int lookup = ++modelLookup;
             std::weak_ptr<int> token = alive;
-            client.fetchModels(settings.baseUrl, settings.requestKey(), [this, token, lookup, keep](std::vector<std::string> ids, std::string error) {
+            client.fetchModels(settings.baseUrl, settings.requestKey(), [this, token, lookup](std::vector<std::string> ids, std::string error) {
                 if (token.expired() || lookup != modelLookup) return;   // a newer list was asked for
                 if (ids.empty()) {
                     modelTip = format("Cannot list the models at %s (%s): type a name", settings.baseUrl.c_str(), error.c_str());
@@ -639,14 +694,17 @@ namespace sirius::app::gui {
                 }
                 std::sort(ids.begin(), ids.end(), [](const std::string& a, const std::string& b) { return toLower(a) < toLower(b); });
                 listedModels = ids;
-                // a saved name that is only a prefix of one the server has
-                // (typed and left, say) becomes that one
-                const std::string chosen = keep.empty() ? ids.front() : LlmClient::resolveModel(keep, ids);
+                // The choice as it is now, not as it was when the list was
+                // asked for: a name typed or picked meanwhile stands. One that
+                // is only a prefix of a name the server has (typed and left,
+                // say) becomes that name.
+                const std::string current = settings.model;
+                const std::string chosen = current.empty() ? ids.front() : LlmClient::resolveModel(current, ids);
                 if (std::find(ids.begin(), ids.end(), chosen) == ids.end()) ids.insert(ids.begin(), chosen);
                 modelItems = ids;
                 if (!modelEditing) modelText = chosen;
                 modelTip = format("%d model(s) at %s: pick one, or type a name", static_cast<int>(ids.size()), settings.baseUrl.c_str());
-                if (chosen != keep) commitModel(chosen);
+                if (chosen != current) commitModel(chosen);
             });
         }
 
@@ -705,13 +763,22 @@ namespace sirius::app::gui {
         }
 
         // Draws a laid-out text at `origin`; a click on a link opens it.
+        // The model wrote the target, so it is shown while the link is
+        // hovered, and only a web address is handed to the shell (which
+        // would start a program or a protocol handler just as readily).
         void drawText(const md::Layout& layout, ImVec2 origin) {
             ImDrawList* dl = ImGui::GetWindowDrawList();
             const int link = md::draw(dl, origin, layout);
             if (link >= 0 && link < static_cast<int>(layout.links.size())) {
-                ImGui::SetMouseCursor(ImGuiMouseCursor_Hand);
                 const std::string& href = layout.links[static_cast<std::size_t>(link)];
-                if (ImGui::IsMouseClicked(ImGuiMouseButton_Left)) platform::openUrl(href);
+                // an item under the text, for the tooltip to hang on
+                place(origin.x, origin.y);
+                ImGui::Dummy(layout.size);
+                widgets::tooltip(href);
+                if (md::isWebUrl(href)) {
+                    ImGui::SetMouseCursor(ImGuiMouseCursor_Hand);
+                    if (ImGui::IsMouseClicked(ImGuiMouseButton_Left)) platform::openUrl(href);
+                }
             }
         }
 
@@ -747,12 +814,10 @@ namespace sirius::app::gui {
                 const bool hot = ImGui::IsItemHovered();
                 if (hot) ImGui::SetMouseCursor(ImGuiMouseCursor_Hand);
                 if (ImGui::IsItemClicked(ImGuiMouseButton_Left)) {
-                    const std::string link = rec.link;
-                    const json state = rec.viewState;
                     // after the transcript was walked: undo and view change what it shows
                     std::weak_ptr<int> token = alive;
-                    app.defer([this, token, link, state] {
-                        if (!token.expired()) onCardLink(link, state);
+                    app.defer([this, token, rec] {
+                        if (!token.expired()) onCardLink(rec);
                     });
                 }
                 if (rec.link == "log") widgets::tooltip(logTail());
