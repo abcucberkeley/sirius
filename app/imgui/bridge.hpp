@@ -138,7 +138,9 @@ namespace sirius::app::gui {
         // happens). Callable from any thread. The application installs the
         // function that does it.
         void wake() const;
-        void setWaker(std::function<void()> waker) { waker_ = std::move(waker); }
+        // Once setWaker(nullptr) returns, no call of the old waker is still
+        // running and none starts: the application terminates GLFW next.
+        void setWaker(std::function<void()> waker);
         // Once per frame, before the frame is built: runs the posted
         // functions, reads the progress and folds finished jobs back in.
         void update();
@@ -173,6 +175,9 @@ namespace sirius::app::gui {
         Workbench& wb_;
         std::unique_ptr<Relay> relay_;
         Revisions rev_;
+        // Guards waker_, which threads call through wake() while the GUI
+        // thread replaces it.
+        mutable std::mutex wakerMutex_;
         std::function<void()> waker_;
 
         // the worker thread and its queue

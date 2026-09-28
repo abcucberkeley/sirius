@@ -123,18 +123,23 @@ namespace sirius::app::gui::secrets {
             return unprotect(blob, key);
         }
 
+        // True only once the settings file holds the change: a value kept in
+        // memory alone is gone at the next launch. A change the file would not
+        // take is taken back (commit), so a later save neither keeps what the
+        // caller is told was not stored nor writes it over another instance's
+        // token, and a plaintext value being migrated is tried again instead
+        // of being saved beside its blob, where read() would never remove it.
         bool writeBackend(const std::string& key, const std::string& value) {
             const std::string blob = protect(value, key);
             if (blob.empty()) return false;   // DPAPI refused; better no value than a plaintext one
-            settings().set(settingsKey(key), toBase64(blob));
-            settings().save();
-            return true;
+            return settings().commit(settingsKey(key), toBase64(blob));
         }
 
         bool removeBackend(const std::string& key) {
-            settings().remove(settingsKey(key));
-            settings().save();
-            return true;
+            // Nothing stored, nothing to write: a save failing over some other
+            // setting is no reason to report this removal as failed.
+            if (!settings().contains(settingsKey(key))) return true;
+            return settings().commit(settingsKey(key), std::nullopt);
         }
 
 #else
@@ -169,8 +174,14 @@ namespace sirius::app::gui::secrets {
         }
 
         bool saveStore(const nlohmann::json& obj) {
-            platform::makePath(storeDir());
-            ::chmod(storeDir().c_str(), S_IRWXU);
+            // Only a directory the store owns is closed to everyone else:
+            // ~/.sirius, or one created here. A --settings directory is the
+            // user's (a shared lab folder, ".") and keeps its mode; the file
+            // itself is 0600 either way.
+            const std::string dir = storeDir();
+            const bool created = !pathExists(dir);
+            platform::makePath(dir);
+            if (storeDirectory().empty() || created) ::chmod(dir.c_str(), S_IRWXU);
             return platform::writeFileAtomic(storePath(), obj.dump(4) + "\n", true);
         }
 

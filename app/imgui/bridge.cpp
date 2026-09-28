@@ -116,7 +116,23 @@ namespace sirius::app::gui {
     }
 
     void Bridge::wake() const {
+        // Called under the lock, so that once setWaker(nullptr) has returned
+        // no wake is running or can start, and none overlaps glfwTerminate in
+        // ~App. The waker (glfwPostEmptyEvent) never calls back into the
+        // Bridge, so holding the lock cannot deadlock.
+        const std::lock_guard<std::mutex> g(wakerMutex_);
         if (waker_) waker_();
+    }
+
+    void Bridge::setWaker(std::function<void()> waker) {
+        // The old waker is destroyed once the lock is released: whatever its
+        // captures do when they go then runs without the lock held.
+        std::function<void()> old;
+        {
+            const std::lock_guard<std::mutex> g(wakerMutex_);
+            old.swap(waker_);
+            waker_ = std::move(waker);
+        }
     }
 
     void Bridge::update() {
