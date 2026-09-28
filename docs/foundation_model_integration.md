@@ -3,7 +3,8 @@
 Handoff for whoever builds the sirius side. Written 2026-09-13.
 Branch `foundation-model`, commit `233314d`, 545/545 tests passing.
 
-The model side is done and merged on that branch. The gap is in the Qt layer.
+The model side is done and merged on that branch. The gap is in the GUI layer
+(then the Qt application; the workbench is now `app/imgui`).
 Read section 4 first if you only read one thing.
 
 ---
@@ -99,10 +100,10 @@ sirius_worker.sbatch` exists for the separate-job case.
 
 ## 3. Constraints you will hit
 
-- **The GUI needs Qt 6** (`QEnterEvent`, `QtOpenGLWidgets`). The Berkeley
-  cluster module is Qt 5.15, so the Qt executable does not build there. Use a
-  machine with Qt 6 or a container. `sirius_app_core`, where the operation
-  lives, is Qt-free and builds and tests on the cluster.
+- **The GUI needs OpenGL 3.3 and a display** (GLFW, Dear ImGui); its other
+  dependencies are fetched by CMake, so it builds on the cluster as well, and a
+  headless node runs it under `xvfb-run`. `sirius_app_core`, where the
+  operation lives, is GUI-free and builds and tests anywhere.
 - **Configure with `-DSIRIUS_ENABLE_APP=ON`** or the whole app and every
   `test_app_*` test is skipped silently. A build that drops from 545 tests to
   215 is this, not a passing build.

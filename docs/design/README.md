@@ -1,15 +1,15 @@
-# Handoff: Sirius — microscopy processing workbench (Qt / C++)
+# Handoff: Sirius — microscopy processing workbench (C++)
 
 ## Overview
 Sirius is a desktop application for loading, viewing and processing multi‑dimensional microscopy data (C × T × Z × Y × X, plus derived label volumes). One window, viewer in the centre, an ordered-but-freely-reorderable stack of optional processing operations on the left, the selected operation's parameters on the right, and a dockable diagnostics area at the bottom. Operations include einsum-style reductions, contrast, deskew/rotate, channel merge, stitch, register, deconvolution, volume reconstruction, SIM reconstruction (with parameter estimation and band-level debug views), Torch-model segmentation and an in-viewer label cleanup mode. An LLM assistant can drive the same operations through a typed API.
 
 ## About the design files
-`Microscopy Workbench v2.dc.html` (+ `support.js`, `_ds/…`) is a **design reference built in HTML** — a clickable prototype showing intended look and behaviour. It is not production code. The task is to **recreate this design in the Qt 6 / C++ codebase** (Qt Widgets — `QMainWindow` + `QDockWidget`s + a GPU viewer widget), following Qt idioms. Where the prototype fakes data (synthetic blobs, FFT rings, canned assistant replies), implement the real thing.
+`Microscopy Workbench v2.dc.html` (+ `support.js`, `_ds/…`) is a **design reference built in HTML** — a clickable prototype showing intended look and behaviour. It is not production code. It is implemented in C++ as `app/imgui` (Dear ImGui with docking, GLFW, OpenGL 3.3; see `app/imgui/README.md`). Where the prototype fakes data (synthetic blobs, FFT rings, canned assistant replies), implement the real thing.
 
 `Microscopy Workbench.dc.html` is an earlier, superseded tabbed layout; keep it only for reference of the Datasets browser (table/grid) which may return as a "File ▸ Open dataset…" dialog.
 
 ## Fidelity
-**High-fidelity for layout, hierarchy, copy and interaction; medium-fidelity for pixel values.** Reproduce the structure, spacing rhythm, type scale and colour tokens below. Exact pixel widths are targets for a 1600 × 960 default window and should scale with dock resizing. All colours/fonts must come from a single QSS theme (see Design tokens).
+**High-fidelity for layout, hierarchy, copy and interaction; medium-fidelity for pixel values.** Reproduce the structure, spacing rhythm, type scale and colour tokens below. Exact pixel widths are targets for a 1600 × 960 default window and should scale with dock resizing. All colours/fonts must come from a single theme (see Design tokens; `app/imgui/theme.hpp`).
 
 ---
 
@@ -32,7 +32,7 @@ Sirius is a desktop application for loading, viewing and processing multi‑dime
 ├─ status bar 26 ─────────────────────────────────────────────────────────────────────┘
 ```
 
-Qt mapping: `QMainWindow`; Ops, Parameters, Diagnostics and Assistant are `QDockWidget`s (movable, floatable, closable; persist with `saveState/restoreState`). Central widget = viewer toolbar + viewer + dims strip in a `QVBoxLayout`.
+Implementation: Ops, Parameters, Diagnostics and Assistant are dock windows (movable, floatable, closable; the arrangement persists). The central area = viewer toolbar + viewer + dims strip.
 
 ### Title / menu bar (38 px)
 - Brand: 12 × 12 accent square + "SIRIUS" 15 px / 800.
@@ -95,7 +95,7 @@ Two panes: left "01 Load · raw", right the viewed step (with label overlay if o
 Grid `120px | 1fr | 80px`, two rows: **Z** (µm readout) slider `n / max`; **T** with 20 × 20 play/pause button (▶ / ❚❚, loops at ~8 fps) and seconds readout. Hide T when t = 1.
 
 ### Diagnostics area (default 250 px; collapsible to 34 px header)
-Header: ▼/▶ toggle · "DIAGNOSTICS · <step name>" · tab row (12 px, active = 2 px accent underline + 800) · hint text · dock controls **▁ docked · ❐ floating · ⛶ maximized**. Floating = 2 px ink border, shadow-lg, movable to another monitor (in Qt this is simply `QDockWidget::setFloating`); maximized covers the viewer. Canvases must keep aspect ratio when resized (re-render at the widget's real size).
+Header: ▼/▶ toggle · "DIAGNOSTICS · <step name>" · tab row (12 px, active = 2 px accent underline + 800) · hint text · dock controls **▁ docked · ❐ floating · ⛶ maximized**. Floating = 2 px ink border, shadow-lg, movable to another monitor; maximized covers the viewer. Canvases must keep aspect ratio when resized (re-render at the widget's real size).
 
 Content by selected step kind (all panels are 2 px-gapped cells on `divider`, each with a 10 px uppercase caption):
 - **SIM reconstruction** — tabs *Raw spectrum · Separated bands · Shifted & stitched · Result spectrum*; three image cells (log-power FFTs; raw shows the k₀ peaks in accent; stitched shows the shifted band circles; result shows the extended support ring) + table **Angle · k₀ (px⁻¹) · Phase · Mod.** with modulation depth < 0.4 in accent; footer "Wiener 0.001 · OTF measured · apodization cosine · resolution gain ≈ 1.9×".
@@ -126,7 +126,7 @@ Below every body, two ruled sections:
 Footer: primary "Run step", secondary "View", ghost "Remove" (hidden for Load).
 
 ### Help window (floating, 520 × ≤760, opened by ? or F1)
-Header "HELP · <step>", "Edit page" link, ✕. Body: h3 title, intro paragraph, **display LaTeX block** (surface fill), figure drop zone (dashed, 170 px), parameter table (name + range | explanation + inline LaTeX), footer note. Pages are Markdown + LaTeX + images stored beside each operation plugin; editable by users. Content for Load, SIM, Einsum, Decon, Segmentation, Contrast, Merge, Deskew, Volume is in the prototype's `HELP` object — reuse the text and formulas. Qt: `QTextBrowser` with KaTeX/MathJax via `QWebEngineView`, or pre-render formulas to SVG.
+Header "HELP · <step>", "Edit page" link, ✕. Body: h3 title, intro paragraph, **display LaTeX block** (surface fill), figure drop zone (dashed, 170 px), parameter table (name + range | explanation + inline LaTeX), footer note. Pages are Markdown + LaTeX + images stored beside each operation plugin; editable by users. Content for Load, SIM, Einsum, Decon, Segmentation, Contrast, Merge, Deskew, Volume is in the prototype's `HELP` object — reuse the text and formulas. The formulas are laid out natively (sub/superscripts, stacked fractions), no web view.
 
 ---
 
@@ -157,7 +157,7 @@ Left: format list (selected = accent border + surface fill): OME-TIFF (zlib) · 
 
 ---
 
-## Design tokens (Modernist theme → QSS)
+## Design tokens (Modernist theme)
 Colours
 - bg `#f3f2f2` · surface `#eae9e9` · text `#201e1d` · divider = text @ 40 % (`#a6a5a4` on bg) · accent `#ec3013` · accent‑600 (hover/pressed) `#dd2b0f` · accent‑700 `#ae1800`
 - neutral 200 `#eae7e7` · 300 `#d7d3d3` · 400 `#bab6b6` · 500 `#9b9797` · 600 `#7d7979` · 700 `#605d5d` · 800 `#444141` · 900 `#2d2b2b`

@@ -31,13 +31,14 @@ ctest --preset linux-gcc-dev
 | Preset | What it adds |
 | --- | --- |
 | `linux-gcc-dev`, `linux-clang-dev`, `win-msvc-dev` | the library, tests, warnings, Python bindings (Debug) |
-| `linux-gcc-app-dev`, `win-msvc-app-dev` | the Qt workbench (`app/`) and TensorStore (zarr / N5) |
-| `linux-gcc-imgui-dev`, `win-msvc-imgui-dev` | the Dear ImGui workbench (`app/imgui`); no Qt, dependencies fetched |
+| `linux-gcc-app-dev`, `win-msvc-app-dev` | the workbench (`app/`, Dear ImGui; its dependencies are fetched) and TensorStore (zarr / N5) |
 | `linux-cuda-dev`, `win-msvc-cuda-dev` | CUDA, cuFFT, nvTIFF, `CMAKE_CUDA_ARCHITECTURES=native` |
 | `fiona-avx2-*` | the cluster builds: AVX2, optionally CUDA |
 | `*-release` | Release, no tests |
 
-Point `SIRIUS_QT_DIR` at a Qt prefix for the `*-app-*` presets. TensorStore's
+On Linux the `*-app-*` presets need GLFW's X11 / Wayland development packages
+and D-Bus (`xorg-dev libwayland-dev libxkbcommon-dev libdbus-1-dev` on Debian
+and Ubuntu); everything else the workbench uses is fetched. TensorStore's
 first configure fetches and builds ~40 dependencies (several minutes, ~1.5 GB,
 needs `nasm` and a `python3`); pass `-DSIRIUS_ENABLE_TENSORSTORE=OFF` while you
 are not touching the zarr paths. Options live in `cmake/ProjectOptions.cmake`.
@@ -45,7 +46,7 @@ are not touching the zarr paths. Options live in `cmake/ProjectOptions.cmake`.
 ## Testing
 
 `ctest --preset <name>` runs the Catch2 suites in `tests/` (the library, and
-the app's Qt-free core when the app is enabled). There is one test binary per
+the app's GUI-free core when the app is enabled). There is one test binary per
 unit -- `test_tiff_io`, `test_registration`, `test_app_labels` -- linking that
 unit and its dependencies and nothing else (docs/architecture.md), plus
 `sirius_tests`, which holds all of them over the archives for running across
@@ -96,7 +97,8 @@ satisfied; match the surrounding file for everything else.
 
 Include order is not enforced by re-sorting (`SortIncludes: Never`). The
 convention is: the file's own header, then the standard library, then
-third-party and Qt, then `sirius/…`, then `core/…` and `qt/…`, blank line
+third-party (Dear ImGui, nlohmann/json …), then `sirius/…`, then `core/…` and
+`imgui/…`, blank line
 between the groups.
 
 `python tools/check_versions.py` asserts the version in `CMakeLists.txt`
@@ -123,8 +125,9 @@ have several.
 
 `.github/workflows/dev-tests.yml` runs on every push to `dev` and every PR:
 `lint`, `cpp-tests` (GCC, and the only job where warnings are errors),
-`app-tests` (Qt 6 plus a headless run of the bundled SIM pipeline),
-`python-tests`, `sanitizers` (ASan + UBSan), `windows` (MSVC + Qt 6) and
+`app-tests` (the workbench, its install check and a headless run of the bundled
+SIM pipeline under Xvfb), `python-tests`, `sanitizers` (ASan + UBSan), `windows`
+(MSVC: the library and the workbench, built and unit-tested) and
 `cuda-build` (compiles the CUDA paths; the GPU cases skip). A run is
 cancelled when you push again to the same branch.
 
@@ -133,4 +136,5 @@ cancelled when you push again to the same branch.
 The Python worker executes what a client asks it to; the trust model and what
 `--allow-install` and `--token` mean are in
 [app/python/SECURITY.md](app/python/SECURITY.md). Secrets the application
-stores go through `app/qt/secret_store.hpp`, never straight into `QSettings`.
+stores go through `app/imgui/secret_store.hpp`, never straight into the settings
+file.

@@ -472,81 +472,63 @@ is loaded. [examples/sim_bundled.sirius.toml](examples/sim_bundled.sirius.toml)
 reconstructs the bundled test stack:
 
 ```
-export SIRIUS_QT_DIR=/path/to/Qt/6.x/gcc_64        # only when Qt is not the system one
 cmake --preset linux-gcc-app-dev                    # add -DSIRIUS_ENABLE_TENSORSTORE=OFF to skip zarr/N5
 cmake --build --preset linux-gcc-app-dev
 ctest --preset linux-gcc-app-dev                    # library + app core tests
 build/linux-gcc-app-dev/app/sirius-app --pipeline examples/sim_bundled.sirius.toml --run
 ```
 
-**Installing on Linux** puts the workbench, its help pages, the Python worker and the
-example plugins under a prefix, with a menu entry and icon:
+**Installing on Linux** puts the workbench, its help pages, the Python worker, the
+example plugins and its fonts under a prefix, with a menu entry and icon:
 
 ```
 cmake --install build/linux-gcc-app-dev --component app --prefix ~/.local   # or /opt/sirius, /usr/local
 update-desktop-database ~/.local/share/applications                         # optional: refresh "Open with"
 ```
 
-That gives `bin/sirius-app`, `share/sirius/{help,python,plugins}`,
+That gives `bin/sirius-app`, `share/sirius/{help,python,plugins,fonts,icons}`,
 `share/applications/sirius-app.desktop` (the menu entry, and *Open with* for TIFF files)
 and the icon in the hicolor theme; a CUDA build's nvTIFF / nvCOMP go to `lib/sirius` and
 are found relative to the executable. The installed application reads its own help pages
-and starts its own copy of the worker (`ctest -R app.install` checks both). Files named
-on the command line open as though dropped on the window: `sirius-app stack.tif` or
-`sirius-app steps.sirius.toml`.
+and starts its own copy of the worker (`ctest -R app.install` checks both; the part that
+starts the application needs a display, so run it under `xvfb-run` on a headless
+machine). Files named on the command line open as though dropped on the window:
+`sirius-app stack.tif` or `sirius-app steps.sirius.toml`.
 
 Command line: `--dataset`, `--pipeline`, `--run`, `[files...]`, and for scripting and smoke tests
 `--tool '{"name":"set_view","args":{"mode":"3d"}}'` (any assistant tool), `--action
 "Export result"` (a menu item by text), `--ask "…"` (a message to the assistant),
-`--screenshot out.png` (grab the window, and any dialog, after the run and quit),
-`--wheel x,y,steps` and `--stroke x0,y0,x1,y1,moves` (real mouse events on the XY pane,
-in voxels, for zoom / paint timing), `--drop <path>` (as though the path were dropped on
-the window), `--record out.jsonl` (record the session, below) and `--quit-after ms`. Scripted
-steps run in the order they are written, so a `--tool get_state` after an `--action` sees what
-the action did. `tools/gui_tests.py --app <binary>` drives the widgets through these hooks —
-the view modes, the compare panes, painting, the wheel, drag and drop, menu actions — and
-asserts on what comes back; CI runs it. `SIRIUS_TRACE_VIEW=1` prints
-what every pane render, label overlay, paint and stroke costs. `QT_QPA_PLATFORM=offscreen`
-runs without a display (the 3D view then shows a notice: Qt's offscreen platform has no
-OpenGL widgets).
+`--screenshot out.png` (grab the window, dialogs included, after the run and quit),
+`--wheel x,y,steps` and `--stroke x0,y0,x1,y1,moves` (mouse input on the XY pane, in voxels,
+for zoom / paint timing), `--drop <path>` (as though the path were dropped on the window),
+`--record out.jsonl` (record the session, above), `--settings <dir>|scratch` (settings of
+the run's own, so a scripted run never reads or overwrites yours), `--size WxH` and
+`--quit-after ms`. Scripted steps run in the order they are written, so a `--tool
+get_state` after an `--action` sees what the action did. `SIRIUS_TRACE_VIEW=1` prints what
+every pane render, label overlay, paint and stroke costs, and `SIRIUS_UI_SCALE` overrides
+the monitor's scale. The application needs a display with OpenGL 3.3; on a headless machine
+`xvfb-run` with Mesa provides both, which is how CI runs the bundled pipeline.
 
-Layout: `app/core` is Qt-free and unit-tested without a display (`tests/test_app_*.cpp`:
+Layout: `app/core` is GUI-free and unit-tested without a display (`tests/test_app_*.cpp`:
 array model, parameters, pipeline files, executor caching, workbench and undo, tool API,
-worker protocol, I/O, help pages, labels, every operation); `app/qt` is the Widgets
-layer (`theme.cpp` holds every colour, font and metric of the design as QSS and
-constants). `SIRIUS_ENABLE_APP=ON` finds Qt 6 (Widgets, OpenGL, OpenGLWidgets, Network)
-with `find_package`; the `*-app-*` presets take the prefix from `$SIRIUS_QT_DIR` or the
-system Qt, and turn on TensorStore (zarr / N5), whose first configure fetches and builds
-it — several minutes, about 1.5 GB, and it needs `nasm` (`conda install -c conda-forge
-nasm` when there is no system package). Add `-DSIRIUS_ENABLE_APP=ON` to a CUDA preset
-for the GPU backend. On Windows `windeployqt` copies the Qt runtime next to the
-executable after every link (`SIRIUS_APP_DEPLOY_QT`).
-
-### The same workbench without Qt (`app/imgui`)
-
-`sirius-imgui` is the workbench again, over [Dear ImGui](https://github.com/ocornut/imgui)
-(docking branch), GLFW and OpenGL 3.3, with [ImPlot](https://github.com/epezent/implot)
-for the diagnostics charts: the same window, panels, dialogs, menus, shortcuts and
-command line, on the same core (`app/core`) — so pipelines, plugins, the Python worker
-and the assistant's tools behave identically. It needs no Qt installation: GLFW, Dear
-ImGui, ImPlot, the text editor widget, native file dialogs and libcurl are fetched and
-built in-tree at pinned revisions (`cmake/Dependencies.cmake`), which makes it the
-application to build on a machine where installing Qt is not an option.
-
-```
-cmake --preset linux-gcc-imgui-dev                  # win-msvc-imgui-dev on Windows; add -DSIRIUS_ENABLE_TENSORSTORE=ON for zarr / N5
-cmake --build --preset linux-gcc-imgui-dev --target sirius-imgui
-build/linux-gcc-imgui-dev/app/imgui/sirius-imgui --pipeline examples/sim_bundled.sirius.toml --run
-```
-
-`SIRIUS_ENABLE_IMGUI_APP=ON` is the option behind the presets; it can be combined with
-`SIRIUS_ENABLE_APP=ON` to build both applications from one tree. On Linux the build
-needs the X11 / Wayland development packages GLFW asks for (`xorg-dev libwayland-dev
+worker protocol, I/O, help pages, labels, every operation); `app/imgui` is the GUI over
+[Dear ImGui](https://github.com/ocornut/imgui) (docking branch), GLFW and OpenGL 3.3,
+with [ImPlot](https://github.com/epezent/implot) for the diagnostics charts
+(`theme.cpp` holds every colour, font and metric of the design);
+[app/imgui/README.md](app/imgui/README.md) describes how it is organised.
+`SIRIUS_ENABLE_APP=ON` builds it. It needs no GUI toolkit installed: GLFW, Dear ImGui,
+ImPlot, a text editor widget, native file dialogs and libcurl are fetched and built
+in-tree at pinned revisions (`cmake/Dependencies.cmake`). On Linux the build needs the
+X11 / Wayland development packages GLFW asks for (`xorg-dev libwayland-dev
 libxkbcommon-dev` on Debian and Ubuntu), `libdbus-1-dev` for the file dialogs (they go
-through the desktop portal) and uses the system's libcurl when there is one. Settings
-live in `<config>/sirius/sirius-imgui.json` with the dock layout in `imgui.ini` beside
-it; secrets are shared with the Qt application's store. [app/imgui/README.md](app/imgui/README.md)
-describes how the layer is organised and how it differs from the Qt one.
+through the desktop portal), and uses the system's libcurl when there is one. The
+`*-app-*` presets also turn on TensorStore (zarr / N5), whose first configure fetches and
+builds it — several minutes, about 1.5 GB, and it needs `nasm` (`conda install -c
+conda-forge nasm` when there is no system package). Add `-DSIRIUS_ENABLE_APP=ON` to a CUDA
+preset for the GPU backend. Settings live in `<config>/sirius/sirius-app.json`
+(`%APPDATA%` on Windows, `~/.config` elsewhere) with the dock layout in `imgui.ini`
+beside it; secrets are never stored as plain text (DPAPI-encrypted in that file on
+Windows, `~/.sirius/secrets.json` with mode 0600 elsewhere).
 
 ## Python Bindings
 Dev install

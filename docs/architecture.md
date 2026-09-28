@@ -71,7 +71,7 @@ Bottom to top; each line's unit may use the ones above it.
 
 ## The workbench core (`app/CMakeLists.txt`, `app/core`)
 
-Qt-free, and tested without a display.
+GUI-free, and tested without a display.
 
 * **Vocabulary** — `cancel`, `errors`, `byte_budget_lru`, `app_paths`,
   `history`, `session_log`, `params`, `help_pages`, `label_frames`.
@@ -94,14 +94,13 @@ Qt-free, and tested without a display.
 * **The top** — `plugin` (a user operation the worker serves), `workbench`,
   `tool_api`.
 
-## The two applications (`app/qt`, `app/imgui`)
+## The application (`app/imgui`)
 
-Both are GUI layers over `sirius_app_core` and nothing else: `sirius-app`
-(Qt Widgets, `SIRIUS_ENABLE_APP`) and `sirius-imgui` (Dear ImGui, GLFW,
-OpenGL 3.3, ImPlot; `SIRIUS_ENABLE_IMGUI_APP`). Neither is a unit graph —
-their sources are globbed — and neither is included by the core, so the
-core's tests run the same whichever application is enabled.
-`app/imgui/README.md` maps the files of one onto the other.
+`sirius-app` (Dear ImGui, GLFW, OpenGL 3.3, ImPlot; `SIRIUS_ENABLE_APP`) is
+a GUI layer over `sirius_app_core` and nothing else. It is not a unit graph —
+its sources are globbed — and nothing in the core includes it, so the core
+builds and tests without a display. `app/imgui/README.md` describes its
+layout.
 
 ## Adding a unit
 
