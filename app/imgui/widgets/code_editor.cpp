@@ -78,6 +78,27 @@ namespace sirius::app::gui::widgets {
             return line.substr(0, i);
         }
 
+        // Whether `text` is indented with tabs: more of its indented lines
+        // start with a tab than with a space. Lines of nothing but blanks and
+        // comment lines do not count, as Python ignores their indentation;
+        // the vote keeps a stray tab-led line (in a docstring, say) from
+        // turning a file indented with spaces over to tabs.
+        bool indentsWithTabs(const std::string& text) {
+            std::size_t tabs = 0, spaces = 0;
+            std::size_t start = 0;
+            while (start < text.size()) {
+                std::size_t end = text.find('\n', start);
+                if (end == std::string::npos) end = text.size();
+                const std::size_t body = text.find_first_not_of(" \t\r", start);
+                if (body > start && body < end && text[body] != '#') {
+                    if (text[start] == '\t') ++tabs;
+                    else ++spaces;
+                }
+                start = end + 1;
+            }
+            return tabs > spaces;
+        }
+
     } // namespace
 
     struct CodeEditor::Impl {
@@ -113,7 +134,13 @@ namespace sirius::app::gui::widgets {
     CodeEditor::~CodeEditor() = default;
 
     void CodeEditor::setText(const std::string& text) {
+        // The editor turns tabs into spaces as it loads them when Tab types
+        // spaces, and a Save would then rewrite every tab in the file. So the
+        // text goes in as it is, and the Tab key follows the file: Python
+        // refuses a block indented partly with tabs and partly with spaces.
+        impl_->editor.SetInsertSpacesOnTabs(false);
         impl_->editor.SetText(text);
+        impl_->editor.SetInsertSpacesOnTabs(!indentsWithTabs(text));
         impl_->editor.SetCursor(TextEditor::DocPos(0, 0));
         impl_->swallowChange = true;
         impl_->changed = false;
@@ -178,9 +205,15 @@ namespace sirius::app::gui::widgets {
                     if (c == ' ' || c == '\t') indent += c;
                     else break;
                 }
+                const bool spaces = ed.IsInsertSpacesOnTabs();
                 const std::string t = trimmed(head);
-                if (!t.empty() && t.back() == ':') indent += "    ";
-                if (!indent.empty()) ed.ReplaceTextInCurrentCursor(indent);
+                if (!t.empty() && t.back() == ':') indent += spaces ? "    " : "\t";
+                if (!indent.empty()) {
+                    // copied as it is: the editor would turn its tabs into spaces
+                    ed.SetInsertSpacesOnTabs(false);
+                    ed.ReplaceTextInCurrentCursor(indent);
+                    ed.SetInsertSpacesOnTabs(spaces);
+                }
             }
         }
 

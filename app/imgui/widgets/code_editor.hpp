@@ -4,8 +4,9 @@
 // A small code editor for plugin files: ImGuiColorTextEdit with a
 // line-number gutter, the theme's monospace face, Python syntax colours
 // from the theme and the few editing habits a quick edit needs (Tab = four
-// spaces, auto-indent after ':', Ctrl+/ toggles comments). Not an IDE: no
-// completion, no folding, no diagnostics.
+// spaces, or a tab in a file indented with tabs; auto-indent after ':';
+// Ctrl+/ toggles comments). Not an IDE: no completion, no folding, no
+// diagnostics.
 //
 // The editor's own header stays out of this one: the dialogs that embed an
 // editor only see this class.
@@ -24,8 +25,8 @@ namespace sirius::app::gui::widgets {
         CodeEditor(const CodeEditor&) = delete;
         CodeEditor& operator=(const CodeEditor&) = delete;
 
-        // Replaces the text (and the undo history); the cursor goes to the
-        // start. Not a change: draw() does not report it.
+        // Replaces the text (and the undo history), tabs kept; the cursor goes
+        // to the start. Not a change: draw() does not report it.
         void setText(const std::string& text);
         std::string text() const;
         void setReadOnly(bool on);

@@ -44,11 +44,24 @@ namespace sirius::app::gui {
             }
         }
 
+        // The backend a default runs on: CUDA falls back to the CPU on a
+        // machine without a CUDA device. The stored default stays as chosen,
+        // so the GPU is used again once there is one.
+        Backend usableBackend(int stored) {
+            const auto b = static_cast<Backend>(std::clamp(stored, 0, 2));
+            return b == Backend::Cuda && !cudaAvailable() ? Backend::Cpu : b;
+        }
+
         class PreferencesDialog : public Dialog {
         public:
             explicit PreferencesDialog(App& app) {
                 const Workbench& wb = app.wb();
                 backend_ = std::clamp(static_cast<int>(wb.backend()), 0, 2);
+                // A stored CUDA default runs on the CPU here (usableBackend);
+                // the field still shows it, so a Save made for anything else
+                // does not replace it.
+                if (!cudaAvailable() && wb.backend() == Backend::Cpu && settings().getInt("compute/backend", 1) == 0)
+                    backend_ = static_cast<int>(Backend::Cuda);
                 const int n = cudaDeviceCount();
                 for (int i = 0; i < n; ++i) {
                     deviceNames_.push_back(deviceLabel(i));
@@ -140,6 +153,8 @@ namespace sirius::app::gui {
                     dev.enabled = deviceEnabled_;
                     widgets::combo("##device", &device_, deviceNames_, dev);
                 }
+                if (backend_ == static_cast<int>(Backend::Cuda) && !cudaAvailable())
+                    note("No CUDA device is available in this build / machine: runs use the CPU until there is one.");
                 widgets::rule(theme::kRule);
                 widgets::caption("HPC worker");
                 {
@@ -195,7 +210,7 @@ namespace sirius::app::gui {
                             const std::string p = providerKey();
                             if (p == "ollama") baseUrl_ = "http://localhost:11434/v1";
                             else if (p == "openrouter") baseUrl_ = "https://openrouter.ai/api/v1";
-                            refreshModelList();
+                            refreshModelList(false);
                         }
                     }
                     ImGui::SameLine(0.0f, px(10));
@@ -251,18 +266,21 @@ namespace sirius::app::gui {
             // The server's model list into the dropdown, keeping whatever is
             // typed; for Ollama the models held in memory are marked, since
             // the first answer from any other one waits for a load.
-            void refreshModelList() {
-                const std::string keep = trimmed(model_);
+            // `fieldKey` false leaves the key field out: after a provider
+            // switch it still holds the key meant for the previous server,
+            // which must not reach the new one unasked (Refresh sends it).
+            void refreshModelList(bool fieldKey = true) {
                 const std::string base = trimmed(baseUrl_);
                 const bool ollama = providerKey() == "ollama";
-                const std::string key = ollama ? std::string() : typedOrEnvironmentKey();   // Ollama takes no key
+                std::string key;   // Ollama takes no key
+                if (!ollama) key = fieldKey ? typedOrEnvironmentKey() : AssistantSettings::environmentKey(providerKey());
                 listedModels_.clear();
                 fetching_ = true;
                 // A provider switched twice asks twice; only the last answer
                 // may fill the list and the note.
                 const int generation = ++generation_;
                 modelNote_ = "Asking " + base + " for its models…";
-                client_.fetchModels(base, key, [this, keep, base, ollama, generation](std::vector<std::string> ids, std::string error) {
+                client_.fetchModels(base, key, [this, base, ollama, generation](std::vector<std::string> ids, std::string error) {
                     if (generation != generation_) return;
                     fetching_ = false;
                     if (ids.empty()) {
@@ -273,7 +291,10 @@ namespace sirius::app::gui {
                     std::sort(ids.begin(), ids.end(), [](const std::string& a, const std::string& b) { return toLower(a) < toLower(b); });
                     listedModels_ = ids;
                     modelItems_ = ids;
-                    model_ = keep.empty() ? ids.front() : keep;
+                    // what is in the field now: a name typed while the server
+                    // was answering is the user's choice
+                    const std::string typed = trimmed(model_);
+                    model_ = typed.empty() ? ids.front() : typed;
                     modelNote_ = format("%d model(s) at %s.", static_cast<int>(ids.size()), base.c_str());
                     if (!ollama) return;
                     client_.fetchLoadedModels(base, [this, generation](std::vector<std::string> loaded, std::string) {
@@ -312,7 +333,7 @@ namespace sirius::app::gui {
                 as.askBeforeActing = askFirst_;
                 as.save();
                 if (apiKey_ != openedApiKey_ && !AssistantSettings::storeApiKey(apiKey_)) notStored.emplace_back("the assistant's API key");
-                wb.setBackend(static_cast<Backend>(backend_));
+                wb.setBackend(usableBackend(backend_));
                 wb.setCudaDevice(device);
                 RemoteConfig rc;
                 rc.host = trimmed(host_);
@@ -364,8 +385,7 @@ namespace sirius::app::gui {
 
     void applyStoredPreferences(Workbench& wb) {
         const Settings& s = settings();
-        const int backend = s.getInt("compute/backend", cudaAvailable() ? 0 : 1);
-        wb.setBackend(static_cast<Backend>(std::max(0, std::min(backend, 2))));
+        wb.setBackend(usableBackend(s.getInt("compute/backend", cudaAvailable() ? 0 : 1)));
         wb.setCudaDevice(s.getInt("compute/cudaDevice", 0));
         RemoteConfig rc;
         rc.host = s.getString("hpc/host", "localhost");

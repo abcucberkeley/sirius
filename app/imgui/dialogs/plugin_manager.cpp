@@ -20,6 +20,10 @@
 #include <imgui_internal.h>
 #include <imgui_stdlib.h>
 
+#ifndef _WIN32
+#include <unistd.h>
+#endif
+
 #include "core/ops/plugin.hpp"
 #include "imgui/platform.hpp"
 #include "imgui/strings.hpp"
@@ -88,7 +92,6 @@ namespace sirius::app::gui {
             }
             while (!out.empty() && out.front() == '_') out.erase(out.begin());
             while (!out.empty() && out.back() == '_') out.pop_back();
-            if (!out.empty() && std::isdigit(static_cast<unsigned char>(out[0]))) out.insert(out.begin(), '_');
             return out;
         }
 
@@ -493,9 +496,17 @@ def run(data, params, meta, ctx):
             if (crlf_) text = replaceAll(text, "\r\n", "\n");
             currentPath_ = path;
             editor_.setText(text);
+#ifdef _WIN32
+            // The permissions report the read-only attribute here (_waccess
+            // checks no more than that either).
             std::error_code ec;
             const fs::perms perms = fs::status(fs::u8path(path), ec).permissions();
             const bool writable = !ec && (perms & fs::perms::owner_write) != fs::perms::none;
+#else
+            // Whether this user may write it: the owner's bit says nothing about
+            // a file someone else owns, such as an installed example (root's).
+            const bool writable = ::access(fs::u8path(path).c_str(), W_OK) == 0;
+#endif
             editor_.setReadOnly(!writable);
             readOnlyFile_ = !writable;
             setModified(false);
@@ -549,7 +560,12 @@ def run(data, params, meta, ctx):
                          if (button == 2) {
                              if (self->save()) proceed();
                          } else if (button == 1) {
-                             self->setModified(false);
+                             // Back to the file on disk: the discarded text would
+                             // otherwise stay in the editor, unmarked, for a later
+                             // Save to write. A file that can no longer be read
+                             // leaves the editor empty.
+                             self->revert();
+                             if (self->modified_) self->showNothing();
                              proceed();
                          }
                      });
@@ -569,11 +585,15 @@ def run(data, params, meta, ctx):
         }
 
         void createPlugin(const std::string& raw) {
-            const std::string kind = identifier(raw);
-            if (kind.empty()) {
+            const std::string words = identifier(raw);
+            if (words.empty()) {
                 app_.message("New user operation", "The name needs at least one letter or digit.");
                 return;
             }
+            // A kind may not start with a digit, and the loader skips a file
+            // whose name starts with '_' as a helper: such a name gets a
+            // prefix of letters, which the title leaves out.
+            const std::string kind = std::isdigit(static_cast<unsigned char>(words[0])) ? "op_" + words : words;
             const std::string dir = cleanDir(userPluginDirectory(true));
             std::error_code ec;
             if (!fs::is_directory(fs::u8path(dir), ec)) {
@@ -590,7 +610,7 @@ def run(data, params, meta, ctx):
                 return;
             }
             std::ofstream out(fs::u8path(path), std::ios::binary);
-            if (!out || !(out << pluginTemplate(kind, titleCase(kind))) || !out.flush()) {
+            if (!out || !(out << pluginTemplate(kind, titleCase(words))) || !out.flush()) {
                 std::error_code we(errno, std::generic_category());
                 app_.message("New user operation", "Could not write " + path + ":\n" + we.message());
                 return;
