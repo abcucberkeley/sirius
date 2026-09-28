@@ -1,0 +1,1479 @@
+#include "imgui/panels/params_panel.hpp"
+
+#include <algorithm>
+#include <array>
+#include <cmath>
+#include <cstdint>
+#include <exception>
+#include <functional>
+#include <limits>
+#include <map>
+#include <memory>
+#include <string>
+#include <utility>
+#include <vector>
+
+#include <imgui.h>
+#include <imgui_internal.h>
+
+#include <sirius/device.hpp>
+
+#include "core/ops/contrast.hpp"
+#include "core/workbench.hpp"
+#include "imgui/app.hpp"
+#include "imgui/dialogs/dialogs.hpp"
+#include "imgui/platform.hpp"
+#include "imgui/strings.hpp"
+#include "imgui/theme.hpp"
+#include "imgui/widgets/controls.hpp"
+
+namespace sirius::app::gui {
+
+    namespace {
+
+        using theme::px;
+        using theme::Weight;
+
+        const char* const kFrozen = "Not while a run or load is in progress — cancel it (Esc) or wait";
+
+        // Display pixels as the design pixels the widgets take.
+        float dp(float displayPx) { return displayPx / std::max(theme::scale(), 0.01f); }
+
+        float lineHeight(float designPx, Weight w = Weight::Regular) { return theme::textSize("Ag", designPx, w).y; }
+
+        float captionHeight() {
+            const theme::FontScope f(theme::kCaptionPx, theme::captionFont());
+            return ImGui::CalcTextSize("AG").y;
+        }
+
+        float captionWidth(const std::string& s) {
+            const std::string t = captionCase(s);
+            const theme::FontScope f(theme::kCaptionPx, theme::captionFont());
+            return ImGui::CalcTextSize(t.c_str(), t.c_str() + t.size()).x;
+        }
+
+        // A caption cut to `width` display pixels, on code point boundaries.
+        std::string fitCaption(const std::string& s, float width) {
+            if (captionWidth(s) <= width) return s;
+            std::vector<std::size_t> ends;
+            for (std::size_t i = 0; i < s.size();) {
+                nextCodepoint(s, i);
+                ends.push_back(i);
+            }
+            for (std::size_t n = ends.size(); n-- > 0;) {
+                std::string cut = s.substr(0, n == 0 ? 0 : ends[n - 1]);
+                while (!cut.empty() && cut.back() == ' ') cut.pop_back();
+                cut += "…";
+                if (captionWidth(cut) <= width || n == 0) return cut;
+            }
+            return "…";
+        }
+
+        float wrappedHeight(const std::string& s, float designPx, float wrapWidth, Weight w = Weight::Regular) {
+            const theme::FontScope f(designPx, w);
+            return ImGui::CalcTextSize(s.c_str(), s.c_str() + s.size(), false, std::max(1.0f, wrapWidth)).y;
+        }
+
+        // The cursor, moved by hand; callers submit an item afterwards.
+        void place(float x, float y) { ImGui::SetCursorScreenPos(ImVec2(theme::snap(x), theme::snap(y))); }
+        // ... and tell the layout where the hand-placed content ended.
+        void placeEnd(float x, float y) {
+            place(x, y);
+            ImGui::Dummy(ImVec2(0, 0));
+            place(x, y);
+        }
+
+        // The tooltip of widgets::tooltip, for the last item even when it is
+        // disabled: a control frozen by a run says why it does not answer.
+        void tip(const std::string& s) {
+            if (s.empty() || !ImGui::IsItemHovered(ImGuiHoveredFlags_ForTooltip | ImGuiHoveredFlags_AllowWhenDisabled)) return;
+            ImGui::PushStyleColor(ImGuiCol_Border, theme::kText);
+            ImGui::PushStyleVar(ImGuiStyleVar_PopupBorderSize, theme::crispPen(theme::kBorder));
+            ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, px(8, 4));
+            if (ImGui::BeginTooltip()) {
+                {   // the font is popped inside the tooltip it was pushed in
+                    const theme::FontScope f(12);
+                    ImGui::PushStyleColor(ImGuiCol_Text, theme::kText);
+                    ImGui::PushTextWrapPos(px(360));
+                    ImGui::TextUnformatted(s.c_str(), s.c_str() + s.size());
+                    ImGui::PopTextWrapPos();
+                    ImGui::PopStyleColor();
+                }
+                ImGui::EndTooltip();
+            }
+            ImGui::PopStyleVar(2);
+            ImGui::PopStyleColor();
+        }
+
+        // The heights and natural widths widgets::button gives its buttons.
+        float buttonHeight(bool small = false) {
+            if (small) return theme::snap(std::max(px(14), lineHeight(12, Weight::SemiBold)) + 2 * px(4) + 2 * px(theme::kBorder));
+            return theme::snap(std::max(px(18), lineHeight(13, Weight::ExtraBold)) + 2 * px(7) + 2 * px(theme::kBorder));
+        }
+        float buttonWidth(const std::string& label, bool small, float padX, Weight w = Weight::SemiBold) {
+            return theme::snap(theme::textSize(label, small ? 12.0f : 13.0f, w).x + 2 * px(padX) + 2 * px(theme::kBorder));
+        }
+
+        // core's formatBytes for the number, an em dash for "not known yet".
+        std::string bytesOrDash(std::size_t bytes) { return bytes == 0 ? std::string("—") : bytesText(bytes); }
+
+        bool isNumeric(ParamType t) { return t == ParamType::Int || t == ParamType::Double || t == ParamType::Channel; }
+
+        ImU32 colourOfHex(const std::string& hex, ImU32 fallback) {
+            try {
+                return theme::fromFloat(colorFromHex(hex));
+            } catch (const std::exception&) {
+                return fallback;
+            }
+        }
+
+        std::string wavelengthText(const ChannelInfo& ch) {
+            return ch.wavelengthNm > 0 ? std::to_string(static_cast<int>(std::lround(ch.wavelengthNm))) : std::string("—");
+        }
+
+        // What a text or number field holds while it is being typed into: the
+        // value it shows is the parameter's until the field takes the
+        // keyboard, and the edit is committed when it lets go of it (Qt's
+        // editingFinished), not on every keystroke.
+        struct FieldBuf {
+            double d = 0.0;
+            std::int64_t i = 0;
+            std::string s;
+            int decimals = -2;   // -2: not decided yet
+            bool active = false;
+        };
+
+    } // namespace
+
+    struct ParamsPanel::Impl {
+        App& app;
+        int runFinishedSlot = 0;
+        std::uint64_t runsFinished = 0;
+
+        // What the Qt panel rebuilt its widgets for: the step, its kind, the
+        // values its visibility rules read, and every dataset change and
+        // finished run (diagnostics-driven notes may have changed).
+        int builtFor = -2;
+        std::string builtKind, builtVisibility;
+        std::uint64_t builtDataset = 0, builtRuns = 0;
+        // per form: the field buffers and which "More parameters" are open
+        std::map<std::string, FieldBuf> bufs;
+        std::map<std::string, bool> moreOpen;
+        // derived once per form
+        Diagnostics diagnostics;           // SIM warnings, segmentation facts
+        bool haveUpstream = false;
+        double dataMin = 0.0, dataMax = 1.0;   // contrast: the input's intensity range
+        int contrastDecimals = 3;
+        // contrast: the window an automatic (empty) min / max resolves to
+        ParamSet effParams;
+        std::uint64_t effOutputs = 0;
+        bool effValid = false;
+        double effLo = 0.0, effHi = 1.0;
+
+        // what the core derives for the selected step without running it, kept
+        // until the pipeline, the dataset or the outputs move
+        std::uint64_t derivedStamp = 0;
+        int derivedFor = -2;
+        DatasetMeta derivedInput;
+        Validation derivedValidation;
+        std::size_t derivedBytes = 0;
+
+        void refreshDerived() {
+            const Revisions& r = app.bridge().rev();
+            const std::uint64_t stamp = r.anyPipeline() + r.dataset + r.outputs + r.backend;
+            const int i = index();
+            if (stamp == derivedStamp && i == derivedFor) return;
+            derivedStamp = stamp;
+            derivedFor = i;
+            if (!step()) return;
+            derivedInput = wb().inputMetaOf(i);
+            derivedValidation = wb().stepValidation(i);
+            derivedBytes = wb().estimatedBytesOf(i);
+        }
+
+        // edits made while drawing, run once the frame's form is drawn
+        std::vector<std::function<void()>> actions;
+        bool firstItem = true;
+        // Every parameter edit is refused while a run holds the pipeline, so
+        // the whole form is drawn disabled, as the Qt panel disables its scroll area.
+        bool formEnabled = true;
+        ImU32 dim(ImU32 c) const { return formEnabled ? c : theme::withAlpha(c, 0.45f); }
+        float formX = 0.0f, formW = 1.0f;
+
+        // the channel colour picker (Merge)
+        ImGuiID colourPopup = 0;
+        struct Pick {
+            StepId step = 0;
+            std::size_t channel = 0;
+            float rgb[3] = {1, 1, 1};
+            std::string key;
+            std::vector<std::string> defaults;
+        } pick;
+        // Merge without a colour parameter: the chips remember what was chosen.
+        std::map<std::pair<StepId, std::size_t>, ImU32> chipColour;
+        ImVec2 pickAnchor{0, 0};
+
+        explicit Impl(App& a) : app(a) {
+            runFinishedSlot = app.bridge().runFinished.connect([this](bool, const std::string&) { ++runsFinished; });
+        }
+        ~Impl() { app.bridge().runFinished.disconnect(runFinishedSlot); }
+        Impl(const Impl&) = delete;
+        Impl& operator=(const Impl&) = delete;
+
+        Workbench& wb() { return app.wb(); }
+        int index() const { return app.wb().selectedIndex(); }
+        const Step* step() const {
+            const Pipeline& p = app.wb().pipeline();
+            const int i = index();
+            return i >= 0 && i < p.size() ? &p.at(i) : nullptr;
+        }
+        // A file, colour or model dialog outlives the frame it was opened in,
+        // in which a run finishing or another selection may point this form at
+        // another step. What the dialog returns applies only while the step it
+        // was opened for is still the selected one.
+        StepId selectedId() const {
+            const Step* st = step();
+            return st ? st->id : 0;
+        }
+
+        void later(std::function<void()> fn) { actions.push_back(std::move(fn)); }
+
+        void setParam(const std::string& key, ParamValue v, bool merge) {
+            const int i = index();
+            later([this, i, key, v, merge] { wb().setStepParam(i, key, v, merge ? key : std::string()); });
+        }
+
+        // 12 px between the items of the form.
+        void gap() {
+            if (!firstItem) widgets::vspace(12);
+            firstItem = false;
+        }
+
+        // The 11 px label above an input.
+        void fieldLabel(const std::string& label, float width) {
+            if (label.empty()) return;
+            widgets::elided(label, width, 11, theme::kNeutral600);
+            widgets::vspace(4);
+        }
+
+        // The unit a spin box carries as its suffix, drawn inside the field
+        // left of its arrows while it is not being typed into.
+        static void unitSuffix(ImVec2 at, float width, const std::string& unit) {
+            if (unit.empty()) return;
+            const ImVec2 ts = theme::textSize(unit, 13);
+            const float x = at.x + width - px(16) - px(6) - ts.x;
+            if (x < at.x + px(48)) return;
+            widgets::drawText(ImGui::GetWindowDrawList(), ImVec2(x, at.y + (px(theme::kInputH) - ts.y) * 0.5f), unit, 13,
+                              theme::kNeutral600);
+        }
+
+        FieldBuf& buf(const std::string& key) { return bufs[key]; }
+
+        // --- form shape ------------------------------------------------------------
+        // The values every visibility rule of this step depends on. The form is
+        // rebuilt when one of them moves, since that is what decides which
+        // fields exist at all.
+        static std::string visibilitySignature(const OpInfo& info, const ParamSet& params) {
+            std::string out;
+            for (const ParamSpec& s : info.params)
+                for (const ParamSpec::Visibility& rule : s.visibility)
+                    if (const ParamValue* v = params.find(rule.key)) out += rule.key + "=" + toDisplayString(*v) + ";";
+            return out;
+        }
+
+        void checkShape(const Step* st, int i) {
+            const Revisions& r = app.bridge().rev();
+            const std::string kind = st ? st->kind : std::string();
+            const std::string vis = st ? visibilitySignature(st->op().info(), st->params) : std::string();
+            if (i == builtFor && kind == builtKind && vis == builtVisibility && r.dataset == builtDataset && runsFinished == builtRuns)
+                return;
+            builtFor = i;
+            builtKind = kind;
+            builtVisibility = vis;
+            builtDataset = r.dataset;
+            builtRuns = runsFinished;
+            bufs.clear();
+            moreOpen.clear();
+            effValid = false;
+            diagnostics = Diagnostics{};
+            haveUpstream = false;
+            if (!st) return;
+            if (kind == "sim" || kind == "seg") diagnostics = wb().selectedDiagnostics();
+            if (kind == "contrast") {
+                // the input's intensity range, for the slider extents
+                dataMin = 0.0;
+                dataMax = 1.0;
+                std::shared_ptr<const StepOutput> upstream = wb().upstreamOutput(i);
+                haveUpstream = static_cast<bool>(upstream);
+                if (upstream) {
+                    const StepInput in = upstream->asInput();
+                    float mn = std::numeric_limits<float>::infinity(), mx = -mn;
+                    for (Index c = 0; c < in.meta.dims.c; ++c) {
+                        const ContrastWindow w = contrastWindow(in, st->params, c, 8, true);
+                        mn = std::min(mn, w.dataMin);
+                        mx = std::max(mx, w.dataMax);
+                    }
+                    if (mn < mx) {
+                        dataMin = mn;
+                        dataMax = mx;
+                    }
+                }
+                const double span = dataMax - dataMin;
+                contrastDecimals = span >= 100.0 ? 1 : span >= 10.0 ? 2
+                                                   : span >= 1.0    ? 3
+                                                                    : 4;
+            }
+        }
+
+        // --- generic editors -----------------------------------------------------------
+        // A file / directory field with Browse, and optionally one more button
+        // after it (Hub…, Bundles…).
+        void pathEditor(const ParamSpec& s, const ParamSet& params, float width, const char* extraLabel = nullptr,
+                        const std::string& extraTip = {}, std::function<void()> extra = {}) {
+            const std::string key = s.key;
+            ImGui::PushID("path");
+            const float spacing = px(6);
+            const float browseW = buttonWidth("Browse", true, 10);
+            const float extraW = extraLabel ? buttonWidth(extraLabel, true, 10) : 0.0f;
+            const float editW = std::max(px(40), width - browseW - spacing - (extraLabel ? extraW + spacing : 0.0f));
+            FieldBuf& b = buf(key);
+            if (!b.active) b.s = params.getString(key);
+            const ImVec2 at = ImGui::GetCursorScreenPos();
+            widgets::FieldOpts fo;
+            fo.width = dp(editW);
+            fo.enabled = formEnabled;
+            fo.readOnly = s.readOnly;
+            fo.hint = s.directory ? "directory…" : "file…";
+            widgets::inputText("##edit", &b.s, fo);
+            b.active = ImGui::IsItemActive();
+            if (ImGui::IsItemDeactivatedAfterEdit() && b.s != params.getString(key)) setParam(key, b.s, false);
+            tip(s.help);
+            const float btnY = at.y + (px(theme::kInputH) - buttonHeight(true)) * 0.5f;
+            place(at.x + editW + spacing, btnY);
+            widgets::ButtonOpts bo;
+            bo.small = true;
+            bo.enabled = !s.readOnly && formEnabled;
+            if (widgets::button("Browse##browse", bo)) {
+                App* a = &app;
+                const bool dir = s.directory;
+                const std::string filter = s.fileFilter;
+                const std::string current = b.s;
+                const StepId forStep = selectedId();
+                a->defer([this, a, key, dir, filter, current, forStep] {
+                    const std::string start = current.empty() ? a->lastDir() : parentPath(current);
+                    const std::string path =
+                        dir ? platform::pickFolderDialog("Choose directory", start)
+                            : platform::openFileDialog("Choose file", start,
+                                                       platform::filtersFromQt(filter.empty() ? std::string("All files (*)") : filter));
+                    if (path.empty() || selectedId() != forStep) return;
+                    a->setLastDir(dir ? path : parentPath(path));
+                    bufs.erase(key);
+                    wb().setStepParam(index(), key, path);
+                });
+            }
+            if (extraLabel) {
+                place(at.x + editW + spacing + browseW + spacing, btnY);
+                widgets::ButtonOpts eo;
+                eo.small = true;
+                eo.enabled = formEnabled;
+                eo.tooltip = extraTip;
+                if (widgets::button((std::string(extraLabel) + "##extra").c_str(), eo) && extra) extra();
+            }
+            placeEnd(at.x, at.y + px(theme::kInputH));
+            ImGui::PopID();
+        }
+
+        void editor(const ParamSpec& s, const ParamSet& params, const DatasetMeta& input, float width) {
+            const std::string key = s.key;
+            ImGui::PushID(key.c_str());
+            widgets::FieldOpts fo;
+            fo.width = dp(width);
+            fo.enabled = formEnabled;
+            switch (s.type) {
+                case ParamType::Bool: {
+                    const bool on = params.getBool(key);
+                    if (widgets::tokenCheck((s.label + "##bool").c_str(), on, nullptr, !s.readOnly && formEnabled)) setParam(key, !on, false);
+                    tip(s.help);
+                    break;
+                }
+                case ParamType::Channel: {
+                    std::vector<std::string> items;
+                    for (const ChannelInfo& ch : input.channels) items.push_back(ch.shortName() + " " + ch.label);
+                    if (items.empty()) items.emplace_back("ch 0");
+                    int cur = std::clamp(static_cast<int>(params.getInt(key)), 0, static_cast<int>(items.size()) - 1);
+                    if (widgets::combo("##channel", &cur, items, fo)) setParam(key, static_cast<std::int64_t>(cur), false);
+                    tip(s.help);
+                    break;
+                }
+                case ParamType::Int: {
+                    FieldBuf& b = buf(key);
+                    const ImGuiID fid = ImGui::GetID("##int");
+                    const bool was = b.active;
+                    if (!was) b.i = params.getInt(key);
+                    const std::int64_t lo = std::isfinite(s.min) ? static_cast<std::int64_t>(s.min) : -1000000000;
+                    const std::int64_t hi = std::isfinite(s.max) ? static_cast<std::int64_t>(s.max) : 1000000000;
+                    const std::int64_t step = s.step > 0 ? static_cast<std::int64_t>(s.step) : 1;
+                    fo.readOnly = s.readOnly;
+                    const ImVec2 at = ImGui::GetCursorScreenPos();
+                    ImGui::BeginGroup();
+                    const bool changed = widgets::inputInt("##int", &b.i, lo, hi, step, fo);
+                    b.active = ImGui::GetActiveID() == fid;
+                    if (!b.active) unitSuffix(at, width, s.unit);
+                    ImGui::EndGroup();
+                    tip(s.help);
+                    // arrows and the wheel commit at once, typing when the field lets go;
+                    // a run of arrow clicks is one undo entry
+                    if ((changed && !b.active) || (was && !b.active && b.i != params.getInt(key))) setParam(key, b.i, true);
+                    break;
+                }
+                case ParamType::Double: {
+                    FieldBuf& b = buf(key);
+                    const ImGuiID fid = ImGui::GetID("##double");
+                    const bool was = b.active;
+                    if (!was) b.d = params.getDouble(key);
+                    if (b.decimals == -2) {
+                        int decimals = s.decimals;
+                        if (decimals < 0) {
+                            const double mag = std::abs(b.d) > 0 ? std::abs(b.d) : (s.step > 0 ? s.step : 1.0);
+                            decimals = mag >= 100 ? 1 : mag >= 1  ? 2
+                                                    : mag >= 0.01 ? 4
+                                                                  : 6;
+                        }
+                        b.decimals = decimals;
+                    }
+                    const double lo = std::isfinite(s.min) ? s.min : -1e12;
+                    const double hi = std::isfinite(s.max) ? s.max : 1e12;
+                    const double step = s.step > 0 ? s.step : std::pow(10.0, -std::max(b.decimals - 1, 0));
+                    fo.readOnly = s.readOnly;
+                    const ImVec2 at = ImGui::GetCursorScreenPos();
+                    ImGui::BeginGroup();
+                    const bool changed = widgets::inputDouble("##double", &b.d, lo, hi, step, b.decimals, fo);
+                    b.active = ImGui::GetActiveID() == fid;
+                    if (!b.active) unitSuffix(at, width, s.unit);
+                    ImGui::EndGroup();
+                    tip(s.help);
+                    if ((changed && !b.active) || (was && !b.active && b.d != params.getDouble(key))) setParam(key, b.d, true);
+                    break;
+                }
+                case ParamType::Choice: {
+                    int cur = -1;
+                    const std::string value = params.getString(key);
+                    for (std::size_t c = 0; c < s.choices.size(); ++c)
+                        if (s.choices[c] == value) cur = static_cast<int>(c);
+                    fo.enabled = !s.readOnly && formEnabled;
+                    if (widgets::combo("##choice", &cur, s.choices, fo) && cur >= 0)
+                        setParam(key, s.choices[static_cast<std::size_t>(cur)], false);
+                    tip(s.help);
+                    break;
+                }
+                case ParamType::Path: pathEditor(s, params, width); break;
+                case ParamType::String:
+                case ParamType::DoubleList:
+                case ParamType::StringList:
+                case ParamType::Axes: {
+                    FieldBuf& b = buf(key);
+                    const ParamValue* v = params.find(key);
+                    const std::string shown = v ? toDisplayString(*v) : std::string();
+                    if (!b.active) b.s = shown;
+                    fo.readOnly = s.readOnly;
+                    if (s.type == ParamType::DoubleList) fo.hint = "z, y, x";
+                    widgets::inputText("##text", &b.s, fo);
+                    b.active = ImGui::IsItemActive();
+                    tip(s.help);
+                    if (ImGui::IsItemDeactivatedAfterEdit() && b.s != shown) {
+                        const std::string text = b.s;
+                        if (s.type == ParamType::DoubleList) {
+                            ParamSet tmp;
+                            tmp.set("v", text);
+                            setParam(key, tmp.getDoubleList("v"), false);
+                        } else if (s.type == ParamType::StringList) {
+                            ParamSet tmp;
+                            tmp.set("v", text);
+                            setParam(key, tmp.getStringList("v"), false);
+                        } else {
+                            setParam(key, text, false);
+                        }
+                    }
+                    break;
+                }
+            }
+            ImGui::PopID();
+        }
+
+        // Generic form: numeric fields in pairs, everything else full width.
+        void generic(const std::vector<ParamSpec>& specs, const ParamSet& params, const DatasetMeta& input, bool includeAdvanced,
+                     const std::vector<std::string>& skip = {}, const std::string& block = "main") {
+            std::vector<ParamSpec> advanced;
+            std::string group;
+            int col = -1;   // position in the current pair grid; -1 = none
+            float rowTop = 0.0f;
+            const float colGap = px(10);
+            const float colW = std::floor((formW - colGap) * 0.5f);
+            const float cellH = lineHeight(11) + px(4) + px(theme::kInputH);
+            for (const ParamSpec& s : specs) {
+                if (std::find(skip.begin(), skip.end(), s.key) != skip.end()) continue;
+                // a field the current mode ignores is not shown at all, not
+                // even folded away under "More parameters"
+                if (!s.visibleFor(params)) continue;
+                if (s.advanced && !includeAdvanced) {
+                    ParamSpec c = s;
+                    c.advanced = false;
+                    advanced.push_back(std::move(c));
+                    continue;
+                }
+                if (!s.group.empty() && s.group != group) {
+                    group = s.group;
+                    col = -1;
+                    gap();
+                    widgets::rule(theme::kRule);
+                    gap();
+                    widgets::caption(fitCaption(group, formW));
+                }
+                if (s.readOnly && (s.type == ParamType::String || isNumeric(s.type))) {
+                    col = -1;
+                    gap();
+                    const ParamValue* v = params.find(s.key);
+                    const std::string value = v ? toDisplayString(*v) : std::string();
+                    const float y = ImGui::GetCursorScreenPos().y;
+                    const float valueW = std::min(theme::textSize(value, 12).x, formW * 0.6f);
+                    widgets::elided(s.label, formW - valueW - px(8), 12, theme::kNeutral600);
+                    tip(s.help);
+                    place(formX + formW - valueW, y);
+                    widgets::elided(value, valueW, 12, theme::kText);
+                    placeEnd(formX, y + lineHeight(12));
+                    continue;
+                }
+                if (isNumeric(s.type)) {
+                    if (col < 0) col = 0;
+                    const bool second = col % 2 == 1;
+                    if (!second) {
+                        gap();
+                        rowTop = ImGui::GetCursorScreenPos().y;
+                    }
+                    const float x = second ? formX + colW + colGap : formX;
+                    const float w = second ? formW - colW - colGap : colW;
+                    place(x, rowTop);
+                    ImGui::BeginGroup();
+                    fieldLabel(s.label, w);
+                    editor(s, params, input, w);
+                    ImGui::EndGroup();
+                    placeEnd(formX, rowTop + cellH);
+                    ++col;
+                    continue;
+                }
+                col = -1;
+                gap();
+                if (s.type != ParamType::Bool) fieldLabel(s.label, formW);
+                editor(s, params, input, formW);
+            }
+            if (!advanced.empty()) {
+                gap();
+                bool& open = moreOpen[block];
+                ImGui::PushID(block.c_str());
+                if (widgets::linkButton(open ? "Fewer parameters##more" : "More parameters…##more", formEnabled)) open = !open;
+                if (open) generic(advanced, params, input, true, {}, block + "/more");
+                ImGui::PopID();
+            }
+        }
+
+        // --- kind decorations ------------------------------------------------------------
+        void factsTable(const std::vector<std::pair<std::string, std::string>>& rows) {
+            gap();
+            widgets::rule(theme::kRule);
+            gap();
+            const float keyW = px(90);
+            const float h12 = lineHeight(12);
+            float y = ImGui::GetCursorScreenPos().y;
+            for (const auto& [k, v] : rows) {
+                place(formX, y + px(6));
+                widgets::elided(k, keyW - px(4), 12, theme::kNeutral600);
+                place(formX + keyW, y + px(6));
+                widgets::textWrapped(v, 12, theme::kText, Weight::Regular, formW - keyW);
+                const float valueH = wrappedHeight(v, 12, formW - keyW);
+                y += px(6) + std::max(h12, valueH) + px(6);
+                place(formX, y);
+                widgets::rule(1);
+                y = ImGui::GetCursorScreenPos().y;
+            }
+            placeEnd(formX, y);
+        }
+
+        void channelList(const DatasetMeta& meta) {
+            if (meta.channels.empty()) return;
+            gap();
+            widgets::text("Channels", 11, theme::kNeutral600);
+            const float h12 = lineHeight(12);
+            float y = ImGui::GetCursorScreenPos().y;
+            ImDrawList* dl = ImGui::GetWindowDrawList();
+            for (const ChannelInfo& ch : meta.channels) {
+                const float top = y + px(5);
+                const float chip = px(10);
+                const float cy = top + h12 * 0.5f;
+                dl->AddRectFilled(ImVec2(theme::snap(formX), theme::snap(cy - chip * 0.5f)),
+                                  ImVec2(theme::snap(formX + chip), theme::snap(cy - chip * 0.5f) + theme::snap(chip)),
+                                  colourOfHex(ch.hexColor(), theme::kNeutral500));
+                widgets::drawText(dl, ImVec2(formX + chip + px(10), top), wavelengthText(ch), 12, theme::kText);
+                const float labelX = formX + chip + px(10) + px(36) + px(10);
+                place(labelX, top);
+                widgets::elided(ch.label, formX + formW - labelX, 12, theme::kText);
+                y = top + h12 + px(5);
+                place(formX, y);
+                widgets::rule(1);
+                y = ImGui::GetCursorScreenPos().y;
+            }
+            placeEnd(formX, y);
+        }
+
+        void buildLoad(const Step& step, const ParamSet& params, const OpInfo& info) {
+            Workbench& w = wb();
+            const DatasetMeta& ds = w.dataset();
+            std::vector<std::string> done;
+            // the path field first, then facts, channels, then the rest
+            for (const ParamSpec& s : info.params)
+                if (s.type == ParamType::Path) {
+                    gap();
+                    fieldLabel(s.label, formW);
+                    editor(s, params, ds, formW);
+                    done.push_back(s.key);
+                    break;
+                }
+            if (w.hasDataset()) {
+                std::vector<std::pair<std::string, std::string>> facts{
+                    {"Shape", ds.shapeString()},
+                    {"Acquisition", ds.acquisition.empty() ? std::string("—") : ds.acquisition},
+                    {"Voxel", ds.voxelString()},
+                    {"Dtype", std::string(toString(ds.sourceType)) + " · " + bytesOrDash(ds.bytesOnDisk)}};
+                if (ds.hasTiles()) {
+                    // grid extent from the tiles' grid indices (rows × columns, layers when > 1)
+                    Index rows = 0, cols = 0, layers = 0;
+                    for (const TileInfo& t : ds.tiles) {
+                        layers = std::max(layers, t.gridIndex[0] + 1);
+                        rows = std::max(rows, t.gridIndex[1] + 1);
+                        cols = std::max(cols, t.gridIndex[2] + 1);
+                    }
+                    std::string tiles = std::to_string(ds.tiles.size());
+                    if (rows * cols > 1) tiles += format(" · %lld × %lld grid", static_cast<long long>(rows), static_cast<long long>(cols));
+                    if (layers > 1) tiles += format(" · %lld layers", static_cast<long long>(layers));
+                    facts.emplace_back("Tiles", tiles);
+                }
+                factsTable(facts);
+                channelList(ds);
+                // the tile chooser, bound to Load ▸ tile like the viewer toolbar's
+                const bool hasTileParam =
+                    std::any_of(info.params.begin(), info.params.end(), [](const ParamSpec& s) { return s.key == "tile"; });
+                if (ds.hasTiles() && hasTileParam) {
+                    std::vector<std::string> items;
+                    for (std::size_t i = 0; i < ds.tiles.size(); ++i) items.push_back(std::to_string(i + 1) + " · " + ds.tiles[i].name);
+                    int cur = std::clamp(static_cast<int>(params.getInt("tile")), 0, static_cast<int>(items.size()) - 1);
+                    gap();
+                    fieldLabel("Tile", formW);
+                    widgets::FieldOpts fo;
+                    fo.width = dp(formW);
+                    fo.enabled = formEnabled;
+                    if (widgets::combo("##tile", &cur, items, fo)) {
+                        const int i = index();
+                        const std::int64_t tile = cur;
+                        later([this, i, tile] {
+                            wb().setStepParam(i, "tile", tile);
+                            Bridge& bridge = app.bridge();
+                            if (!bridge.running()) bridge.startRun(wb().viewedIndex());
+                        });
+                    }
+                    tip("Which tile of the multi-file dataset the pipeline reads; the viewed step is re-run on it");
+                    done.emplace_back("tile");
+                }
+            } else {
+                gap();
+                widgets::textWrapped("No dataset loaded. Choose a file above or use File ▸ Open dataset…", 12, theme::kNeutral600,
+                                     Weight::Regular, formW);
+            }
+            (void)step;
+            generic(info.params, params, ds, false, done);
+        }
+
+        // Einsum axis tiles: kept = outlined, reduced = accent-filled with the
+        // reduction name underneath. Click toggles.
+        bool axisTiles(std::string& kept, const std::string& reduction) {
+            const int n = 5;
+            const float h = theme::snap(px(46));
+            const float g = theme::snap(px(2));
+            const float w = std::floor((formW - g * static_cast<float>(n - 1)) / static_cast<float>(n));
+            const ImVec2 origin = ImGui::GetCursorScreenPos();
+            ImDrawList* dl = ImGui::GetWindowDrawList();
+            bool changed = false;
+            for (int i = 0; i < n; ++i) {
+                const char ax = "ctzyx"[i];
+                const bool keep = kept.find(ax) != std::string::npos;
+                const float x = origin.x + static_cast<float>(i) * (w + g);
+                const float x1 = i == n - 1 ? origin.x + formW : x + w;
+                const ImVec2 a(x, origin.y), b(x1, origin.y + h);
+                place(a.x, a.y);
+                ImGui::PushID(i);
+                const bool pressed = ImGui::InvisibleButton("##axis", ImVec2(std::max(1.0f, b.x - a.x), h));
+                const bool hovered = ImGui::IsItemHovered();
+                ImGui::PopID();
+                if (hovered) ImGui::SetMouseCursor(ImGuiMouseCursor_Hand);
+                if (!keep) dl->AddRectFilled(a, b, dim(theme::kAccent));
+                widgets::crispRect(dl, a, b, dim(keep ? (hovered && formEnabled ? theme::kAccent : theme::kDivider) : theme::kAccent), theme::kBorder);
+                const ImU32 ink = dim(keep ? theme::kText : theme::kBg);
+                widgets::drawTextIn(dl, ImVec2(a.x, a.y + px(6)), ImVec2(b.x, b.y - px(14)), std::string(1, ax), 16, ink,
+                                    Weight::ExtraBold, 0.5f, 0.0f);
+                {
+                    const std::string cap = captionCase(keep ? std::string("keep") : reduction);
+                    const theme::FontScope f(9, theme::captionFont());
+                    const ImVec2 ts = ImGui::CalcTextSize(cap.c_str());
+                    dl->AddText(ImGui::GetFont(), ImGui::GetFontSize(),
+                                ImVec2(theme::snap((a.x + b.x - ts.x) * 0.5f), theme::snap(b.y - px(5) - ts.y)), ink, cap.c_str());
+                }
+                if (pressed) {
+                    std::string k;
+                    for (const char c : std::string("ctzyx")) {
+                        const bool on = kept.find(c) != std::string::npos;
+                        if ((c == ax) != on) k += c;   // toggle the clicked axis
+                    }
+                    kept = k;
+                    changed = true;
+                }
+            }
+            placeEnd(origin.x, origin.y + h);
+            return changed;
+        }
+
+        void buildEinsum(const ParamSet& params, const OpInfo& info, const DatasetMeta& input) {
+            const ParamSpec* axesSpec = nullptr;
+            const ParamSpec* redSpec = nullptr;
+            for (const ParamSpec& s : info.params) {
+                if (!axesSpec && s.type == ParamType::Axes) axesSpec = &s;
+                if (!redSpec && s.type == ParamType::Choice && std::find(s.choices.begin(), s.choices.end(), "mean") != s.choices.end())
+                    redSpec = &s;
+            }
+            if (!axesSpec) {
+                generic(info.params, params, input, false);
+                return;
+            }
+            const std::string axesKey = axesSpec->key;
+            const std::string redKey = redSpec ? redSpec->key : std::string();
+            const auto normalizeKept = [](const std::string& raw) {
+                std::string kept;
+                for (const char c : std::string("ctzyx"))
+                    if (raw.find(c) != std::string::npos) kept += c;
+                return kept;
+            };
+            std::string kept = normalizeKept(params.getString(axesKey, "ctzyx"));
+            const std::string reduction = redKey.empty() ? std::string("mean") : params.getString(redKey, "mean");
+            gap();
+            fieldLabel(axesSpec->label.empty() ? std::string("Axes — click to keep or reduce") : axesSpec->label, formW);
+            if (axisTiles(kept, reduction)) setParam(axesKey, kept, false);
+            std::vector<std::string> done{axesKey};
+            if (redSpec) {
+                gap();
+                fieldLabel(redSpec->label, formW);
+                int cur = -1;
+                for (std::size_t c = 0; c < redSpec->choices.size(); ++c)
+                    if (redSpec->choices[c] == reduction) cur = static_cast<int>(c);
+                widgets::SegmentedOpts so;
+                so.tiles = true;
+                so.enabled = formEnabled;
+                so.width = dp(formW);
+                if (widgets::segmented("##reduction", redSpec->choices, &cur, so) && cur >= 0)
+                    setParam(redKey, redSpec->choices[static_cast<std::size_t>(cur)], false);
+                done.push_back(redKey);
+            }
+            // the expression, monospace on the surface
+            gap();
+            fieldLabel("Expression", formW);
+            {
+                const std::string expr = "ctzyx -> " + (kept.empty() ? std::string("·") : kept);
+                const ImVec2 at = ImGui::GetCursorScreenPos();
+                const float th = theme::textSize("Ag", 15).y;
+                const float h = px(10) + th + px(10);
+                ImDrawList* dl = ImGui::GetWindowDrawList();
+                dl->AddRectFilled(at, ImVec2(at.x + formW, at.y + h), theme::kSurface);
+                place(at.x + px(12), at.y + px(10));
+                widgets::mono(expr, 15, theme::kText);
+                placeEnd(at.x, at.y + h);
+            }
+            generic(info.params, params, input, false, done);
+        }
+
+        void buildSim(const ParamSet& params, const OpInfo& info, const DatasetMeta& input) {
+            std::vector<std::string> done;
+            // first Choice = mode -> segmented control
+            for (const ParamSpec& s : info.params) {
+                if (s.type != ParamType::Choice || s.advanced) continue;
+                bool modeLike = false;
+                for (const std::string& c : s.choices)
+                    if (c.find("stimate") != std::string::npos || c.find("anual") != std::string::npos) modeLike = true;
+                if (!modeLike) continue;
+                int cur = -1;
+                const std::string value = params.getString(s.key);
+                for (std::size_t c = 0; c < s.choices.size(); ++c)
+                    if (s.choices[c] == value) cur = static_cast<int>(c);
+                gap();
+                widgets::SegmentedOpts modeOpts;
+                modeOpts.enabled = formEnabled;
+                if (widgets::segmented("##simMode", s.choices, &cur, modeOpts) && cur >= 0)
+                    setParam(s.key, s.choices[static_cast<std::size_t>(cur)], false);
+                tip(s.help);
+                done.push_back(s.key);
+                break;
+            }
+            generic(info.params, params, input, false, done);
+            if (!diagnostics.warnings.empty()) {
+                gap();
+                widgets::rule(theme::kRule);
+                for (const std::string& w : diagnostics.warnings) {
+                    gap();
+                    widgets::textWrapped(w, 11, theme::kNeutral600, Weight::Regular, formW);
+                }
+            }
+        }
+
+        // The foundation step's model is a bundle, and a bundle is picked from
+        // the registry rather than found on disk: what distinguishes two .ltb
+        // files is inside them (task, voxel size, the thresholds they were
+        // validated at), and a file dialog shows none of it.
+        void buildFoundation(const ParamSet& params, const OpInfo& info, const DatasetMeta& input) {
+            std::vector<std::string> done;
+            for (const ParamSpec& s : info.params) {
+                if (s.type != ParamType::Path || s.advanced) continue;
+                const std::string key = s.key;
+                gap();
+                fieldLabel(s.label, formW);
+                ImGui::PushID(key.c_str());
+                pathEditor(s, params, formW, "Bundles…",
+                           "Choose from the bundles in the registry, with what each was trained for and calibrated at",
+                           [this, key] { openHub(key, true); });
+                ImGui::PopID();
+                done.push_back(key);
+                break;
+            }
+            generic(info.params, params, input, false, done);
+        }
+
+        // Hugging Face, the model cache and the model families (or the
+        // foundation bundles) in one dialog; its choice becomes the step's model.
+        void openHub(const std::string& key, bool bundles) {
+            App* a = &app;
+            const StepId forStep = selectedId();
+            a->defer([this, a, key, bundles, forStep] {
+                a->showDialog(makeModelHubDialog(*a, bundles, [this, key, forStep](const std::string& chosen) {
+                    if (chosen.empty() || selectedId() != forStep) return;
+                    bufs.erase(key);
+                    wb().setStepParam(index(), key, chosen);
+                }));
+            });
+        }
+
+        void buildSeg(const ParamSet& params, const OpInfo& info, const DatasetMeta& input) {
+            std::vector<std::string> done;
+            for (const ParamSpec& s : info.params)
+                if (s.type == ParamType::Path && !s.advanced) {
+                    // the path editor (file + Browse) plus "Hub…": Hugging Face
+                    // downloads and the local model cache in one dialog
+                    const std::string key = s.key;
+                    gap();
+                    fieldLabel(s.label, formW);
+                    ImGui::PushID(key.c_str());
+                    pathEditor(s, params, formW, "Hub…", "Search Hugging Face, pick a Cellpose / micro-SAM model, or a cached file",
+                               [this, key] { openHub(key, false); });
+                    ImGui::PopID();
+                    done.push_back(key);
+                    break;
+                }
+            std::string facts;
+            for (const DiagnosticFact& f : diagnostics.facts) {
+                if (!facts.empty()) facts += " · ";
+                facts += f.key.empty() ? f.value : f.key + " " + f.value;
+            }
+            if (!facts.empty()) {
+                gap();
+                widgets::textWrapped(facts, 11, theme::kNeutral600, Weight::Regular, formW);
+            }
+            generic(info.params, params, input, false, done);
+            gap();
+            widgets::rule(theme::kRule);
+            gap();
+            widgets::vspace(10);
+            const float y = ImGui::GetCursorScreenPos().y;
+            widgets::text("Label opacity", 12, theme::kNeutral600);
+            const std::string pct = format("%d %%", static_cast<int>(std::lround(wb().viewState().labelOpacity * 100.0)));
+            place(formX + formW - theme::textSize(pct, 12).x, y);
+            widgets::text(pct, 12, theme::kText);
+            placeEnd(formX, y + lineHeight(12));
+        }
+
+        // Per-channel rows with a colour chip; a StringList spec (if any)
+        // receives the hex colours, otherwise the chips are informative.
+        void buildMerge(const Step& step, const ParamSet& params, const OpInfo& info, const DatasetMeta& input) {
+            const ParamSpec* colorSpec = nullptr;
+            for (const ParamSpec& s : info.params)
+                if (s.type == ParamType::StringList) {
+                    colorSpec = &s;
+                    break;
+                }
+            const std::vector<std::string> colors = colorSpec ? params.getStringList(colorSpec->key) : std::vector<std::string>{};
+            std::vector<std::string> defaults;
+            for (const ChannelInfo& other : input.channels) defaults.push_back(other.hexColor());
+            if (!input.channels.empty()) gap();
+            ImDrawList* dl = ImGui::GetWindowDrawList();
+            const float h12 = lineHeight(12);
+            float y = ImGui::GetCursorScreenPos().y;
+            for (std::size_t c = 0; c < input.channels.size(); ++c) {
+                const ChannelInfo& ch = input.channels[c];
+                const std::string hex = c < colors.size() && !colors[c].empty() ? colors[c] : ch.hexColor();
+                ImU32 colour = colourOfHex(hex, theme::kNeutral500);
+                if (!colorSpec) {
+                    const auto it = chipColour.find({step.id, c});
+                    if (it != chipColour.end()) colour = it->second;
+                }
+                const float rowH = px(22);
+                const float top = y + px(6);
+                const float textY = top + (rowH - h12) * 0.5f;
+                widgets::drawText(dl, ImVec2(formX, textY), wavelengthText(ch), 12, theme::kText);
+                const float chipsW = px(44) + px(2) + px(44);
+                const float labelX = formX + px(44) + px(10);
+                const float labelW = formW - px(44) - px(10) - px(10) - chipsW;
+                if (labelW > px(8)) {
+                    place(labelX, textY);
+                    widgets::elided(ch.label, labelW, 12, theme::kText);
+                }
+                const float chipX = formX + formW - chipsW;
+                dl->AddRectFilled(ImVec2(theme::snap(chipX), theme::snap(top)), ImVec2(theme::snap(chipX + px(44)), theme::snap(top + rowH)),
+                                  colour);
+                place(chipX + px(44) + px(2), top);
+                ImGui::PushID(static_cast<int>(c));
+                widgets::GlyphOpts go;
+                go.tooltip = "Choose display colour";
+                go.glyphPx = 13;
+                go.enabled = formEnabled;
+                if (widgets::glyphTextButton("##pick", "…", ImVec2(44, 22), go)) {
+                    pick = Pick{};
+                    pick.step = step.id;
+                    pick.channel = c;
+                    const ImVec4 v = theme::vec(colour);
+                    pick.rgb[0] = v.x;
+                    pick.rgb[1] = v.y;
+                    pick.rgb[2] = v.z;
+                    pick.key = colorSpec ? colorSpec->key : std::string();
+                    pick.defaults = defaults;
+                    pickAnchor = ImVec2(ImGui::GetItemRectMax().x, ImGui::GetItemRectMax().y + px(4));
+                    ImGui::OpenPopup(colourPopup);
+                }
+                ImGui::PopID();
+                y = top + rowH + px(6);
+                place(formX, y);
+                widgets::rule(1);
+                y = ImGui::GetCursorScreenPos().y;
+            }
+            if (!input.channels.empty()) placeEnd(formX, y);
+            std::vector<std::string> done;
+            if (colorSpec) done.push_back(colorSpec->key);
+            generic(info.params, params, input, false, done);
+        }
+
+        // "Channel colour": the picker the "…" of a Merge row opens.
+        void drawColourPopup() {
+            ImGui::PushStyleColor(ImGuiCol_Border, theme::kText);
+            ImGui::PushStyleColor(ImGuiCol_PopupBg, theme::kBg);
+            ImGui::PushStyleVar(ImGuiStyleVar_PopupBorderSize, theme::crispPen(2));
+            ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, px(12, 12));
+            ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, px(8, 8));
+            // under the "…" that opened it, right-aligned with it
+            ImGui::SetNextWindowPos(pickAnchor, ImGuiCond_Appearing, ImVec2(1.0f, 0.0f));
+            if (ImGui::BeginPopupEx(colourPopup, ImGuiWindowFlags_AlwaysAutoResize | ImGuiWindowFlags_NoTitleBar |
+                                                     ImGuiWindowFlags_NoSavedSettings)) {
+                widgets::caption("Channel colour");
+                ImGui::SetNextItemWidth(px(220));
+                ImGui::ColorPicker3("##picker", pick.rgb,
+                                    ImGuiColorEditFlags_NoSidePreview | ImGuiColorEditFlags_PickerHueBar | ImGuiColorEditFlags_DisplayHex |
+                                        ImGuiColorEditFlags_InputRGB | ImGuiColorEditFlags_NoAlpha);
+                if (widgets::ghostButton("Cancel##colour", false)) ImGui::CloseCurrentPopup();
+                ImGui::SameLine();
+                if (widgets::primaryButton("OK##colour")) {
+                    const Pick chosen = pick;
+                    later([this, chosen] { applyColour(chosen); });
+                    ImGui::CloseCurrentPopup();
+                }
+                ImGui::EndPopup();
+            }
+            ImGui::PopStyleVar(3);
+            ImGui::PopStyleColor(2);
+        }
+
+        void applyColour(const Pick& chosen) {
+            if (selectedId() != chosen.step) return;
+            const ImU32 c = ImGui::ColorConvertFloat4ToU32(ImVec4(chosen.rgb[0], chosen.rgb[1], chosen.rgb[2], 1.0f));
+            chipColour[{chosen.step, chosen.channel}] = c;
+            if (chosen.key.empty()) return;
+            const Step* st = step();
+            if (!st) return;
+            std::vector<std::string> cols = st->params.getStringList(chosen.key);
+            cols.resize(std::max(cols.size(), std::max(chosen.defaults.size(), chosen.channel + 1)));
+            for (std::size_t k = 0; k < cols.size(); ++k)
+                if (cols[k].empty() && k < chosen.defaults.size()) cols[k] = chosen.defaults[k];
+            cols[chosen.channel] = theme::hex(c);
+            wb().setStepParam(index(), chosen.key, cols);
+        }
+
+        // Contrast: min / max sliders over the input's range, gamma, Auto /
+        // Reset. Every edit is a parameter change, so the viewer's live
+        // preview follows it and it is undoable.
+        // The window an automatic (empty) min / max resolves to on channel 0.
+        bool effective(const ParamSet& p, double& lo, double& hi) {
+            const std::uint64_t outs = app.bridge().rev().outputs;
+            if (!effValid || effOutputs != outs || effParams != p) {
+                effValid = true;
+                effOutputs = outs;
+                effParams = p;
+                std::shared_ptr<const StepOutput> up = wb().upstreamOutput(index());
+                haveUpstream = static_cast<bool>(up);
+                if (up) {
+                    const ContrastWindow eff = contrastWindow(up->asInput(), p, 0, 8);
+                    effLo = eff.lo;
+                    effHi = eff.hi;
+                }
+            }
+            if (!haveUpstream) return false;
+            lo = effLo;
+            hi = effHi;
+            return true;
+        }
+
+        void contrastCommit(const std::string& k, double value, bool merge) {
+            const int i = index();
+            later([this, i, k, value, merge] {
+                const Pipeline& p = wb().pipeline();
+                if (i < 0 || i >= p.size()) return;
+                ParamSet np = p.at(i).params;
+                if (!(np.getDouble("max", 0.0) > np.getDouble("min", 0.0)))   // leave automatic: pin the other bound
+                    if (auto up = wb().upstreamOutput(i)) {
+                        const ContrastWindow eff = contrastWindow(up->asInput(), np, 0, 8);
+                        np.set("min", static_cast<double>(eff.lo));
+                        np.set("max", static_cast<double>(eff.hi));
+                    }
+                np.set(k, value);
+                wb().setStepParams(i, np, "Step " + Step::number(i) + " · " + (k == "min" ? "Min" : "Max"), merge ? k : std::string());
+            });
+        }
+
+        void buildContrast(const ParamSet& params, const OpInfo& info, const DatasetMeta& input) {
+            const std::vector<std::string> done{"min", "max", "gamma"};
+            const auto specOf = [&](const char* key) -> const ParamSpec* {
+                for (const ParamSpec& sp : info.params)
+                    if (sp.key == key) return &sp;
+                return nullptr;
+            };
+            const double lo = dataMin, hi = dataMax;
+            const float spinW = px(96), spacing = px(8);
+            const float sliderW = std::max(px(40), formW - spinW - spacing);
+            const float sliderDy = (px(theme::kInputH) - theme::snap(px(18))) * 0.5f;
+            // an empty window (the default) is automatic: show what it resolves to
+            double effLoV = 0.0, effHiV = 0.0;
+            const bool automatic = !(params.getDouble("max", 0.0) > params.getDouble("min", 0.0));
+            const bool resolved = automatic && effective(params, effLoV, effHiV);
+
+            // manual min / max: slider + spin box over the data range
+            gap();
+            for (const char* key : {"min", "max"}) {
+                const std::string k = key;
+                if (k == "max") widgets::vspace(10);
+                double v = params.getDouble(k, lo);
+                if (resolved) v = k == "min" ? effLoV : effHiV;
+                ImGui::PushID(key);
+                fieldLabel(k == "min" ? "Min" : "Max", formW);
+                const ImVec2 at = ImGui::GetCursorScreenPos();
+                place(at.x, at.y + sliderDy);
+                double sv = std::clamp(v, std::min(lo, hi), std::max(lo, hi));
+                widgets::SliderOpts so;
+                so.width = dp(sliderW);
+                so.enabled = formEnabled;
+                if (widgets::slider("##slider", &sv, lo, hi, so)) contrastCommit(k, sv, true);   // one undo entry per drag
+                place(at.x + sliderW + spacing, at.y);
+                FieldBuf& b = buf("contrast/" + k);
+                const ImGuiID fid = ImGui::GetID("##spin");
+                const bool was = b.active;
+                if (!was) b.d = v;
+                widgets::FieldOpts fo;
+                fo.width = dp(spinW);
+                fo.enabled = formEnabled;
+                // the slider spans the data; typed values are not clamped
+                const bool changed = widgets::inputDouble("##spin", &b.d, -1e12, 1e12, (hi - lo) / 200.0, contrastDecimals, fo);
+                b.active = ImGui::GetActiveID() == fid;
+                if ((changed && !b.active) || (was && !b.active && b.d != v)) contrastCommit(k, b.d, false);
+                placeEnd(at.x, at.y + px(theme::kInputH));
+                ImGui::PopID();
+            }
+
+            // gamma: slider (0.1 .. 5) with the generic spin box
+            if (const ParamSpec* g = specOf("gamma")) {
+                gap();
+                fieldLabel(g->label, formW);
+                const ImVec2 at = ImGui::GetCursorScreenPos();
+                place(at.x, at.y + sliderDy);
+                double gv = std::clamp(params.getDouble("gamma", 1.0), 0.1, 5.0);
+                widgets::SliderOpts so;
+                so.width = dp(sliderW);
+                so.enabled = formEnabled;
+                if (widgets::slider("##gammaSlider", &gv, 0.1, 5.0, so)) setParam("gamma", std::round(gv * 100.0) / 100.0, true);
+                place(at.x + sliderW + spacing, at.y);
+                editor(*g, params, input, spinW);
+                placeEnd(at.x, at.y + px(theme::kInputH));
+            }
+
+            // Auto / Reset
+            gap();
+            {
+                const ImVec2 at = ImGui::GetCursorScreenPos();
+                widgets::ButtonOpts ao;
+                ao.small = true;
+                ao.enabled = formEnabled;
+                ao.tooltip = "Min / max on the input's percentiles (see More parameters)";
+                const int i = index();
+                if (widgets::button("Auto##auto", ao))
+                    later([this, i] {
+                        const Pipeline& p = wb().pipeline();
+                        auto up = wb().upstreamOutput(i);
+                        if (i >= 0 && i < p.size() && up)
+                            wb().setStepParams(i, contrastAutoParams(p.at(i).params, up->asInput()), "Auto contrast");
+                    });
+                place(at.x + buttonWidth("Auto", true, 10) + px(8), at.y);
+                widgets::ButtonOpts ro;
+                ro.kind = widgets::ButtonKind::Ghost;
+                ro.small = true;
+                ro.enabled = formEnabled;
+                ro.tooltip = "Min / max over the input's full range, gamma 1";
+                if (widgets::button("Reset##reset", ro))
+                    later([this, i] {
+                        const Pipeline& p = wb().pipeline();
+                        auto up = wb().upstreamOutput(i);
+                        if (i >= 0 && i < p.size() && up)
+                            wb().setStepParams(i, contrastResetParams(p.at(i).params, up->asInput()), "Reset contrast");
+                    });
+                placeEnd(at.x, at.y + buttonHeight(true));
+            }
+
+            generic(info.params, params, input, false, done);
+        }
+
+        // Offered above the fields by any operation that has them. Choosing
+        // one writes its values into the step -- an ordinary undoable
+        // parameter change -- and the control returns to its caption, because
+        // what a step holds afterwards is a set of values and not a mode.
+        void buildPresets(const OpInfo& info) {
+            if (info.presets.empty()) return;
+            gap();
+            fieldLabel("Preset", formW);
+            const float fontSize = 13;
+            ImGui::PushFont(theme::font(), fontSize);
+            const float fh = ImGui::GetFontSize();
+            ImGui::PushStyleVar(ImGuiStyleVar_FramePadding, ImVec2(px(8), std::max(2.0f, std::floor((px(theme::kInputH) - fh) * 0.5f))));
+            ImGui::PushStyleVar(ImGuiStyleVar_FrameBorderSize, theme::crispPen(theme::kBorder));
+            ImGui::PushStyleColor(ImGuiCol_FrameBg, theme::kBg);
+            ImGui::PushStyleColor(ImGuiCol_FrameBgHovered, theme::kBg);
+            ImGui::PushStyleColor(ImGuiCol_FrameBgActive, theme::kBg);
+            ImGui::PushStyleColor(ImGuiCol_Border, theme::kText);
+            ImGui::PushStyleColor(ImGuiCol_Header, theme::kSurface);
+            ImGui::PushStyleColor(ImGuiCol_HeaderHovered, theme::kNeutral200);
+            ImGui::PushStyleColor(ImGuiCol_HeaderActive, theme::kNeutral300);
+            ImGui::PushStyleColor(ImGuiCol_PopupBg, theme::kBg);
+            ImGui::SetNextItemWidth(formW);
+            ImGui::PushStyleVar(ImGuiStyleVar_PopupBorderSize, theme::crispPen(2));
+            ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, px(0, 2));
+            ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, px(0, 0));
+            const bool open = ImGui::BeginCombo("##preset", "", ImGuiComboFlags_NoArrowButton | ImGuiComboFlags_HeightLarge);
+            std::string chosen;
+            if (open) {
+                for (std::size_t k = 0; k < info.presets.size(); ++k) {
+                    const ParamPreset& preset = info.presets[k];
+                    ImGui::PushID(static_cast<int>(k));
+                    const ImVec2 p = ImGui::GetCursorScreenPos();
+                    const float h = theme::snap(px(26));
+                    if (ImGui::Selectable("##item", false, ImGuiSelectableFlags_None, ImVec2(0, h))) chosen = preset.name;
+                    widgets::drawTextIn(ImGui::GetWindowDrawList(), ImVec2(p.x + px(8), p.y), ImVec2(p.x + ImGui::GetItemRectSize().x, p.y + h),
+                                        preset.name, 12, theme::kText, Weight::Regular, 0.0f, 0.5f);
+                    tip(preset.summary);
+                    ImGui::PopID();
+                }
+                ImGui::EndCombo();
+            }
+            ImGui::PopStyleVar(3);
+            const ImVec2 min = ImGui::GetItemRectMin(), max = ImGui::GetItemRectMax();
+            ImGui::PopStyleColor(8);
+            ImGui::PopStyleVar(2);
+            ImGui::PopFont();
+            if (!open) {
+                ImDrawList* dl = ImGui::GetWindowDrawList();
+                widgets::drawTextIn(dl, ImVec2(min.x + px(8), min.y), ImVec2(max.x - px(24), max.y), "Start from…", 13, dim(theme::kText),
+                                    Weight::Regular, 0.0f, 0.5f);
+                drawIcon(dl, ImVec2(max.x - px(13), (min.y + max.y) * 0.5f), px(12), Icon::ChevronDown, dim(theme::kText), px(1.5f));
+                if (ImGui::IsItemHovered()) ImGui::SetMouseCursor(ImGuiMouseCursor_Hand);
+                tip("Fill the fields below for a kind of structure; every one stays editable");
+            }
+            if (!chosen.empty()) {
+                const int i = index();
+                later([this, i, chosen] { wb().applyPreset(i, chosen); });
+            }
+        }
+
+        // --- the form ---------------------------------------------------------------------
+        void drawForm(const Step* st) {
+            firstItem = true;
+            formX = ImGui::GetCursorScreenPos().x;
+            formW = std::max(px(60), ImGui::GetContentRegionAvail().x);
+            colourPopup = ImGui::GetID("##channelColour");
+            if (!st) {
+                widgets::text("No step selected.", 12, theme::kNeutral600);
+                return;
+            }
+            const ParamSet params = st->params;   // a copy: edits land after the frame
+            const OpInfo& info = st->op().info();
+            const DatasetMeta& input = derivedInput;
+            buildPresets(info);
+            const std::string& kind = st->kind;
+            if (kind == "load") buildLoad(*st, params, info);
+            else if (kind == "einsum") buildEinsum(params, info, input);
+            else if (kind == "sim") buildSim(params, info, input);
+            else if (kind == "seg") buildSeg(params, info, input);
+            else if (kind == "foundation") buildFoundation(params, info, input);
+            else if (kind == "merge") buildMerge(*st, params, info, input);
+            else if (kind == "contrast") buildContrast(params, info, input);
+            else generic(info.params, params, input, false);
+
+            // validation: errors in the accent, warnings in grey
+            const Validation& v = derivedValidation;
+            std::string text;
+            for (const std::string& e : v.errors) text += (text.empty() ? "" : "\n") + e;
+            for (const std::string& w : v.warnings) text += (text.empty() ? "" : "\n") + w;
+            if (!text.empty()) {
+                gap();
+                widgets::textWrapped(text, 11, v.ok() ? theme::kNeutral600 : theme::kAccentText, Weight::Regular, formW);
+            }
+            drawColourPopup();
+        }
+
+        // --- the panel ----------------------------------------------------------------------
+        void draw() {
+            Workbench& w = wb();
+            Bridge& bridge = app.bridge();
+            const int i = index();
+            const Step* st = step();
+            checkShape(st, i);
+            refreshDerived();
+            const bool running = bridge.running();
+            const bool busy = running || bridge.taskRunning();
+            // Every parameter edit is refused while a run holds the pipeline
+            // (Workbench::canEdit), so the whole form goes with it rather
+            // than accepting values that are dropped.
+            const bool editable = w.canEdit() && !bridge.taskRunning();
+
+            ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, ImVec2(0, 0));
+            const ImVec2 origin = ImGui::GetCursorScreenPos();
+            const ImVec2 avail = ImGui::GetContentRegionAvail();
+            ImDrawList* dl = ImGui::GetWindowDrawList();
+            const float x = origin.x + px(18);
+            const float width = std::max(px(40), avail.x - px(36));
+            const float rule = theme::crispPen(theme::kRule);
+            const float h10 = captionHeight(), h11 = lineHeight(11), h12 = lineHeight(12);
+
+            // --- header ---
+            float headerH = 0.0f;
+            {
+                const float kickH = std::max(h10, h11);
+                const float nameH = std::max(theme::snap(px(24)), lineHeight(theme::kH4Px, Weight::ExtraBold));
+                const float y0 = origin.y + px(14);
+                const std::string kicker = st ? "Step " + Step::number(i) + " · " + st->op().info().kindLabel : std::string("Step");
+                const std::string state = st ? (st->enabled ? "enabled" : "skipped") : std::string();
+                const float stateW = state.empty() ? 0.0f : theme::textSize(state, 11).x;
+                place(x, y0 + (kickH - h10) * 0.5f);
+                // The accent at 10 / 11 px is 3.8:1 on this background; the
+                // darkened one (theme::kAccentText) is the same red at 5.2:1.
+                widgets::caption(fitCaption(kicker, width - stateW - px(8)), theme::kAccentText);
+                if (!state.empty()) {
+                    place(x + width - stateW, y0 + (kickH - h11) * 0.5f);
+                    widgets::text(state, 11, st->enabled ? theme::kAccentText : theme::kNeutral600);
+                }
+                const float ny = y0 + kickH + px(4);
+                const float helpS = theme::snap(px(24));
+                const std::string name = st ? st->name : std::string("—");
+                const float nameW = width - px(10) - helpS;
+                const std::string shown = widgets::elideText(name, nameW, theme::kH4Px, Weight::ExtraBold);
+                place(x, ny + (nameH - lineHeight(theme::kH4Px, Weight::ExtraBold)) * 0.5f);
+                widgets::text(shown, theme::kH4Px, theme::kText, Weight::ExtraBold);
+                if (st) {
+                    tip(shown != name ? name + "\nDouble-click to rename" : std::string("Double-click to rename"));
+                    if (ImGui::IsItemHovered() && ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Left)) {
+                        App* a = &app;
+                        const StepId id = st->id;
+                        const std::string current = st->name;
+                        a->defer([a, id, current] {
+                            a->promptText("Rename step", "Name", current, [a, id](const std::string& text) {
+                                const int now = a->wb().pipeline().indexOf(id);
+                                if (now >= 0) a->wb().renameStep(now, text);
+                            });
+                        });
+                    }
+                }
+                place(x + width - helpS, ny + (nameH - helpS) * 0.5f);
+                widgets::GlyphOpts ho;
+                ho.active = app.helpOpen();
+                ho.iconPx = 14;
+                ho.tooltip = widgets::withShortcut("Explain this step", shortcutText(keys::helpForStep));
+                if (widgets::glyphButton("##help", Icon::Help, 24, ho)) {
+                    App* a = &app;
+                    a->defer([a] { a->toggleHelp(); });
+                }
+                headerH = theme::snap(px(14) + kickH + px(4) + nameH + px(10));
+            }
+
+            // --- the fixed sections' metrics: backend, cache, footer ---
+            std::string backendNote;
+            if (st && w.backend() == Backend::Hpc) {
+                // Only operations the Python worker implements (OpInfo::remoteCapable)
+                // are handed to the remote worker; the C++ ones run here whatever
+                // the backend says, so the panel says which one this is.
+                backendNote = st->op().info().remoteCapable
+                                  ? std::string("Runs on the HPC worker.")
+                                  : st->op().info().name + " has no HPC implementation: this step runs on this machine even with the HPC "
+                                                           "backend selected.";
+            }
+            static const char* const kCacheNotes[] = {
+                "Fastest scrubbing; evicted first when GPU/RAM fills.",
+                "Survives restarts; written to the zarr scratch directory. Best for slow steps like reconstruction.",
+                "Nothing stored; recomputed from the previous step on demand. Good for cheap steps."};
+            const std::string cacheNote = st ? kCacheNotes[static_cast<int>(st->cache)] : std::string();
+            const float tileH = theme::snap(px(36));
+            const float backendH = px(16) + h10 + px(8) + tileH + (backendNote.empty() ? 0.0f : px(8) + wrappedHeight(backendNote, 12, width)) + px(16);
+            const float cacheH = px(16) + std::max(h10, h12) + px(8) + tileH + (cacheNote.empty() ? 0.0f : px(8) + wrappedHeight(cacheNote, 12, width)) + px(16);
+            const float btnH = buttonHeight();
+            const float footerH = rule + px(14) + btnH + px(14);
+            const float sectionsH = rule + backendH + rule + cacheH;
+            const float bodyH = std::max(px(60), avail.y - headerH - sectionsH - footerH);
+
+            // --- body ---
+            place(origin.x, origin.y + headerH);
+            ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(px(18), 0));
+            const bool bodyOpen = ImGui::BeginChild("##form", ImVec2(avail.x, bodyH), ImGuiChildFlags_AlwaysUseWindowPadding,
+                                                    ImGuiWindowFlags_None);
+            ImGui::PopStyleVar();
+            if (bodyOpen) {
+                formEnabled = editable;
+                ImGui::BeginDisabled(!editable);
+                drawForm(st);
+                ImGui::EndDisabled();
+                widgets::vspace(16);
+            }
+            ImGui::EndChild();
+            if (!editable) tip(kFrozen);
+
+            // --- backend ---
+            float y = origin.y + headerH + bodyH;
+            dl->AddRectFilled(ImVec2(x, theme::snap(y)), ImVec2(x + width, theme::snap(y) + rule), theme::kDivider);
+            y = theme::snap(y) + rule + px(16);
+            place(x, y);
+            widgets::caption("Backend");
+            y += h10 + px(8);
+            place(x, y);
+            {
+                int backend = static_cast<int>(w.backend());
+                widgets::SegmentedOpts so;
+                so.tiles = true;
+                so.width = dp(width);
+                const bool cuda = cudaAvailable();
+                so.optionEnabled = {cuda, true, true};
+                so.tooltips = {cuda ? "Run on the selected CUDA device" : "No CUDA device is available in this build / machine", "",
+                               "Run on the remote worker (Preferences ▸ HPC)"};
+                if (widgets::segmented("##backend", {"CUDA", "CPU", "HPC"}, &backend, so)) {
+                    const Backend b = static_cast<Backend>(backend);
+                    later([this, b] { wb().setBackend(b); });
+                }
+            }
+            y += tileH;
+            if (!backendNote.empty()) {
+                place(x, y + px(8));
+                widgets::textWrapped(backendNote, 12, theme::kNeutral600, Weight::Regular, width);
+                y += px(8) + wrappedHeight(backendNote, 12, width);
+            }
+            y += px(16);
+
+            // --- cache output ---
+            dl->AddRectFilled(ImVec2(x, theme::snap(y)), ImVec2(x + width, theme::snap(y) + rule), theme::kDivider);
+            y = theme::snap(y) + rule + px(16);
+            {
+                const float headH = std::max(h10, h12);
+                place(x, y + (headH - h10) * 0.5f);
+                widgets::caption("Cache output");
+                if (st) {
+                    const std::string size = "≈ " + bytesOrDash(derivedBytes);
+                    place(x + width - theme::textSize(size, 12).x, y + (headH - h12) * 0.5f);
+                    widgets::text(size, 12, theme::kNeutral700);
+                }
+                y += headH + px(8);
+            }
+            place(x, y);
+            {
+                int cache = st ? static_cast<int>(st->cache) : -1;
+                widgets::SegmentedOpts so;
+                so.tiles = true;
+                so.width = dp(width);
+                so.enabled = editable && st;
+                if (editable) so.tooltips = {"Cached in GPU/RAM", "Cached on disk (zarr scratch)", "Recomputed on demand"};
+                if (widgets::segmented("##cache", {"Memory", "Disk", "Recompute"}, &cache, so) && cache >= 0) {
+                    const CachePolicy c = static_cast<CachePolicy>(cache);
+                    later([this, i, c] { wb().setStepCache(i, c); });
+                }
+                if (!editable) tip(kFrozen);
+            }
+            y += tileH;
+            if (!cacheNote.empty()) {
+                place(x, y + px(8));
+                widgets::textWrapped(cacheNote, 12, theme::kNeutral600, Weight::Regular, width);
+            }
+
+            // --- footer: Run step / View / Remove ---
+            {
+                const float fy = origin.y + avail.y - footerH;
+                dl->AddRectFilled(ImVec2(origin.x, theme::snap(fy)), ImVec2(origin.x + avail.x, theme::snap(fy) + rule), theme::kDivider);
+                const float by = fy + rule + px(14);
+                const bool showRemove = st && !st->pinned;
+                const float viewW = buttonWidth("View", false, 12);
+                const float removeW = buttonWidth("Remove", false, 8);
+                const float runW = std::max(px(40), width - px(8) - viewW - (showRemove ? px(8) + removeW : 0.0f));
+                App* a = &app;
+                place(x, by);
+                widgets::ButtonOpts run;
+                run.kind = widgets::ButtonKind::Primary;
+                run.width = dp(runW);
+                run.enabled = st && !busy && w.hasDataset();
+                if (widgets::button("Run step##run", run)) a->defer([a] { a->runSelectedStep(); });
+                tip(widgets::withShortcut("Run this step; its input has to be computed already", shortcutText(keys::runSelected)));
+                place(x + runW + px(8), by);
+                widgets::ButtonOpts view;
+                view.enabled = st != nullptr;
+                view.tooltip = "Show this step's output in the viewer";
+                if (widgets::button("View##view", view)) later([this, i] { wb().view(i); });
+                if (showRemove) {
+                    place(x + runW + px(8) + viewW + px(8), by);
+                    widgets::ButtonOpts remove;
+                    remove.kind = widgets::ButtonKind::Ghost;
+                    remove.enabled = editable;
+                    if (widgets::button("Remove##remove", remove)) a->defer([a, i] { a->removeStepAt(i); });
+                    if (!editable) tip(kFrozen);
+                }
+                placeEnd(origin.x, origin.y + avail.y);
+            }
+            ImGui::PopStyleVar();
+
+            // the edits of this frame, now that nothing is drawn from the old values
+            std::vector<std::function<void()>> pendingActions;
+            pendingActions.swap(actions);
+            for (auto& fn : pendingActions) fn();
+        }
+    };
+
+    ParamsPanel::ParamsPanel(App& app) : impl_(std::make_unique<Impl>(app)) {}
+    ParamsPanel::~ParamsPanel() = default;
+
+    void ParamsPanel::draw() { impl_->draw(); }
+
+} // namespace sirius::app::gui

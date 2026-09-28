@@ -1,12 +1,17 @@
-# The SIRIUS workbench (docs/design/README.md). Gated by SIRIUS_ENABLE_APP at
-# the top level; Qt is located in cmake/Dependencies.cmake as sirius::qt.
+# The SIRIUS workbench (docs/design/README.md). Gated by SIRIUS_ENABLE_APP
+# and / or SIRIUS_ENABLE_IMGUI_APP at the top level; Qt is located in
+# cmake/Dependencies.cmake as sirius::qt, Dear ImGui and friends are fetched
+# there as sirius::imgui.
 #
-#   sirius_app_core  static, Qt-free: array model, operations, pipeline,
+#   sirius_app_core  static, GUI-free: array model, operations, pipeline,
 #                    executor, workbench, tool API, worker protocol, export.
 #                    Built as a graph of units (cmake/Units.cmake), each with
 #                    a test executable of its own in tests/app_tests.cmake.
 #   sirius-app       the Qt Widgets executable (app/qt/**), globbed
 #                    (CONFIGURE_DEPENDS) so adding a panel is adding a file.
+#                    SIRIUS_ENABLE_APP.
+#   sirius-imgui     the same workbench over Dear ImGui (app/imgui/**).
+#                    SIRIUS_ENABLE_IMGUI_APP.
 
 include(Units)
 
@@ -278,7 +283,16 @@ if(SIRIUS_ENABLE_SANITIZERS)
     target_enable_sanitizers(sirius_app_core)
 endif()
 
-# --- GUI --------------------------------------------------------------------
+# --- GUI (Dear ImGui) ---------------------------------------------------------
+if(SIRIUS_ENABLE_IMGUI_APP)
+    add_subdirectory(imgui)
+endif()
+
+# --- GUI (Qt) -----------------------------------------------------------------
+if(NOT SIRIUS_ENABLE_APP)
+    return()
+endif()
+
 set(CMAKE_AUTOMOC ON)
 set(CMAKE_AUTORCC ON)
 

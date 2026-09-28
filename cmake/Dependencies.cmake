@@ -284,6 +284,149 @@ if(SIRIUS_ENABLE_APP)
     message(STATUS "Qt ${Qt${QT_VERSION_MAJOR}_VERSION} (Widgets, OpenGL, Network) for the SIRIUS app")
 endif()
 
+# Dear ImGui application (app/imgui). Unlike Qt everything here is small enough
+# to fetch and build in-tree, pinned like the rest: GLFW for the window and the
+# OpenGL context, Dear ImGui (docking branch: dockable, floatable panels) with
+# its GLFW and OpenGL 3 backends, ImPlot for the diagnostics charts, a text
+# editor widget for the plugin files, native file dialogs, stb for PNG in and
+# out, and libcurl for the assistant and the model hub. Dear ImGui, ImPlot and
+# the editor ship no CMake project, so their targets are described here.
+if(SIRIUS_ENABLE_IMGUI_APP)
+    find_package(OpenGL REQUIRED)
+
+    FetchContent_Declare(
+        glfw
+        GIT_REPOSITORY https://github.com/glfw/glfw.git
+        GIT_TAG        a74efa0d5628b74adc0426af4c5710e287fa7c2c   # 3.4
+        GIT_SHALLOW    TRUE
+        SYSTEM
+    )
+    block()
+        set(BUILD_SHARED_LIBS OFF)
+        set(GLFW_BUILD_EXAMPLES OFF CACHE BOOL "" FORCE)
+        set(GLFW_BUILD_TESTS OFF CACHE BOOL "" FORCE)
+        set(GLFW_BUILD_DOCS OFF CACHE BOOL "" FORCE)
+        set(GLFW_INSTALL OFF CACHE BOOL "" FORCE)
+        FetchContent_MakeAvailable(glfw)
+    endblock()
+    FetchContent_GetProperties(glfw SOURCE_DIR glfw_SOURCE_DIR)   # set inside the block above
+
+    FetchContent_Declare(
+        imgui
+        GIT_REPOSITORY https://github.com/ocornut/imgui.git
+        GIT_TAG        b48d1afbe8ee8b238e2961dc363a949dd7304e23   # v1.92.9b-docking
+        GIT_SHALLOW    TRUE
+    )
+    FetchContent_Declare(
+        implot
+        GIT_REPOSITORY https://github.com/epezent/implot.git
+        GIT_TAG        09e2ba71766e25d88053a2173936c9d1043bae42   # master, 1.92-compatible
+        GIT_SHALLOW    TRUE
+    )
+    FetchContent_Declare(
+        imgui_text_editor
+        GIT_REPOSITORY https://github.com/goossens/ImGuiColorTextEdit.git
+        GIT_TAG        133614b0d5e1008527a26f46a93fdb1d751ca115   # master
+        GIT_SHALLOW    TRUE
+        SOURCE_SUBDIR  cmake-not-used
+    )
+    FetchContent_Declare(
+        stb
+        GIT_REPOSITORY https://github.com/nothings/stb.git
+        GIT_TAG        2c980bb59875b0d32144a71867fbdebb2f77cd20   # master
+        GIT_SHALLOW    TRUE
+    )
+    FetchContent_MakeAvailable(imgui implot imgui_text_editor stb)
+
+    add_library(sirius_imgui STATIC
+        ${imgui_SOURCE_DIR}/imgui.cpp
+        ${imgui_SOURCE_DIR}/imgui_draw.cpp
+        ${imgui_SOURCE_DIR}/imgui_tables.cpp
+        ${imgui_SOURCE_DIR}/imgui_widgets.cpp
+        ${imgui_SOURCE_DIR}/misc/cpp/imgui_stdlib.cpp
+        ${imgui_SOURCE_DIR}/backends/imgui_impl_glfw.cpp
+        ${imgui_SOURCE_DIR}/backends/imgui_impl_opengl3.cpp
+        ${implot_SOURCE_DIR}/implot.cpp
+        ${implot_SOURCE_DIR}/implot_items.cpp
+        ${imgui_text_editor_SOURCE_DIR}/TextEditor.cpp)
+    # SYSTEM: excluded from warnings and MSVC /analyze, like the other deps.
+    target_include_directories(sirius_imgui SYSTEM PUBLIC
+        ${imgui_SOURCE_DIR}
+        ${imgui_SOURCE_DIR}/backends
+        ${imgui_SOURCE_DIR}/misc/cpp
+        ${implot_SOURCE_DIR}
+        ${imgui_text_editor_SOURCE_DIR}
+        ${stb_SOURCE_DIR}
+        # glad's single-header OpenGL 3.3 loader, as GLFW's own examples use it
+        ${glfw_SOURCE_DIR}/deps)
+    target_compile_features(sirius_imgui PUBLIC cxx_std_17)
+    if(MSVC)
+        # third-party sources: not ours to analyse (cmake/StaticAnalysis.cmake)
+        target_compile_options(sirius_imgui PRIVATE /analyze- /w)
+    endif()
+    target_link_libraries(sirius_imgui PUBLIC glfw OpenGL::GL)
+    add_library(sirius::imgui ALIAS sirius_imgui)
+
+    FetchContent_Declare(
+        nfd
+        GIT_REPOSITORY https://github.com/btzy/nativefiledialog-extended.git
+        GIT_TAG        86d5f2005fe1c00747348a12070fec493ea2407e   # v1.2.1
+        GIT_SHALLOW    TRUE
+        SYSTEM
+    )
+    block()
+        set(CMAKE_POLICY_DEFAULT_CMP0077 NEW)   # its option() calls honour the variables set here
+        set(BUILD_SHARED_LIBS OFF)
+        set(NFD_BUILD_TESTS OFF CACHE BOOL "" FORCE)
+        set(NFD_INSTALL OFF CACHE BOOL "" FORCE)
+        # xdg-desktop-portal rather than GTK: no GTK development package to
+        # install, and the dialog is the desktop's own
+        set(NFD_PORTAL ON CACHE BOOL "" FORCE)
+        FetchContent_MakeAvailable(nfd)
+    endblock()
+
+    # libcurl: the system's where there is one (Linux distributions ship it
+    # with their TLS library); built in-tree otherwise, against the platform's
+    # TLS (Schannel on Windows), with everything but HTTP(S) turned off.
+    if(NOT WIN32)
+        find_package(CURL QUIET)
+    endif()
+    if(NOT CURL_FOUND)
+        FetchContent_Declare(
+            curl
+            GIT_REPOSITORY https://github.com/curl/curl.git
+            GIT_TAG        8c908d2d0a6d32abdedda2c52e90bd56ec76c24d   # curl-8_19_0
+            GIT_SHALLOW    TRUE
+            SYSTEM
+        )
+        block()
+            set(BUILD_SHARED_LIBS OFF)
+            set(BUILD_CURL_EXE OFF CACHE BOOL "" FORCE)
+            set(BUILD_STATIC_LIBS ON CACHE BOOL "" FORCE)
+            set(BUILD_TESTING OFF)
+            set(BUILD_EXAMPLES OFF CACHE BOOL "" FORCE)
+            set(BUILD_LIBCURL_DOCS OFF CACHE BOOL "" FORCE)
+            set(BUILD_MISC_DOCS OFF CACHE BOOL "" FORCE)
+            set(ENABLE_CURL_MANUAL OFF CACHE BOOL "" FORCE)
+            set(CURL_DISABLE_INSTALL ON CACHE BOOL "" FORCE)
+            set(HTTP_ONLY ON CACHE BOOL "" FORCE)
+            set(CURL_USE_LIBPSL OFF CACHE BOOL "" FORCE)
+            set(CURL_USE_LIBSSH2 OFF CACHE BOOL "" FORCE)
+            set(USE_LIBIDN2 OFF CACHE BOOL "" FORCE)
+            set(USE_NGHTTP2 OFF CACHE BOOL "" FORCE)
+            set(CURL_BROTLI OFF CACHE BOOL "" FORCE)
+            set(CURL_ZSTD OFF CACHE BOOL "" FORCE)
+            set(CURL_ZLIB OFF CACHE BOOL "" FORCE)
+            if(WIN32)
+                set(CURL_USE_SCHANNEL ON CACHE BOOL "" FORCE)
+                set(CURL_USE_OPENSSL OFF CACHE BOOL "" FORCE)
+            endif()
+            FetchContent_MakeAvailable(curl)
+        endblock()
+    endif()
+    message(STATUS "Dear ImGui (docking), ImPlot, GLFW and libcurl for the SIRIUS ImGui app")
+endif()
+
 if(SIRIUS_ENABLE_CUDA)
     include(CheckLanguage)
     check_language(CUDA)

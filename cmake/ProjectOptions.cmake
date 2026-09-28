@@ -11,6 +11,10 @@ option(SIRIUS_ENABLE_APP "Build the Qt GUI application (needs Qt 6 or Qt 5 Widge
 include(CMakeDependentOption)
 cmake_dependent_option(SIRIUS_APP_DEPLOY_QT "Run windeployqt on sirius-app after linking" ON
                        "SIRIUS_ENABLE_APP;WIN32" OFF)
+# The same workbench over Dear ImGui (app/imgui): GLFW, OpenGL 3.3, ImPlot and
+# friends, all fetched and built in-tree, so it needs no Qt installation. It
+# shares app/core with the Qt application; either, both or neither can be on.
+option(SIRIUS_ENABLE_IMGUI_APP "Build the Dear ImGui GUI application (fetches GLFW, Dear ImGui, ImPlot)" OFF)
 
 # nvTIFF decodes TIFF strips/tiles straight into device memory. It is an NVIDIA
 # redistributable (no source), fetched from developer.download.nvidia.com by

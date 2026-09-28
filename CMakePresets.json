@@ -49,6 +49,14 @@
       "description": "Qt workbench. Adds TensorStore (zarr/N5): the first configure fetches and builds it (several minutes, ~1.5 GB, needs nasm and python3); pass -DSIRIUS_ENABLE_TENSORSTORE=OFF to skip."
     },
     {
+      "name": "imgui-app",
+      "hidden": true,
+      "cacheVariables": {
+        "SIRIUS_ENABLE_IMGUI_APP": "ON"
+      },
+      "description": "Dear ImGui workbench: GLFW, Dear ImGui, ImPlot and libcurl are fetched and built in-tree, no Qt. Add -DSIRIUS_ENABLE_TENSORSTORE=ON for zarr / N5 (long first build, needs nasm and python3)."
+    },
+    {
       "name": "win-msvc-dev",
       "displayName": "Windows (MSVC) Dev",
       "inherits": [
@@ -70,6 +78,14 @@
       ]
     },
     {
+      "name": "win-msvc-imgui-dev",
+      "displayName": "Windows (MSVC) Dev + Dear ImGui app",
+      "inherits": [
+        "win-msvc-dev",
+        "imgui-app"
+      ]
+    },
+    {
       "name": "win-msvc-release",
       "displayName": "Windows (MSVC) Release",
       "inherits": [
@@ -88,6 +104,14 @@
       "inherits": [
         "win-msvc-release",
         "app"
+      ]
+    },
+    {
+      "name": "win-msvc-imgui-release",
+      "displayName": "Windows (MSVC) Release + Dear ImGui app",
+      "inherits": [
+        "win-msvc-release",
+        "imgui-app"
       ]
     },
     {
@@ -154,6 +178,22 @@
       "inherits": [
         "linux-gcc-release",
         "app"
+      ]
+    },
+    {
+      "name": "linux-gcc-imgui-dev",
+      "displayName": "Linux (GCC) Dev + Dear ImGui app",
+      "inherits": [
+        "linux-gcc-dev",
+        "imgui-app"
+      ]
+    },
+    {
+      "name": "linux-gcc-imgui-release",
+      "displayName": "Linux (GCC) Release + Dear ImGui app",
+      "inherits": [
+        "linux-gcc-release",
+        "imgui-app"
       ]
     },
     {
@@ -314,6 +354,22 @@
       "configuration": "Release"
     },
     {
+      "name": "win-msvc-imgui-dev",
+      "inherits": [
+        "base-build"
+      ],
+      "configurePreset": "win-msvc-imgui-dev",
+      "configuration": "Debug"
+    },
+    {
+      "name": "win-msvc-imgui-release",
+      "inherits": [
+        "base-build"
+      ],
+      "configurePreset": "win-msvc-imgui-release",
+      "configuration": "Release"
+    },
+    {
       "name": "linux-gcc-dev",
       "inherits": [
         "base-build"
@@ -333,6 +389,20 @@
         "base-build"
       ],
       "configurePreset": "linux-gcc-app-release"
+    },
+    {
+      "name": "linux-gcc-imgui-dev",
+      "inherits": [
+        "base-build"
+      ],
+      "configurePreset": "linux-gcc-imgui-dev"
+    },
+    {
+      "name": "linux-gcc-imgui-release",
+      "inherits": [
+        "base-build"
+      ],
+      "configurePreset": "linux-gcc-imgui-release"
     },
     {
       "name": "linux-gcc-release",
@@ -432,6 +502,14 @@
       "configuration": "Debug"
     },
     {
+      "name": "win-msvc-imgui-dev",
+      "inherits": [
+        "base-test"
+      ],
+      "configurePreset": "win-msvc-imgui-dev",
+      "configuration": "Debug"
+    },
+    {
       "name": "linux-gcc-dev",
       "inherits": [
         "base-test"
@@ -444,6 +522,13 @@
         "base-test"
       ],
       "configurePreset": "linux-gcc-app-dev"
+    },
+    {
+      "name": "linux-gcc-imgui-dev",
+      "inherits": [
+        "base-test"
+      ],
+      "configurePreset": "linux-gcc-imgui-dev"
     },
     {
       "name": "linux-clang-dev",

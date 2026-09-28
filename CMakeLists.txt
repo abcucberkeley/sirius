@@ -19,7 +19,7 @@ include(Dependencies)
 add_subdirectory(src)
 
 # before tests: the app's Qt-free core library is unit-tested there
-if(SIRIUS_ENABLE_APP)
+if(SIRIUS_ENABLE_APP OR SIRIUS_ENABLE_IMGUI_APP)
     add_subdirectory(app)
 endif()
 
