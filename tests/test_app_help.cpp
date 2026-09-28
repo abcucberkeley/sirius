@@ -113,6 +113,38 @@ TEST_CASE("loadHelpPage of an unknown kind yields the placeholder page", "[app][
     CHECK(contains(page.path, "no-such-operation.md"));
 }
 
+TEST_CASE("a page saved in a legacy 8-bit encoding loads as UTF-8", "[app][help]") {
+    // An editor that saves Windows-1252 writes "é" as the single byte 0xE9.
+    // Turned into a path such a byte throws on Windows (the test, like the
+    // application, runs with the UTF-8 code page), and the help window turns
+    // the figure path and every link target into one: the loader replaces
+    // what is not UTF-8 with U+FFFD before anyone sees it.
+    const std::string bad = "\xEF\xBF\xBD";   // U+FFFD
+    const std::string oeSz = "\xF6\xDF";      // "öß" in Windows-1252
+    const fs::path tmp = fs::temp_directory_path() / "sirius-help-encoding-test";
+    fs::create_directories(tmp);
+    std::ofstream(tmp / "latin1.md", std::ios::binary)
+        << "---\ntitle: Sch\xE9ma\nfigure_path: Sch\xE9ma.png\n---\n\nIntro, 5 \xC2\xB5m \xE2\x86\x92 [gr" + oeSz + "e](gr" + oeSz +
+               "e.png) \xE2\x82\n";
+    HelpPage page;
+    CHECK_NOTHROW(page = loadHelpPage("latin1", tmp.string()));
+    CHECK(page.title == "Sch" + bad + "ma");
+    CHECK(page.figurePath == (tmp / ("Sch" + bad + "ma.png")).string());
+    // well-formed sequences stay; a sequence cut short is one replacement
+    CHECK(page.intro == "Intro, 5 \xC2\xB5m \xE2\x86\x92 [gr" + bad + bad + "e](gr" + bad + bad + "e.png) " + bad);
+    CHECK_FALSE(contains(page.markdown, "\xE9"));
+
+    // a page that is UTF-8 already is read as it is
+    const std::string utf8 = "---\ntitle: Gr\xC3\xB6\xC3\x9F\n---\n\n5 \xC2\xB5m \xE2\x86\x92 \xF0\x9F\x94\xAC\n";
+    std::ofstream(tmp / "utf8.md", std::ios::binary) << utf8;
+    CHECK(loadHelpPage("utf8", tmp.string()).markdown == utf8);
+
+    // a page registered in memory (a plugin's docstring) is repaired too
+    registerHelpPage("sirius-test-latin1-docstring", "---\ntitle: Gr" + oeSz + "e\n---\n\nIntro.\n");
+    CHECK(loadHelpPage("sirius-test-latin1-docstring", tmp.string()).title == "Gr" + bad + bad + "e");
+    fs::remove_all(tmp);
+}
+
 TEST_CASE("latexToHtml renders fractions, scripts, Greek and bold", "[app][help][latex]") {
     SECTION("inline fraction uses a fraction slash with sup/sub") {
         const std::string html = latexToHtml(R"(\frac{a}{b})", false);

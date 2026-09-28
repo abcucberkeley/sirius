@@ -200,14 +200,24 @@ namespace sirius::app::gui {
     std::string bytesText(std::uint64_t bytes) { return formatBytes(bytes); }
 
     std::string durationText(double seconds) {
-        if (seconds < 60.0) return format("%d s", static_cast<int>(seconds + 0.5));
-        const int m = static_cast<int>(seconds / 60.0), sec = static_cast<int>(seconds + 0.5) % 60;
+        // rounded once, so that 119.6 s is "2:00 min" and not "1:00 min"
+        const int total = static_cast<int>(seconds + 0.5);
+        if (total < 60) return format("%d s", total);
+        const int m = total / 60, sec = total % 60;
         if (m < 60) return format("%d:%02d min", m, sec);
         return format("%d h %d min", m / 60, m % 60);
     }
 
     namespace {
-        std::filesystem::path fsPath(const std::string& p) { return std::filesystem::u8path(p); }
+        // Empty for bytes that are not UTF-8: u8path throws on them on
+        // Windows, and these helpers are called while windows are drawn.
+        std::filesystem::path fsPath(const std::string& p) {
+            try {
+                return std::filesystem::u8path(p);
+            } catch (const std::exception&) {
+                return {};
+            }
+        }
         std::string fromPath(const std::filesystem::path& p) { return p.u8string(); }
     } // namespace
 
@@ -223,16 +233,21 @@ namespace sirius::app::gui {
         return dot == std::string::npos || dot == 0 ? name : name.substr(0, dot);
     }
 
+    // Both with '/' separators, as the file dialogs return paths: a file then
+    // has one spelling whether it was dropped, typed or chosen, where
+    // std::filesystem on Windows would write "C:\data\x.tif".
     std::string absolutePath(const std::string& path) {
+        const std::filesystem::path in = fsPath(path);
+        if (in.empty()) return path;
         std::error_code ec;
-        const std::filesystem::path p = std::filesystem::absolute(fsPath(path), ec);
-        return ec ? path : fromPath(p.lexically_normal());
+        const std::filesystem::path p = std::filesystem::absolute(in, ec);
+        return ec ? path : p.lexically_normal().generic_u8string();
     }
 
     std::string parentPath(const std::string& path) {
         std::filesystem::path p = fsPath(absolutePath(path));
         if (!p.has_filename() && p.has_parent_path()) p = p.parent_path();
-        return fromPath(p.parent_path());
+        return p.parent_path().generic_u8string();
     }
 
     bool pathExists(const std::string& path) {

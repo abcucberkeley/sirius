@@ -53,7 +53,7 @@ namespace sirius::app::gui {
             std::string line;
             Remainder out;
             bool inFront = false, frontDone = false, introDone = page.intro.empty(), texDone = page.tex.empty();
-            bool inTex = false, inIntro = false, afterParams = false, skipping = false;
+            bool inTex = false, inIntro = false, afterParams = false, skipping = false, inParams = false;
             std::size_t lineNo = 0;
             while (std::getline(in, line)) {
                 const std::string t = trimmed(line);
@@ -79,16 +79,18 @@ namespace sirius::app::gui {
                     }
                     continue;
                 }
+                if (inIntro) {
+                    // The intro ends where parseHelpMarkdown ends a paragraph:
+                    // a heading, a table or a formula right after it is not
+                    // part of it.
+                    if (!(t.empty() || t[0] == '#' || t[0] == '|' || startsWith(t, "$$"))) continue;
+                    inIntro = false;
+                    introDone = true;
+                    if (t.empty()) continue;
+                }
                 if (!texDone && startsWith(t, "$$")) {
                     if (t.find("$$", 2) != std::string::npos) texDone = true;
                     else inTex = true;
-                    continue;
-                }
-                if (inIntro) {
-                    if (t.empty()) {
-                        inIntro = false;
-                        introDone = true;
-                    }
                     continue;
                 }
                 if (!introDone && !t.empty() && t[0] != '#' && t[0] != '|') {
@@ -99,10 +101,17 @@ namespace sirius::app::gui {
                     std::size_t level = 0;
                     while (level < t.size() && t[level] == '#') ++level;
                     const std::string name = toLower(trimmed(t.substr(level)));
-                    skipping = name == "parameters" || name == "note";
-                    if (name == "parameters") afterParams = true;
+                    skipping = name == "note";   // rendered from page.note
+                    inParams = name == "parameters";
+                    if (inParams) {   // the caption and the rows come from page.params
+                        afterParams = true;
+                        continue;
+                    }
                 }
                 if (skipping) continue;
+                // page.params holds the section's table rows only; what else
+                // the section says follows the rows
+                if (inParams && !t.empty() && t[0] == '|') continue;
                 (afterParams ? out.after : out.before) += line + "\n";
             }
             return out;
@@ -201,6 +210,41 @@ namespace sirius::app::gui {
             return ss.str();
         }
 
+        // `md` with "<key>: <value>" in its front matter, which is what
+        // parseHelpMarkdown reads: the lines between a first line "---" and
+        // the next "---" (to the end when none follows), where the last line
+        // of a key wins. The body is never searched -- a page may well
+        // mention the key in its text -- and the file keeps its line endings
+        // (the pages are checked out with CRLF on Windows).
+        std::string withFrontMatterValue(std::string md, const std::string& key, const std::string& value) {
+            const std::string entry = key + ": " + value;
+            const std::size_t firstEnd = std::min(md.find('\n'), md.size());
+            const std::string nl = firstEnd < md.size() && firstEnd > 0 && md[firstEnd - 1] == '\r' ? "\r\n" : "\n";
+            if (trimmed(std::string_view(md).substr(0, firstEnd)) != "---") return "---" + nl + entry + nl + "---" + nl + nl + md;
+            std::size_t found = std::string::npos, foundEnd = 0, close = std::string::npos;
+            for (std::size_t begin = firstEnd + 1; begin < md.size();) {
+                const std::size_t next = std::min(md.find('\n', begin), md.size());
+                std::size_t end = next;   // the line without its ending
+                if (end > begin && md[end - 1] == '\r') --end;
+                const std::string_view line = std::string_view(md).substr(begin, end - begin);
+                if (trimmed(line) == "---") {
+                    close = begin;
+                    break;
+                }
+                const std::size_t colon = line.find(':');
+                if (colon != std::string_view::npos && trimmed(line.substr(0, colon)) == key) {
+                    found = begin;
+                    foundEnd = end;
+                }
+                begin = next + 1;
+            }
+            if (found != std::string::npos) md.replace(found, foundEnd - found, entry);
+            else if (close != std::string::npos) md.insert(close, entry + nl);
+            else if (firstEnd < md.size()) md.insert(firstEnd + 1, entry + nl);   // nothing closes the block
+            else md += nl + entry + nl;
+            return md;
+        }
+
     } // namespace
 
     struct HelpWindow::Impl {
@@ -224,6 +268,7 @@ namespace sirius::app::gui {
 
         // the page as laid out for one width and one scale
         markdown::Images images;
+        std::vector<markdown::Images> retired;   // replaced this frame, released by the next draw()
         markdown::Layout top, bottom;   // above and below the figure
         float figureTop = 0.0f;         // where the figure starts, below `top`
         float layoutWidth = -1.0f, layoutScale = -1.0f;
@@ -237,8 +282,26 @@ namespace sirius::app::gui {
         }
 
         void load(const std::string& k) {
+            HelpPage loaded;
+            try {
+                loaded = loadHelpPage(k);
+            } catch (const std::exception& e) {
+                // Called from draw() and from the selection signal, where an
+                // exception would end the application. The page shown stays.
+                // The file's time is taken all the same, so that poll() reads
+                // the file again when it next changes, not every frame.
+                app.wb().logLine("Help: cannot read the " + k + " page: " + e.what());
+                if (page.kind.empty()) {   // the first page: at least its name
+                    kind = k;
+                    page.kind = k;
+                    page.title = k;
+                }
+                reloadAt = -1.0;
+                stamp();
+                return;
+            }
             kind = k;
-            page = loadHelpPage(k);
+            page = std::move(loaded);
             source = page.markdown;
 #ifndef __APPLE__
             if (k == "shortcuts") {
@@ -256,7 +319,11 @@ namespace sirius::app::gui {
                 page = std::move(shown);
             }
 #endif
-            images.clear();
+            // The draw list of this frame may already hold the old figure's
+            // texture (a dialog drawn after this window changes the
+            // selection): the next draw(), after the frame has been
+            // rendered, deletes it.
+            retired.push_back(std::exchange(images, markdown::Images{}));
             dirty = true;
             scrollToTop = true;
             reloadAt = -1.0;
@@ -312,17 +379,7 @@ namespace sirius::app::gui {
             }
             // the file as it is now (it may have been edited since it was read)
             std::string md = fs::exists(pagePath, ec) ? readText(pagePath) : source;
-            const std::string key = "figure_path:";
-            const std::size_t at = md.find(key);
-            const std::string value = target.filename().string();
-            if (at != std::string::npos) {
-                const std::size_t eol = md.find('\n', at);
-                md.replace(at, (eol == std::string::npos ? md.size() : eol) - at, key + " " + value);
-            } else if (md.rfind("---\n", 0) == 0) {
-                md.insert(4, key + " " + value + "\n");
-            } else {
-                md = "---\n" + key + " " + value + "\n---\n\n" + md;
-            }
+            md = withFrontMatterValue(std::move(md), "figure_path", target.filename().string());
             std::ofstream(pagePath, std::ios::binary) << md;
             load(kind);
         }
@@ -656,6 +713,7 @@ namespace sirius::app::gui {
 
     void HelpWindow::draw() {
         Impl& d = *impl_;
+        d.retired.clear();   // the frame that could draw them has been rendered
         d.seenSelection = d.app.bridge().rev().selection;
         if (!d.visible) return;
         d.poll();
@@ -708,7 +766,9 @@ namespace sirius::app::gui {
         d.followSelection = true;
         d.load(kind);
         d.visible = true;
-        d.raise = true;
+        // Following the selection only changes the page: taking the focus
+        // would end the typing in another window and hand it the keys.
+        if (!followCall) d.raise = true;
     }
 
     void HelpWindow::showManual() {

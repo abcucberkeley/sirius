@@ -38,6 +38,58 @@ namespace sirius::app {
 
         bool startsWith(const std::string& s, const char* prefix) { return s.rfind(prefix, 0) == 0; }
 
+        // The text with every ill-formed UTF-8 sequence (its longest valid
+        // prefix, or one byte) replaced by U+FFFD. A page saved in a legacy
+        // 8-bit encoding writes "é" as the single byte 0xE9; such bytes in a
+        // figure path or a link target make every conversion to a path throw
+        // on Windows, where the code page is UTF-8.
+        std::string validUtf8(const std::string& s) {
+            const auto byte = [&s](std::size_t k) { return static_cast<unsigned char>(s[k]); };
+            std::string out;
+            std::size_t copied = 0;   // s up to here is in `out`
+            std::size_t i = 0;
+            while (i < s.size()) {
+                const unsigned char lead = byte(i);
+                if (lead < 0x80) {
+                    ++i;
+                    continue;
+                }
+                // continuation bytes the lead byte asks for, and the range of
+                // the first one (no overlong forms, surrogates or code points
+                // past U+10FFFF)
+                std::size_t need = 0;
+                unsigned char lo = 0x80, hi = 0xBF;
+                if (lead >= 0xC2 && lead <= 0xDF) {
+                    need = 1;
+                } else if (lead >= 0xE0 && lead <= 0xEF) {
+                    need = 2;
+                    if (lead == 0xE0) lo = 0xA0;
+                    if (lead == 0xED) hi = 0x9F;
+                } else if (lead >= 0xF0 && lead <= 0xF4) {
+                    need = 3;
+                    if (lead == 0xF0) lo = 0x90;
+                    if (lead == 0xF4) hi = 0x8F;
+                }
+                std::size_t n = 1;   // bytes of the sequence that are well formed so far
+                while (n <= need && i + n < s.size()) {
+                    const unsigned char c = byte(i + n);
+                    if (n == 1 ? (c < lo || c > hi) : (c < 0x80 || c > 0xBF)) break;
+                    ++n;
+                }
+                if (need > 0 && n == need + 1) {
+                    i += n;
+                    continue;
+                }
+                out.append(s, copied, i - copied);
+                out += "\xEF\xBF\xBD";
+                i += n;
+                copied = i;
+            }
+            if (copied == 0) return s;   // nothing replaced
+            out.append(s, copied, std::string::npos);
+            return out;
+        }
+
         std::string lower(std::string s) {
             std::transform(s.begin(), s.end(), s.begin(), [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
             return s;
@@ -1206,7 +1258,7 @@ namespace sirius::app {
         if (!in) {
             auto mem = memoryPages().find(kind);
             if (mem != memoryPages().end() && !mem->second.empty()) {
-                HelpPage page = parseHelpMarkdown(kind, mem->second);
+                HelpPage page = parseHelpMarkdown(kind, validUtf8(mem->second));
                 page.path = file.string();   // "Edit page" creates the override here
                 return page;
             }
@@ -1220,7 +1272,10 @@ namespace sirius::app {
         }
         std::stringstream ss;
         ss << in.rdbuf();
-        HelpPage page = parseHelpMarkdown(kind, ss.str());
+        // Repaired once here, so that nothing that reads the page -- the
+        // figure path below, the link targets the window resolves, the help
+        // tool's JSON reply -- sees bytes that are not UTF-8.
+        HelpPage page = parseHelpMarkdown(kind, validUtf8(ss.str()));
         page.path = file.string();
         if (!page.figurePath.empty()) {
             const fs::path fig(page.figurePath);

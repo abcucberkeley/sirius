@@ -6,6 +6,7 @@
 #include <cmath>
 #include <cstdlib>
 #include <cstring>
+#include <exception>
 #include <filesystem>
 #include <utility>
 
@@ -499,6 +500,9 @@ namespace sirius::app::gui::markdown {
                     last = k;
                     j = k;
                 }
+                // Only the spaces that end the text are left (preformatted
+                // text keeps them): they make no line of their own.
+                if (!broke && last == first) break;
                 // metrics of the line
                 float asc = base.ascent, desc = base.size - base.ascent;
                 for (std::size_t k = first; k < last; ++k) {
@@ -715,9 +719,15 @@ namespace sirius::app::gui::markdown {
 
         std::string resolvePath(const std::string& target, const std::string& baseDir) {
             if (baseDir.empty() || isUrl(target)) return target;
-            const fs::path p = fs::u8path(target);
-            if (p.is_absolute()) return target;
-            return (fs::u8path(baseDir) / p).lexically_normal().u8string();
+            // u8path throws on Windows for bytes that are not UTF-8, and this
+            // runs while a window is drawn; such a target names no file.
+            try {
+                const fs::path p = fs::u8path(target);
+                if (p.is_absolute()) return target;
+                return (fs::u8path(baseDir) / p).lexically_normal().u8string();
+            } catch (const std::exception&) {
+                return target;
+            }
         }
 
         struct InlineParser {

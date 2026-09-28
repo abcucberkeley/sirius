@@ -68,7 +68,9 @@ namespace sirius::app::gui {
     // "40 s", "3:05 min", "1 h 12 min"
     std::string durationText(double seconds);
 
-    // File name helpers on UTF-8 paths (std::filesystem underneath).
+    // File name helpers on UTF-8 paths (std::filesystem underneath). The
+    // paths they make are written with '/', on Windows too, like the paths
+    // the file dialogs return.
     std::string fileName(const std::string& path);            // "stack.ome.tif"
     std::string completeBaseName(const std::string& path);    // "stack.ome"
     std::string parentPath(const std::string& path);          // absolute
