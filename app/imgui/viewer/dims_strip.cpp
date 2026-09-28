@@ -3,6 +3,8 @@
 #include <algorithm>
 #include <cstdint>
 
+#include <imgui_internal.h>
+
 #include "imgui/strings.hpp"
 #include "imgui/theme.hpp"
 #include "imgui/widgets/controls.hpp"
@@ -17,9 +19,13 @@ namespace sirius::app::gui {
         constexpr float kMarginX = 14, kMarginY = 8, kCol0 = 120, kCol2 = 80, kGap = 14, kRowGap = 6, kRowH = 20;
 
         // A slider's extra keys: page up / down step a tenth of the axis,
-        // home / end go to its ends (the arrows are the slider's own).
+        // home / end go to its ends (the arrows are the slider's own). The
+        // slider owns them while it has focus, so a shortcut on the same key
+        // stands back, as it does for the arrows.
         bool pageKeys(std::int64_t* v, std::int64_t n) {
             if (!ImGui::IsItemFocused() || n <= 1) return false;
+            for (ImGuiKey key : {ImGuiKey_PageUp, ImGuiKey_PageDown, ImGuiKey_Home, ImGuiKey_End})
+                ImGui::SetKeyOwner(key, ImGui::GetItemID());
             const std::int64_t page = std::max<std::int64_t>(1, n / 10);
             std::int64_t nv = *v;
             if (ImGui::IsKeyPressed(ImGuiKey_PageUp)) nv -= page;

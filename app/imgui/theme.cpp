@@ -96,7 +96,9 @@ namespace sirius::app::gui::theme {
             for (const std::string& fb : fallbacks) {
                 ImFontConfig cfg;
                 cfg.MergeMode = true;
-                io.Fonts->AddFontFromFileTTF(fb.c_str(), kBodyPx, &cfg);
+                // At the face's own reference size (0): merging at an explicit size into
+                // the default face, whose size is implicit, is an assertion in Dear ImGui.
+                io.Fonts->AddFontFromFileTTF(fb.c_str(), 0.0f, &cfg);
             }
             return f;
         }
@@ -143,7 +145,9 @@ namespace sirius::app::gui::theme {
         ImFont* f = font(w);
         if (!f) f = ImGui::GetFont();
         const ImGuiStyle& st = ImGui::GetStyle();
-        const float size = designPx * st.FontScaleMain * st.FontScaleDpi;
+        // Dear ImGui draws PushFont text at the rounded size (UpdateCurrentFontSize):
+        // measured at the exact one, text at 125 % would come out wider than said.
+        const float size = std::max(1.0f, snap(designPx * st.FontScaleMain * st.FontScaleDpi));
         ImVec2 s = f->CalcTextSizeA(size, FLT_MAX, 0.0f, text, end);
         s.x = std::ceil(s.x);
         return s;

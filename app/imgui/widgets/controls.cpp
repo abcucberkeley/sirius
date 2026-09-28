@@ -17,9 +17,11 @@ namespace sirius::app::gui::widgets {
 
     namespace {
 
+        // Rounded the way Dear ImGui rounds the size it draws PushFont text at
+        // (UpdateCurrentFontSize), so text drawn here matches theme::textSize.
         float fontPx(float designPx) {
             const ImGuiStyle& st = ImGui::GetStyle();
-            return designPx * st.FontScaleMain * st.FontScaleDpi;
+            return std::max(1.0f, ImGui::GetRoundedFontSize(designPx * st.FontScaleMain * st.FontScaleDpi));
         }
 
         ImU32 dim(ImU32 c, bool enabled) { return enabled ? c : theme::withAlpha(c, 0.45f); }
@@ -578,6 +580,15 @@ namespace sirius::app::gui::widgets {
             const float x = ImGui::GetIO().MousePos.x;
             return std::clamp(static_cast<double>((x - t.x0) / std::max(1.0f, t.x1 - t.x0)), 0.0, 1.0);
         }
+
+        // The arrows step a focused slider: the slider (the last item) owns them,
+        // so a plain Left / Right menu shortcut, which asks for keys nobody owns,
+        // stands back. Ownership set now holds on the frame the key goes down.
+        void claimArrows() {
+            const ImGuiID id = ImGui::GetItemID();
+            ImGui::SetKeyOwner(ImGuiKey_LeftArrow, id);
+            ImGui::SetKeyOwner(ImGuiKey_RightArrow, id);
+        }
     } // namespace
 
     bool slider(const char* id, double* v, double lo, double hi, const SliderOpts& o) {
@@ -593,6 +604,7 @@ namespace sirius::app::gui::widgets {
             }
         }
         if (ImGui::IsItemFocused() && o.enabled && span > 0.0) {
+            claimArrows();
             const double step = span / 100.0;
             if (ImGui::IsKeyPressed(ImGuiKey_LeftArrow)) {
                 *v = std::max(lo, *v - step);
@@ -626,6 +638,7 @@ namespace sirius::app::gui::widgets {
             }
         }
         if (ImGui::IsItemFocused() && o.enabled && span > 0) {
+            claimArrows();
             if (ImGui::IsKeyPressed(ImGuiKey_LeftArrow) && value > lo) {
                 --value;
                 changed = true;
@@ -894,7 +907,13 @@ namespace sirius::app::gui::widgets {
             const FieldFrame frame(o);
             ImGuiInputTextFlags flags = o.readOnly ? ImGuiInputTextFlags_ReadOnly : ImGuiInputTextFlags_None;
             std::int64_t v = *value;
-            if (ImGui::InputScalar(id, ImGuiDataType_S64, &v, nullptr, nullptr, "%lld", flags)) {
+            // the spin arrows are items over the field's right end
+            if (step > 0 && !o.readOnly) ImGui::SetNextItemAllowOverlap();
+            // live edit, as inputDouble: typing reports on the frames it happens, both alike
+            ImGui::PushItemFlag(ImGuiItemFlags_LiveEditOnInputScalar, true);
+            const bool edited = ImGui::InputScalar(id, ImGuiDataType_S64, &v, nullptr, nullptr, "%lld", flags);
+            ImGui::PopItemFlag();
+            if (edited) {
                 v = std::clamp(v, lo, std::max(lo, hi));
                 if (v != *value) {
                     *value = v;
@@ -903,7 +922,9 @@ namespace sirius::app::gui::widgets {
             }
             min = ImGui::GetItemRectMin();
             max = ImGui::GetItemRectMax();
-            if (ImGui::IsItemHovered() && ImGui::IsItemFocused() && step > 0 && !o.readOnly) {
+            // the wheel steps over the whole field, the spin arrows on it included
+            if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenOverlappedByItem) && ImGui::IsItemFocused() && step > 0 &&
+                !o.readOnly) {
                 const float wheel = ImGui::GetIO().MouseWheel;
                 if (wheel != 0.0f) {
                     *value = std::clamp(*value + (wheel > 0 ? step : -step), lo, std::max(lo, hi));
@@ -933,11 +954,36 @@ namespace sirius::app::gui::widgets {
             const FieldFrame frame(o);
             ImGuiInputTextFlags flags = o.readOnly ? ImGuiInputTextFlags_ReadOnly : ImGuiInputTextFlags_None;
             double v = *value;
-            if (ImGui::InputScalar(id, ImGuiDataType_Double, &v, nullptr, nullptr, fmt.c_str(), flags)) {
+            // the spin arrows are items over the field's right end
+            if (step > 0.0 && !o.readOnly) ImGui::SetNextItemAllowOverlap();
+            // Without live edit, Dear ImGui parses the field's text whenever it lets
+            // go, typed into or not: a value with more digits than it shows would
+            // come back rounded to them just for being focused.
+            ImGui::PushItemFlag(ImGuiItemFlags_LiveEditOnInputScalar, true);
+            const bool edited = ImGui::InputScalar(id, ImGuiDataType_Double, &v, nullptr, nullptr, fmt.c_str(), flags);
+            ImGui::PopItemFlag();
+            // Escape after typing puts back the text the field showed when it took
+            // the keyboard, which live edit then parses: the value rounded to
+            // `decimals`. The value itself is kept to put back instead. Only one
+            // item has the keyboard at a time, so one slot serves every field.
+            static struct {
+                ImGuiID id;
+                double value;
+            } typedFrom = {0, 0.0};
+            const ImGuiID fieldId = ImGui::GetItemID();
+            if (ImGui::IsItemActivated()) typedFrom = {fieldId, *value};
+            if (edited) {
                 if (std::isfinite(lo)) v = std::max(v, lo);
                 if (std::isfinite(hi)) v = std::min(v, hi);
                 if (v != *value) {
                     *value = v;
+                    changed = true;
+                }
+            }
+            if (ImGui::IsItemDeactivated() && typedFrom.id == fieldId) {
+                typedFrom.id = 0;
+                if (ImGui::IsKeyPressed(ImGuiKey_Escape, false) && *value != typedFrom.value) {
+                    *value = typedFrom.value;
                     changed = true;
                 }
             }
@@ -961,19 +1007,22 @@ namespace sirius::app::gui::widgets {
     }
 
     namespace {
-        // The popup of a dropdown: 2 px ink border, rows that highlight in neutral-200.
+        // The popup of a dropdown: 2 px ink border, rows that highlight in neutral-200
+        // and touch. Without `rowSpacing` the rows' spacing is left to the caller,
+        // for BeginCombo, which lays out its field under the same pushes.
         struct PopupLook {
-            PopupLook() {
+            int vars;
+            explicit PopupLook(bool rowSpacing = true) : vars(rowSpacing ? 3 : 2) {
                 ImGui::PushStyleColor(ImGuiCol_Border, theme::kText);
                 ImGui::PushStyleColor(ImGuiCol_Header, theme::kSurface);
                 ImGui::PushStyleColor(ImGuiCol_HeaderHovered, theme::kNeutral200);
                 ImGui::PushStyleColor(ImGuiCol_HeaderActive, theme::kNeutral300);
                 ImGui::PushStyleVar(ImGuiStyleVar_PopupBorderSize, theme::crispPen(2));
                 ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, px(0, 2));
-                ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, px(0, 0));
+                if (rowSpacing) ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, px(0, 0));
             }
             ~PopupLook() {
-                ImGui::PopStyleVar(3);
+                ImGui::PopStyleVar(vars);
                 ImGui::PopStyleColor(4);
             }
         };
@@ -999,37 +1048,48 @@ namespace sirius::app::gui::widgets {
         bool changed = false;
         const int n = static_cast<int>(items.size());
         const std::string preview = current && *current >= 0 && *current < n ? items[static_cast<std::size_t>(*current)] : std::string();
-        bool open = false;
+        ImVec2 min, max;
         {
             const FieldFrame frame(o);
-            const PopupLook look;
-            // the preview is drawn here, elided, so a long choice never runs under the chevron
-            open = ImGui::BeginCombo(id, "", ImGuiComboFlags_NoArrowButton | ImGuiComboFlags_HeightLarge);
-            if (open) {
-                for (int i = 0; i < n; ++i) {
-                    ImGui::PushID(i);
-                    if (popupItem(items[static_cast<std::size_t>(i)], current && *current == i)) {
-                        if (current && *current != i) {
-                            *current = i;
-                            changed = true;
+            {
+                // BeginCombo draws the field and begins the popup in one call, and the
+                // popup's ink border is read there: the field is drawn without a border
+                // and gets FieldFrame's below. The rows' spacing is pushed inside the
+                // popup, so the field keeps the usual spacing under it.
+                const PopupLook look(false);
+                ImGui::PushStyleVar(ImGuiStyleVar_FrameBorderSize, 0.0f);
+                // ten rows before the list scrolls
+                ImGui::SetNextWindowSizeConstraints(ImVec2(0.0f, 0.0f), ImVec2(FLT_MAX, 10.0f * theme::snap(px(26)) + px(4)));
+                // the preview is drawn below, elided, so a long choice never runs under the chevron
+                if (ImGui::BeginCombo(id, "", ImGuiComboFlags_NoArrowButton)) {
+                    ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, px(0, 0));
+                    for (int i = 0; i < n; ++i) {
+                        ImGui::PushID(i);
+                        if (popupItem(items[static_cast<std::size_t>(i)], current && *current == i)) {
+                            if (current && *current != i) {
+                                *current = i;
+                                changed = true;
+                            }
                         }
+                        ImGui::PopID();
                     }
-                    ImGui::PopID();
+                    ImGui::PopStyleVar();
+                    ImGui::EndCombo();
                 }
-                ImGui::EndCombo();
+                ImGui::PopStyleVar();
             }
+            // The popup's End() made the field the last item again: its rectangle
+            // is the field's whether the list is open or not.
+            min = ImGui::GetItemRectMin();
+            max = ImGui::GetItemRectMax();
+            ImGui::RenderFrameBorder(min, max, 0.0f);
         }
-        // BeginCombo's item is the last item only while the popup is closed; its
-        // rectangle is kept by the combo's own id either way
-        const ImVec2 min = ImGui::GetItemRectMin(), max = ImGui::GetItemRectMax();
-        if (!open) {
-            ImDrawList* dl = ImGui::GetWindowDrawList();
-            const float room = (max.x - min.x) - px(8) - px(24);
-            drawTextIn(dl, ImVec2(min.x + px(8), min.y), ImVec2(max.x - px(24), max.y), elideText(preview, room, 13), 13,
-                       dim(theme::kText, o.enabled), Weight::Regular, 0.0f, 0.5f);
-            chevron(min, max, o.enabled);
-            if (ImGui::IsItemHovered() && o.enabled) ImGui::SetMouseCursor(ImGuiMouseCursor_Hand);
-        }
+        ImDrawList* dl = ImGui::GetWindowDrawList();
+        const float room = (max.x - min.x) - px(8) - px(24);
+        drawTextIn(dl, ImVec2(min.x + px(8), min.y), ImVec2(max.x - px(24), max.y), elideText(preview, room, 13), 13,
+                   dim(theme::kText, o.enabled), Weight::Regular, 0.0f, 0.5f);
+        chevron(min, max, o.enabled);
+        if (ImGui::IsItemHovered() && o.enabled) ImGui::SetMouseCursor(ImGuiMouseCursor_Hand);
         return changed;
     }
 
@@ -1042,6 +1102,8 @@ namespace sirius::app::gui::widgets {
             const FieldFrame frame(o, 0.0f);
             ImGui::PushStyleColor(ImGuiCol_TextDisabled, theme::kNeutral500);
             ImGuiInputTextFlags flags = o.enterReturnsTrue ? ImGuiInputTextFlags_EnterReturnsTrue : ImGuiInputTextFlags_None;
+            // the drop button is an item over the field's right end
+            ImGui::SetNextItemAllowOverlap();
             if (o.hint.empty()) changed = ImGui::InputText("##edit", value, flags);
             else changed = ImGui::InputTextWithHint("##edit", o.hint.c_str(), value, flags);
             ImGui::PopStyleColor();
