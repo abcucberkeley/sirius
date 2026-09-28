@@ -142,6 +142,12 @@ namespace sirius::app::gui::dialog_support {
 
     // "Cancel" (ghost) and the primary action, flush right. Enter accepts
     // when nothing is being edited, as a dialog's default button does.
+    //
+    // Not while a popup is open above the dialog: a message box shown over
+    // it or one of its own dropdowns. Their focus counts as the dialog's (the
+    // focus test follows the popup hierarchy), and the dialog is drawn before
+    // them, so the Enter that answers the box started the export and dropped
+    // the box unanswered.
     inline Action actionRow(const std::string& primary, bool enabled) {
         const float gap = theme::px(8);
         const float total = buttonWidth("Cancel", widgets::ButtonKind::Ghost) + gap + buttonWidth(primary, widgets::ButtonKind::Primary);
@@ -153,8 +159,8 @@ namespace sirius::app::gui::dialog_support {
         if (widgets::button("Cancel##dialogCancel", cancel)) action = Action::Cancel;
         ImGui::SameLine(0.0f, gap);
         if (widgets::primaryButton((primary + "##dialogAccept").c_str(), 0.0f, enabled)) action = Action::Accept;
-        if (action == Action::None && enabled && ImGui::IsWindowFocused(ImGuiFocusedFlags_RootAndChildWindows) &&
-            !ImGui::IsAnyItemActive() &&
+        if (action == Action::None && enabled && !ImGui::IsPopupOpen("", ImGuiPopupFlags_AnyPopupId) &&
+            ImGui::IsWindowFocused(ImGuiFocusedFlags_RootAndChildWindows) && !ImGui::IsAnyItemActive() &&
             (ImGui::IsKeyPressed(ImGuiKey_Enter, false) || ImGui::IsKeyPressed(ImGuiKey_KeypadEnter, false)))
             action = Action::Accept;
         return action;

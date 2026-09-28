@@ -368,6 +368,10 @@ namespace sirius::app {
         if (r.nc() <= 0) return "No channel selected.";
         if (o.scaling == ExportScaling::FixedRange && !(o.rangeHi > o.rangeLo)) return "The fixed range needs hi > lo.";
         if (o.scaling == ExportScaling::Percentile && !(o.percentileHi > o.percentileLo)) return "The percentile range needs hi > lo.";
+        // percentiles() clamps to 0..100: 100 / 4000 became 100 / 100 and fell
+        // back to min - max, -5 / 150 became 0 / 100, with nothing said
+        if (o.scaling == ExportScaling::Percentile && (o.percentileLo < 0.0 || o.percentileHi > 100.0))
+            return "Percentiles must be within 0..100.";
         if (o.format == ExportFormat::Tiff) {
             if (o.tiff.tiled && (o.tiff.tileWidth < 16 || o.tiff.tileHeight < 16)) return "TIFF tiles must be at least 16 x 16.";
             if (o.tiff.pyramidLevels < 1 || o.tiff.pyramidLevels > 16) return "Pyramid levels must be 1..16.";
@@ -382,6 +386,11 @@ namespace sirius::app {
             if (o.zarr.pyramidLevels < 1 || o.zarr.pyramidLevels > 16) return "Pyramid levels must be 1..16.";
             if (o.zarr.codec != "blosc-zstd" && o.zarr.codec != "blosc-lz4" && o.zarr.codec != "zstd" && o.zarr.codec != "gzip" && o.zarr.codec != "none")
                 return "Unknown codec '" + o.zarr.codec + "'.";
+            // TensorStore refuses a level the codec does not take, and only
+            // when the store is created, after the whole array was converted
+            if ((o.zarr.codec == "blosc-zstd" || o.zarr.codec == "blosc-lz4") && (o.zarr.level < 0 || o.zarr.level > 9))
+                return "The blosc compression level must be 0..9.";
+            if (o.zarr.codec == "zstd" && o.zarr.level > 22) return "The zstd compression level must be at most 22.";
         }
         return {};
     }

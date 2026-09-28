@@ -303,6 +303,18 @@ TEST_CASE("export options: extension, availability, estimate and validation", "[
     o.rangeLo = 1.0;
     o.rangeHi = 0.0;
     CHECK_FALSE(validateExport(o, d).empty());
+    // percentiles outside 0..100 were clamped at export: 100 / 4000 silently
+    // became min - max, -5 / 150 the 0th to the 100th percentile
+    o.scaling = ExportScaling::Percentile;
+    o.percentileLo = 100.0;
+    o.percentileHi = 4000.0;
+    CHECK_THAT(validateExport(o, d), Catch::Matchers::ContainsSubstring("0..100"));
+    o.percentileLo = -5.0;
+    o.percentileHi = 150.0;
+    CHECK_THAT(validateExport(o, d), Catch::Matchers::ContainsSubstring("0..100"));
+    o.percentileLo = 0.0;
+    o.percentileHi = 100.0;
+    CHECK(validateExport(o, d).empty());
     o.scaling = ExportScaling::Cast;
     o.range.t0 = 5;
     CHECK_THAT(validateExport(o, d), Catch::Matchers::ContainsSubstring("time range"));
@@ -316,6 +328,26 @@ TEST_CASE("export options: extension, availability, estimate and validation", "[
     CHECK(estimateExportBytes(d, o) == 0);
     o.includeLabels = true;
     CHECK(estimateExportBytes(d, o) == 0);
+}
+
+TEST_CASE("zarr export validation refuses a compression level the codec does not take", "[app][io][export][zarr]") {
+    if (!sirius::app::zarrSupported()) SKIP("built without TensorStore");
+    ExportOptions o;
+    o.path = "/tmp/x.zarr";
+    o.format = ExportFormat::Zarr;
+    const Dims5 d{2, 3, 4, 100, 100};
+    // blosc takes 0..9: level 19 failed in TensorStore after the whole array was converted
+    o.zarr.codec = "blosc-zstd";
+    o.zarr.level = 9;
+    CHECK(validateExport(o, d).empty());
+    o.zarr.level = 19;
+    CHECK_THAT(validateExport(o, d), Catch::Matchers::ContainsSubstring("0..9"));
+    o.zarr.codec = "blosc-lz4";
+    CHECK_THAT(validateExport(o, d), Catch::Matchers::ContainsSubstring("0..9"));
+    o.zarr.codec = "zstd";
+    CHECK(validateExport(o, d).empty());
+    o.zarr.level = 23;
+    CHECK_THAT(validateExport(o, d), Catch::Matchers::ContainsSubstring("22"));
 }
 
 TEST_CASE("zarr export chunks are given as (c, t, z, y, x) and written as (t, c, z, y, x)", "[app][io][export][zarr]") {

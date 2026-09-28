@@ -85,7 +85,7 @@ namespace sirius::app::gui {
         public:
             ExportDialog(App& app, std::function<void(int, const ExportOptions&)> accepted) : accepted_(std::move(accepted)) {
                 const Workbench& wb = app.wb();
-                step_ = std::max(0, wb.viewedIndex());
+                chosenStep(wb);   // no step chosen yet: the viewed one
 
                 // defaults from the dataset
                 const DatasetMeta& ds = wb.dataset();
@@ -107,10 +107,9 @@ namespace sirius::app::gui {
 
             void draw(App& app) override {
                 const Workbench& wb = app.wb();
-                const Pipeline& p = wb.pipeline();
-                step_ = std::clamp(step_, 0, std::max(0, p.size() - 1));
-                DatasetMeta meta = wb.outputMetaOf(step_);
-                const std::shared_ptr<const StepOutput> out = wb.output(step_);
+                int step = chosenStep(wb);
+                DatasetMeta meta = wb.outputMetaOf(step);
+                const std::shared_ptr<const StepOutput> out = wb.output(step);
                 if (out) meta = out->meta;
                 followStep(meta.dims);
                 labelsAvailable_ = out && out->labels;
@@ -122,19 +121,24 @@ namespace sirius::app::gui {
                     ImGui::TableNextColumn();
                     drawFormats(meta.dims);
                     ImGui::TableNextColumn();
-                    drawOptions(app, meta.dims, out != nullptr);
+                    drawOptions(app, step, meta.dims, out != nullptr);
                     ImGui::EndTable();
                 }
                 ImGui::PopStyleVar();
 
                 widgets::vspace(6);
+                // A run or a task (a load, another export) holds the worker and
+                // the export task would be refused, after the pipeline sidecar
+                // was written: Export waits, with the dialog kept open.
+                const bool busy = app.bridge().busy();
+                if (busy) note("A run or a task is in progress: Export is available again when it has finished.", theme::kAccentText);
                 const ExportOptions o = options();
-                const std::string problem = validateExport(o, meta.dims);
-                const bool enabled = problem.empty() && !trimmed(destination_).empty();
+                const std::string problem = problemOf(o, meta.dims);
+                const bool enabled = problem.empty() && !trimmed(destination_).empty() && !busy;
                 switch (actionRow(std::string("Export ") + formatRows()[static_cast<std::size_t>(format_)].name, enabled)) {
                     case Action::Cancel: close(); break;
                     case Action::Accept:
-                        if (accepted_) accepted_(step_, o);
+                        if (accepted_) accepted_(step, o);
                         close();
                         break;
                     case Action::None: break;
@@ -142,6 +146,71 @@ namespace sirius::app::gui {
             }
 
         private:
+            // The index of the chosen step, which is held by its id: the
+            // assistant's tool calls run between frames and can add, remove
+            // or move steps while the dialog is open, and an index kept from
+            // the frame before then named another step, whose output the
+            // export wrote. A replaced pipeline (the example, a dropped
+            // .sirius.toml) keeps the ids its steps bring, so the id can come
+            // back as another step; no edit changes a step's kind, so a step
+            // of another kind under it is the replacement's, and is gone as
+            // the chosen one. (The name is no test: a rename keeps the step.)
+            // A gone step's place is taken by the viewed one. A replacement
+            // that puts a step of the same kind under the id keeps it chosen;
+            // the old outputs went with the old pipeline, so it has none
+            // until it runs.
+            int chosenStep(const Workbench& wb) {
+                const Pipeline& p = wb.pipeline();
+                int step = p.indexOf(stepId_);
+                if (step < 0 || p.at(step).kind != stepKind_) {
+                    step = std::clamp(wb.viewedIndex(), 0, std::max(0, p.size() - 1));
+                    choose(p, step);
+                }
+                return step;
+            }
+
+            void choose(const Pipeline& p, int step) {
+                const bool known = step >= 0 && step < p.size();
+                stepId_ = known ? p.at(step).id : StepId{0};
+                stepKind_ = known ? p.at(step).kind : std::string();
+            }
+
+            // What keeps Export disabled, or empty. The channel and chunk
+            // fields are checked here before validateExport: options() cannot
+            // pass on an entry it does not read, and dropping one exported
+            // every channel, or the default chunks, with nothing said.
+            std::string problemOf(const ExportOptions& o, const Dims5& dims) const {
+                std::string problem = channelsProblem(dims);
+                if (problem.empty() && (o.format == ExportFormat::Zarr || o.format == ExportFormat::N5)) problem = chunkProblem();
+                if (problem.empty()) problem = validateExport(o, dims);
+                return problem;
+            }
+
+            std::string channelsProblem(const Dims5& dims) const {
+                for (const std::string& part : split(channels_, ',', true)) {
+                    const std::string entry = trimmed(part);
+                    if (entry.empty()) continue;   // "0, 2, ": a blank entry names no channel
+                    long long c = 0;
+                    if (!parseInt(entry, c) || c < 0)
+                        return "Channels are numbers separated by commas, such as 0, 2: '" + entry + "' is not one.";
+                    const long long n = static_cast<long long>(dims.c);
+                    if (n > 0 && c >= n)
+                        return format("There is no channel %lld: this step has %lld channel%s, numbered from 0.", c, n, n == 1 ? "" : "s");
+                }
+                return {};
+            }
+
+            std::string chunkProblem() const {
+                const std::vector<std::string> parts = split(chunk_, ',', true);
+                bool readable = parts.size() == 5;
+                for (std::size_t i = 0; readable && i < parts.size(); ++i) {
+                    long long v = 0;
+                    readable = parseInt(parts[i], v) && v > 0;
+                }
+                if (readable) return {};
+                return "The chunk shape is five numbers of at least 1, separated by commas: c, t, z, y, x.";
+            }
+
             void selectFormat(int i) {
                 if (i < 0 || i >= static_cast<int>(formatRows().size())) return;
                 const FormatRow& f = formatRows()[static_cast<std::size_t>(i)];
@@ -217,7 +286,7 @@ namespace sirius::app::gui {
                 }
             }
 
-            void drawOptions(App& app, const Dims5& dims, bool computed) {
+            void drawOptions(App& app, int& step, const Dims5& dims, bool computed) {
                 const Workbench& wb = app.wb();
                 const Pipeline& p = wb.pipeline();
                 const Spacing spacing(8, 12);
@@ -234,13 +303,13 @@ namespace sirius::app::gui {
                         steps.push_back(std::move(label));
                     }
                     const Field f("From step");
-                    widgets::combo("##step", &step_, steps);
+                    if (widgets::combo("##step", &step, steps)) choose(p, step);
                 }
                 // The file gets the step's last output, while the sidecar records the
                 // pipeline as it is now: after a parameter edit or an undo the two do
                 // not belong together, and nothing said so.
-                if (computed && !wb.outputFresh(step_))
-                    note("The parameters changed since step " + Step::number(step_) +
+                if (computed && !wb.outputFresh(step))
+                    note("The parameters changed since step " + Step::number(step) +
                              " was computed: the export writes that earlier "
                              "result, and a pipeline sidecar would record the current parameters, which did not "
                              "produce it. Run the step again for a matching pair.",
@@ -367,8 +436,15 @@ namespace sirius::app::gui {
                     }
                     ImGui::SameLine(0.0f, px(10));
                     {
+                        // The levels the codec takes: blosc 0..9, zstd up to 22,
+                        // gzip 1..9. One range for all let blosc have 19, which
+                        // TensorStore refused after the whole array was converted.
+                        // A level kept from another codec is brought into range.
+                        const std::string& codec = codecName();
+                        const std::int64_t lo = codec == "gzip" ? 1 : 0, hi = codec == "zstd" ? 22 : 9;
+                        if (codec != "none") zarrLevel_ = std::clamp(zarrLevel_, lo, hi);
                         const Field f(" ");
-                        prefixedInt("##zarrLevel", "level", &zarrLevel_, 0, 22, w);
+                        prefixedInt("##zarrLevel", "level", &zarrLevel_, lo, hi, w, 1, codec != "none");
                     }
                     widgets::checkbox("Shard chunks (zarr v3)", &shard_, o.format == ExportFormat::Zarr && o.zarr.zarrVersion == 3);
                     widgets::checkbox("OME-NGFF multiscales metadata", &ngff_);
@@ -394,7 +470,7 @@ namespace sirius::app::gui {
                     widgets::checkbox("Include pipeline sidecar (.pipeline.toml)", &sidecarPipeline_);
                     widgets::checkbox("Include labels sidecar", &sidecarLabels_, labelsAvailable_);
                 }
-                const std::string problem = validateExport(o, dims);
+                const std::string problem = problemOf(o, dims);
                 if (!problem.empty()) note(problem, theme::kAccentText);
             }
 
@@ -406,6 +482,10 @@ namespace sirius::app::gui {
                 const std::string chosen = dir ? platform::saveFileDialog("Export store", start, fileName(current), {{"Stores", "zarr,n5"}})
                                                : platform::saveFileDialog("Export file", start, fileName(current));
                 if (!chosen.empty()) destination_ = chosen;
+            }
+
+            const std::string& codecName() const {
+                return codecs()[static_cast<std::size_t>(std::clamp(codec_, 0, static_cast<int>(codecs().size()) - 1))];
             }
 
             ExportOptions options() const {
@@ -445,13 +525,15 @@ namespace sirius::app::gui {
                 o.tiff.downsample = static_cast<int>(downsample_);
                 o.zarr.zarrVersion = zarrVersion_ == 1 ? 2 : 3;
                 {
+                    // An entry that is missing or does not read is 0, which
+                    // validation refuses, rather than the default it kept.
                     const std::vector<std::string> parts = split(chunk_, ',', true);
-                    for (std::size_t i = 0; i < 5 && i < parts.size(); ++i) {
+                    for (std::size_t i = 0; i < 5; ++i) {
                         long long v = 0;
-                        if (parseInt(parts[i], v) && v > 0) o.zarr.chunk[i] = static_cast<Index>(v);
+                        o.zarr.chunk[i] = i < parts.size() && parseInt(parts[i], v) ? static_cast<Index>(v) : 0;
                     }
                 }
-                o.zarr.codec = codecs()[static_cast<std::size_t>(std::clamp(codec_, 0, static_cast<int>(codecs().size()) - 1))];
+                o.zarr.codec = codecName();
                 o.zarr.level = static_cast<int>(zarrLevel_);
                 o.zarr.shard = shard_;
                 o.zarr.pyramidLevels = static_cast<int>(pyramid_);
@@ -464,7 +546,8 @@ namespace sirius::app::gui {
 
             std::function<void(int, const ExportOptions&)> accepted_;
             int format_ = 0;
-            int step_ = 0;
+            StepId stepId_ = 0;
+            std::string stepKind_;   // the chosen step's kind, which tells it from a replacement's under its id
             std::int64_t t0_ = 0, t1_ = 0, z0_ = 0, z1_ = 0;
             // Whether the user set the t / z range. Until then it follows the
             // chosen step's extents; it used to keep the first step's, so a
