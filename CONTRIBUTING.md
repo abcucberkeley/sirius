@@ -32,6 +32,7 @@ ctest --preset linux-gcc-dev
 | --- | --- |
 | `linux-gcc-dev`, `linux-clang-dev`, `win-msvc-dev` | the library, tests, warnings, Python bindings (Debug) |
 | `linux-gcc-app-dev`, `win-msvc-app-dev` | the Qt workbench (`app/`) and TensorStore (zarr / N5) |
+| `linux-gcc-imgui-dev`, `win-msvc-imgui-dev` | the Dear ImGui workbench (`app/imgui`); no Qt, dependencies fetched |
 | `linux-cuda-dev`, `win-msvc-cuda-dev` | CUDA, cuFFT, nvTIFF, `CMAKE_CUDA_ARCHITECTURES=native` |
 | `fiona-avx2-*` | the cluster builds: AVX2, optionally CUDA |
 | `*-release` | Release, no tests |

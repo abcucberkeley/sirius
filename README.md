@@ -522,6 +522,32 @@ nasm` when there is no system package). Add `-DSIRIUS_ENABLE_APP=ON` to a CUDA p
 for the GPU backend. On Windows `windeployqt` copies the Qt runtime next to the
 executable after every link (`SIRIUS_APP_DEPLOY_QT`).
 
+### The same workbench without Qt (`app/imgui`)
+
+`sirius-imgui` is the workbench again, over [Dear ImGui](https://github.com/ocornut/imgui)
+(docking branch), GLFW and OpenGL 3.3, with [ImPlot](https://github.com/epezent/implot)
+for the diagnostics charts: the same window, panels, dialogs, menus, shortcuts and
+command line, on the same core (`app/core`) — so pipelines, plugins, the Python worker
+and the assistant's tools behave identically. It needs no Qt installation: GLFW, Dear
+ImGui, ImPlot, the text editor widget, native file dialogs and libcurl are fetched and
+built in-tree at pinned revisions (`cmake/Dependencies.cmake`), which makes it the
+application to build on a machine where installing Qt is not an option.
+
+```
+cmake --preset linux-gcc-imgui-dev                  # win-msvc-imgui-dev on Windows; add -DSIRIUS_ENABLE_TENSORSTORE=ON for zarr / N5
+cmake --build --preset linux-gcc-imgui-dev --target sirius-imgui
+build/linux-gcc-imgui-dev/app/imgui/sirius-imgui --pipeline examples/sim_bundled.sirius.toml --run
+```
+
+`SIRIUS_ENABLE_IMGUI_APP=ON` is the option behind the presets; it can be combined with
+`SIRIUS_ENABLE_APP=ON` to build both applications from one tree. On Linux the build
+needs the X11 / Wayland development packages GLFW asks for (`xorg-dev libwayland-dev
+libxkbcommon-dev` on Debian and Ubuntu), `libdbus-1-dev` for the file dialogs (they go
+through the desktop portal) and uses the system's libcurl when there is one. Settings
+live in `<config>/sirius/sirius-imgui.json` with the dock layout in `imgui.ini` beside
+it; secrets are shared with the Qt application's store. [app/imgui/README.md](app/imgui/README.md)
+describes how the layer is organised and how it differs from the Qt one.
+
 ## Python Bindings
 Dev install
 ```

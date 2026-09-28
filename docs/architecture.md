@@ -94,6 +94,15 @@ Qt-free, and tested without a display.
 * **The top** — `plugin` (a user operation the worker serves), `workbench`,
   `tool_api`.
 
+## The two applications (`app/qt`, `app/imgui`)
+
+Both are GUI layers over `sirius_app_core` and nothing else: `sirius-app`
+(Qt Widgets, `SIRIUS_ENABLE_APP`) and `sirius-imgui` (Dear ImGui, GLFW,
+OpenGL 3.3, ImPlot; `SIRIUS_ENABLE_IMGUI_APP`). Neither is a unit graph —
+their sources are globbed — and neither is included by the core, so the
+core's tests run the same whichever application is enabled.
+`app/imgui/README.md` maps the files of one onto the other.
+
 ## Adding a unit
 
 1. Put the header and sources where they belong and declare the unit in
