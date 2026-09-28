@@ -40,6 +40,12 @@ namespace sirius::app {
         SimLayout sim;
         std::string acquisition;
         std::string pattern;                            // FilenameRule::pattern that produced it, for reference
+        // How that rule placed the tiles, so it can be offered again as it
+        // was: FilenameRule::positions as positionsName writes it, and the
+        // grid's overlapFraction. Empty in a manifest written before they
+        // were recorded, or by hand.
+        std::string positions;
+        std::optional<double> overlapFraction;
         // TIFF directory when this file is stored somewhere else. Empty: the
         // directory that holds the manifest (the usual in-folder case).
         std::string filesFolder;
@@ -84,6 +90,11 @@ namespace sirius::app {
         // Optional per-channel-token names / wavelengths ("488" -> {label "GFP", 488 nm, colour}).
         std::map<std::string, ChannelInfo> channelInfo;
     };
+
+    // FilenameRule::Positions as a manifest records it: "none", "grid" or
+    // "microns". And back: nullopt for any other text.
+    const char* positionsName(FilenameRule::Positions positions) noexcept;
+    std::optional<FilenameRule::Positions> positionsFromName(const std::string& name);
 
     struct FilenameMatch {
         std::string file;

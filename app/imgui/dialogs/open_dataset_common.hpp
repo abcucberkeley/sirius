@@ -7,10 +7,13 @@
 // field and the buttons beside it, the raw SIM layout, the voxel sizes) and
 // the button row at the bottom.
 //
-// Threads: a dialog owns one Worker. Its jobs run in the order they were
-// given and report with Bridge::post; what they post checks the dialog's
-// `alive` flag first, which the destructor clears before it joins the
-// thread, so a result that arrives late finds nothing to touch.
+// Threads: a dialog owns a Worker. Its jobs run in the order they were
+// given and report through the Worker (Worker::Post), never through the
+// dialog: the dialog closes on the GUI thread without waiting for a job
+// that is still waiting on a network share. What a job posts checks the
+// dialog's `alive` flag first, which the destructor clears, and that the
+// dialog is still on screen, so a result that arrives late or after
+// Cancel finds nothing to touch.
 
 #include <algorithm>
 #include <atomic>
@@ -31,6 +34,7 @@
 #include <imgui.h>
 
 #include "imgui/app.hpp"
+#include "imgui/bridge.hpp"
 #include "imgui/theme.hpp"
 #include "imgui/widgets/controls.hpp"
 
@@ -38,8 +42,10 @@ namespace sirius::app::gui::dataset_dialogs {
 
     // The folder dialog as the Open dialog's Folder… raises it: `opened` is
     // called when the dataset has started to open, so the Open dialog under
-    // it closes too (and remembers the folder). (folder_dataset_dialog.cpp)
-    std::shared_ptr<Dialog> makeFolderDatasetDialog(App& app, const std::string& folder, std::function<void()> opened);
+    // it closes too (and remembers the folder); `readAll` is the Open
+    // dialog's "Read as". (folder_dataset_dialog.cpp)
+    std::shared_ptr<Dialog> makeFolderDatasetDialog(App& app, const std::string& folder, std::function<void()> opened,
+                                                    bool readAll);
 
     // --- paths ---------------------------------------------------------------
     // The GUI's strings are UTF-8; std::filesystem takes them as such only
@@ -60,53 +66,92 @@ namespace sirius::app::gui::dataset_dialogs {
     }
 
     // --- the dialog's own thread ------------------------------------------------
+    // The thread is not joined when the Worker goes: a job can sit in a stat
+    // of an unreachable share for as long as the network takes, and the GUI
+    // thread that destroys the dialog must not wait for it. The queue lives
+    // in a State the thread shares; the Worker's destructor drops the jobs
+    // not started and lets the thread go, and the job in progress finishes
+    // into nothing, since its Post forwards to Bridge::post only while the
+    // Worker exists (and so, at shutdown, while the Bridge does). At quit,
+    // too, such a job is not waited for, or quitting would wait on the same
+    // share: it runs on into the process's exit, which ends it. The jobs
+    // only read, into their own copies (the dialogs write their files on
+    // the GUI thread), so one ended there leaves nothing half-written.
     class Worker {
     public:
-        Worker() : thread_([this] { loop(); }) {}
+        class Post;
+        // Runs on the thread; reports through the Post it is given.
+        using Job = std::function<void(const Post&)>;
+
+    private:
+        struct State {
+            explicit State(Bridge& b) : bridge(&b) {}
+            std::mutex mutex;
+            std::condition_variable ready;
+            std::deque<Job> jobs;
+            bool alive = true;   // false once the Worker is gone
+            Bridge* bridge;
+        };
+
+    public:
+        // Bridge::post for a job: runs `fn` on the GUI thread at the start of
+        // the next frame, or drops it when the Worker is gone.
+        class Post {
+        public:
+            void operator()(std::function<void()> fn) const {
+                const std::lock_guard<std::mutex> lock(state_->mutex);
+                if (state_->alive) state_->bridge->post(std::move(fn));
+            }
+
+        private:
+            friend class Worker;
+            explicit Post(std::shared_ptr<State> state) : state_(std::move(state)) {}
+            std::shared_ptr<State> state_;
+        };
+
+        explicit Worker(Bridge& bridge) : state_(std::make_shared<State>(bridge)) {
+            std::thread([state = state_] { loop(state); }).detach();
+        }
         ~Worker() {
             {
-                const std::lock_guard<std::mutex> lock(mutex_);
-                quit_ = true;
-                jobs_.clear();   // what has not started is not wanted any more
+                const std::lock_guard<std::mutex> lock(state_->mutex);
+                state_->alive = false;
+                state_->jobs.clear();   // what has not started is not wanted any more
             }
-            ready_.notify_all();
-            if (thread_.joinable()) thread_.join();
+            state_->ready.notify_all();
         }
         Worker(const Worker&) = delete;
         Worker& operator=(const Worker&) = delete;
 
-        void run(std::function<void()> job) {
+        void run(Job job) {
             {
-                const std::lock_guard<std::mutex> lock(mutex_);
-                jobs_.push_back(std::move(job));
+                const std::lock_guard<std::mutex> lock(state_->mutex);
+                state_->jobs.push_back(std::move(job));
             }
-            ready_.notify_one();
+            state_->ready.notify_one();
         }
 
     private:
-        void loop() {
+        static void loop(const std::shared_ptr<State>& state) {
+            const Post post(state);
             for (;;) {
-                std::function<void()> job;
+                Job job;
                 {
-                    std::unique_lock<std::mutex> lock(mutex_);
-                    ready_.wait(lock, [this] { return quit_ || !jobs_.empty(); });
-                    if (quit_) return;
-                    job = std::move(jobs_.front());
-                    jobs_.pop_front();
+                    std::unique_lock<std::mutex> lock(state->mutex);
+                    state->ready.wait(lock, [&state] { return !state->alive || !state->jobs.empty(); });
+                    if (!state->alive) return;
+                    job = std::move(state->jobs.front());
+                    state->jobs.pop_front();
                 }
                 try {
-                    job();
+                    job(post);
                 } catch (const std::exception&) {
                     // a job reports its own errors; one that threw past that has nobody to tell
                 }
             }
         }
 
-        std::mutex mutex_;
-        std::condition_variable ready_;
-        std::deque<std::function<void()>> jobs_;
-        bool quit_ = false;
-        std::thread thread_;   // last: it uses the members above
+        std::shared_ptr<State> state_;
     };
 
     using Alive = std::shared_ptr<std::atomic<bool>>;

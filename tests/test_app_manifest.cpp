@@ -434,6 +434,51 @@ TEST_CASE("manifestFromFolder builds the manifest from a filename rule", "[app][
     }
 }
 
+TEST_CASE("A manifest records how the rule placed its tiles", "[app][manifest]") {
+    // Every mode writes a grid index per tile (a row for no positions, the
+    // ranks for stage coordinates), so the tiles alone do not say which rule
+    // made them, and a manifest loaded as a template was rebuilt as a grid.
+    const TempFolder folder;
+    writeTileFolder(folder.path);
+    FilenameRule rule = tileRule();
+    for (const FilenameRule::Positions p :
+         {FilenameRule::Positions::None, FilenameRule::Positions::GridIndex, FilenameRule::Positions::Microns})
+        CHECK(positionsFromName(positionsName(p)) == p);
+    CHECK(std::string(positionsName(FilenameRule::Positions::GridIndex)) == "grid");
+    CHECK_FALSE(positionsFromName("").has_value());
+    CHECK_FALSE(positionsFromName("Grid").has_value());
+
+    SECTION("grid indices, with their overlap, through the TOML file") {
+        manifestFromFolder(folder.path, rule).save(folder.path);
+        const DatasetManifest m = DatasetManifest::load(folder.path);
+        CHECK(positionsFromName(m.positions) == FilenameRule::Positions::GridIndex);
+        REQUIRE(m.overlapFraction.has_value());
+        CHECK_THAT(*m.overlapFraction, WithinAbs(1.0 / 3.0, 1e-12));
+    }
+    SECTION("stage coordinates and no positions have no overlap") {
+        for (const FilenameRule::Positions p : {FilenameRule::Positions::Microns, FilenameRule::Positions::None}) {
+            rule.positions = p;
+            manifestFromFolder(folder.path, rule).save(folder.path);
+            const DatasetManifest m = DatasetManifest::load(folder.path);
+            CHECK(positionsFromName(m.positions) == p);
+            CHECK_FALSE(m.overlapFraction.has_value());
+            REQUIRE(m.tiles.size() == 4);
+            CHECK(m.tiles[3].gridIndex != std::array<Index, 3>{0, 0, 0});   // what the old guess took for a grid
+        }
+    }
+    SECTION("a manifest written before they were recorded says nothing, and writes nothing back") {
+        nlohmann::json j = manifestFromFolder(folder.path, rule).toJson();
+        j.erase("positions");
+        j.erase("overlap_fraction");
+        const DatasetManifest m = DatasetManifest::fromJson(j);
+        CHECK(m.positions.empty());
+        CHECK_FALSE(m.overlapFraction.has_value());
+        const nlohmann::json again = m.toJson();
+        CHECK_FALSE(again.contains("positions"));
+        CHECK_FALSE(again.contains("overlap_fraction"));
+    }
+}
+
 // --- opening the folder ----------------------------------------------------------
 
 TEST_CASE("A folder with a manifest opens as one tiled dataset", "[app][manifest]") {
@@ -819,10 +864,10 @@ TEST_CASE("A folder of TIFFs reads as one stack without a pattern", "[app][manif
             writeTiffStack<std::uint16_t>((real.path / ("f" + std::to_string(t == 0 ? 1 : t * 5) + ".tif")).string(),
                                           stack.view(), TiffCompression::None);
         }
-        const DatasetManifest m = manifestOfOneStack(real.path);
-        REQUIRE(m.files.size() == static_cast<std::size_t>(frames));
-        CHECK(m.validate(real.path).empty());
-        m.save(real.path / DatasetManifest::kFileName);
+        const DatasetManifest written = manifestOfOneStack(real.path);
+        REQUIRE(written.files.size() == static_cast<std::size_t>(frames));
+        CHECK(written.validate(real.path).empty());
+        written.save(real.path / DatasetManifest::kFileName);
         CHECK(isFolderDataset(real.path.string()));
 
         const OpenResult opened = openDataset(real.path.string(), {});

@@ -11,7 +11,9 @@
 #include <cstdint>
 #include <cstdlib>
 #include <fstream>
+#include <initializer_list>
 #include <map>
+#include <optional>
 #include <regex>
 #include <set>
 #include <sstream>
@@ -114,7 +116,7 @@ namespace sirius::app {
         bool isNumber(const std::string& s) {
             if (s.empty()) return false;
             char* end = nullptr;
-            std::strtod(s.c_str(), &end);
+            static_cast<void>(std::strtod(s.c_str(), &end));   // only where it stopped matters
             return end && *end == '\0';
         }
 
@@ -278,6 +280,8 @@ namespace sirius::app {
         j["frame_interval_s"] = frameIntervalS;
         j["acquisition"] = acquisition;
         j["pattern"] = pattern;
+        if (!positions.empty()) j["positions"] = positions;
+        if (overlapFraction) j["overlap_fraction"] = *overlapFraction;
         if (!filesFolder.empty()) j["files_folder"] = filesFolder;
         j["sim"] = json{{"present", sim.present}, {"ndirs", sim.ndirs}, {"nphases", sim.nphases}, {"fast_si", sim.fastSi}};
         j["channels"] = json::array();
@@ -298,6 +302,9 @@ namespace sirius::app {
         m.frameIntervalS = numberField(j, "frame_interval_s", 0.0);
         m.acquisition = stringField(j, "acquisition");
         m.pattern = stringField(j, "pattern");
+        m.positions = stringField(j, "positions");
+        if (j.contains("overlap_fraction") && !j["overlap_fraction"].is_null())
+            m.overlapFraction = numberField(j, "overlap_fraction", 0.0);
         m.filesFolder = stringField(j, "files_folder");
         if (j.contains("sim") && j["sim"].is_object()) {
             const json& s = j["sim"];
@@ -397,6 +404,22 @@ namespace sirius::app {
     }
 
     // --- filename patterns ------------------------------------------------------------
+
+    const char* positionsName(FilenameRule::Positions positions) noexcept {
+        switch (positions) {
+            case FilenameRule::Positions::GridIndex: return "grid";
+            case FilenameRule::Positions::Microns: return "microns";
+            case FilenameRule::Positions::None: break;
+        }
+        return "none";
+    }
+
+    std::optional<FilenameRule::Positions> positionsFromName(const std::string& name) {
+        for (const FilenameRule::Positions p :
+             {FilenameRule::Positions::None, FilenameRule::Positions::GridIndex, FilenameRule::Positions::Microns})
+            if (name == positionsName(p)) return p;
+        return std::nullopt;
+    }
 
     std::string plainPattern(const std::string& pattern, std::vector<std::string>* groupNames) {
         std::string out;
@@ -626,6 +649,11 @@ namespace sirius::app {
         manifest.sim = rule.sim;
         manifest.acquisition = rule.acquisition;
         manifest.pattern = rule.pattern;
+        // The tiles alone do not say how they were placed: a grid index is
+        // written for every mode, so a manifest loaded as a template would
+        // otherwise be rebuilt as a grid.
+        manifest.positions = positionsName(rule.positions);
+        if (rule.positions == FilenameRule::Positions::GridIndex) manifest.overlapFraction = rule.overlapFraction;
         if (matched.empty()) return manifest;
 
         // channels, in natural token order; names from the rule when given

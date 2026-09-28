@@ -14,13 +14,17 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <chrono>
 #include <cmath>
+#include <cstdint>
 #include <cstdlib>
 #include <ctime>
 #include <exception>
 #include <filesystem>
+#include <memory>
 #include <optional>
+#include <stdexcept>
 #include <string>
 #include <utility>
 #include <vector>
@@ -158,10 +162,12 @@ namespace sirius::app::gui {
             using Accepted = std::function<void(const std::string&, const OpenOptions&)>;
 
             OpenDatasetDialog(App& app, const std::string& initialPath, Accepted accepted)
-                : bridge_(app.bridge()), accepted_(std::move(accepted)), path_(initialPath) {
+                : accepted_(std::move(accepted)), path_(initialPath), worker_(app.bridge()), scanWorker_(app.bridge()) {
                 // The names at once; what needs the disk (a folder with a
                 // manifest, the date, whether the file is still there) when
-                // the thread has looked.
+                // the thread has looked. That thread is not the probe's: one
+                // recent entry on an unreachable share keeps it for as long as
+                // the network takes, and the path being opened must not wait.
                 for (const std::string& f : App::recentFiles()) {
                     RecentRow row;
                     row.path = f;
@@ -171,7 +177,7 @@ namespace sirius::app::gui {
                 }
                 if (!recent_.empty()) {
                     std::vector<RecentRow> rows = recent_;
-                    worker_.run([this, alive = alive_, rows]() mutable {
+                    scanWorker_.run([this, alive = alive_, rows](const Worker::Post& post) mutable {
                         for (RecentRow& row : rows) {
                             if (!alive->load()) return;
                             try {
@@ -187,8 +193,8 @@ namespace sirius::app::gui {
                                 row.modified = "missing";
                             }
                         }
-                        bridge_.post([this, alive, rows] {
-                            if (alive->load()) recent_ = rows;
+                        post([this, alive, rows] {
+                            if (alive->load() && isOpen()) recent_ = rows;
                         });
                     });
                 }
@@ -220,6 +226,12 @@ namespace sirius::app::gui {
                 if (acceptedNow_ && accepted_) accepted_(acceptedPath_, acceptedOptions_);
             }
 
+            // The close box or Escape: the same as Cancel.
+            bool canClose(App&) override {
+                forgetAccept();
+                return true;
+            }
+
         private:
             // --- the path and its probe ----------------------------------------------
 
@@ -238,12 +250,16 @@ namespace sirius::app::gui {
                 probeOk_ = false;
                 openEnabled_ = false;
                 acceptPending_ = false;
+                // Open as one stack writes a manifest into the folder: not
+                // into this one before its probe has said it is a bare folder.
+                oneStackVisible_ = false;
                 pageCheck_.clear();
                 scheduleProbe();
             }
 
             void scheduleProbe() {
                 ++generation_;   // a probe still running is for a path that was
+                latestProbe_->store(generation_);
                 probing_ = false;
                 probeAt_ = Clock::now() + std::chrono::milliseconds(kProbeDelayMs);
             }
@@ -252,11 +268,15 @@ namespace sirius::app::gui {
                 probeAt_.reset();
                 probing_ = true;
                 const std::uint64_t generation = ++generation_;
-                worker_.run([this, alive = alive_, p = path(), generation] {
-                    if (!alive->load()) return;
+                latestProbe_->store(generation);
+                worker_.run([this, alive = alive_, latest = latestProbe_, p = path(), generation](const Worker::Post& post) {
+                    // A probe for a path that has been replaced since reads
+                    // nothing: the newer one is queued or scheduled, and
+                    // clears `probing_` when it reports.
+                    if (!alive->load() || latest->load() != generation) return;
                     ProbeResult r = probePath(p, generation);
-                    bridge_.post([this, alive, r = std::move(r)] {
-                        if (alive->load()) applyProbe(r);
+                    post([this, alive, r = std::move(r)] {
+                        if (alive->load() && isOpen()) applyProbe(r);
                     });
                 });
             }
@@ -305,12 +325,18 @@ namespace sirius::app::gui {
                 const DatasetMeta& m = probed_;
                 pages_ = m.dims.planes();
                 dimsFromMetadata_ = r.folder || m.format != "tiff";   // plain TIFF: the page mapping is the user's call
+                // An OME-TIFF's pages are in its DimensionOrder, which the
+                // first order stands for (options() passes any other): an
+                // order chosen for the file before is not this file's.
+                if (m.format == "ome-tiff") order_ = 0;
                 facts_ = format("%s · %s · %s · %s · %d channel(s)", m.format.c_str(), m.shapeString().c_str(), toString(m.sourceType),
                                 bytesText(m.bytesOnDisk).c_str(), static_cast<int>(m.channels.size()));
                 if (m.hasTiles()) facts_ += format(" · %d tiles", static_cast<int>(m.tiles.size()));
-                c_ = std::clamp<std::int64_t>(m.dims.c, 1, 64);
-                t_ = std::clamp<std::int64_t>(m.dims.t, 1, 1000000);
-                z_ = std::clamp<std::int64_t>(m.dims.z, 0, 1000000);
+                // the file's own counts, not the spin boxes' usual ranges: a
+                // 100-channel stack is 100 channels (drawLayout widens the ranges)
+                c_ = std::max<std::int64_t>(m.dims.c, 1);
+                t_ = std::max<std::int64_t>(m.dims.t, 1);
+                z_ = std::max<std::int64_t>(m.dims.z, 0);
                 if (m.voxelUm[0] > 0.0) voxel_[0] = m.voxelUm[0];
                 if (m.voxelUm[1] > 0.0) voxel_[1] = m.voxelUm[1];
                 if (m.voxelUm[2] > 0.0) voxel_[2] = m.voxelUm[2];
@@ -321,6 +347,7 @@ namespace sirius::app::gui {
                     names.push_back(n);
                 }
                 channels_ = join(names, ", ");
+                probedChannels_ = channels_;
                 sim_.present = m.sim.present;
                 sim_.dirs = std::clamp(m.sim.ndirs, 1, 9);
                 sim_.phases = std::clamp(m.sim.nphases, 1, 15);
@@ -373,6 +400,16 @@ namespace sirius::app::gui {
                 close();
             }
 
+            // Cancelled: an Open that is waiting for the probe does not happen,
+            // nor one the probe completed at the start of this frame, before
+            // the Cancel of this frame was seen.
+            void forgetAccept() { acceptPending_ = acceptedNow_ = false; }
+
+            void cancel() {
+                forgetAccept();
+                close();
+            }
+
             OpenOptions options() const {
                 OpenOptions o;
                 if (isFolder_) {
@@ -387,28 +424,50 @@ namespace sirius::app::gui {
                 po.t = static_cast<Index>(t_);
                 po.z = static_cast<Index>(z_);
                 const DatasetMeta& m = probed_;
-                if (!dimsFromMetadata_ || po.c != m.dims.c || po.t != m.dims.t || (po.z != 0 && po.z != m.dims.z)) o.pageOrder = po;
+                // An order other than the default is the user's even where the
+                // metadata gives the dimensions: an OME DimensionOrder can be
+                // wrong. Only a TIFF's pages have an order to override.
+                const bool paged = m.format == "tiff" || m.format == "ome-tiff";
+                if (!dimsFromMetadata_ || (paged && po.order != kOrders[0]) || po.c != m.dims.c || po.t != m.dims.t ||
+                    (po.z != 0 && po.z != m.dims.z))
+                    o.pageOrder = po;
                 if (voxel_ != m.voxelUm) o.voxelUm = voxel_;
-                // channels: "488 name, 640 other"
-                std::vector<ChannelInfo> channels;
-                for (const std::string& part : split(channels_, ',', true)) {
-                    ChannelInfo ch;
-                    std::string s = trimmed(part);
-                    const std::size_t space = s.find(' ');
-                    const std::string head = space == std::string::npos ? s : s.substr(0, space);
-                    double nm = 0.0;
-                    if (toNumber(head, nm) && nm > 100.0) {
-                        ch.wavelengthNm = nm;
-                        s = space == std::string::npos ? std::string() : trimmed(s.substr(space + 1));
+                // channels: "488 name, 640 other". The text does not carry all
+                // of a channel (its colour, its exposure) and does not read
+                // back exactly (a label "488" reads as a wavelength), so the
+                // file's channels are replaced only when the field was edited,
+                // and then only the parts that were.
+                if (trimmed(channels_) != trimmed(probedChannels_)) {
+                    const std::vector<std::string> parts = split(channels_, ',', true);
+                    const std::vector<std::string> probedParts = split(probedChannels_, ',', true);
+                    std::vector<ChannelInfo> channels;
+                    for (std::size_t i = 0; i < parts.size(); ++i) {
+                        const bool known = i < m.channels.size();
+                        if (known && i < probedParts.size() && trimmed(parts[i]) == trimmed(probedParts[i])) {
+                            channels.push_back(m.channels[i]);
+                            continue;
+                        }
+                        ChannelInfo ch = known ? m.channels[i] : ChannelInfo{};
+                        std::string s = trimmed(parts[i]);
+                        const std::size_t space = s.find(' ');
+                        const std::string head = space == std::string::npos ? s : s.substr(0, space);
+                        double nm = 0.0;
+                        if (toNumber(head, nm) && nm > 100.0) s = space == std::string::npos ? std::string() : trimmed(s.substr(space + 1));
+                        else nm = 0.0;
+                        ch.label = s;
+                        // a new wavelength brings its colour; the same one keeps the file's
+                        if (!known || std::abs(nm - ch.wavelengthNm) >= 0.5) {
+                            ch.wavelengthNm = nm;
+                            ch.color = colorForWavelength(nm);
+                        }
+                        channels.push_back(ch);
                     }
-                    ch.label = s;
-                    ch.color = colorForWavelength(ch.wavelengthNm);
-                    channels.push_back(ch);
+                    bool sameChannels = channels.size() == m.channels.size();
+                    for (std::size_t i = 0; sameChannels && i < channels.size(); ++i)
+                        sameChannels = channels[i].label == m.channels[i].label &&
+                                       std::abs(channels[i].wavelengthNm - m.channels[i].wavelengthNm) < 0.5;
+                    if (!channels.empty() && !sameChannels) o.channels = channels;
                 }
-                bool sameChannels = channels.size() == m.channels.size();
-                for (std::size_t i = 0; sameChannels && i < channels.size(); ++i)
-                    sameChannels = channels[i].label == m.channels[i].label && channels[i].wavelengthNm == m.channels[i].wavelengthNm;
-                if (!channels.empty() && !sameChannels) o.channels = channels;
                 SimLayout sim;
                 sim.present = sim_.present;
                 sim.ndirs = static_cast<int>(sim_.dirs);
@@ -428,7 +487,8 @@ namespace sirius::app::gui {
             // opens directly from then on and the reading can be corrected by hand.
             void openAsOneStack(App& app) {
                 const std::string folder = path();
-                if (folder.empty() || oneStackBusy_) return;
+                // only for the path the probe found to be a bare folder of TIFFs
+                if (folder.empty() || oneStackBusy_ || probeAt_ || probing_ || !oneStackVisible_) return;
                 // The manifest is written before the dataset is opened, so the
                 // refusal has to come first: otherwise a run in progress leaves
                 // the file behind for a dataset that never opened.
@@ -438,11 +498,16 @@ namespace sirius::app::gui {
                     return;
                 }
                 oneStackBusy_ = true;
-                worker_.run([this, alive = alive_, folder, appPtr = &app] {
+                worker_.run([this, alive = alive_, folder, appPtr = &app](const Worker::Post& post) {
                     OneStackResult r;
                     r.folder = folder;
                     try {
                         const fs::path dir = toPath(folder);
+                        // The manifest written below would replace one the
+                        // folder has, a hand-edited one included.
+                        if (isFolderDataset(folder))
+                            throw std::runtime_error(folder + " already has a " + std::string(DatasetManifest::kFileName) +
+                                                     ": open it with Open.");
                         r.manifest = manifestOfOneStack(dir);
                         if (!r.manifest.files.empty()) {
                             try {
@@ -455,14 +520,15 @@ namespace sirius::app::gui {
                     } catch (const std::exception& e) {
                         r.error = e.what();
                     }
-                    bridge_.post([this, alive, appPtr, r = std::move(r)] {
-                        if (alive->load()) oneStackListed(*appPtr, r);
+                    post([this, alive, appPtr, r = std::move(r)] {
+                        if (alive->load() && isOpen()) oneStackListed(*appPtr, r);
                     });
                 });
             }
 
             void oneStackListed(App& app, const OneStackResult& r) {
                 oneStackBusy_ = false;
+                if (r.folder != path()) return;   // the path has changed since: this is another folder's
                 if (!r.error.empty()) {
                     app.message("Open as one stack", r.error);
                     return;
@@ -483,7 +549,8 @@ namespace sirius::app::gui {
                                      "inside each file.",
                                      static_cast<int>(r.manifest.files.size()));
                 const std::string text =
-                    format("Read the %d files as one stack, one time point each?", static_cast<int>(r.manifest.files.size())) +
+                    format("Read the %d files in %s as one stack, one time point each?", static_cast<int>(r.manifest.files.size()),
+                           r.folder.c_str()) +
                     "\n\n" + "In name order, " + r.manifest.files.front().path + " first and " + r.manifest.files.back().path +
                     " last." + caution + " A " + DatasetManifest::kFileName +
                     " is written beside the files so the folder opens directly from then on; edit it, or use Folder…, for "
@@ -500,7 +567,7 @@ namespace sirius::app::gui {
                     manifest.save(toPath(folder) / DatasetManifest::kFileName);
                     OpenOptions options;
                     options.tile = 0;
-                    options.readAll = true;
+                    options.readAll = readAs_ == 1;
                     if (!app.bridge().openDatasetAsync(folder, options)) {
                         app.message("Open as one stack", "Another task is still running: cancel it or wait.");
                         return;
@@ -596,11 +663,14 @@ namespace sirius::app::gui {
                 // the dataset itself, so this one then closes without asking
                 // the caller to open it again
                 app.setLastDir(d);
-                app.showDialog(dataset_dialogs::makeFolderDatasetDialog(app, d, [this, alive = alive_, d] {
-                    if (!alive->load()) return;
-                    App::addRecentFile(d);
-                    close();
-                }));
+                app.showDialog(dataset_dialogs::makeFolderDatasetDialog(
+                    app, d,
+                    [this, alive = alive_, d] {
+                        if (!alive->load()) return;
+                        App::addRecentFile(d);
+                        close();
+                    },
+                    readAs_ == 1));
             }
 
             void drawFacts() {
@@ -634,18 +704,19 @@ namespace sirius::app::gui {
                 widgets::tooltip("Which axis changes fastest from page to page (ImageJ hyperstacks: c, then z, then t)");
                 grid.track();
 
+                // the Load step's ranges, or the file's own count when that is more
                 grid.labelled(column + spacing, "Channels (c)");
-                changed = widgets::inputInt("##c", &c_, 1, 64, 1, f) || changed;
+                changed = widgets::inputInt("##c", &c_, 1, std::max<std::int64_t>(1024, probed_.dims.c), 1, f) || changed;
                 grid.track();
 
                 grid.labelled(2 * (column + spacing), "Time points (t)");
-                changed = widgets::inputInt("##t", &t_, 1, 1000000, 1, f) || changed;
+                changed = widgets::inputInt("##t", &t_, 1, std::max<std::int64_t>(1000000, probed_.dims.t), 1, f) || changed;
                 grid.track();
 
                 grid.labelled(3 * (column + spacing), "Planes (z)");
                 const ImGuiID zId = ImGui::GetID("##z");
                 const ImVec2 zMin = ImGui::GetCursorScreenPos();
-                changed = widgets::inputInt("##z", &z_, 0, 1000000, 1, f) || changed;
+                changed = widgets::inputInt("##z", &z_, 0, std::max<std::int64_t>(1000000, probed_.dims.z), 1, f) || changed;
                 // the spin arrows are the last items: the field's rectangle again, for its tool tip
                 const ImVec2 zMax(zMin.x + column, zMin.y + theme::snap(px(theme::kInputH)));
                 ImGui::SetCursorScreenPos(zMin);
@@ -788,13 +859,12 @@ namespace sirius::app::gui {
                 buttons.push_back({"Open", widgets::ButtonKind::Primary, openEnabled_, {}});
                 const int pressed = footer(buttons);
                 const int last = static_cast<int>(buttons.size()) - 1;
-                if (pressed == 0) close();
+                if (pressed == 0) cancel();
                 else if (pressed == last) accept();
                 else if (pressed == 1) openAsOneStack(app);
                 else if (enterPressed(popupAtStart_)) accept();
             }
 
-            Bridge& bridge_;
             Accepted accepted_;
 
             std::string path_;
@@ -810,6 +880,7 @@ namespace sirius::app::gui {
             // typical widefield sampling until a file says otherwise
             std::array<double, 3> voxel_{0.1, 0.1, 0.2};
             std::string channels_;
+            std::string probedChannels_;     // channels_ as the probe filled it
             SimFields sim_;
             int readAs_ = 1;
             std::vector<RecentRow> recent_;
@@ -821,6 +892,8 @@ namespace sirius::app::gui {
             std::optional<Clock::time_point> probeAt_;
             bool probing_ = false;
             std::uint64_t generation_ = 0;
+            // generation_ for the thread: a queued probe it has overtaken is skipped
+            std::shared_ptr<std::atomic<std::uint64_t>> latestProbe_ = std::make_shared<std::atomic<std::uint64_t>>(0);
             bool acceptPending_ = false;
             DatasetMeta probed_;
             bool probeOk_ = false;
@@ -833,7 +906,8 @@ namespace sirius::app::gui {
             OpenOptions acceptedOptions_;
 
             Alive alive_ = makeAlive();
-            Worker worker_;                  // last: its jobs use what is above
+            Worker worker_;                  // the probe and the one-stack listing
+            Worker scanWorker_;              // the recent files' dates, which may wait on the network
         };
 
     } // namespace

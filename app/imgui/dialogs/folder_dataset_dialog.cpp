@@ -102,6 +102,34 @@ namespace sirius::app::gui {
                                                                                                        : 0;
         }
 
+        // positionsIndex for a manifest that does not say how its tiles were
+        // placed (written before it recorded that, or by hand), from the tiles
+        // themselves. manifestFromFolder gives every tile a grid index, so the
+        // indices alone say nothing: none when every tile sits at the origin;
+        // grid indices when each axis's position is its index times one step;
+        // else stage coordinates, whose indices are their ranks. Evenly spaced
+        // coordinates from 0 look like a grid: the recorded mode is what settles it.
+        int guessedPositionsIndex(const DatasetManifest& m) {
+            const bool anyPosition = std::any_of(m.tiles.begin(), m.tiles.end(), [](const TileInfo& t) {
+                return t.positionUm[0] != 0.0 || t.positionUm[1] != 0.0 || t.positionUm[2] != 0.0;
+            });
+            if (m.tiles.size() <= 1 || !anyPosition) return 0;
+            for (std::size_t k = 0; k < 3; ++k) {
+                std::optional<double> step;
+                for (const TileInfo& t : m.tiles) {
+                    const double p = t.positionUm[k];
+                    if (t.gridIndex[k] == 0) {
+                        if (std::abs(p) > 1e-9) return 2;
+                        continue;
+                    }
+                    const double s = p / static_cast<double>(t.gridIndex[k]);
+                    if (!step) step = s;
+                    else if (std::abs(s - *step) > 1e-6 * std::max(1.0, std::abs(*step))) return 2;
+                }
+            }
+            return 1;
+        }
+
         // First of the group aliases that matched, else empty.
         const std::string& group(const FilenameMatch& m, std::initializer_list<const char*> names) {
             static const std::string none;
@@ -223,10 +251,19 @@ namespace sirius::app::gui {
             std::string error;
         };
 
+        // What the dialog remembers for a folder once it has opened
+        // (rememberPatternFor), as the fields were when Open was pressed.
+        struct RememberedFields {
+            std::string pattern;
+            int positions = 1;
+            double overlap = 10.0;
+        };
+
         struct BuildRequest {
             std::string folder;
             std::string destText;
             FilenameRule rule;
+            RememberedFields fields;
             std::string loadedManifestPath;
             std::optional<DatasetManifest> existing;
         };
@@ -235,6 +272,7 @@ namespace sirius::app::gui {
             fs::path dest;
             bool openAsIs = false;       // the loaded manifest is valid: nothing to write
             DatasetManifest manifest;
+            RememberedFields fields;     // the request's
             std::string error;
             bool destExists = false;
             bool destInFolder = false;
@@ -242,6 +280,7 @@ namespace sirius::app::gui {
 
         BuildResult build(const BuildRequest& q) {
             BuildResult r;
+            r.fields = q.fields;
             try {
                 const fs::path folderPath = toPath(q.folder);
                 r.dest = toPath(q.destText);
@@ -323,11 +362,12 @@ namespace sirius::app::gui {
 
         class FolderDatasetDialog final : public Dialog {
         public:
-            FolderDatasetDialog(App& app, const std::string& folder, std::function<void()> opened)
-                : app_(app), bridge_(app.bridge()), opened_(std::move(opened)), folder_(absolutePath(folder)) {
+            FolderDatasetDialog(App& app, const std::string& folder, std::function<void()> opened, bool readAll)
+                : app_(app), bridge_(app.bridge()), opened_(std::move(opened)), readAll_(readAll), folder_(absolutePath(folder)),
+                  worker_(app.bridge()) {
                 manifestPath_ = folder_ + "/" + DatasetManifest::kFileName;
                 status_ = "Matching files…";
-                worker_.run([this, alive = alive_, dir = folder_] {
+                worker_.run([this, alive = alive_, dir = folder_](const Worker::Post& post) {
                     Listing l;
                     std::vector<std::string> names;
                     try {
@@ -348,8 +388,8 @@ namespace sirius::app::gui {
                     }
                     if (l.canonicalFolder.empty()) l.canonicalFolder = dir;
                     l.names = std::make_shared<const std::vector<std::string>>(std::move(names));
-                    bridge_.post([this, alive, l = std::move(l)] {
-                        if (alive->load()) listed(l);
+                    post([this, alive, l = std::move(l)] {
+                        if (alive->load() && isOpen()) listed(l);
                     });
                 });
             }
@@ -368,13 +408,21 @@ namespace sirius::app::gui {
                     if (Clock::now() >= *previewAt_) runPreview();
                     else app.requestRedraw();   // the timer: frames until it is due
                 }
+                // While the manifest is being built, the fields are what it
+                // is built from: an edit then would be lost, or remembered for
+                // the folder without having opened it.
+                const bool building = building_;
                 drawFolderRows(app);
+                ImGui::BeginDisabled(building);
                 drawPattern();
+                ImGui::EndDisabled();
                 drawPreview();
                 const float lowerTop = ImGui::GetCursorPosY();
+                ImGui::BeginDisabled(building);
                 drawPositions();
                 drawMetadata();
                 drawChannelsAndTiles();
+                ImGui::EndDisabled();
                 drawButtons();
                 const float lower = ImGui::GetCursorPosY() - lowerTop;
                 if (std::abs(lower - lowerHeight_) > 0.5f) {
@@ -426,7 +474,8 @@ namespace sirius::app::gui {
             void listed(const Listing& l) {
                 names_ = l.names;
                 canonicalFolder_ = l.canonicalFolder;
-                existing_ = l.existing;
+                // a manifest loaded (Load…) while the folder was being listed stands
+                if (!existing_) existing_ = l.existing;
                 const std::string remembered = rememberedPatternFor(canonicalFolder_);
                 if (touched_) {
                     // typed while the folder was being listed: what was typed stands
@@ -459,14 +508,11 @@ namespace sirius::app::gui {
                 sim_.dirs = std::clamp(m.sim.ndirs, 1, 9);
                 sim_.phases = std::clamp(m.sim.nphases, 1, 15);
                 sim_.fastSi = m.sim.fastSi;
-                bool anyGrid = false, anyPos = false;
-                for (const TileInfo& t : m.tiles) {
-                    anyGrid = anyGrid || t.gridIndex[1] != 0 || t.gridIndex[2] != 0;
-                    anyPos = anyPos || t.positionUm[1] != 0.0 || t.positionUm[2] != 0.0;
-                }
-                positions_ = m.tiles.size() <= 1 ? 0 : anyGrid ? 1
-                                                   : anyPos    ? 2
-                                                               : 0;
+                // how the rule placed the tiles, when the manifest recorded it
+                if (const std::optional<FilenameRule::Positions> p = positionsFromName(m.positions)) positions_ = positionsIndex(*p);
+                else positions_ = guessedPositionsIndex(m);
+                if (m.overlapFraction && std::isfinite(*m.overlapFraction))
+                    overlap_ = std::clamp(*m.overlapFraction * 100.0, 0.0, 90.0);
                 if (!m.pattern.empty()) setPattern(m.pattern);
                 existing_ = m;
             }
@@ -544,7 +590,7 @@ namespace sirius::app::gui {
                     return;
                 }
                 matching_ = true;
-                worker_.run([this, alive = alive_, names = names_, pat, generation] {
+                worker_.run([this, alive = alive_, names = names_, pat, generation](const Worker::Post& post) {
                     if (!alive->load()) return;
                     MatchResult r;
                     r.generation = generation;
@@ -554,8 +600,8 @@ namespace sirius::app::gui {
                         r.error = e.what();
                         r.matches.clear();
                     }
-                    bridge_.post([this, alive, pat, r = std::move(r)]() mutable {
-                        if (alive->load()) applyMatches(r, pat);
+                    post([this, alive, pat, r = std::move(r)]() mutable {
+                        if (alive->load() && isOpen()) applyMatches(r, pat);
                     });
                 });
             }
@@ -677,8 +723,18 @@ namespace sirius::app::gui {
                         miny = std::min(miny, p.second);
                         maxy = std::max(maxy, p.second);
                     }
-                    tileNote_ = format("%d tiles · %d × %d grid", static_cast<int>(tilePoints_.size()), static_cast<int>(maxy - miny) + 1,
-                                       static_cast<int>(maxx - minx) + 1);
+                    // Checked as doubles: an x group that caught a time stamp
+                    // spans more cells than an int holds.
+                    const double spanX = maxx - minx, spanY = maxy - miny;
+                    constexpr double kMaxCells = 1.0e6;
+                    if (!std::isfinite(spanX) || !std::isfinite(spanY) || spanX > kMaxCells || spanY > kMaxCells) {
+                        gridNx_ = gridNy_ = 0;
+                        tileNote_ = format("%d tiles · grid indices out of range", static_cast<int>(tilePoints_.size()));
+                    } else {
+                        gridNx_ = static_cast<int>(spanX) + 1;
+                        gridNy_ = static_cast<int>(spanY) + 1;
+                        tileNote_ = format("%d tiles · %d × %d grid", static_cast<int>(tilePoints_.size()), gridNy_, gridNx_);
+                    }
                 } else {
                     tileNote_ = format("%d positions (µm)", static_cast<int>(tilePoints_.size()));
                 }
@@ -699,14 +755,16 @@ namespace sirius::app::gui {
                 q.destText = trimmed(manifestPath_);
                 if (q.destText.empty()) q.destText = folder_ + "/" + DatasetManifest::kFileName;
                 q.rule = rule();
+                q.fields = {pattern_, positions_, overlap_};
                 q.loadedManifestPath = loadedManifestPath_;
                 q.existing = existing_;
                 building_ = true;
-                worker_.run([this, alive = alive_, q = std::move(q)] {
+                worker_.run([this, alive = alive_, q = std::move(q)](const Worker::Post& post) {
                     if (!alive->load()) return;
                     BuildResult r = build(q);
-                    bridge_.post([this, alive, r = std::move(r)] {
-                        if (alive->load()) built(r);
+                    // not after Cancel, which may have come in the frame this arrived in
+                    post([this, alive, r = std::move(r)] {
+                        if (alive->load() && isOpen()) built(r);
                     });
                 });
             }
@@ -718,7 +776,7 @@ namespace sirius::app::gui {
                     return;
                 }
                 if (r.openAsIs) {
-                    open(r.dest, "Another task is still running: cancel it or wait, then open the dataset.");
+                    open(r.dest, r.fields, "Another task is still running: cancel it or wait, then open the dataset.");
                     return;
                 }
                 // Nothing is written into a folder, or over a file, the user has
@@ -729,7 +787,7 @@ namespace sirius::app::gui {
                 if (r.destExists) {
                     app_.ask(kTitle, fromPath(r.dest) + " exists.\n\nReplace it with the mapping built from this pattern?",
                              {"Yes", "Cancel"}, [this, alive = alive_, r](int answer) {
-                                 if (answer == 0 && alive->load()) writeAndOpen(r.manifest, r.dest);
+                                 if (answer == 0 && alive->load()) writeAndOpen(r.manifest, r.dest, r.fields);
                              });
                     return;
                 }
@@ -752,7 +810,7 @@ namespace sirius::app::gui {
                     placeAndOpen(r, where == "data");
                     return;
                 }
-                writeAndOpen(r.manifest, r.dest);
+                writeAndOpen(r.manifest, r.dest, r.fields);
             }
 
             void placeAndOpen(const BuildResult& r, bool besideTheFiles) {
@@ -761,10 +819,10 @@ namespace sirius::app::gui {
                     dest = cachedManifestPath(canonicalFolder_);
                     manifestPath_ = fromPath(dest);
                 }
-                writeAndOpen(r.manifest, dest);
+                writeAndOpen(r.manifest, dest, r.fields);
             }
 
-            void writeAndOpen(DatasetManifest manifest, fs::path dest) {
+            void writeAndOpen(DatasetManifest manifest, fs::path dest, const RememberedFields& fields) {
                 const fs::path folderPath = toPath(folder_);
                 auto writeManifest = [&](const fs::path& path) {
                     if (!samePath(path.parent_path(), folderPath)) manifest.filesFolder = fromPath(canonicalPath(folderPath));
@@ -791,20 +849,22 @@ namespace sirius::app::gui {
                         return;
                     }
                 }
-                open(dest, "The mapping is ready but another task is still running: cancel it or wait, then open the dataset.");
+                open(dest, fields, "The mapping is ready but another task is still running: cancel it or wait, then open the dataset.");
             }
 
-            void open(const fs::path& dest, const char* busyText) {
+            void open(const fs::path& dest, const RememberedFields& fields, const char* busyText) {
                 OpenOptions options;
                 options.tile = 0;
-                options.readAll = true;
+                options.readAll = readAll_;
                 // refused while a run or another task is active: the dialog stays
                 if (!app_.wb().canEdit() || !bridge_.openDatasetAsync(fromPath(dest), options)) {
                     app_.message(kTitle, busyText);
                     return;
                 }
-                // only a pattern that opened something is worth offering again
-                rememberPatternFor(canonicalFolder_, pattern_, positions_, overlap_);
+                // only a pattern that opened something is worth offering again,
+                // and it is the one the manifest was built with, not what the
+                // fields were edited to while it was being built
+                rememberPatternFor(canonicalFolder_, fields.pattern, fields.positions, fields.overlap);
                 if (opened_) opened_();
                 close();
             }
@@ -1249,8 +1309,8 @@ namespace sirius::app::gui {
                     return ImVec2(theme::snap(o.x + static_cast<float>(x) * s), theme::snap(o.y + static_cast<float>(y) * s));
                 };
                 if (tileGrid_) {
-                    const int nx = static_cast<int>(maxx - minx) + 1;
-                    const int ny = static_cast<int>(maxy - miny) + 1;
+                    const int nx = gridNx_, ny = gridNy_;   // 0: out of range, which the note says
+                    if (nx <= 0 || ny <= 0) return;
                     const double cell = std::clamp(std::min(width / nx, height / ny), 4.0, 26.0);
                     const double ox = left + (width - cell * nx) / 2.0;
                     const double oy = top + (height - cell * ny) / 2.0;
@@ -1290,6 +1350,7 @@ namespace sirius::app::gui {
             App& app_;
             Bridge& bridge_;
             std::function<void()> opened_;                // the Open dialog under this one, when it raised it
+            bool readAll_ = true;                         // full load, or lazy: that dialog's "Read as"
             std::string folder_;
             std::string canonicalFolder_;
             Names names_;                                 // null until the folder is listed
@@ -1324,21 +1385,23 @@ namespace sirius::app::gui {
             std::vector<std::string> tokens_;             // channel table rows, in order
             std::vector<std::pair<double, double>> tilePoints_;
             bool tileGrid_ = true;
+            int gridNx_ = 0, gridNy_ = 0;                 // grid indices: the map's columns and rows, 0 = out of range
             std::string tileNote_ = "—";
             float lowerHeight_ = 430.0f;                  // of what lies below the preview, as last laid out
 
             Alive alive_ = makeAlive();
-            Worker worker_;                               // last: its jobs use what is above
+            Worker worker_;
         };
 
     } // namespace
 
     std::shared_ptr<Dialog> makeFolderDatasetDialog(App& app, const std::string& folder) {
-        return std::make_shared<FolderDatasetDialog>(app, folder, nullptr);
+        return std::make_shared<FolderDatasetDialog>(app, folder, nullptr, true);
     }
 
-    std::shared_ptr<Dialog> dataset_dialogs::makeFolderDatasetDialog(App& app, const std::string& folder, std::function<void()> opened) {
-        return std::make_shared<FolderDatasetDialog>(app, folder, std::move(opened));
+    std::shared_ptr<Dialog> dataset_dialogs::makeFolderDatasetDialog(App& app, const std::string& folder, std::function<void()> opened,
+                                                                     bool readAll) {
+        return std::make_shared<FolderDatasetDialog>(app, folder, std::move(opened), readAll);
     }
 
 } // namespace sirius::app::gui
