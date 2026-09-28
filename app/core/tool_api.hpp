@@ -6,6 +6,7 @@
 // OpenAI / Ollama "tools" format; every mutating call goes through the
 // workbench, so it is undoable and shows up as an action card.
 
+#include <cstdint>
 #include <functional>
 #include <string>
 #include <vector>
@@ -27,6 +28,10 @@ namespace sirius::app {
         std::string link;                 // "undo", "view", "log", ""
         nlohmann::json viewState;         // for "view": what to restore
         std::string toolName;
+        // For "undo": the history's revision before and after the call that
+        // made the change, so the link undoes that change and nothing newer.
+        // A call that pushed nothing gets no "undo" link.
+        std::uint64_t revBefore = 0, revAfter = 0;
     };
 
     class ToolApi {

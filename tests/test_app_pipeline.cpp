@@ -224,6 +224,26 @@ namespace {
         }
     };
 
+    // Wants the Python worker, so a run connects to one, but passes its
+    // input on without calling it.
+    struct WorkerOp final : Operation {
+        OpInfo info_;
+        WorkerOp() {
+            info_.kind = "test_worker";
+            info_.name = "Worker";
+            info_.group = "Intensity";
+            info_.kindLabel = "INTENSITY";
+            info_.remoteCapable = true;
+        }
+        const OpInfo& info() const noexcept override { return info_; }
+        StepOutput run(const StepInput& in, const ParamSet&, const StepContext&) const override {
+            StepOutput o;
+            o.meta = in.meta;
+            o.array = in.materialize();
+            return o;
+        }
+    };
+
     void registerTestOps() {
         static bool done = false;
         if (done) return;
@@ -236,6 +256,7 @@ namespace {
         registerOperation(std::make_unique<CancellingOp>());
         registerOperation(std::make_unique<LabelOp>());
         registerOperation(std::make_unique<FileOp>());
+        registerOperation(std::make_unique<WorkerOp>());
     }
 
     std::shared_ptr<MemorySource> syntheticSource(Index c = 2, Index t = 3, Index z = 4, Index y = 8, Index x = 8) {
@@ -1921,6 +1942,51 @@ TEST_CASE("A run job cancelled before it starts does not start a worker", "[app]
     CHECK_FALSE(wb.running());
 }
 
+TEST_CASE("A run lets go of its worker when it finishes, before the GUI thread gets to it", "[app][workbench][run]") {
+    registerTestOps();
+    Scratch scratch;
+    Workbench wb(scratch.dir);
+    wb.setDataset(syntheticSource());
+    wb.setBackend(Backend::Cpu);
+    while (wb.pipeline().size() > 1) wb.removeStep(1);
+    wb.addStep("test_worker");
+    // The worker's end of the connection: it answers the hello, then waits
+    // for the client to go, as the single-client worker does.
+    std::atomic<bool> closed{false};
+    std::thread server;
+    wb.setLocalWorkerLauncher([&] {
+        auto [client, peer] = rpc::loopbackPair();
+        server = std::thread([&closed, t = std::move(peer)] {
+            std::vector<std::byte> buf;
+            try {
+                for (;;) {
+                    if (auto m = rpc::decodeFrame(buf)) {
+                        json hello{{"version", "test"}, {"methods", json::array()}, {"device", "cpu"}, {"hostname", "loop"}};
+                        hello["protocol_version"] = rpc::kProtocolVersion;
+                        t->send(rpc::encodeFrame({{"id", m->header.value("id", 0ull)}, {"type", "result"}, {"result", hello}}, {}));
+                        continue;
+                    }
+                    t->receive(buf, std::chrono::milliseconds(20));
+                }
+            } catch (const std::exception&) {
+                closed = true;   // the client closed the connection
+            }
+        });
+        return std::make_unique<RemoteWorker>(std::move(client));
+    });
+    auto job = wb.createRun();
+    REQUIRE(job);
+    job->execute();
+    CHECK(job->succeeded());
+    // finishRun, on the GUI thread, has not run: another client (the model
+    // hub's) must not have to wait for it
+    for (int i = 0; i < 200 && !closed; ++i) std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    CHECK(closed);
+    wb.finishRun(job);
+    if (server.joinable()) server.join();
+    CHECK(logContains(wb, "Local worker: cpu"));
+}
+
 TEST_CASE("Label edits on a step survive its re-run over the same input labels", "[app][workbench][labels][executor]") {
     registerTestOps();
     Scratch scratch;
@@ -2618,6 +2684,195 @@ TEST_CASE("On tracked labels a split travels along the track", "[app][workbench]
     for (Index t = 0; t < 3; ++t) CHECK(labels->at(t, cz, cy, cx + 4) == 1);
     wb.redo();
     for (Index t = 0; t < 3; ++t) CHECK(labels->at(t, cz, cy, cx + 4) == part);
+}
+
+TEST_CASE("A split puts its seeds onto the label, and refuses with a log line", "[app][workbench][labels]") {
+    registerTestOps();
+    Scratch scratch;
+    Workbench wb(scratch.dir);
+    wb.setDataset(syntheticSource(1, 1, 4, 16, 16));
+    wb.setBackend(Backend::Cpu);
+    while (wb.pipeline().size() > 1) wb.removeStep(1);
+    wb.addStep("test_labels");
+    REQUIRE(runSync(wb)->succeeded());
+    wb.view(1);
+    std::shared_ptr<LabelVolume> labels = wb.viewedLabels();
+    REQUIRE(labels);
+    // An L of label 5 on plane 1: the middle of its bounding box, where the
+    // label table's "split" link puts its seeds, is background.
+    std::uint32_t* v = labels->volume(0);
+    for (Index i = 2; i <= 12; ++i) {
+        v[(1 * 16 + i) * 16 + 2] = 5;    // the upright, x = 2
+        v[(1 * 16 + 12) * 16 + i] = 5;   // the foot, y = 12
+    }
+    labels->recomputeStats(0);
+    REQUIRE(countLabel(*labels, 0, 5) == 21);
+    const std::size_t entries = wb.history().size();
+
+    SECTION("seeds off the label are moved onto its nearest voxels") {
+        wb.splitLabel(5, {1, 4, 7}, {1, 9, 7});   // threw std::invalid_argument, out of the frame
+        CHECK(wb.history().undoLabel() == "Split label 5");
+        const std::uint32_t part = labels->at(0, 1, 12, 7);
+        CHECK(labels->at(0, 1, 4, 2) == 5);   // the upright keeps the id ...
+        CHECK(part != 5);                     // ... and the foot has one of its own
+        CHECK(part != 0);
+        CHECK(countLabel(*labels, 0, 5) + countLabel(*labels, 0, part) == 21);
+    }
+    SECTION("a label that is not there, or one point twice, changes nothing") {
+        CHECK_NOTHROW(wb.splitLabel(77, {1, 4, 2}, {1, 12, 7}));
+        CHECK(logContains(wb, "Split: label 77 is not in this frame."));
+        CHECK_NOTHROW(wb.splitLabel(5, {1, 4, 3}, {1, 4, 4}));   // both land on (1, 4, 2)
+        CHECK(logContains(wb, "pick two different points"));
+        CHECK(wb.history().size() == entries);
+        CHECK(countLabel(*labels, 0, 5) == 21);
+    }
+}
+
+TEST_CASE("A refused split is no edit", "[app][labels]") {
+    LabelVolume v(1, 1, 4, 4);
+    v.volume(0)[5] = 3;   // (y 1, x 1), as a step writes it: not an edit
+    REQUIRE_FALSE(v.edited());
+    const std::shared_ptr<LabelVolume> other = v.share();
+    CHECK_THROWS_AS(v.split(0, 3, {0, 1, 1}, {0, 3, 3}), std::invalid_argument);
+    CHECK_FALSE(v.edited());
+    CHECK(v.sharesVoxels());   // nor were the shared voxels copied for it
+}
+
+TEST_CASE("z, t and the crosshair are clamped to the data on screen", "[app][workbench]") {
+    registerTestOps();
+    Scratch scratch;
+    Workbench wb(scratch.dir);
+    wb.setDataset(syntheticSource(1, 3, 4, 8, 8));
+    wb.setBackend(Backend::Cpu);
+    while (wb.pipeline().size() > 1) wb.removeStep(1);
+    wb.addStep("test_fail");
+    wb.addStep("test_maxz");   // z 4 -> 1
+    wb.view(2);
+    // Not run yet: the viewer shows the Load step's data, all four planes.
+    CHECK(wb.outputMetaOf(2).dims.z == 1);
+    CHECK(wb.displayedMeta().dims.z == 4);
+    wb.setZ(3);
+    CHECK(wb.viewState().z == 3);   // was held at 0, the prediction's only plane
+    wb.setCrosshair(7, 6, 2);
+    CHECK(wb.viewState().z == 2);
+    wb.setT(2);
+    CHECK(wb.viewState().t == 2);
+    ToolApi api(wb);
+    api.call("set_view", {{"z", 3}});
+    CHECK(wb.viewState().z == 3);
+
+    // a run that fails above the step leaves the same data on screen
+    CHECK_FALSE(runSync(wb)->succeeded());
+    CHECK(wb.viewState().z == 3);
+    // once the step has run, its own output is what is shown
+    wb.setStepEnabled(1, false);
+    REQUIRE(runSync(wb)->succeeded());
+    CHECK(wb.displayedMeta().dims.z == 1);
+    CHECK(wb.viewState().z == 0);
+    CHECK(wb.viewState().t == 2);
+    wb.setZ(3);
+    CHECK(wb.viewState().z == 0);
+}
+
+TEST_CASE("The lasso paints a new label, as the brush does", "[app][workbench][labels]") {
+    registerTestOps();
+    Scratch scratch;
+    Workbench wb(scratch.dir);
+    wb.setDataset(syntheticSource(1, 1, 4, 16, 16));
+    wb.setBackend(Backend::Cpu);
+    while (wb.pipeline().size() > 1) wb.removeStep(1);
+    wb.addStep("test_labels");   // label 1, a disc at (2, 8, 8)
+    REQUIRE(runSync(wb)->succeeded());
+    wb.view(1);
+    std::shared_ptr<LabelVolume> labels = wb.viewedLabels();
+    REQUIRE(labels);
+    REQUIRE(labels->at(0, 2, 8, 8) == 1);
+    wb.setPaintTool(PaintTool::Lasso);
+    ViewState s = wb.viewState();
+    s.selectedLabel = 0;   // nothing selected
+    s.brushPx = 2;
+    s.paint3d = false;
+    wb.setViewState(s);
+    wb.beginPaintStroke();
+    wb.paintLabels(2, 8, 8, false);
+    wb.paintLabels(1, 4, 4, false);
+    wb.endPaintStroke();
+    CHECK(wb.viewState().selectedLabel == 2);
+    CHECK(labels->at(0, 2, 8, 8) == 2);   // was 0: the stroke erased label 1
+    CHECK(labels->at(0, 1, 4, 4) == 2);
+    CHECK(wb.history().undoLabel() == "Paint label 2");
+}
+
+TEST_CASE("Paint in 3D reaches the planes its checkbox names", "[app][workbench][labels]") {
+    CHECK(Workbench::paintZRadius(2) == 1);
+    CHECK(Workbench::paintZRadius(9) == 1);    // the checkbox said ±2
+    CHECK(Workbench::paintZRadius(15) == 2);   // ... and ±3 here
+    CHECK(Workbench::paintZRadius(60) == 10);
+
+    registerTestOps();
+    Scratch scratch;
+    Workbench wb(scratch.dir);
+    wb.setDataset(syntheticSource(1, 1, 8, 16, 16));
+    wb.setBackend(Backend::Cpu);
+    while (wb.pipeline().size() > 1) wb.removeStep(1);
+    wb.addStep("test_labels");
+    REQUIRE(runSync(wb)->succeeded());
+    wb.view(1);
+    std::shared_ptr<LabelVolume> labels = wb.viewedLabels();
+    REQUIRE(labels);
+    wb.setPaintTool(PaintTool::Brush);
+    ViewState s = wb.viewState();
+    s.selectedLabel = 9;
+    s.brushPx = 15;
+    s.paint3d = true;
+    wb.setViewState(s);
+    wb.beginPaintStroke();
+    wb.paintLabels(3, 12, 12, false);
+    wb.endPaintStroke();
+    const Index reach = Workbench::paintZRadius(15);
+    for (Index z = 0; z < 8; ++z) {
+        INFO("plane " << z);
+        CHECK((labels->at(0, z, 12, 12) == 9) == (z >= 3 - reach && z <= 3 + reach));
+    }
+}
+
+TEST_CASE("An action card's undo names the change its own call made", "[app][tools][history]") {
+    registerTestOps();
+    Scratch scratch;
+    Workbench wb(scratch.dir);
+    wb.setDataset(syntheticSource());
+    while (wb.pipeline().size() > 1) wb.removeStep(1);
+    ToolApi api(wb);
+    const std::uint64_t r0 = wb.history().revision();
+    // two history entries in one call: the step, then its parameters
+    REQUIRE_FALSE(api.call("add_step", {{"kind", "test_scale"}, {"params", {{"factor", 4}}}}).contains("error"));
+    const std::uint64_t r1 = wb.history().revision();
+    REQUIRE(r1 != r0);
+    // a value set to what it already is pushes nothing, so there is nothing to undo
+    REQUIRE_FALSE(api.call("set_params", {{"step", 2}, {"params", {{"factor", 4}}}}).contains("error"));
+    CHECK(wb.history().revision() == r1);
+    REQUIRE_FALSE(api.call("set_params", {{"step", 2}, {"params", {{"factor", 5}}}}).contains("error"));
+    const std::uint64_t r2 = wb.history().revision();
+    REQUIRE_FALSE(api.call("view_step", {{"step", 2}}).contains("error"));
+
+    const std::vector<ActionRecord> cards = api.takeActions();
+    REQUIRE(cards.size() == 4);
+    CHECK(cards[0].link == "undo");
+    CHECK(cards[0].revBefore == r0);
+    CHECK(cards[0].revAfter == r1);
+    CHECK(cards[1].link.empty());
+    CHECK(cards[2].link == "undo");
+    CHECK(cards[2].revBefore == r1);
+    CHECK(cards[2].revAfter == r2);
+    CHECK(cards[3].link == "view");
+    CHECK(cards[3].revBefore == 0);
+    CHECK(cards[3].revAfter == 0);
+    // undoing down to the first card's revBefore takes its whole change away
+    wb.undo();
+    CHECK(wb.history().revision() == cards[2].revBefore);
+    while (wb.history().revision() != cards[0].revBefore && wb.history().canUndo()) wb.undo();
+    CHECK(wb.history().revision() == r0);
+    CHECK(wb.pipeline().size() == 1);
 }
 
 TEST_CASE("All-GPUs device index round-robins volumes", "[app][pipeline][cuda]") {

@@ -626,14 +626,17 @@ namespace sirius::app {
         diff.t = t;
         if (t < 0 || t >= t_) throw std::out_of_range("LabelVolume::split: t out of range");
         if (!id) throw std::invalid_argument("LabelVolume::split: cannot split the background");
-        edited_ = true;
-        std::uint32_t* v = writable(t);
+        // checked on the voxels as they are (read only: no detach): a refused
+        // split is no edit, and must not copy voxels shared with another output
+        const std::uint32_t* current = static_cast<const LabelVolume&>(*this).volume(t);
         auto inside = [&](const std::array<Index, 3>& s) {
             return s[0] >= 0 && s[0] < z_ && s[1] >= 0 && s[1] < y_ && s[2] >= 0 && s[2] < x_ &&
-                   v[(s[0] * y_ + s[1]) * x_ + s[2]] == id;
+                   current[(s[0] * y_ + s[1]) * x_ + s[2]] == id;
         };
         if (!inside(seedA) || !inside(seedB))
             throw std::invalid_argument("LabelVolume::split: both seeds must lie inside label " + std::to_string(id));
+        edited_ = true;
+        std::uint32_t* v = writable(t);
 
         // bounding box of the label, padded by one background voxel so the
         // distance transform sees the object's boundary on every side

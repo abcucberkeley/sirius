@@ -243,6 +243,11 @@ namespace sirius::app {
         if (cancelledResult_) error_ = "cancelled";
         seconds_ = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
         progress_.set(1.0, -1, "");
+        // The worker serves one client at a time: the connection is closed
+        // here, on the run's thread, so a client waiting for the worker (the
+        // model hub's) does not depend on the GUI thread getting to finishRun.
+        ctx_.remote = nullptr;
+        ownedRemote_.reset();
         finished_.store(true, std::memory_order_release);
     }
 
@@ -1062,7 +1067,7 @@ namespace sirius::app {
     }
 
     void Workbench::setZ(Index z) {
-        const DatasetMeta meta = outputMetaOf(viewed_);
+        const DatasetMeta meta = displayedMeta();
         z = std::clamp<Index>(z, 0, std::max<Index>(meta.dims.z - 1, 0));
         if (view_.z == z) return;
         view_.z = z;
@@ -1070,7 +1075,7 @@ namespace sirius::app {
     }
 
     void Workbench::setT(Index t) {
-        const DatasetMeta meta = outputMetaOf(viewed_);
+        const DatasetMeta meta = displayedMeta();
         t = std::clamp<Index>(t, 0, std::max<Index>(meta.dims.t - 1, 0));
         if (view_.t == t) return;
         view_.t = t;
@@ -1080,7 +1085,7 @@ namespace sirius::app {
     }
 
     void Workbench::setCrosshair(Index x, Index y, Index z) {
-        const DatasetMeta meta = outputMetaOf(viewed_);
+        const DatasetMeta meta = displayedMeta();
         view_.cx = std::clamp<Index>(x, 0, std::max<Index>(meta.dims.x - 1, 0));
         view_.cy = std::clamp<Index>(y, 0, std::max<Index>(meta.dims.y - 1, 0));
         view_.z = std::clamp<Index>(z, 0, std::max<Index>(meta.dims.z - 1, 0));
@@ -1131,6 +1136,11 @@ namespace sirius::app {
         }
         if (actualIndex) *actualIndex = -1;
         return nullptr;
+    }
+
+    DatasetMeta Workbench::displayedMeta() const {
+        if (const std::shared_ptr<const StepOutput> out = displayOutput()) return out->meta;
+        return outputMetaOf(viewed_);
     }
 
     std::shared_ptr<const StepOutput> Workbench::upstreamOutput(int index, int* actualIndex) const {
@@ -1412,8 +1422,13 @@ namespace sirius::app {
         if (reopened) notify(&Observer::datasetChanged);
         const DatasetMeta meta = outputMetaOf(viewed_);
         view_.channelVisible.resize(static_cast<std::size_t>(std::max<Index>(meta.dims.c, 1)), true);
-        view_.z = std::clamp<Index>(view_.z, 0, std::max<Index>(meta.dims.z - 1, 0));
-        view_.t = std::clamp<Index>(view_.t, 0, std::max<Index>(meta.dims.t - 1, 0));
+        // z and t stay within the data on screen (displayedMeta). The output
+        // is held across the statistics below, so a spilled array comes off
+        // the disk once for both.
+        const std::shared_ptr<const StepOutput> shown = displayOutput();
+        const Dims5 dims = shown ? shown->meta.dims : meta.dims;
+        view_.z = std::clamp<Index>(view_.z, 0, std::max<Index>(dims.z - 1, 0));
+        view_.t = std::clamp<Index>(view_.t, 0, std::max<Index>(dims.t - 1, 0));
         syncLabelStats();   // a tracking step leaves the last frame's table
         notify(&Observer::outputsChanged);
         notify(&Observer::viewStateChanged);
@@ -1538,7 +1553,10 @@ namespace sirius::app {
         strokeDiff_ = LabelDiff{};
         strokeLabels_ = editableLabels(&strokeStep_);
         strokeOpen_ = static_cast<bool>(strokeLabels_);
-        if (view_.selectedLabel == 0 && strokeLabels_ && view_.paintTool == PaintTool::Brush)
+        // The lasso paints with the brush for now, and so paints a new label
+        // too: label 0 would erase whatever the stroke crosses.
+        if (view_.selectedLabel == 0 && strokeLabels_ &&
+            (view_.paintTool == PaintTool::Brush || view_.paintTool == PaintTool::Lasso))
             view_.selectedLabel = strokeLabels_->maxLabel() + 1;
         // the stroke's bounds: what a replay needs to group the paint events
         // between them (each move records one), and what undo works on
@@ -1567,7 +1585,7 @@ namespace sirius::app {
             }
         } report{trace, t0, t1};
         const double radius = std::max(1.0, view_.brushPx / 2.0);
-        const Index zRadius = view_.paint3d ? std::max<Index>(1, view_.brushPx / 6) : 0;
+        const Index zRadius = view_.paint3d ? paintZRadius(view_.brushPx) : 0;
         const std::uint32_t label = erase ? 0u : view_.selectedLabel;
         LabelDiff diff = labels->paint(view_.t, z, y, x, radius, zRadius, label, erase ? view_.selectedLabel : 0u);
         if (diff.empty()) return;
@@ -1585,6 +1603,8 @@ namespace sirius::app {
         staleBelow(strokeStep_);   // cheap; the outputsChanged notification waits for the stroke's end
         notifyLabels(strokeStep_);
     }
+
+    int Workbench::paintZRadius(int brushPx) noexcept { return std::max(1, brushPx / 6); }
 
     void Workbench::endPaintStroke() {
         if (!strokeOpen_) return;
@@ -1662,9 +1682,17 @@ namespace sirius::app {
         }
 
         // Moves `seed` onto the voxel of `id` nearest to it in frame t (the
-        // centroid of a bent object lies outside it); false when `id` is absent.
+        // centroid of a bent object lies outside it); false when `id` is absent,
+        // or the labels have no frame t (a view on a time point past them).
         bool snapToLabel(const LabelVolume& labels, Index t, std::uint32_t id, std::array<Index, 3>& seed) {
+            if (t < 0 || t >= labels.t()) return false;
             const std::uint32_t* v = labels.volume(t);
+            // A seed on the label stays, without a pass over the volume: the
+            // viewer's Split tool only takes clicks on the label, and a
+            // centroid usually lies inside its object.
+            if (seed[0] >= 0 && seed[0] < labels.z() && seed[1] >= 0 && seed[1] < labels.y() && seed[2] >= 0 &&
+                seed[2] < labels.x() && v[(seed[0] * labels.y() + seed[1]) * labels.x() + seed[2]] == id)
+                return true;
             double best = std::numeric_limits<double>::infinity();
             std::array<Index, 3> nearest{-1, -1, -1};
             for (Index z = 0; z < labels.z(); ++z)
@@ -1678,7 +1706,6 @@ namespace sirius::app {
                         if (d < best) {
                             best = d;
                             nearest = {z, y, x};
-                            if (d == 0.0) break;
                         }
                     }
                 }
@@ -1694,6 +1721,17 @@ namespace sirius::app {
         StepId id = 0;
         auto labels = editableLabels(&id);
         if (!labels) return;
+        // The seeds go onto the label's nearest voxels: points picked from its
+        // bounding box, or clicked just beside it, fall outside a bent, ring
+        // or diagonal object, and the split would refuse them.
+        if (!snapToLabel(*labels, view_.t, label, a) || !snapToLabel(*labels, view_.t, label, b)) {
+            logLine("Split: label " + std::to_string(label) + " is not in this frame.");
+            return;
+        }
+        if (a == b) {
+            logLine("Split: pick two different points inside label " + std::to_string(label) + ".");
+            return;
+        }
         if (labels->tracked() && labels->t() > 1) {
             // The split travels along the track: the two parts' centroids in
             // one frame seed the same watershed of the same id in the next,

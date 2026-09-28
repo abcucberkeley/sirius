@@ -154,7 +154,9 @@ namespace sirius::app::gui {
         bool drawn = false;
         if (ImGui::BeginTable("##tracks", ColumnCount, flags, ImVec2(r.width(), r.height()))) {
             drawn = true;
-            ImGui::TableSetupScrollFreeze(0, 1);
+            // The ID column stays put: the row's Selectable lives in it, and
+            // a column scrolled out of view submits nothing.
+            ImGui::TableSetupScrollFreeze(1, 1);
             // fixed widths (they include the 6 px cell padding)
             auto width = [&](const char* sample, float extra) {
                 return std::max(px(10), theme::textSize(sample, theme::kSmallPx).x + px(extra) - 2.0f * px(6));

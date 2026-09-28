@@ -337,6 +337,11 @@ namespace sirius::app {
         // has one, else the nearest computed upstream output (Load's lazy
         // source at worst). `actualIndex` reports which one it is.
         std::shared_ptr<const StepOutput> displayOutput(int* actualIndex = nullptr) const;
+        // The metadata of that output, or the viewed step's predicted output
+        // when nothing is on screen yet: what z, t and the crosshair are
+        // clamped to. A step that has not run is shown on its input, whose
+        // shape can differ from the step's own (a crop, a SIM reconstruction).
+        DatasetMeta displayedMeta() const;
         // Nearest computed output upstream of step `index` (the step's input).
         std::shared_ptr<const StepOutput> upstreamOutput(int index, int* actualIndex = nullptr) const;
         // True while the viewed step is shown as a live preview on its input
@@ -405,6 +410,9 @@ namespace sirius::app {
         void beginPaintStroke();
         void paintLabels(Index z, Index y, Index x, bool erase);          // uses brush size / label
         void endPaintStroke();
+        // The planes a "Paint in 3D" stroke reaches above and below the one
+        // painted, for a brush of `brushPx`: what the panel says it paints.
+        static int paintZRadius(int brushPx) noexcept;
         void fillLabel(Index z, Index y, Index x);
         // On tracked labels (LabelVolume::tracked) a merge or a delete
         // applies to every time point: the id is the object's whole life.

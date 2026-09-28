@@ -332,7 +332,7 @@ namespace sirius::app {
                      s.pitch = a["pitch"].get<double>();
                      note("pitch");
                  }
-                 const DatasetMeta meta = wb_.outputMetaOf(wb_.viewedIndex());
+                 const DatasetMeta meta = wb_.displayedMeta();
                  s.z = std::clamp<Index>(s.z, 0, std::max<Index>(meta.dims.z - 1, 0));
                  s.t = std::clamp<Index>(s.t, 0, std::max<Index>(meta.dims.t - 1, 0));
                  wb_.setViewState(s);
@@ -534,11 +534,30 @@ namespace sirius::app {
     json ToolApi::call(const std::string& name, const json& args) {
         for (const Tool& t : tools_) {
             if (t.name != name) continue;
+            const std::size_t firstRecord = actions_.size();
+            const std::uint64_t before = wb_.history().revision();
+            json result;
             try {
-                return t.fn(args.is_object() ? args : json::object());
+                result = t.fn(args.is_object() ? args : json::object());
             } catch (const std::exception& e) {
-                return json{{"error", e.what()}};
+                result = json{{"error", e.what()}};
             }
+            // An "undo" card undoes its own call's change, not whatever is
+            // newest by then: it keeps the revisions around the call. A call
+            // that pushed nothing (a value set to what it was, an edit
+            // refused during a run) has nothing of its own to undo.
+            const std::uint64_t after = wb_.history().revision();
+            for (std::size_t i = firstRecord; i < actions_.size(); ++i) {
+                ActionRecord& r = actions_[i];
+                if (r.link != "undo") continue;
+                if (after == before) {
+                    r.link.clear();
+                } else {
+                    r.revBefore = before;
+                    r.revAfter = after;
+                }
+            }
+            return result;
         }
         return json{{"error", "unknown tool '" + name + "'"}};
     }

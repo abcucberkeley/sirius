@@ -110,12 +110,20 @@ namespace sirius::app::gui {
         // frame on screen).
         const std::uint64_t key = rev.labels + (sortColumn_ >= 0 ? rev.viewState : 0);
         if (orderedFor_ == labels_.get() && orderedSize_ == st.size() && orderedRev_ == key) return;
+        // The Shift+click anchor is a display row, and the rows are about to
+        // move: it follows its entry of the statistics (kept in id order) to
+        // the entry's new row. When entries came or went an index names
+        // another label, so the anchor is dropped; the refresh after an edit
+        // anchors on the selected label again (setLabels).
+        const bool sameEntries = (!orderedFor_ || orderedFor_ == labels_.get()) && orderedSize_ == st.size();
+        const int anchorEntry = sameEntries && anchorRow_ >= 0 && anchorRow_ < static_cast<int>(order_.size())
+                                    ? order_[static_cast<std::size_t>(anchorRow_)]
+                                    : -1;
         orderedFor_ = labels_.get();
         orderedSize_ = st.size();
         orderedRev_ = key;
         order_.resize(st.size());
         for (std::size_t i = 0; i < order_.size(); ++i) order_[i] = static_cast<int>(i);
-        if (sortColumn_ < 0) return;
         const int column = sortColumn_;
         const bool descending = sortDescending_;
         auto less = [&](int ia, int ib) {
@@ -130,7 +138,10 @@ namespace sirius::app::gui {
                 default: return false;
             }
         };
-        std::stable_sort(order_.begin(), order_.end(), [&](int a, int b) { return descending ? less(b, a) : less(a, b); });
+        if (column >= 0)
+            std::stable_sort(order_.begin(), order_.end(), [&](int a, int b) { return descending ? less(b, a) : less(a, b); });
+        const auto anchor = std::find(order_.begin(), order_.end(), anchorEntry);
+        anchorRow_ = anchorEntry >= 0 && anchor != order_.end() ? static_cast<int>(anchor - order_.begin()) : -1;
     }
 
     void SegmentCleanupView::clickRow(int displayRow, std::uint32_t id) {
@@ -201,7 +212,13 @@ namespace sirius::app::gui {
             std::array<Index, 3> a = centre, b = centre;
             a[ax] = s->bbox[2 * ax] + extent[ax] / 4;
             b[ax] = s->bbox[2 * ax] + (3 * extent[ax]) / 4;
-            wb.splitLabel(id, a, b);
+            // the core puts the seeds onto the label; what it still refuses
+            // (a frame the labels do not have) is a log line, not a crash
+            try {
+                wb.splitLabel(id, a, b);
+            } catch (const std::exception& e) {
+                wb.logLine(std::string("Split: ") + e.what());
+            }
         }
     }
 
@@ -265,7 +282,7 @@ namespace sirius::app::gui {
         y += px(18) + px(8);
 
         ImGui::SetCursorScreenPos(ImVec2(left, y));
-        const std::string label = format("Paint in 3D (±%d z)###paint3d", std::max(1, static_cast<int>(std::lround(vs.brushPx / 6.0))));
+        const std::string label = format("Paint in 3D (±%d z)###paint3d", Workbench::paintZRadius(vs.brushPx));
         if (widgets::tokenCheck(label.c_str(), vs.paint3d, nullptr, editable)) {
             ViewState next = wb.viewState();
             next.paint3d = !next.paint3d;
@@ -291,7 +308,9 @@ namespace sirius::app::gui {
         bool drawn = false;
         if (ImGui::BeginTable("##labels", 6, flags, ImVec2(r.width(), r.height()))) {
             drawn = true;
-            ImGui::TableSetupScrollFreeze(0, 1);
+            // The ID column stays put: the row's Selectable lives in it, and
+            // a column scrolled out of view submits nothing.
+            ImGui::TableSetupScrollFreeze(1, 1);
             // fixed widths: measuring every row would take seconds on a large volume
             auto width = [&](const char* sample, float extra) {
                 return std::max(px(10), theme::textSize(sample, theme::kSmallPx).x + px(extra) - 2.0f * px(6));
