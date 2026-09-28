@@ -30,7 +30,9 @@ namespace sirius::app::gui {
         Texture(Texture&& o) noexcept;
         Texture& operator=(Texture&& o) noexcept;
 
-        // `rgba` is width * height * 4 bytes, rows top to bottom.
+        // `rgba` is width * height * 4 bytes, rows top to bottom. A size
+        // above maxTextureSize() releases the texture instead (valid() turns
+        // false), since the GPU would keep none of the image.
         void upload(const std::uint8_t* rgba, int width, int height, bool smooth = false);
         // 0xAARRGGBB pixels as the slice renderers produce them: converted on
         // the way in.
@@ -39,6 +41,12 @@ namespace sirius::app::gui {
         void uploadGray(const std::uint8_t* gray, int width, int height, bool smooth = false);
         void setSmooth(bool smooth);
         void reset();
+        // Adds the texture to `dl` over (a, b). The OpenGL backend binds its
+        // own linear sampler object for every draw list, and a sampler
+        // overrides the texture's filter: a texture that is not smooth asks
+        // the backend for its nearest sampler around the image, and puts the
+        // linear one back after it for what follows.
+        void draw(ImDrawList* dl, ImVec2 a, ImVec2 b, ImVec2 uv0 = ImVec2(0, 0), ImVec2 uv1 = ImVec2(1, 1)) const;
 
         bool valid() const noexcept { return id_ != 0; }
         int width() const noexcept { return w_; }
@@ -83,6 +91,10 @@ namespace sirius::app::gui {
         GLint prevFbo_ = 0;
         GLint prevViewport_[4] = {0, 0, 0, 0};
     };
+
+    // GL_MAX_TEXTURE_SIZE, asked once (the context must be current): the
+    // longest side a 2D texture can have.
+    int maxTextureSize();
 
     // Compiles and links a program; 0 (and `log` filled) on failure.
     GLuint buildProgram(const char* vertexSource, const char* fragmentSource, std::string* log = nullptr);

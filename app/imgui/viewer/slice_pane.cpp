@@ -198,7 +198,12 @@ namespace sirius::app::gui {
 
     void SlicePane::keyNavigation() {
         if (!onKeyNavigate) return;
-        const int step = ImGui::GetIO().KeyShift ? 10 : 1;
+        const ImGuiIO& io = ImGui::GetIO();
+        // IsKeyPressed ignores modifiers, and an arrow with Ctrl, Alt or
+        // Super is a window action (Alt+Up moves the step): only the plain
+        // and Shift+ keys walk the crosshair.
+        if (io.KeyCtrl || io.KeyAlt || io.KeySuper) return;
+        const int step = io.KeyShift ? 10 : 1;
         int dc = 0, dr = 0, dd = 0;
         if (ImGui::IsKeyPressed(ImGuiKey_LeftArrow)) dc = -step;
         if (ImGui::IsKeyPressed(ImGuiKey_RightArrow)) dc = step;
@@ -226,7 +231,7 @@ namespace sirius::app::gui {
             texture_.setSmooth(smooth);
             const ImVec2 a(min_.x + static_cast<float>(view_.ox + originX_ * view_.zx), min_.y + static_cast<float>(view_.oy + originY_ * view_.zy));
             const ImVec2 b(a.x + static_cast<float>(imageW_ * factor_ * view_.zx), a.y + static_cast<float>(imageH_ * factor_ * view_.zy));
-            dl->AddImage(texture_.ref(), a, b);
+            texture_.draw(dl, a, b);
         }
 
         if (tracks_ && hasContent())

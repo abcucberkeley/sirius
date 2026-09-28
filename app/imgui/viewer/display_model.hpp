@@ -2,11 +2,12 @@
 #define SIRIUS_IMGUI_VIEWER_DISPLAY_MODEL_HPP
 
 // Turns one step output into the pixels the panes draw: per-channel display
-// windows (robust percentiles, computed once per output and channel), the
-// additive channel blend into an RGB image, the XZ / YZ re-slices and the
-// z maximum projection, and the label overlay. Lazy (on-disk) outputs are
-// read plane by plane for XY and as one (c, t) volume, cached, for the
-// re-slices; everything else reads straight out of the in-memory array.
+// windows (robust percentiles computed once per output and channel, or each
+// (c, t) volume's full range), the additive channel blend into an RGB image,
+// the XZ / YZ re-slices and the z maximum projection, and the label overlay.
+// Lazy (on-disk) outputs are read plane by plane for XY and as one (c, t)
+// volume, cached, for the re-slices; everything else reads straight out of
+// the in-memory array.
 //
 // Nothing here ever reads a whole volume: volumeState() says whether one is
 // in memory, has to be produced (by ViewerLoader, off the GUI thread) or is
@@ -81,7 +82,9 @@ namespace sirius::app::gui {
         // that need a whole volume report "too large" instead of reading it.
         static constexpr std::size_t kVolumeCacheLimit = std::size_t{3} << 30;   // 3 GiB
         // The projections of the time points already played, least recently
-        // shown dropped first (64 frames of one 2048 x 2048 channel).
+        // shown dropped first (64 frames of one 2048 x 2048 channel). An
+        // output whose frames are larger gets room for two of them (see
+        // setOutput).
         static constexpr std::size_t kMipCacheLimit = std::size_t{1} << 30;      // 1 GiB
 
         void setOutput(std::shared_ptr<const StepOutput> out);
@@ -93,8 +96,11 @@ namespace sirius::app::gui {
         const LabelVolume* labels() const noexcept;
 
         // --- windows ---------------------------------------------------------
-        // Auto: robust percentiles (0.1 / 99.9) of a few sampled planes;
-        // Full: the (c, t) volume's minimum and maximum, nothing clipped.
+        // Auto: robust percentiles (0.1 / 99.9) of a few sampled planes, one
+        // window per channel; Full: the (c, t) volume's minimum and maximum,
+        // nothing clipped, one window per channel and time point. A window set
+        // with setWindow() overrides both for every time point until
+        // resetWindows(), setWindowMode() or a new output.
         enum class WindowMode { Auto,
                                 Full };
         DisplayWindow window(Index c, Index t);
@@ -190,12 +196,16 @@ namespace sirius::app::gui {
 
         std::shared_ptr<const StepOutput> out_;
         DatasetMeta meta_;
-        std::map<Index, DisplayWindow> windows_;          // per channel
+        std::map<Index, DisplayWindow> explicit_;   // per channel, from setWindow()
+        // Computed: Key{c, -1} in Auto mode, Key{c, t} in Full mode. Kept
+        // apart from explicit_ so that the exact range replacing Full mode's
+        // sampled stand-in never throws a live preview's window away.
+        std::map<Key, DisplayWindow> windows_;
         WindowMode windowMode_ = WindowMode::Auto;
         // Shared so a loader thread can hold a volume the model has evicted.
         std::map<Key, std::shared_ptr<Buffer<float>>> volumes_;   // lazy sources only
         std::map<Key, std::shared_ptr<Buffer<float>>> mips_;
-        mutable ByteBudgetLru<Key> mipBudget_{kMipCacheLimit};   // touched by mipIfReady
+        mutable ByteBudgetLru<Key> mipBudget_{kMipCacheLimit};   // touched by mipIfReady; sized by setOutput
         struct Range {
             float lo = 0.0f, hi = 1.0f;
         };

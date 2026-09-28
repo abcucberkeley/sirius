@@ -159,9 +159,10 @@ namespace sirius::app::gui {
         // mouse into the callbacks above. True when it was pressed this frame
         // (the pane takes the keyboard).
         bool input();
-        // The arrow / page keys (shift: ten at a time) for a pane that has
-        // the keyboard; the viewer calls this only then (and claims the
-        // keys from the window's menu actions meanwhile).
+        // The arrow / page keys (shift: ten at a time; with Ctrl, Alt or
+        // Super they are the window's) for a pane that has the keyboard; the
+        // viewer calls this only then (and claims the plain keys from the
+        // window's menu actions meanwhile).
         void keyNavigation();
         bool hovered() const noexcept { return hovered_; }
         bool dragging() const noexcept { return button_ >= 0; }

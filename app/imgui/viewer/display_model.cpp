@@ -57,7 +57,14 @@ namespace sirius::app::gui {
         meta_ = out_ ? out_->meta : DatasetMeta{};
         volumes_.clear();
         mips_.clear();
-        mipBudget_.clear();
+        // The projections of every channel of two time points (the one on
+        // screen and play's read-ahead) have to fit. Otherwise storing one
+        // channel's evicts another's of the frame on screen, which is then
+        // asked for again, and the viewer never stops loading.
+        const Dims5& d = meta_.dims;
+        std::size_t frameBytes = 0;
+        if (d.c > 0 && d.y > 0 && d.x > 0) frameBytes = static_cast<std::size_t>(d.c * d.y * d.x) * sizeof(float);
+        mipBudget_ = ByteBudgetLru<Key>(std::max(kMipCacheLimit, 2 * frameBytes));
         ranges_.clear();
         planes_.clear();
         tooLarge_ = false;
@@ -65,6 +72,7 @@ namespace sirius::app::gui {
         // output can share its input's shape while living in a different
         // intensity range (Contrast rescales to 0..1), and a stale window
         // then clips it to white.
+        explicit_.clear();
         windows_.clear();
     }
 
@@ -82,19 +90,29 @@ namespace sirius::app::gui {
     // --- windows -------------------------------------------------------------
 
     DisplayWindow DisplayModel::window(Index c, Index t) {
-        auto it = windows_.find(c);
+        // a live preview's window holds for every time point
+        auto eit = explicit_.find(c);
+        if (eit != explicit_.end()) return eit->second;
+        // Full mode is each volume's own range, so a frame looks the same
+        // whichever frame was shown before it; Auto keeps one per channel.
+        const Key key = windowMode_ == WindowMode::Full ? Key{c, t} : Key{c, -1};
+        auto it = windows_.find(key);
         if (it != windows_.end()) return it->second;
         const DisplayWindow w = computeWindow(c, t);
-        windows_[c] = w;
+        windows_[key] = w;
         return w;
     }
 
-    void DisplayModel::setWindow(Index c, DisplayWindow w) { windows_[c] = w; }
+    void DisplayModel::setWindow(Index c, DisplayWindow w) { explicit_[c] = w; }
 
-    void DisplayModel::resetWindows() { windows_.clear(); }
+    void DisplayModel::resetWindows() {
+        explicit_.clear();
+        windows_.clear();
+    }
 
     void DisplayModel::setWindowMode(WindowMode m) {
         windowMode_ = m;
+        explicit_.clear();
         windows_.clear();
     }
 
@@ -211,7 +229,10 @@ namespace sirius::app::gui {
         tooLarge_ = false;
         // in memory and small: the projection costs less than a thread hop
         if (d.z * n > kInlineProjectVoxels) return VolumeState::Wanted;
-        const float* v = out_->array->plane(c, t, 0);
+        // The in-memory array, or a lazy source's cached volume whose
+        // projection was evicted: a lazy output has no array.
+        const float* v = volumeIfReady(c, t);
+        if (!v) return VolumeState::Wanted;
         auto m = std::make_shared<Buffer<float>>(Shape{d.y, d.x});
         float lo = std::numeric_limits<float>::infinity(), hi = -lo;
         std::fill_n(m->data(), n, -std::numeric_limits<float>::infinity());
@@ -235,7 +256,7 @@ namespace sirius::app::gui {
         storeMip(key, std::move(m));
         // the same pass gives the exact range the full-range window wants
         ranges_[key] = Range{lo, hi};
-        if (windowMode_ == WindowMode::Full) windows_.erase(c);
+        if (windowMode_ == WindowMode::Full) windows_.erase(key);
         return VolumeState::Ready;
     }
 
@@ -263,7 +284,7 @@ namespace sirius::app::gui {
         if (hi > lo) {
             ranges_[key] = Range{lo, hi};
             // the full-range window was standing in on samples until now
-            if (windowMode_ == WindowMode::Full) windows_.erase(c);
+            if (windowMode_ == WindowMode::Full) windows_.erase(key);
         }
     }
 

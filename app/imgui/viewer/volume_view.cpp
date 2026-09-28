@@ -495,7 +495,12 @@ namespace sirius::app::gui {
             if (gl_->textureCount > 0) {
                 glEnable(GL_BLEND);
                 glBlendEquation(GL_FUNC_ADD);
-                glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+                // The ray caster's colour is already weighted by its opacity
+                // (premultiplied): weighting it again squared a MIP's
+                // intensities. The same factors on alpha keep the target
+                // opaque over the opaque clear, so no canvas shows through
+                // when Dear ImGui draws it.
+                glBlendFuncSeparate(GL_ONE, GL_ONE_MINUS_SRC_ALPHA, GL_ONE, GL_ONE_MINUS_SRC_ALPHA);
                 const GLuint p = gl_->ray;
                 glUseProgram(p);
                 const Mat4 inv = inverted(gl_->viewProj);

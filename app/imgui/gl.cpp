@@ -74,8 +74,24 @@ namespace sirius::app::gui {
         glBindTexture(GL_TEXTURE_2D, static_cast<GLuint>(prev));
     }
 
+    int maxTextureSize() {
+        static GLint size = 0;
+        if (size <= 0) {
+            glGetIntegerv(GL_MAX_TEXTURE_SIZE, &size);
+            // OpenGL 3.3 guarantees at least 1024.
+            if (size <= 0) size = 1024;
+        }
+        return size;
+    }
+
     void Texture::upload(const std::uint8_t* rgba, int width, int height, bool smooth) {
         if (!rgba || width <= 0 || height <= 0) return;
+        if (width > maxTextureSize() || height > maxTextureSize()) {
+            // glTexImage2D would fail and leave a texture without an image,
+            // which samples black; one that is not valid() is not drawn.
+            reset();
+            return;
+        }
         GLint prev = 0, prevAlign = 4, prevRow = 0;
         glGetIntegerv(GL_TEXTURE_BINDING_2D, &prev);
         glGetIntegerv(GL_UNPACK_ALIGNMENT, &prevAlign);
@@ -129,6 +145,14 @@ namespace sirius::app::gui {
             out[4 * i + 3] = 0xFF;
         }
         upload(out, width, height, smooth);
+    }
+
+    void Texture::draw(ImDrawList* dl, ImVec2 a, ImVec2 b, ImVec2 uv0, ImVec2 uv1) const {
+        const ImGuiPlatformIO& pio = ImGui::GetPlatformIO();
+        const bool nearest = !smooth_ && pio.DrawCallback_SetSamplerNearest && pio.DrawCallback_SetSamplerLinear;
+        if (nearest) dl->AddCallback(pio.DrawCallback_SetSamplerNearest, nullptr);
+        dl->AddImage(ref(), a, b, uv0, uv1);
+        if (nearest) dl->AddCallback(pio.DrawCallback_SetSamplerLinear, nullptr);
     }
 
     // --- RenderTarget -------------------------------------------------------------

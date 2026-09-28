@@ -258,7 +258,7 @@ namespace sirius::app::gui {
             const ImVec2 max(min.x + w, min.y + h);
             // pixels stay pixels when enlarged, and are averaged when reduced
             texture->setSmooth(s < 1.0f);
-            dl->AddImage(texture->ref(), min, max);
+            texture->draw(dl, min, max);
             if (marks.empty()) return;
             dl->PushClipRect(r.min, r.max, true);
             const float pen = std::max(1.0f, px(1.2f));
