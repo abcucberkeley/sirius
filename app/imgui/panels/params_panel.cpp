@@ -141,6 +141,29 @@ namespace sirius::app::gui {
             std::string s;
             int decimals = -2;   // -2: not decided yet
             bool active = false;
+            bool edited = false;   // the number changed while the field had the keyboard
+
+            // After a number field is drawn: `changed` is what the widget
+            // returned, `nowActive` whether the field has the keyboard now.
+            // True when the value is an edit to commit. The arrows and the
+            // wheel commit at once, typing when the field lets go of the
+            // keyboard -- and only if something was typed while it had it:
+            // the value the field was given when it took the keyboard is no
+            // edit, and may be stale by then (the assistant edits steps too),
+            // so writing it back would undo the newer one. Escape drops what
+            // was typed.
+            bool settle(bool changed, bool nowActive) {
+                const bool was = active;
+                active = nowActive;
+                if (active) {
+                    edited = (was && edited) || changed;
+                    return false;
+                }
+                const bool typed = was && edited;
+                edited = false;
+                if (was && ImGui::IsKeyPressed(ImGuiKey_Escape, false)) return false;
+                return changed || typed;
+            }
         };
 
     } // namespace
@@ -150,17 +173,19 @@ namespace sirius::app::gui {
         int runFinishedSlot = 0;
         std::uint64_t runsFinished = 0;
 
-        // What resets the form's buffers when it changes: the step, its kind, the
-        // values its visibility rules read, and every dataset change and
-        // finished run (diagnostics-driven notes may have changed).
+        // What resets the form's buffers when it changes: the step, by id (a
+        // step added at the selected place takes the place over), its kind,
+        // the values its visibility rules read, and every dataset change and
+        // finished run. The contrast range is read from the input, so it is
+        // read again when the step's place changes too.
         int builtFor = -2;
+        StepId builtStep = 0;
         std::string builtKind, builtVisibility;
         std::uint64_t builtDataset = 0, builtRuns = 0;
         // per form: the field buffers and which "More parameters" are open
         std::map<std::string, FieldBuf> bufs;
         std::map<std::string, bool> moreOpen;
         // derived once per form
-        Diagnostics diagnostics;           // SIM warnings, segmentation facts
         bool haveUpstream = false;
         double dataMin = 0.0, dataMax = 1.0;   // contrast: the input's intensity range
         int contrastDecimals = 3;
@@ -169,6 +194,11 @@ namespace sirius::app::gui {
         std::uint64_t effOutputs = 0;
         bool effValid = false;
         double effLo = 0.0, effHi = 1.0;
+        // contrast: an input that failed to read. It is treated as no input,
+        // and neither read nor reported again until the form is rebuilt or
+        // the input is another output: a drag on an automatic window would
+        // otherwise read it, and log the same error, on every frame.
+        std::weak_ptr<const StepOutput> unreadable;
 
         // what the core derives for the selected step without running it, kept
         // until the pipeline, the dataset or the outputs move
@@ -177,6 +207,7 @@ namespace sirius::app::gui {
         DatasetMeta derivedInput;
         Validation derivedValidation;
         std::size_t derivedBytes = 0;
+        Diagnostics diagnostics;   // SIM warnings, segmentation facts
 
         void refreshDerived() {
             const Revisions& r = app.bridge().rev();
@@ -185,10 +216,14 @@ namespace sirius::app::gui {
             if (stamp == derivedStamp && i == derivedFor) return;
             derivedStamp = stamp;
             derivedFor = i;
-            if (!step()) return;
+            const Step* st = step();
+            if (!st) return;
             derivedInput = wb().inputMetaOf(i);
             derivedValidation = wb().stepValidation(i);
             derivedBytes = wb().estimatedBytesOf(i);
+            // The step's validation is part of these, and so is whether its
+            // result is older than its parameters: they follow every edit.
+            diagnostics = st->kind == "sim" || st->kind == "seg" ? wb().selectedDiagnostics() : Diagnostics{};
         }
 
         // edits made while drawing, run once the frame's form is drawn
@@ -238,9 +273,19 @@ namespace sirius::app::gui {
 
         void later(std::function<void()> fn) { actions.push_back(std::move(fn)); }
 
+        // An edit of the step the form shows, run with its index once the
+        // frame's form is drawn. The step is found again by id then, and the
+        // edit dropped if it is gone.
+        void onStep(std::function<void(int)> fn) {
+            const StepId id = selectedId();
+            later([this, id, fn = std::move(fn)] {
+                const int i = wb().pipeline().indexOf(id);
+                if (i >= 0) fn(i);
+            });
+        }
+
         void setParam(const std::string& key, ParamValue v, bool merge) {
-            const int i = index();
-            later([this, i, key, v, merge] { wb().setStepParam(i, key, v, merge ? key : std::string()); });
+            onStep([this, key, v, merge](int i) { wb().setStepParam(i, key, v, merge ? key : std::string()); });
         }
 
         // 12 px between the items of the form.
@@ -269,6 +314,12 @@ namespace sirius::app::gui {
 
         FieldBuf& buf(const std::string& key) { return bufs[key]; }
 
+        bool readable(const std::shared_ptr<const StepOutput>& input) const { return input && unreadable.lock() != input; }
+        void readFailed(const std::shared_ptr<const StepOutput>& input, const std::exception& e) {
+            unreadable = input;
+            wb().logLine(std::string("Contrast: ") + e.what());
+        }
+
         // --- form shape ------------------------------------------------------------
         // The values every visibility rule of this step depends on. The form is
         // rebuilt when one of them moves, since that is what decides which
@@ -285,20 +336,27 @@ namespace sirius::app::gui {
             const Revisions& r = app.bridge().rev();
             const std::string kind = st ? st->kind : std::string();
             const std::string vis = st ? visibilitySignature(st->op().info(), st->params) : std::string();
-            if (i == builtFor && kind == builtKind && vis == builtVisibility && r.dataset == builtDataset && runsFinished == builtRuns)
-                return;
+            const StepId id = st ? st->id : 0;
+            const bool sameForm = id == builtStep && kind == builtKind && vis == builtVisibility && r.dataset == builtDataset &&
+                                  runsFinished == builtRuns;
+            if (sameForm && i == builtFor) return;
             builtFor = i;
+            builtStep = id;
             builtKind = kind;
             builtVisibility = vis;
             builtDataset = r.dataset;
             builtRuns = runsFinished;
-            bufs.clear();
-            moreOpen.clear();
+            // A step moved by an edit above it keeps its fields, one of which
+            // may be being typed into; only its input, and so the contrast
+            // range, is another one.
+            if (!sameForm) {
+                bufs.clear();
+                moreOpen.clear();
+            }
             effValid = false;
-            diagnostics = Diagnostics{};
             haveUpstream = false;
+            unreadable.reset();
             if (!st) return;
-            if (kind == "sim" || kind == "seg") diagnostics = wb().selectedDiagnostics();
             if (kind == "contrast") {
                 // the input's intensity range, for the slider extents
                 dataMin = 0.0;
@@ -306,16 +364,24 @@ namespace sirius::app::gui {
                 std::shared_ptr<const StepOutput> upstream = wb().upstreamOutput(i);
                 haveUpstream = static_cast<bool>(upstream);
                 if (upstream) {
-                    const StepInput in = upstream->asInput();
-                    float mn = std::numeric_limits<float>::infinity(), mx = -mn;
-                    for (Index c = 0; c < in.meta.dims.c; ++c) {
-                        const ContrastWindow w = contrastWindow(in, st->params, c, 8, true);
-                        mn = std::min(mn, w.dataMin);
-                        mx = std::max(mx, w.dataMax);
-                    }
-                    if (mn < mx) {
-                        dataMin = mn;
-                        dataMax = mx;
+                    // A lazily read input reads planes here, and one that cannot
+                    // be read (a truncated file, a share gone away) leaves the
+                    // sliders on 0 .. 1 rather than taking the panel down.
+                    try {
+                        const StepInput in = upstream->asInput();
+                        float mn = std::numeric_limits<float>::infinity(), mx = -mn;
+                        for (Index c = 0; c < in.meta.dims.c; ++c) {
+                            const ContrastWindow w = contrastWindow(in, st->params, c, 8, true);
+                            mn = std::min(mn, w.dataMin);
+                            mx = std::max(mx, w.dataMax);
+                        }
+                        if (mn < mx) {
+                            dataMin = mn;
+                            dataMax = mx;
+                        }
+                    } catch (const std::exception& e) {
+                        haveUpstream = false;
+                        readFailed(upstream, e);
                     }
                 }
                 const double span = dataMax - dataMin;
@@ -327,9 +393,19 @@ namespace sirius::app::gui {
 
         // --- generic editors -----------------------------------------------------------
         // A file / directory field with Browse, and optionally one more button
-        // after it (Hub…, Bundles…).
+        // after it (Hub…, Bundles…). `opensDataset`: the Load step's Source,
+        // where a path chosen while no dataset is open opens it -- nothing
+        // else would, and the form says to choose a file there. It goes
+        // through the Open dataset dialog, as File ▸ Open dataset… does, so a
+        // plain TIFF asks how its pages map onto (c, t, z). With a dataset
+        // open, the path is an edit like the tile or the page order, and the
+        // next run of the Load step opens it; so is an emptied field.
+        static void openSource(App* a, const std::string& path) {
+            a->showDialog(makeOpenDatasetDialog(*a, path, [a](const std::string& p, const OpenOptions& o) { a->openWith(p, o); }));
+        }
+
         void pathEditor(const ParamSpec& s, const ParamSet& params, float width, const char* extraLabel = nullptr,
-                        const std::string& extraTip = {}, std::function<void()> extra = {}) {
+                        const std::string& extraTip = {}, std::function<void()> extra = {}, bool opensDataset = false) {
             const std::string key = s.key;
             ImGui::PushID("path");
             const float spacing = px(6);
@@ -346,7 +422,15 @@ namespace sirius::app::gui {
             fo.hint = s.directory ? "directory…" : "file…";
             widgets::inputText("##edit", &b.s, fo);
             b.active = ImGui::IsItemActive();
-            if (ImGui::IsItemDeactivatedAfterEdit() && b.s != params.getString(key)) setParam(key, b.s, false);
+            if (ImGui::IsItemDeactivatedAfterEdit() && b.s != params.getString(key)) {
+                if (opensDataset && !wb().hasDataset() && !b.s.empty()) {
+                    App* a = &app;
+                    const std::string path = b.s;
+                    a->defer([a, path] { openSource(a, path); });
+                } else {
+                    setParam(key, b.s, false);
+                }
+            }
             tip(s.help);
             const float btnY = at.y + (px(theme::kInputH) - buttonHeight(true)) * 0.5f;
             place(at.x + editW + spacing, btnY);
@@ -359,7 +443,7 @@ namespace sirius::app::gui {
                 const std::string filter = s.fileFilter;
                 const std::string current = b.s;
                 const StepId forStep = selectedId();
-                a->defer([this, a, key, dir, filter, current, forStep] {
+                a->defer([this, a, key, dir, filter, current, forStep, opensDataset] {
                     const std::string start = current.empty() ? a->lastDir() : parentPath(current);
                     const std::string path =
                         dir ? platform::pickFolderDialog("Choose directory", start)
@@ -368,7 +452,8 @@ namespace sirius::app::gui {
                     if (path.empty() || selectedId() != forStep) return;
                     a->setLastDir(dir ? path : parentPath(path));
                     bufs.erase(key);
-                    wb().setStepParam(index(), key, path);
+                    if (opensDataset && !wb().hasDataset()) openSource(a, path);
+                    else wb().setStepParam(index(), key, path);
                 });
             }
             if (extraLabel) {
@@ -400,7 +485,11 @@ namespace sirius::app::gui {
                     std::vector<std::string> items;
                     for (const ChannelInfo& ch : input.channels) items.push_back(ch.shortName() + " " + ch.label);
                     if (items.empty()) items.emplace_back("ch 0");
-                    int cur = std::clamp(static_cast<int>(params.getInt(key)), 0, static_cast<int>(items.size()) - 1);
+                    // A channel the input does not have shows no entry, not the
+                    // nearest one: then picking any entry is a change, and
+                    // repairs the step.
+                    const std::int64_t stored = params.getInt(key);
+                    int cur = stored >= 0 && stored < static_cast<std::int64_t>(items.size()) ? static_cast<int>(stored) : -1;
                     if (widgets::combo("##channel", &cur, items, fo)) setParam(key, static_cast<std::int64_t>(cur), false);
                     tip(s.help);
                     break;
@@ -408,8 +497,7 @@ namespace sirius::app::gui {
                 case ParamType::Int: {
                     FieldBuf& b = buf(key);
                     const ImGuiID fid = ImGui::GetID("##int");
-                    const bool was = b.active;
-                    if (!was) b.i = params.getInt(key);
+                    if (!b.active) b.i = params.getInt(key);
                     const std::int64_t lo = std::isfinite(s.min) ? static_cast<std::int64_t>(s.min) : -1000000000;
                     const std::int64_t hi = std::isfinite(s.max) ? static_cast<std::int64_t>(s.max) : 1000000000;
                     const std::int64_t step = s.step > 0 ? static_cast<std::int64_t>(s.step) : 1;
@@ -417,20 +505,18 @@ namespace sirius::app::gui {
                     const ImVec2 at = ImGui::GetCursorScreenPos();
                     ImGui::BeginGroup();
                     const bool changed = widgets::inputInt("##int", &b.i, lo, hi, step, fo);
-                    b.active = ImGui::GetActiveID() == fid;
+                    const bool commit = b.settle(changed, ImGui::GetActiveID() == fid);
                     if (!b.active) unitSuffix(at, width, s.unit);
                     ImGui::EndGroup();
                     tip(s.help);
-                    // arrows and the wheel commit at once, typing when the field lets go;
                     // a run of arrow clicks is one undo entry
-                    if ((changed && !b.active) || (was && !b.active && b.i != params.getInt(key))) setParam(key, b.i, true);
+                    if (commit && b.i != params.getInt(key)) setParam(key, b.i, true);
                     break;
                 }
                 case ParamType::Double: {
                     FieldBuf& b = buf(key);
                     const ImGuiID fid = ImGui::GetID("##double");
-                    const bool was = b.active;
-                    if (!was) b.d = params.getDouble(key);
+                    if (!b.active) b.d = params.getDouble(key);
                     if (b.decimals == -2) {
                         int decimals = s.decimals;
                         if (decimals < 0) {
@@ -448,11 +534,11 @@ namespace sirius::app::gui {
                     const ImVec2 at = ImGui::GetCursorScreenPos();
                     ImGui::BeginGroup();
                     const bool changed = widgets::inputDouble("##double", &b.d, lo, hi, step, b.decimals, fo);
-                    b.active = ImGui::GetActiveID() == fid;
+                    const bool commit = b.settle(changed, ImGui::GetActiveID() == fid);
                     if (!b.active) unitSuffix(at, width, s.unit);
                     ImGui::EndGroup();
                     tip(s.help);
-                    if ((changed && !b.active) || (was && !b.active && b.d != params.getDouble(key))) setParam(key, b.d, true);
+                    if (commit && b.d != params.getDouble(key)) setParam(key, b.d, true);
                     break;
                 }
                 case ParamType::Choice: {
@@ -633,7 +719,9 @@ namespace sirius::app::gui {
                 if (s.type == ParamType::Path) {
                     gap();
                     fieldLabel(s.label, formW);
-                    editor(s, params, ds, formW);
+                    ImGui::PushID(s.key.c_str());
+                    pathEditor(s, params, formW, nullptr, {}, {}, true);
+                    ImGui::PopID();
                     done.push_back(s.key);
                     break;
                 }
@@ -664,16 +752,17 @@ namespace sirius::app::gui {
                 if (ds.hasTiles() && hasTileParam) {
                     std::vector<std::string> items;
                     for (std::size_t i = 0; i < ds.tiles.size(); ++i) items.push_back(std::to_string(i + 1) + " · " + ds.tiles[i].name);
-                    int cur = std::clamp(static_cast<int>(params.getInt("tile")), 0, static_cast<int>(items.size()) - 1);
+                    // a tile the dataset does not have shows no entry (see the Channel field)
+                    const std::int64_t stored = params.getInt("tile");
+                    int cur = stored >= 0 && stored < static_cast<std::int64_t>(items.size()) ? static_cast<int>(stored) : -1;
                     gap();
                     fieldLabel("Tile", formW);
                     widgets::FieldOpts fo;
                     fo.width = dp(formW);
                     fo.enabled = formEnabled;
                     if (widgets::combo("##tile", &cur, items, fo)) {
-                        const int i = index();
                         const std::int64_t tile = cur;
-                        later([this, i, tile] {
+                        onStep([this, tile](int i) {
                             wb().setStepParam(i, "tile", tile);
                             Bridge& bridge = app.bridge();
                             if (!bridge.running()) bridge.startRun(wb().viewedIndex());
@@ -1027,11 +1116,18 @@ namespace sirius::app::gui {
                 effOutputs = outs;
                 effParams = p;
                 std::shared_ptr<const StepOutput> up = wb().upstreamOutput(index());
-                haveUpstream = static_cast<bool>(up);
-                if (up) {
-                    const ContrastWindow eff = contrastWindow(up->asInput(), p, 0, 8);
-                    effLo = eff.lo;
-                    effHi = eff.hi;
+                haveUpstream = readable(up);
+                if (haveUpstream) {
+                    // a plane that cannot be read leaves the window unresolved
+                    // (see checkShape)
+                    try {
+                        const ContrastWindow eff = contrastWindow(up->asInput(), p, 0, 8);
+                        effLo = eff.lo;
+                        effHi = eff.hi;
+                    } catch (const std::exception& e) {
+                        haveUpstream = false;
+                        readFailed(up, e);
+                    }
                 }
             }
             if (!haveUpstream) return false;
@@ -1041,19 +1137,27 @@ namespace sirius::app::gui {
         }
 
         void contrastCommit(const std::string& k, double value, bool merge) {
-            const int i = index();
-            later([this, i, k, value, merge] {
+            onStep([this, k, value, merge](int i) {
                 const Pipeline& p = wb().pipeline();
-                if (i < 0 || i >= p.size()) return;
                 ParamSet np = p.at(i).params;
-                if (!(np.getDouble("max", 0.0) > np.getDouble("min", 0.0)))   // leave automatic: pin the other bound
-                    if (auto up = wb().upstreamOutput(i)) {
-                        const ContrastWindow eff = contrastWindow(up->asInput(), np, 0, 8);
-                        np.set("min", static_cast<double>(eff.lo));
-                        np.set("max", static_cast<double>(eff.hi));
+                // Leaving automatic pins the other bound to what it resolves
+                // to. An input that cannot be read has none, as with no input.
+                if (!(np.getDouble("max", 0.0) > np.getDouble("min", 0.0))) {
+                    const std::shared_ptr<const StepOutput> up = wb().upstreamOutput(i);
+                    if (readable(up)) {
+                        try {
+                            const ContrastWindow eff = contrastWindow(up->asInput(), np, 0, 8);
+                            np.set("min", static_cast<double>(eff.lo));
+                            np.set("max", static_cast<double>(eff.hi));
+                        } catch (const std::exception& e) {
+                            readFailed(up, e);
+                        }
                     }
+                }
                 np.set(k, value);
-                wb().setStepParams(i, np, "Step " + Step::number(i) + " · " + (k == "min" ? "Min" : "Max"), merge ? k : std::string());
+                // a drag is one undo entry, and a drag on another Contrast step another one
+                const std::string mergeKey = merge ? "contrast/" + k + "#" + std::to_string(p.at(i).id) : std::string();
+                wb().setStepParams(i, np, "Step " + Step::number(i) + " · " + (k == "min" ? "Min" : "Max"), mergeKey);
             });
         }
 
@@ -1092,15 +1196,13 @@ namespace sirius::app::gui {
                 place(at.x + sliderW + spacing, at.y);
                 FieldBuf& b = buf("contrast/" + k);
                 const ImGuiID fid = ImGui::GetID("##spin");
-                const bool was = b.active;
-                if (!was) b.d = v;
+                if (!b.active) b.d = v;
                 widgets::FieldOpts fo;
                 fo.width = dp(spinW);
                 fo.enabled = formEnabled;
                 // the slider spans the data; typed values are not clamped
                 const bool changed = widgets::inputDouble("##spin", &b.d, -1e12, 1e12, (hi - lo) / 200.0, contrastDecimals, fo);
-                b.active = ImGui::GetActiveID() == fid;
-                if ((changed && !b.active) || (was && !b.active && b.d != v)) contrastCommit(k, b.d, false);
+                if (b.settle(changed, ImGui::GetActiveID() == fid) && b.d != v) contrastCommit(k, b.d, false);
                 placeEnd(at.x, at.y + px(theme::kInputH));
                 ImGui::PopID();
             }
@@ -1129,13 +1231,10 @@ namespace sirius::app::gui {
                 ao.small = true;
                 ao.enabled = formEnabled;
                 ao.tooltip = "Min / max on the input's percentiles (see More parameters)";
-                const int i = index();
                 if (widgets::button("Auto##auto", ao))
-                    later([this, i] {
-                        const Pipeline& p = wb().pipeline();
-                        auto up = wb().upstreamOutput(i);
-                        if (i >= 0 && i < p.size() && up)
-                            wb().setStepParams(i, contrastAutoParams(p.at(i).params, up->asInput()), "Auto contrast");
+                    onStep([this](int i) {
+                        if (auto up = wb().upstreamOutput(i))
+                            wb().setStepParams(i, contrastAutoParams(wb().pipeline().at(i).params, up->asInput()), "Auto contrast");
                     });
                 place(at.x + buttonWidth("Auto", true, 10) + px(8), at.y);
                 widgets::ButtonOpts ro;
@@ -1144,11 +1243,9 @@ namespace sirius::app::gui {
                 ro.enabled = formEnabled;
                 ro.tooltip = "Min / max over the input's full range, gamma 1";
                 if (widgets::button("Reset##reset", ro))
-                    later([this, i] {
-                        const Pipeline& p = wb().pipeline();
-                        auto up = wb().upstreamOutput(i);
-                        if (i >= 0 && i < p.size() && up)
-                            wb().setStepParams(i, contrastResetParams(p.at(i).params, up->asInput()), "Reset contrast");
+                    onStep([this](int i) {
+                        if (auto up = wb().upstreamOutput(i))
+                            wb().setStepParams(i, contrastResetParams(wb().pipeline().at(i).params, up->asInput()), "Reset contrast");
                     });
                 placeEnd(at.x, at.y + buttonHeight(true));
             }
@@ -1210,10 +1307,7 @@ namespace sirius::app::gui {
                 if (ImGui::IsItemHovered()) ImGui::SetMouseCursor(ImGuiMouseCursor_Hand);
                 tip("Fill the fields below for a kind of structure; every one stays editable");
             }
-            if (!chosen.empty()) {
-                const int i = index();
-                later([this, i, chosen] { wb().applyPreset(i, chosen); });
-            }
+            if (!chosen.empty()) onStep([this, chosen](int i) { wb().applyPreset(i, chosen); });
         }
 
         // --- the form ---------------------------------------------------------------------
@@ -1229,6 +1323,12 @@ namespace sirius::app::gui {
             const ParamSet params = st->params;   // a copy: edits land after the frame
             const OpInfo& info = st->op().info();
             const DatasetMeta& input = derivedInput;
+            // The fields' ids carry the step's: when another step is selected
+            // (the assistant selects and adds steps too), a field of the one
+            // before that still has the keyboard, a drag or an open popup is
+            // not taken for this step's field of the same key, and its edit
+            // is dropped rather than written into this step.
+            ImGui::PushID(static_cast<int>(st->id));
             buildPresets(info);
             const std::string& kind = st->kind;
             if (kind == "load") buildLoad(*st, params, info);
@@ -1239,6 +1339,7 @@ namespace sirius::app::gui {
             else if (kind == "merge") buildMerge(*st, params, info, input);
             else if (kind == "contrast") buildContrast(params, info, input);
             else generic(info.params, params, input, false);
+            ImGui::PopID();
 
             // validation: errors in the accent, warnings in grey
             const Validation& v = derivedValidation;
@@ -1420,7 +1521,7 @@ namespace sirius::app::gui {
                 if (editable) so.tooltips = {"Cached in GPU/RAM", "Cached on disk (zarr scratch)", "Recomputed on demand"};
                 if (widgets::segmented("##cache", {"Memory", "Disk", "Recompute"}, &cache, so) && cache >= 0) {
                     const CachePolicy c = static_cast<CachePolicy>(cache);
-                    later([this, i, c] { wb().setStepCache(i, c); });
+                    onStep([this, c](int now) { wb().setStepCache(now, c); });
                 }
                 if (!editable) tip(kFrozen);
             }
@@ -1457,17 +1558,32 @@ namespace sirius::app::gui {
                     widgets::ButtonOpts remove;
                     remove.kind = widgets::ButtonKind::Ghost;
                     remove.enabled = editable;
-                    if (widgets::button("Remove##remove", remove)) a->defer([a, i] { a->removeStepAt(i); });
+                    // Between frames an assistant call deferred ahead of this one
+                    // may have moved or removed steps: the step is found again by id.
+                    const StepId id = st->id;
+                    if (widgets::button("Remove##remove", remove))
+                        a->defer([a, id] {
+                            const int now = a->wb().pipeline().indexOf(id);
+                            if (now >= 0) a->removeStepAt(now);
+                        });
                     if (!editable) tip(kFrozen);
                 }
                 placeEnd(origin.x, origin.y + avail.y);
             }
             ImGui::PopStyleVar();
 
-            // the edits of this frame, now that nothing is drawn from the old values
+            // the edits of this frame, now that nothing is drawn from the old values;
+            // one may read the input (Contrast's Auto, Reset, a bound leaving
+            // automatic), and a plane of a lazily read input can fail
             std::vector<std::function<void()>> pendingActions;
             pendingActions.swap(actions);
-            for (auto& fn : pendingActions) fn();
+            for (auto& fn : pendingActions) {
+                try {
+                    fn();
+                } catch (const std::exception& e) {
+                    w.logLine(std::string("Error: ") + e.what());
+                }
+            }
         }
     };
 

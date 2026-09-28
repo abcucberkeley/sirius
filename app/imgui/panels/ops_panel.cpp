@@ -396,10 +396,19 @@ namespace sirius::app::gui {
                 remove.border = theme::kNeutral400;
                 remove.enabled = editable;
                 place(rightX + px(14) + px(4) + px(20) + px(4), midY - px(10));
-                // The window handles removal (cache warning, undo hint).
+                // The window handles removal (cache warning, undo hint). It runs
+                // between frames, after any assistant call deferred ahead of it
+                // that may move or remove steps, so the step goes by its id.
                 App* a = &app;
-                if (widgets::glyphButton("##remove", Icon::Trash, 20, remove))
-                    action = [a, index] { a->defer([a, index] { a->removeStepAt(index); }); };
+                if (widgets::glyphButton("##remove", Icon::Trash, 20, remove)) {
+                    const StepId id = wb.pipeline().at(index).id;
+                    action = [a, id] {
+                        a->defer([a, id] {
+                            const int now = a->wb().pipeline().indexOf(id);
+                            if (now >= 0) a->removeStepAt(now);
+                        });
+                    };
+                }
                 tip(widgets::withShortcut("Remove this step", shortcutText(keys::removeStep)) + (editable ? "" : kFrozenSuffix));
             }
 
