@@ -369,9 +369,12 @@ namespace sirius::app::gui {
         d.drawHeader(avail.x);
         if (!d.collapsed) {
             widgets::rule(theme::kHairline);
-            ImGui::SetCursorScreenPos(ImVec2(origin.x, ImGui::GetCursorScreenPos().y));
             const ImVec2 rest = ImGui::GetContentRegionAvail();
             if (rest.y >= 2.0f) {
+                // The cursor is placed by hand only when the page follows: a
+                // window too short for it must not end on a moved cursor with
+                // no item after it.
+                ImGui::SetCursorScreenPos(ImVec2(origin.x, ImGui::GetCursorScreenPos().y));
                 // the page in a region of its own: whatever it lays out stays inside
                 ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(0, 0));
                 ImGui::PushStyleColor(ImGuiCol_ChildBg, theme::kBg);

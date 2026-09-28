@@ -52,7 +52,7 @@ namespace sirius::app::gui {
 
         bool following = true;
         bool scrollToBottom = true;         // the next frame puts the view on the last line
-        int ignoreScrollFrames = 0;         // a programmatic scroll is not the reader scrolling
+        bool resetScrollX = true;           // the next frame puts the view on the first column
         float lastScrollY = 0.0f;
         double copiedUntil = 0.0;           // "Copied" on the button until then
 
@@ -69,8 +69,23 @@ namespace sirius::app::gui {
             return f->CalcTextSizeA(kMonoSize * st.FontScaleMain * st.FontScaleDpi, FLT_MAX, 0.0f, s.c_str(), s.c_str() + s.size()).x;
         }
 
-        void push(const std::string& line) {
-            lines.push_back(line);
+        // An entry may span lines (a worker's stderr, a traceback): each of its
+        // lines is a row of its own, as QPlainTextEdit made it a block of its
+        // own, so that a row is one line high and the rows under it stay clear.
+        void push(const std::string& text) {
+            std::size_t start = 0;
+            for (;;) {
+                const std::size_t nl = text.find('\n', start);
+                std::string line = text.substr(start, nl == std::string::npos ? std::string::npos : nl - start);
+                if (!line.empty() && line.back() == '\r') line.pop_back();
+                pushLine(std::move(line));
+                if (nl == std::string::npos) break;
+                start = nl + 1;
+            }
+        }
+
+        void pushLine(std::string line) {
+            lines.push_back(std::move(line));
             widths.push_back(-1.0f);   // measured when next drawn (fonts may not be loaded yet)
             while (lines.size() > kMaxLines) {
                 lines.pop_front();
@@ -99,6 +114,7 @@ namespace sirius::app::gui {
             for (const std::string& line : app.wb().log()) push(line);
             following = true;
             scrollToBottom = true;
+            resetScrollX = true;
         }
 
         void clear() {
@@ -108,6 +124,7 @@ namespace sirius::app::gui {
             hasSelection = selecting = false;
             following = true;
             scrollToBottom = true;
+            resetScrollX = true;
         }
 
         std::string selectedText() const {
@@ -271,17 +288,32 @@ namespace sirius::app::gui {
         if (open) {
             ImDrawList* dl = ImGui::GetWindowDrawList();
             const ImVec2 base = ImGui::GetCursorScreenPos();   // scrolled origin of the content
+            // The width inside the vertical scrollbar: text no wider than this
+            // needs no horizontal scrollbar.
+            const float visibleW = ImGui::GetContentRegionAvail().x;
             const float contentW = widest + 2 * padX;
             const float contentH = static_cast<float>(lines.size()) * lineH + 2 * padY;
 
-            // The reader scrolled: following stops the moment they scroll up,
-            // and resumes when they come back to the bottom themselves.
+            // The scroll moved: following stops the moment the reader scrolls
+            // up, and resumes when they come back to the bottom themselves.
+            // The jump to the last line made below lands on the scroll limit,
+            // which already counts the lines it was made for, so it reads as
+            // the bottom and keeps following. The jump lands a frame after it
+            // is made, and a wheel or Page Down in between replaces it with a
+            // step down from the old bottom, short of the new one: a move down
+            // does not stop following, and makes the jump again.
             const float scrollY = ImGui::GetScrollY(), maxY = ImGui::GetScrollMaxY();
-            if (ignoreScrollFrames > 0) {
-                --ignoreScrollFrames;
-            } else if (std::abs(scrollY - lastScrollY) > 0.5f) {
-                const bool bottom = scrollY >= maxY - 2.0f;
-                if (bottom != following) following = bottom;
+            if (std::abs(scrollY - lastScrollY) > 0.5f) {
+                if (scrollY >= maxY - 2.0f) {
+                    following = true;
+                } else if (scrollY < lastScrollY) {
+                    following = false;
+                    // A line that arrived this frame queued a jump: it must not
+                    // undo the reader's scroll.
+                    scrollToBottom = false;
+                } else if (following) {
+                    scrollToBottom = true;
+                }
             }
             lastScrollY = scrollY;
 
@@ -289,7 +321,7 @@ namespace sirius::app::gui {
             const ImVec2 winMin = ImGui::GetWindowPos();
             const ImVec2 winSize = ImGui::GetWindowSize();
             ImGui::SetCursorScreenPos(base);
-            ImGui::InvisibleButton("##text", ImVec2(std::max(contentW, winSize.x), std::max(contentH, 1.0f)));
+            ImGui::InvisibleButton("##text", ImVec2(std::max(contentW, visibleW), std::max(contentH, 1.0f)));
             const bool hovered = ImGui::IsItemHovered();
             if (hovered) ImGui::SetMouseCursor(ImGuiMouseCursor_TextInput);
             auto posAt = [&](ImVec2 mouse) {
@@ -381,10 +413,14 @@ namespace sirius::app::gui {
             if (scrollToBottom) {
                 // past the end: Dear ImGui clamps it to the new bottom next frame
                 ImGui::SetScrollY(contentH);
-                ImGui::SetScrollX(0.0f);
                 scrollToBottom = false;
-                ignoreScrollFrames = 2;
                 app.requestRedraw();
+            }
+            // Following a new line only moves the view down: the reader who
+            // scrolled right to read the end of a long line stays there.
+            if (resetScrollX) {
+                ImGui::SetScrollX(0.0f);
+                resetScrollX = false;
             }
         }
         ImGui::EndChild();
