@@ -19,6 +19,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <chrono>
 #include <cmath>
 #include <condition_variable>
 #include <cstdint>
@@ -58,13 +59,18 @@ namespace sirius::app::gui {
         //
         // Calls to the Python worker block while it starts and while it
         // answers, so they run on a thread of the dialog's own, one after the
-        // other, and their results come back through Bridge::post. The
-        // connections belong to that thread. Destroying the object cancels the
-        // call in flight and waits for the thread; what was posted before
-        // finds `alive` cleared and does nothing.
+        // other, and their results come back through Bridge::post. Each call
+        // has a connection of its own, closed when it is answered: the worker
+        // serves one client at a time, and a connection kept open here would
+        // hold a run, or the plugins loading on the GUI thread, until the hub
+        // closed. Destroying the object cancels the call in flight, and a
+        // handshake still waiting for the worker, and waits for the thread;
+        // what was posted before finds `alive` cleared and does nothing.
         class HubWorker {
         public:
-            using Done = std::function<void(const nlohmann::json& result, const std::string& error)>;
+            // `unreachable`: the error is that no worker could be reached (it
+            // did not start, or refused the handshake), not the call's.
+            using Done = std::function<void(const nlohmann::json& result, const std::string& error, bool unreachable)>;
 
             HubWorker(Bridge& bridge, WorkerLauncher& launcher) : bridge_(bridge), launcher_(launcher) {}
             HubWorker(const HubWorker&) = delete;
@@ -116,7 +122,8 @@ namespace sirius::app::gui {
             };
 
             void loop() {
-                std::unique_ptr<RemoteWorker> local, hpc;
+                const std::shared_ptr<Shared> shared = shared_;
+                const std::function<bool()> cancelled = [shared] { return shared->cancel.load(); };
                 for (;;) {
                     Job job;
                     {
@@ -127,32 +134,38 @@ namespace sirius::app::gui {
                         jobs_.pop_front();
                     }
                     std::string text, error;
+                    bool unreachable = false;
                     try {
-                        RemoteWorker* worker = nullptr;
-                        if (job.useRemote) {
-                            if (!hpc || !hpc->isOpen()) hpc = RemoteWorker::connect(job.remote.host, job.remote.port, job.remote.token);
-                            worker = hpc.get();
-                        } else {
-                            if (!local || !local->isOpen()) local = launcher_.connect();
-                            worker = local.get();
+                        // With `cancelled` the handshake has no deadline: it waits for a run that holds the
+                        // worker, or for a worker's first answer, which imports torch, until the dialog closes.
+                        // A worker that is only busy or slow is therefore never taken for an unreachable one.
+                        std::unique_ptr<RemoteWorker> worker;
+                        try {
+                            worker = job.useRemote ? RemoteWorker::connect(job.remote.host, job.remote.port, job.remote.token,
+                                                                           std::chrono::seconds(5), cancelled)
+                                                   : launcher_.connect(cancelled);
+                        } catch (const std::exception&) {
+                            unreachable = true;
+                            throw;
                         }
-                        const std::shared_ptr<Shared> shared = shared_;
-                        const WorkerResult r = worker->call(job.method, job.params, {}, {}, [shared] { return shared->cancel.load(); });
+                        // Cancelled only when the dialog is gone: nothing waits for the answer then.
+                        worker->setCancelGrace(std::chrono::milliseconds(0));
+                        const WorkerResult r = worker->call(job.method, job.params, {}, {}, cancelled);
                         text = r.result.dump();   // results cross threads as JSON text
                     } catch (const std::exception& e) {
                         error = e.what();
                         if (error.empty()) error = "the worker gave no reason";
                     }
-                    bridge_.post([shared = shared_, done = std::move(job.done), text, error] {
+                    bridge_.post([shared, done = std::move(job.done), text, error, unreachable] {
                         if (!shared->alive.load()) return;
                         if (!done) return;
                         if (!error.empty()) {
-                            done(nlohmann::json(), error);
+                            done(nlohmann::json(), error, unreachable);
                             return;
                         }
                         const nlohmann::json result = nlohmann::json::parse(text, nullptr, false);
-                        if (result.is_discarded()) done(nlohmann::json(), "the worker's answer is not JSON");
-                        else done(result, std::string());
+                        if (result.is_discarded()) done(nlohmann::json(), "the worker's answer is not JSON", false);
+                        else done(result, std::string(), false);
                     });
                 }
             }
@@ -210,7 +223,9 @@ namespace sirius::app::gui {
 
         // A Hugging Face failure as one sentence that says what to do (the
         // worker's _hub_error, from the answer's status and error headers).
-        std::string hubError(const http::Response& r, const std::string& repo) {
+        // `withToken`: the request carried the stored access token, which
+        // makes a 401 a rejected token rather than a repository that needs one.
+        std::string hubError(const http::Response& r, const std::string& repo, bool withToken) {
             if (r.status == 0) return "Hugging Face is unreachable from this machine (" + r.message() + ").";
             const auto header = [&r](const char* name) {
                 const auto it = r.headers.find(name);
@@ -227,8 +242,13 @@ namespace sirius::app::gui {
                 return repo + " is a gated repository: sign in at https://huggingface.co/" + repo +
                        ", accept its terms, then paste an access token (Hugging Face settings > Access Tokens) into the hub's "
                        "Token field or Preferences > Compute.";
-            if (code == "RepoNotFound" || r.status == 401)
+            if (code == "RepoNotFound" || (r.status == 401 && !withToken))
                 return repo + " was not found on Hugging Face (a private repository needs your access token).";
+            // Hugging Face turns a bad bearer away on every endpoint, public ones and the search included,
+            // so nothing succeeds until the token is replaced or cleared.
+            if (r.status == 401)
+                return "Hugging Face rejected the stored access token" + (text.empty() ? std::string() : " (" + text + ")") +
+                       ": replace or clear it with Token….";
             if (code == "EntryNotFound" || code == "RevisionNotFound")
                 return repo + ": no such file in the repository (" + (text.empty() ? r.message() : text) + ").";
             if (!r.error.empty()) return repo + ": " + r.error;
@@ -559,8 +579,13 @@ namespace sirius::app::gui {
                 ok.width = 84;
                 ok.centered = true;
                 ok.enabled = !chosen_.empty();
-                // OK is the default button: Enter presses it, unless a field took the key
-                const bool enter = ok.enabled && !enterUsed_ && enterPressed() && !ImGui::GetIO().WantTextInput && !ImGui::IsAnyItemActive();
+                // OK is the default button: Enter presses it, unless a field took the key, or it answers a popup
+                // above the hub (a message box, the token prompt). The hub is drawn before them, and their focus
+                // counts as the hub's (the focus test follows the popup hierarchy), so the Enter that answered
+                // "Delete model" also applied the chosen model and closed the hub under the box.
+                const bool enter = ok.enabled && !enterUsed_ && !ImGui::IsPopupOpen("", ImGuiPopupFlags_AnyPopupId) &&
+                                   ImGui::IsWindowFocused(ImGuiFocusedFlags_RootAndChildWindows) && enterPressed() &&
+                                   !ImGui::GetIO().WantTextInput && !ImGui::IsAnyItemActive();
                 if (widgets::button("OK", ok) || enter) accept();
                 footerRestH_ = ImGui::GetCursorPosY() - footerTop - statusH;
             }
@@ -600,13 +625,17 @@ namespace sirius::app::gui {
             // --- the worker ------------------------------------------------------------
 
             // Calls `method` on the worker's thread and `done(result)` back
-            // here; a throw becomes a status line.
+            // here; a throw becomes a status line. During a run it may wait:
+            // the worker serves one client at a time, and a run that uses it
+            // keeps it until the run ends. The call goes ahead then by itself
+            // (or is dropped when the hub closes); a run that does not use
+            // that worker does not hold it up at all.
             void callWorker(const std::string& what, nlohmann::json params, const std::string& method,
                             std::function<void(const nlohmann::json&)> done, bool preferRemote = false) {
-                setStatus(what + "…", false);
+                setStatus(what + (app_.bridge().running() ? "… (after the run, if it is using the worker)" : "…"), false);
                 const RemoteConfig remote = app_.wb().remoteConfig();
                 worker_.call(method, std::move(params), preferRemote ? &remote : nullptr,
-                             [this, what, done = std::move(done)](const nlohmann::json& result, const std::string& error) {
+                             [this, what, done = std::move(done)](const nlohmann::json& result, const std::string& error, bool) {
                                  if (!error.empty()) {
                                      setStatus(what + " failed: " + error, true);
                                      return;
@@ -734,10 +763,13 @@ namespace sirius::app::gui {
                 if (!q.empty()) url += "&search=" + http::urlEncode(q);
                 for (const char* field : {"gated", "private", "downloads", "likes", "tags", "pipeline_tag", "lastModified", "library_name"})
                     url += std::string("&expand%5B%5D=") + field;
+                // Whether the token went along is fixed here: it may be changed while the request runs.
+                const http::Request request = hubRequest(url);
+                const bool withToken = !request.bearer.empty();
                 http::Fetch::Handlers handlers;
-                handlers.done = [this, what, q](const http::Response& r) {
+                handlers.done = [this, what, q, withToken](const http::Response& r) {
                     if (!r.ok()) {
-                        setStatus(what + " failed: " + hubError(r, q.empty() ? std::string("search") : q), true);
+                        setStatus(what + " failed: " + hubError(r, q.empty() ? std::string("search") : q, withToken), true);
                         return;
                     }
                     const nlohmann::json models = nlohmann::json::parse(r.body, nullptr, false);
@@ -766,7 +798,7 @@ namespace sirius::app::gui {
                     }
                     setStatus(results_.empty() ? std::string("No models found.") : std::to_string(results_.size()) + " models", false);
                 };
-                searchFetch_.start(hubRequest(url), std::move(handlers));
+                searchFetch_.start(request, std::move(handlers));
             }
 
             void listFiles(const std::string& id, bool gated) {
@@ -778,11 +810,13 @@ namespace sirius::app::gui {
                 downloadedPath_.clear();
                 const std::string what = "Listing files of " + id;
                 setStatus(what + "…", false);
+                const http::Request request = hubRequest("https://huggingface.co/api/models/" + id + "?blobs=true");
+                const bool withToken = !request.bearer.empty();
                 http::Fetch::Handlers handlers;
-                handlers.done = [this, what, id](const http::Response& r) {
+                handlers.done = [this, what, id, withToken](const http::Response& r) {
                     if (id != repo_) return;
                     if (!r.ok()) {
-                        setStatus(what + " failed: " + hubError(r, id), true);
+                        setStatus(what + " failed: " + hubError(r, id, withToken), true);
                         return;
                     }
                     const nlohmann::json info = nlohmann::json::parse(r.body, nullptr, false);
@@ -816,7 +850,7 @@ namespace sirius::app::gui {
                     fileRow_ = -1;
                     if (anyModel) selectFile(0);
                 };
-                filesFetch_.start(hubRequest("https://huggingface.co/api/models/" + id + "?blobs=true"), std::move(handlers));
+                filesFetch_.start(request, std::move(handlers));
             }
 
             bool downloading() const { return downloadFetch_.busy(); }
@@ -833,21 +867,29 @@ namespace sirius::app::gui {
                 downloadedPath_ = path;
                 progress_ = 1.0f;
                 setStatus("In the cache: " + path, false);
-                describeCached(path);
+                // only a model file can be opened by the worker; a README would only "fail to load"
+                if (files_[static_cast<std::size_t>(row)].model) describeCached(path);
             }
 
             // What the file holds, for the status line: only the worker can
             // open a model. The file is usable without the answer, so a worker
-            // that does not start is not reported here (and not asked twice).
+            // that does not start is not reported here (and not asked twice);
+            // a model the worker cannot load is, since choosing it would fail
+            // the step. Behind a run that uses the worker, the answer comes
+            // when the run ends.
             void describeCached(const std::string& path) {
                 if (workerFailed_) return;
                 worker_.call("model_info", {{"path", path}, {"model", path}, {"spec", path}}, nullptr,
-                             [this, path](const nlohmann::json& info, const std::string& error) {
-                                 if (!error.empty()) {
+                             [this, path](const nlohmann::json& info, const std::string& error, bool unreachable) {
+                                 if (unreachable) {
                                      workerFailed_ = true;
                                      return;
                                  }
                                  if (downloadedPath_ != path || status_ != "In the cache: " + path) return;
+                                 if (!error.empty()) {
+                                     setStatus("In the cache: " + path + " · cannot be loaded: " + error, true);
+                                     return;
+                                 }
                                  setStatus("In the cache: " + path + " · " + torchModelSummary(info), false);
                              });
             }
@@ -887,12 +929,20 @@ namespace sirius::app::gui {
                                   (total > 0.0 ? format("%.0f / %.0f MB", received / mb, total / mb) : format("%.0f MB", received / mb)),
                               false);
                 };
-                handlers.done = [this, what, id, file, target](const http::Response& r) {
+                const bool withToken = !request.bearer.empty();
+                handlers.done = [this, what, id, file, target, withToken](const http::Response& r) {
                     if (!r.ok()) {
                         progress_ = 0.0f;
+                        // http::download could not create the file: a problem on this machine, not the network's
+                        if (!r.cancelled && startsWith(r.error, "cannot write ")) {
+                            setStatus(what + " failed: " + r.error + " (is the model cache " + modelhub::cacheDirectory() +
+                                          " writable, with room to spare? SIRIUS_MODEL_CACHE chooses another)",
+                                      true);
+                            return;
+                        }
                         http::Response answer = r;
                         if (answer.status >= 400) answer.error.clear();
-                        setStatus(what + " failed: " + hubError(answer, id), true);
+                        setStatus(what + " failed: " + hubError(answer, id, withToken), true);
                         return;
                     }
                     downloaded(id, file, target);

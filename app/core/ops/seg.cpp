@@ -172,7 +172,7 @@ namespace sirius::app {
                     {"model", p.getString("model")},
                     {"tile", {static_cast<Index>(tile[0]), static_cast<Index>(tile[1]), static_cast<Index>(tile[2])}},
                     {"overlap", p.getInt("overlap", 32)},
-                    {"device", ctx.backend == Backend::Cpu ? "cpu" : "auto"},
+                    {"device", workerDevice(ctx)},
                 };
                 if (!ctx.hubToken.empty()) params["token"] = ctx.hubToken;   // a gated hf: model
                 double seconds = 0.0;

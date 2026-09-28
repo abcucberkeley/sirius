@@ -112,11 +112,25 @@ namespace sirius::app {
     // cancelled from another thread.
     class RemoteWorker {
     public:
-        explicit RemoteWorker(std::unique_ptr<rpc::Transport> transport, std::string token = {});
+        // How long the handshake of a caller that cannot cancel waits by
+        // default: a worker's first answer imports torch and sets up CUDA,
+        // which takes minutes on a cluster's shared filesystem.
+        static constexpr std::chrono::milliseconds kHelloTimeout{300000};
+
+        // Sends "hello" and waits for the answer. The worker serves one
+        // client at a time and reads a connection's hello only once the
+        // client before it (a run, the model hub) has gone, so the wait may
+        // be long. With `cancelled` it lasts until the answer comes or
+        // `cancelled` says to stop (CancelledError); a caller that cannot
+        // cancel is given `helloTimeout` instead, then ProtocolError.
+        explicit RemoteWorker(std::unique_ptr<rpc::Transport> transport, std::string token = {},
+                              const std::function<bool()>& cancelled = {}, std::chrono::milliseconds helloTimeout = kHelloTimeout);
         ~RemoteWorker();
 
+        // `timeout` bounds the TCP connect; `cancelled` the handshake, as above.
         static std::unique_ptr<RemoteWorker> connect(const std::string& host, int port, const std::string& token,
-                                                     std::chrono::milliseconds timeout = std::chrono::seconds(5));
+                                                     std::chrono::milliseconds timeout = std::chrono::seconds(5),
+                                                     const std::function<bool()>& cancelled = {});
 
         const WorkerCapabilities& capabilities() const noexcept { return caps_; }
         bool supports(const std::string& kind) const noexcept;
@@ -129,7 +143,8 @@ namespace sirius::app {
         bool isOpen() const noexcept;
         // How long a cancelled call waits for the worker's answer before
         // the connection is given up (a stuck worker must not hold the run
-        // thread forever); 15 s by default, shorter in tests.
+        // thread forever); 15 s by default, shorter in tests. Zero gives the
+        // connection up at once, without asking the worker to stop.
         void setCancelGrace(std::chrono::milliseconds grace) noexcept { cancelGrace_ = grace; }
 
     private:

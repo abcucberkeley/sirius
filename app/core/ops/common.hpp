@@ -42,6 +42,18 @@ namespace sirius::app {
     // Label table + review-queue facts (the segmentation panel's data).
     Diagnostics labelDiagnostics(const LabelVolume& labels, const std::string& summary);
 
+    // The "device" of a request to the Python worker: where this run was
+    // asked to go, as the launcher names it when it starts a local worker.
+    // "auto" would mean the worker's own, fixed when its process started
+    // and kept for the session, so a backend or GPU chosen since never
+    // reached it. The HPC worker keeps its own device.
+    inline std::string workerDevice(const StepContext& ctx) {
+        if (ctx.backend == Backend::Cpu) return "cpu";
+        if (ctx.backend == Backend::Cuda)
+            return ctx.device.isCuda() && ctx.device.index >= 0 ? "cuda:" + std::to_string(ctx.device.index) : std::string("cuda");
+        return "auto";
+    }
+
 } // namespace sirius::app
 
 #endif // SIRIUS_APP_OPS_COMMON_HPP

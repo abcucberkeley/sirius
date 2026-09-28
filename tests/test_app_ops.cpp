@@ -20,9 +20,11 @@
 #include <filesystem>
 #include <fstream>
 #include <limits>
+#include <mutex>
 #include <numeric>
 #include <optional>
 #include <random>
+#include <string>
 #include <thread>
 
 #include <sirius/tiff_io.hpp>
@@ -1374,6 +1376,10 @@ TEST_CASE("The 3D filters ask whether they have been cancelled", "[app][ops][cla
 
 
 namespace {
+    // The "device" of the last run request fakeWorker received.
+    std::mutex fakeWorkerMutex;
+    std::string fakeWorkerDevice;
+
     // A worker that answers hello / model_info / run(torch_segment) with a
     // probability map thresholding the input at 500 (plus a flat boundary
     // channel), using the public framing API.
@@ -1399,6 +1405,10 @@ namespace {
                 transport->send(rpc::encodeFrame(reply, {}));
             } else if (method == "run") {
                 REQUIRE(msg->tensors.size() == 1);
+                {
+                    const std::lock_guard<std::mutex> lock(fakeWorkerMutex);
+                    fakeWorkerDevice = h.at("params").at("params").value("device", std::string());
+                }
                 const rpc::Tensor& in = msg->tensors.front();
                 nlohmann::json prog = {{"id", h.value("id", 0)}, {"type", "progress"}, {"fraction", 0.5}, {"message", "tile 1/2"}};
                 transport->send(rpc::encodeFrame(prog, {}));
@@ -1471,8 +1481,30 @@ TEST_CASE("Segmentation drives the worker protocol and labels the probabilities"
         REQUIRE(w.labels);
         CHECK(w.labels->stats().size() >= 2);
     }
+    SECTION("the request names the GPU the run was given") {
+        // "auto" was the device the worker process started on and kept for
+        // the session: a GPU chosen in Preferences since never reached it
+        prog.ctx.backend = Backend::Cuda;
+        prog.ctx.device = Device::cuda(1);
+        (void)op.run(inputOf(data, meta), p, prog.ctx);
+        const std::lock_guard<std::mutex> lock(fakeWorkerMutex);
+        CHECK(fakeWorkerDevice == "cuda:1");
+    }
     remote->close();
     worker.join();
+}
+
+TEST_CASE("A request to the Python worker names the device of the run", "[app][ops][seg]") {
+    StepContext ctx;
+    ctx.backend = Backend::Cpu;
+    CHECK(workerDevice(ctx) == "cpu");
+    ctx.backend = Backend::Cuda;
+    ctx.device = Device::cuda(1);
+    CHECK(workerDevice(ctx) == "cuda:1");
+    ctx.device = Device::cuda(-1);   // every GPU: the launcher's "cuda" too
+    CHECK(workerDevice(ctx) == "cuda");
+    ctx.backend = Backend::Hpc;
+    CHECK(workerDevice(ctx) == "auto");   // the remote worker's own
 }
 
 namespace {

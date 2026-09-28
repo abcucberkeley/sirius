@@ -1,11 +1,13 @@
 #include "imgui/worker_launcher.hpp"
 
+#include <chrono>
 #include <exception>
 #include <random>
 #include <stdexcept>
 
 #include <nlohmann/json.hpp>
 
+#include "core/cancel.hpp"
 #include "imgui/platform.hpp"
 #include "imgui/settings.hpp"
 #include "imgui/strings.hpp"
@@ -34,7 +36,7 @@ namespace sirius::app::gui {
         device_ = device;
     }
     void WorkerLauncher::setLogHandler(std::function<void(const std::string& line)> handler) {
-        const std::lock_guard<std::mutex> g(mutex_);
+        const std::lock_guard<std::mutex> g(handlerMutex_);
         handler_ = std::move(handler);
     }
 
@@ -112,12 +114,13 @@ namespace sirius::app::gui {
         process_ = std::make_unique<ChildProcess>();
         process_->setErrorHandler([this](const std::string& line) {
             appendLog(line + "\n");
-            std::function<void(const std::string&)> handler;
-            {
-                const std::lock_guard<std::mutex> g(mutex_);
-                handler = handler_;
-            }
-            if (handler && !line.empty()) handler(line);
+            if (line.empty()) return;
+            // Called with the lock held, not on a copy: the worker still
+            // writes while it stops at exit, and a copy could post into the
+            // Bridge after main() has detached the handler and destroyed it.
+            // A separate lock, so that the handler may still ask lastLog().
+            const std::lock_guard<std::mutex> g(handlerMutex_);
+            if (handler_) handler_(line);
         });
         ChildProcess::Options o;
         o.program = cfg.python;
@@ -155,19 +158,27 @@ namespace sirius::app::gui {
         running_.store(true);
     }
 
-    std::unique_ptr<RemoteWorker> WorkerLauncher::connect() {
+    std::unique_ptr<RemoteWorker> WorkerLauncher::connect(const std::function<bool()>& cancelled) {
         const std::lock_guard<std::mutex> lock(processMutex_);
         if (process_ && !process_->running()) {   // it died between runs
             port_.store(0);
             running_.store(false);
         }
         if (!isRunning()) start();
+        const auto timeout = std::chrono::seconds(5);
         try {
-            return RemoteWorker::connect("127.0.0.1", port_.load(), token_);
+            return RemoteWorker::connect("127.0.0.1", port_.load(), token_, timeout, cancelled);
+        } catch (const CancelledError&) {
+            throw;   // the caller stopped waiting; the worker is fine
         } catch (const std::exception&) {
-            // the process may have died between runs: start once more
+            // The process may have died between runs: start once more. One
+            // that still runs answered and refused, or did not answer before
+            // the handshake's deadline (still starting, or serving another
+            // client); starting it again would not help, and would end that
+            // start or that client's work.
+            if (process_ && process_->running()) throw;
             start();
-            return RemoteWorker::connect("127.0.0.1", port_.load(), token_);
+            return RemoteWorker::connect("127.0.0.1", port_.load(), token_, timeout, cancelled);
         }
     }
 

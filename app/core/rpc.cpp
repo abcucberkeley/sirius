@@ -384,10 +384,37 @@ namespace sirius::app {
 
     using json = nlohmann::json;
 
-    RemoteWorker::RemoteWorker(std::unique_ptr<rpc::Transport> transport, std::string token)
+    RemoteWorker::RemoteWorker(std::unique_ptr<rpc::Transport> transport, std::string token, const std::function<bool()>& cancelled,
+                               std::chrono::milliseconds helloTimeout)
         : transport_(std::move(transport)), token_(std::move(token)) {
         if (!transport_) throw std::invalid_argument("RemoteWorker: no transport");
-        const WorkerResult hello = call("hello", {{"token", token_}, {"protocol_version", rpc::kProtocolVersion}});
+        // Behind another client the hello is not even read yet, so there is
+        // nothing to cancel on the worker's side: a wait that is given up
+        // closes the connection at once instead of granting the worker the
+        // cancel grace of a call, and a caller that has to join this thread
+        // (the model hub closing, the application quitting) is not held for
+        // as long as the other client keeps its connection. A caller that can
+        // cancel decides how long it waits; the deadline is for one that
+        // cannot, and it is long because a slow answer is most often a worker
+        // still importing torch for its first one.
+        const auto deadline = std::chrono::steady_clock::now() + helloTimeout;
+        bool late = false;
+        const std::chrono::milliseconds grace = cancelGrace_;
+        cancelGrace_ = std::chrono::milliseconds(0);
+        WorkerResult hello;
+        try {
+            hello = call("hello", {{"token", token_}, {"protocol_version", rpc::kProtocolVersion}}, {}, {}, [&] {
+                if (cancelled) return cancelled();
+                late = std::chrono::steady_clock::now() >= deadline;
+                return late;
+            });
+        } catch (const CancelledError&) {
+            if (!late) throw;
+            throw ProtocolError("worker: no answer to the handshake within " + std::to_string((helloTimeout.count() + 999) / 1000) +
+                                " s. The worker may still be starting (it imports torch for its first answer), or be serving another "
+                                "client: it serves one at a time, and a run or the model hub may still be using it.");
+        }
+        cancelGrace_ = grace;
         // Same version on both ends or nothing: the framing and the method set
         // are versioned together, so a mismatch is reported here rather than
         // as a puzzling failure in the middle of a run. A worker predating the
@@ -414,8 +441,8 @@ namespace sirius::app {
     RemoteWorker::~RemoteWorker() { close(); }
 
     std::unique_ptr<RemoteWorker> RemoteWorker::connect(const std::string& host, int port, const std::string& token,
-                                                        std::chrono::milliseconds timeout) {
-        return std::make_unique<RemoteWorker>(rpc::connectTcp(host, port, timeout), token);
+                                                        std::chrono::milliseconds timeout, const std::function<bool()>& cancelled) {
+        return std::make_unique<RemoteWorker>(rpc::connectTcp(host, port, timeout), token, cancelled);
     }
 
     bool RemoteWorker::supports(const std::string& kind) const noexcept {
@@ -437,10 +464,15 @@ namespace sirius::app {
         // After a cancel the worker gets cancelGrace_ to answer (its job
         // polls the flag between tiles); then the connection is given up so
         // a hung worker cannot hold the run thread, and with it every edit
-        // and the application's exit, forever.
+        // and the application's exit, forever. Without a grace it is given
+        // up at once.
         std::chrono::steady_clock::time_point cancelDeadline{};
         for (;;) {
             if (cancelled && cancelled() && !cancelSent) {
+                if (cancelGrace_ <= std::chrono::milliseconds(0)) {
+                    transport_->close();
+                    throw CancelledError();
+                }
                 transport_->send(rpc::encodeFrame({{"id", nextId_++}, {"type", "request"}, {"method", "cancel"}, {"params", {{"id", id}}}}, {}));
                 cancelSent = true;
                 cancelDeadline = std::chrono::steady_clock::now() + cancelGrace_;

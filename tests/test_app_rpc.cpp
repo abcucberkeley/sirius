@@ -14,10 +14,12 @@
 #include <catch2/matchers/catch_matchers_string.hpp>
 
 #include <atomic>
+#include <cstdlib>
 #include <filesystem>
 #include <fstream>
 #include <limits>
 #include <mutex>
+#include <string>
 #include <thread>
 
 #include "core/app_paths.hpp"
@@ -381,6 +383,59 @@ TEST_CASE("A worker that ignores a cancel is given up after the grace period", "
     canceller.join();
 }
 
+// The worker serves one client at a time: a second connection is accepted by
+// the listen backlog, and its hello is read only once the first client has
+// gone. Closing the model hub while a run held the worker waited in that
+// handshake, on the GUI thread, for as long as the run lasted. The deadline is
+// for a caller that cannot cancel: a worker's first answer imports torch, and
+// cutting that short failed a run or the plugins loading at start-up.
+TEST_CASE("A handshake the worker does not answer can be cancelled, or else has a deadline", "[app][rpc][cancel]") {
+    SECTION("cancelled, it gives up at once") {
+        auto pair = rpc::loopbackPair();   // nobody reads the other end
+        std::atomic<bool> cancel{false};
+        std::thread canceller([&] {
+            std::this_thread::sleep_for(std::chrono::milliseconds(100));
+            cancel = true;
+        });
+        const auto t0 = std::chrono::steady_clock::now();
+        CHECK_THROWS_AS(RemoteWorker(std::move(pair.first), "", [&] { return cancel.load(); }), CancelledError);
+        CHECK(std::chrono::steady_clock::now() - t0 < std::chrono::seconds(5));   // not the 15 s grace of a call
+        canceller.join();
+    }
+    SECTION("unanswered past the deadline, it says why") {
+        auto pair = rpc::loopbackPair();
+        const auto t0 = std::chrono::steady_clock::now();
+        CHECK_THROWS_WITH(RemoteWorker(std::move(pair.first), "", {}, std::chrono::milliseconds(300)),
+                          Catch::Matchers::ContainsSubstring("no answer to the handshake") &&
+                              Catch::Matchers::ContainsSubstring("may still be starting") &&
+                              Catch::Matchers::ContainsSubstring("one at a time"));
+        CHECK(std::chrono::steady_clock::now() - t0 < std::chrono::seconds(5));
+    }
+    SECTION("answered past the deadline, a caller that can cancel still connects, and a call keeps its cancel grace") {
+        auto pair = rpc::loopbackPair();
+        std::unique_ptr<ScriptedWorker> worker;
+        std::thread later([&worker, &pair] {
+            std::this_thread::sleep_for(std::chrono::milliseconds(400));
+            worker = std::make_unique<ScriptedWorker>(std::move(pair.second), "", true);
+        });
+        std::atomic<bool> cancel{false};
+        RemoteWorker rw(std::move(pair.first), "", [&] { return cancel.load(); }, std::chrono::milliseconds(100));
+        later.join();
+        CHECK(rw.capabilities().version == "test");
+        std::vector<float> in{1.f};
+        std::thread canceller([&] {
+            std::this_thread::sleep_for(std::chrono::milliseconds(100));
+            cancel = true;
+        });
+        // the worker's own "cancelled" answer, which only a call that waits for it receives
+        CHECK_THROWS_AS(rw.call("run", {{"kind", "torch_segment"}}, {{"input", "float32", {1}, in.data(), 4}}, {},
+                                [&] { return cancel.load(); }),
+                        CancelledError);
+        CHECK(rw.isOpen());
+        canceller.join();
+    }
+}
+
 TEST_CASE("the foundation step keeps the labels the worker returns and reports its run", "[app][rpc][foundation]") {
     registerBuiltinOperations();
     auto [client, server] = rpc::loopbackPair();
@@ -439,6 +494,17 @@ TEST_CASE("the foundation step keeps the labels the worker returns and reports i
         CHECK_THAT(out.note, Catch::Matchers::ContainsSubstring("2 tracks"));
         CHECK(std::any_of(out.diagnostics.facts.begin(), out.diagnostics.facts.end(),
                           [](const DiagnosticFact& f) { return f.key == "Divisions (approx.)" && f.value == "1"; }));
+    }
+    SECTION("the request names the device the run was given, not the worker's own") {
+        // "auto" was the device the worker process started on, kept for the session
+        ctx.backend = Backend::Cuda;
+        ctx.device = Device::cuda(1);
+        (void)op.run(StepInput{meta, array, nullptr, nullptr}, p, ctx);
+        CHECK(sent().value("device", "") == "cuda:1");
+        ctx.backend = Backend::Cpu;
+        ctx.device = Device::cpu();
+        (void)op.run(StepInput{meta, array, nullptr, nullptr}, p, ctx);
+        CHECK(sent().value("device", "") == "cpu");
     }
     SECTION("a tile with some extents given is sent, zero meaning the bundle's on that axis") {
         p.set("tile", std::vector<double>{0, 32, 32});
@@ -925,6 +991,67 @@ TEST_CASE("A plugin whose file is gone stays in the pipeline as not loaded", "[a
     }
     std::error_code ec;
     std::filesystem::remove_all(scratch, ec);
+}
+
+// The plugin manager draws an entry without an error as loaded ("Loaded as
+// ..."), so a plugin the application refuses has to say why in its entry, not
+// only in the log line the next status line replaces.
+TEST_CASE("A plugin the application refuses says why in its entry", "[app][rpc][plugin]") {
+    registerBuiltinOperations();
+    PluginCatalog catalog;
+    catalog.set(json::array({pluginSpec("zz_refusal_fine", 0.0),
+                             {{"kind", "contrast"}, {"name", "Contrast"}, {"file", "/plugins/contrast.py"}},
+                             {{"kind", "zz_refusal_bad"},
+                              {"name", "zz_refusal_bad"},
+                              {"file", "/plugins/zz_refusal_bad.py"},
+                              {"params", json::array({{{"key", "x"}, {"type", "nope"}}})}}}));
+    const std::unique_ptr<RemoteWorker> worker = catalog.connect();
+    const PluginLoadResult r = registerPluginOperations(*worker, false);
+    const auto errorOf = [&r](const std::string& file) {
+        for (const PluginLoadResult::Entry& e : r.entries)
+            if (e.file == file) return e.error;
+        FAIL("no entry for " << file);
+        return std::string();
+    };
+    REQUIRE(r.entries.size() == 3);
+    CHECK(errorOf("/plugins/zz_refusal_fine.py").empty());
+    CHECK_THAT(errorOf("/plugins/contrast.py"), Catch::Matchers::ContainsSubstring("built-in"));      // named after a built-in
+    CHECK_THAT(errorOf("/plugins/zz_refusal_bad.py"), Catch::Matchers::ContainsSubstring("unknown type"));   // a spec it cannot use
+    CHECK(r.kinds == std::vector<std::string>{"zz_refusal_fine"});
+    CHECK(r.errors.size() == 2);
+}
+
+// New writes into userPluginDirectory(), and the worker imports from
+// Path.home()/.sirius/plugins; on Windows that home is USERPROFILE whatever
+// HOME says, so a HOME of its own (an MSYS2 shell) lost every new plugin.
+TEST_CASE("The user plugin folder is under the home the worker's Python uses", "[app][rpc][plugin]") {
+    namespace fs = std::filesystem;
+#ifdef _WIN32
+    struct Variable {
+        const wchar_t* name;
+        std::wstring saved;
+        bool had = false;
+        explicit Variable(const wchar_t* n) : name(n) {
+            wchar_t* value = nullptr;
+            std::size_t length = 0;
+            if (_wdupenv_s(&value, &length, name) == 0 && value) {
+                saved = value;
+                had = true;
+            }
+            std::free(value);
+        }
+        ~Variable() { [[maybe_unused]] const errno_t restored = _wputenv_s(name, had ? saved.c_str() : L""); }
+        void set(const wchar_t* value) const { REQUIRE(_wputenv_s(name, value) == 0); }
+    };
+    const Variable profile(L"USERPROFILE"), home(L"HOME");
+    // a user name outside the ANSI code page, as UTF-8 in the result
+    profile.set(L"C:\\Users\\J\u00fcrgen");
+    home.set(L"C:\\msys64\\home\\someone");
+    CHECK(fs::u8path(userPluginDirectory()) == fs::path(L"C:\\Users\\J\u00fcrgen") / ".sirius" / "plugins");
+#else
+    const char* home = std::getenv("HOME");
+    CHECK(fs::path(userPluginDirectory()) == fs::path(home && *home ? home : ".") / ".sirius" / "plugins");
+#endif
 }
 
 #ifndef _WIN32

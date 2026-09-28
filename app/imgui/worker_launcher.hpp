@@ -41,13 +41,18 @@ namespace sirius::app::gui {
         std::string python() const;
         std::string scriptDir() const;
 
-        // Every line the worker writes to stderr (any thread).
+        // Every line the worker writes to stderr (any thread). A call in
+        // progress finishes before this returns, and the handler it replaces
+        // is not called again, so its captures may go right after.
         void setLogHandler(std::function<void(const std::string& line)> handler);
 
         // Starts the process when needed and connects; throws std::runtime_error
         // with the worker's stderr when it fails to come up. Blocks the caller
-        // for the start-up (up to about a minute).
-        std::unique_ptr<RemoteWorker> connect();
+        // for the start-up (up to about a minute) and for the handshake, which
+        // waits for any other client of the worker to go: `cancelled` ends
+        // that wait with CancelledError, and without it the wait ends after
+        // RemoteWorker::kHelloTimeout (RemoteWorker's constructor).
+        std::unique_ptr<RemoteWorker> connect(const std::function<bool()>& cancelled = {});
         bool isRunning() const;
         int port() const noexcept { return port_.load(); }
         void stop();
@@ -64,12 +69,13 @@ namespace sirius::app::gui {
 
         std::mutex processMutex_;            // one start / stop at a time
         std::unique_ptr<ChildProcess> process_;
-        mutable std::mutex mutex_;           // python_, scriptDir_, device_, log_, handler_
+        mutable std::mutex mutex_;           // python_, scriptDir_, device_, log_
         std::string python_;
         std::string scriptDir_;
         std::string device_ = "auto";
         std::string token_;                  // fixed at construction
         std::string log_;
+        std::mutex handlerMutex_;            // handler_, held while it runs
         std::function<void(const std::string&)> handler_;
         std::atomic<int> port_{0};
         std::atomic<bool> running_{false};

@@ -180,7 +180,7 @@ namespace sirius::app {
                     {"min_separation", p.getDouble("min_separation", 0.0)},
                     {"min_voxels", p.getInt("min_voxels", 0)},
                     {"voxel_um", {meta.voxelUm[0], meta.voxelUm[1], meta.voxelUm[2]}},
-                    {"device", ctx.backend == Backend::Cpu ? "cpu" : "auto"},
+                    {"device", workerDevice(ctx)},
                 };
                 const std::vector<double> tile = p.getDoubleList("tile");
                 if (tile.size() == 3 && (tile[0] > 0 || tile[1] > 0 || tile[2] > 0))

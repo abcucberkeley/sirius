@@ -9,6 +9,7 @@
 #include <mutex>
 #include <set>
 #include <stdexcept>
+#include <string>
 
 #include "core/array_source.hpp"
 #include "core/executor.hpp"
@@ -68,6 +69,20 @@ namespace sirius::app {
             std::transform(s.begin(), s.end(), s.begin(), [](unsigned char c) { return static_cast<char>(std::toupper(c)); });
             return s;
         }
+
+#ifdef _WIN32
+        // A variable of the environment as UTF-16, "" when it is not set:
+        // getenv gives it in the ANSI code page, which a user name need not
+        // fit in.
+        std::wstring environmentVariable(const wchar_t* name) {
+            wchar_t* value = nullptr;
+            std::size_t length = 0;
+            if (_wdupenv_s(&value, &length, name) != 0 || !value) return std::wstring();
+            const std::wstring out(value);
+            std::free(value);
+            return out;
+        }
+#endif
 
         class PluginOperation final : public Operation {
         public:
@@ -341,12 +356,16 @@ namespace sirius::app {
                 unloadable.insert(file);
                 continue;
             }
+            // A refusal below goes into this entry too: the plugin manager
+            // shows an entry without an error as loaded.
             result.entries.push_back(entry);
             try {
                 auto op = makePluginOperation(spec);
                 const std::string kind = op->kind();
                 if (builtins.count(kind)) {
-                    result.errors.push_back(file + ": kind '" + kind + "' is a built-in operation");
+                    const std::string why = "kind '" + kind + "' is a built-in operation";
+                    result.entries.back().error = why;
+                    result.errors.push_back(file + ": " + why);
                     unloadable.insert(file);
                     continue;
                 }
@@ -358,6 +377,7 @@ namespace sirius::app {
                 }
                 result.kinds.push_back(kind);
             } catch (const std::exception& e) {
+                result.entries.back().error = e.what();
                 result.errors.push_back(file + ": " + e.what());
                 unloadable.insert(file);
             }
@@ -391,16 +411,27 @@ namespace sirius::app {
     }
 
     std::string userPluginDirectory(bool create) {
-        const char* home = std::getenv("HOME");
+        // The folder the worker imports from: its plugin_dirs() takes
+        // Path.home(), which on Windows is USERPROFILE, else HOMEDRIVE +
+        // HOMEPATH, and never HOME (Python 3.8 on). A HOME set to another
+        // folder (an MSYS2 shell) had New write plugins the worker never saw.
+        // Read wide, and returned as UTF-8, for a home outside the code page.
 #ifdef _WIN32
-        if (!home) home = std::getenv("USERPROFILE");
+        std::filesystem::path home = environmentVariable(L"USERPROFILE");
+        if (home.empty() && !environmentVariable(L"HOMEPATH").empty())
+            home = environmentVariable(L"HOMEDRIVE") + environmentVariable(L"HOMEPATH");
+        if (home.empty()) home = environmentVariable(L"HOME");
+#else
+        const char* env = std::getenv("HOME");
+        std::filesystem::path home = env ? env : "";
 #endif
-        const std::filesystem::path dir = std::filesystem::path(home ? home : ".") / ".sirius" / "plugins";
+        if (home.empty()) home = ".";
+        const std::filesystem::path dir = home / ".sirius" / "plugins";
         if (create) {
             std::error_code ec;
             std::filesystem::create_directories(dir, ec);
         }
-        return dir.string();
+        return dir.u8string();
     }
 
     std::vector<std::string> pluginKinds() {
