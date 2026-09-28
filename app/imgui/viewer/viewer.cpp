@@ -4,6 +4,7 @@
 #include <array>
 #include <cmath>
 #include <cstdio>
+#include <cstring>
 #include <exception>
 #include <functional>
 #include <limits>
@@ -71,6 +72,13 @@ namespace sirius::app::gui {
             return theme::fromFloat(c);
         }
 
+        // The paint tools that draw a brush outline over the XY pane (Lasso
+        // paints with the brush); the others are single clicks.
+        bool brushLike(const ViewState& s) {
+            return s.tool == ViewerTool::Paint &&
+                   (s.paintTool == PaintTool::Brush || s.paintTool == PaintTool::Erase || s.paintTool == PaintTool::Lasso);
+        }
+
         // One coloured run of the "Viewing 05 Contrast …" line.
         struct Run {
             std::string text;
@@ -117,9 +125,10 @@ namespace sirius::app::gui {
         VolumeView volume;
         DimsStrip dims;
         // The ortho grid's balance: the YZ / MIP column's width and the XZ /
-        // MIP row's height, design pixels; < 0 until the first layout sets
-        // the design's targets (or the saved balance).
-        float orthoCol = -1.0f, orthoRow = -1.0f;
+        // MIP row's height, design pixels; the first layout sets the design's
+        // targets (or the saved balance) and raises orthoLoaded.
+        float orthoCol = 0.0f, orthoRow = 0.0f;
+        bool orthoLoaded = false;
         bool orthoSaved = false;
         SlicePane* focused = nullptr;   // the pane that has the keyboard
         bool contextMenuPending = false;
@@ -130,6 +139,7 @@ namespace sirius::app::gui {
         // here, never on the GUI thread.
         ViewerLoader loader;
         std::uint64_t volumeKey = 0;    // the reduction the 3D view is waiting for
+        std::uint64_t shownVolumeKey = 0;   // the reduction whose bricks the 3D view has
         std::string sliceNotice;        // "Loading 37%" for the panes that need a volume
         bool loadActive = false;        // volume decode in flight; drives the status bar
         double loadFrac = 0.0;
@@ -180,6 +190,21 @@ namespace sirius::app::gui {
             const RectI r{x0, y0, x1 - x0, y1 - y0};
             const RectI whole{0, 0, static_cast<int>(cols), static_cast<int>(rows)};
             return static_cast<double>(r.w) * r.h >= 0.7 * static_cast<double>(cols) * static_cast<double>(rows) ? whole : r;
+        }
+        // `want` raised until the region rendered at that factor fits in a
+        // texture: one longer than GL_MAX_TEXTURE_SIZE on a side is not
+        // created at all. The region, not the plane, is the bound: a plane
+        // wider than the limit would otherwise be sub-sampled at every zoom.
+        // The whole plane fits at ceil(n / limit), and no region is larger.
+        static int textureFactor(const SlicePane& pane, int want, Index cols, Index rows) {
+            const int limit = maxTextureSize();
+            const int whole = static_cast<int>(std::max<Index>(1, (std::max(cols, rows) + limit - 1) / limit));
+            int f = std::max(want, 1);
+            for (; f < whole; ++f) {
+                const RectI r = renderRegion(pane, f, cols, rows);
+                if ((r.w + f - 1) / f <= limit && (r.h + f - 1) / f <= limit) break;
+            }
+            return f;
         }
         struct Dirty {
             bool xy = true, xz = true, yz = true, mip = true, cmp = true, vol = true;
@@ -281,6 +306,9 @@ namespace sirius::app::gui {
         void rebuildOutput();          // display output changed
         void applyLivePreview();       // window / gamma of a previewed step
         bool previewing = false;
+        // The output whose preview window could not be computed, logged
+        // once: every rebuild tries again.
+        std::weak_ptr<const StepOutput> previewFailed;
         void refreshChrome();
         void refreshDims();
         void refreshHints();
@@ -293,6 +321,9 @@ namespace sirius::app::gui {
         // Asks the loader for whatever (c, t) volumes the visible channels
         // still need; the aggregate state of those channels.
         DisplayModel::VolumeState ensureVolumes(DisplayModel& m, Index t);
+        // Drops the reads of time points no longer on screen (nor read
+        // ahead for play), so they do not hold up the one that is.
+        void retainVolumes();
         // Visible channels: volume is in RAM (slices can draw), MIP is cached.
         void volumeReadiness(const DisplayModel& m, Index t, bool& haveVol, bool& haveMip) const;
         void onVolumeReady(const ViewerLoader::Volume& v);
@@ -315,7 +346,7 @@ namespace sirius::app::gui {
         // null) and stays over the same point of the data.
         void zoomAround(double factor, const DPoint& anchor, const SlicePane* pane = nullptr);
         void fit();
-        void setCursorFor(ViewerTool t);
+        void setCursorFor(const ViewState& s);
         void setPlaying(bool on);
 
         // tools
@@ -538,6 +569,19 @@ namespace sirius::app::gui {
         return wanted ? DisplayModel::VolumeState::Wanted : DisplayModel::VolumeState::Ready;
     }
 
+    void Viewer::Impl::retainVolumes() {
+        // The loader reads first in first out: every frame scrubbed or played
+        // past would be read in full before the one the user stopped on.
+        std::vector<Index> keep{curT()};
+        if (playing && nt() > 1) keep.push_back((curT() + 1) % nt());
+        const bool shared = rawModel.output() == model.output();
+        if (shared) keep.push_back(compareT());   // one output, one set of reads
+        loader.retain(model.output().get(), keep);
+        if (!shared) loader.retain(rawModel.output().get(), {compareT()});
+        // a dropped read no longer counts: when it was the last one, nothing else ends the load
+        if (!loader.busy()) endLoad();
+    }
+
     void Viewer::Impl::volumeReadiness(const DisplayModel& m, Index t, bool& haveVol, bool& haveMip) const {
         haveVol = haveMip = true;
         if (!m.valid()) {
@@ -552,36 +596,52 @@ namespace sirius::app::gui {
     }
 
     void Viewer::Impl::onVolumeReady(const ViewerLoader::Volume& v) {
-        DisplayModel* target = nullptr;
-        if (v.out == model.output()) target = &model;
-        else if (v.out == rawModel.output()) target = &rawModel;
-        if (!target) {
+        // Both models show the Load output while it is the one viewed (or
+        // the viewed step has not run): the read serves both.
+        const bool forModel = v.out == model.output(), forRaw = v.out == rawModel.output();
+        if (!forModel && !forRaw) {
             if (!loader.busy()) endLoad();
             return;   // the viewer moved on: drop it
         }
+        const bool onScreen = (forModel && v.t == curT()) || (forRaw && v.t == compareT());
         if (!v.ok) {
             failedVolumes.insert({v.out.get(), v.c, v.t});
             sliceNotice = "could not read the volume";
             refreshHints();
             wb.logLine("Viewer: " + v.error);
+            if (onScreen) {   // the panes waiting for it show that instead
+                dirty = Dirty{};
+                scheduleUpdate();
+            }
             if (!loader.busy()) endLoad();
             return;
         }
         if (ScopedTrace::enabled())
             std::fprintf(stderr, "view volume c%lld t%lld ready in %lld us (%s)\n", static_cast<long long>(v.c), static_cast<long long>(v.t),
                          v.micros, v.volume ? "read" : "in memory");
-        std::shared_ptr<Buffer<float>> vol = v.volume;
-        // A late lazy read must not evict the time point on screen; its MIP
-        // is still worth keeping for the next loop of play. The exception is
-        // the frame play asked for ahead of time: dropping that one made play
-        // read every frame of a lazy source twice.
-        const Index shown = target == &model ? curT() : compareT();
-        const bool readAhead = target == &model && playing && nt() > 1 && v.t == (shown + 1) % nt();
-        if (v.t != shown && !readAhead) vol.reset();
-        target->installVolume(v.c, v.t, std::move(vol), v.mip, v.lo, v.hi, v.t == shown ? Index{-1} : shown);
+        if (forModel) {
+            std::shared_ptr<Buffer<float>> vol = v.volume;
+            // A late lazy read must not evict the time point on screen; its MIP
+            // is still worth keeping for the next loop of play. The exception is
+            // the frame play asked for ahead of time: dropping that one made play
+            // read every frame of a lazy source twice.
+            const Index shown = curT();
+            const bool readAhead = playing && nt() > 1 && v.t == (shown + 1) % nt();
+            if (v.t != shown && !readAhead) vol.reset();
+            model.installVolume(v.c, v.t, std::move(vol), v.mip, v.lo, v.hi, v.t == shown ? Index{-1} : shown);
+        }
+        if (forRaw) {
+            // The raw pane draws planes: the projection and the exact range
+            // are what it wants. With one output the volume stays with the
+            // model alone, or the raw model would keep up to 3 GiB alive
+            // after the model moved on to another output.
+            const Index shown = compareT();
+            rawModel.installVolume(v.c, v.t, (forModel || v.t != shown) ? nullptr : v.volume, v.mip, v.lo, v.hi,
+                                   v.t == shown ? Index{-1} : shown);
+        }
         // Cache MIPs for every t (play loops). Only the current frame needs a
         // redraw; an older job that finished late is still worth keeping.
-        if ((target == &model && v.t == curT()) || (target == &rawModel && v.t == compareT())) {
+        if (onScreen) {
             dirty = Dirty{};
             scheduleUpdate();
         }
@@ -595,7 +655,11 @@ namespace sirius::app::gui {
         sliceNotice = format("Loading %d%%", static_cast<int>(std::clamp(fraction, 0.0, 1.0) * 100.0 + 0.5));
         if (!tail.empty()) sliceNotice += " \xC2\xB7 " + tail;
         refreshHints();
-        volume.setPreparing(sliceNotice);
+        // Only while the 3D view waits for this frame: play's read-ahead or
+        // the raw pane's read would otherwise write over a finished rendering.
+        bool haveVol = false, haveMip = false;
+        volumeReadiness(model, curT(), haveVol, haveMip);
+        if (!haveVol) volume.setPreparing(sliceNotice);
         loadFrac = fraction;
     }
 
@@ -616,6 +680,7 @@ namespace sirius::app::gui {
         if (ScopedTrace::enabled())
             std::fprintf(stderr, "view 3d reduction of %d channels in %lld us\n", static_cast<int>(r.channels.size()), r.micros);
         volume.setTextures(r.key, r.channels, model.meta().voxelUm, nz(), ny(), nx());
+        shownVolumeKey = r.key;
     }
 
     // --- output --------------------------------------------------------------------
@@ -643,6 +708,14 @@ namespace sirius::app::gui {
             loader.cancelAll();
             endLoad();
             volumeKey = 0;
+            // The 3D labels' owner is the old output, image array and all:
+            // holding it until the 3D view next renders kept it alive.
+            volume.clearLabels();
+            // The re-slices of the old output are other data: they must not
+            // stand in while the new volume loads (a new time point of the
+            // same output keeps its predecessor's until then).
+            for (SlicePane* p : {&xz, &yz, &mip}) p->clearContent();
+            xzRegion = yzRegion = RectI{};
             sliceNotice.clear();
             failedVolumes.clear();
             dirty = Dirty{};
@@ -673,9 +746,19 @@ namespace sirius::app::gui {
         }
         const Step& st = wb.pipeline().at(wb.viewedIndex());
         const StepInput in = model.output()->asInput();
-        for (Index c = 0; c < model.dims().c; ++c) {
-            const ContrastWindow w = contrastWindow(in, st.params, c, 8);
-            model.setWindow(c, DisplayWindow{w.lo, w.hi, w.gamma});
+        try {
+            for (Index c = 0; c < model.dims().c; ++c) {
+                const ContrastWindow w = contrastWindow(in, st.params, c, 8);
+                model.setWindow(c, DisplayWindow{w.lo, w.hi, w.gamma});
+            }
+        } catch (const std::exception& e) {
+            // The automatic window samples planes of the input, which a lazy
+            // source can fail to read: the panes keep their own windows.
+            model.resetWindows();
+            if (previewFailed.lock() != model.output()) {
+                previewFailed = model.output();
+                wb.logLine(std::string("Viewer: contrast preview: ") + e.what());
+            }
         }
         dirty = Dirty{};
     }
@@ -684,7 +767,7 @@ namespace sirius::app::gui {
         const ViewState& s = vs();
         zoomText = format("%ld %%", std::lround(s.zoom * 100.0));
         refreshHints();
-        setCursorFor(s.tool);
+        setCursorFor(s);
         volume.setBoundingBox(s.boundingBox);
         volume.setOrientation(s.yaw, s.pitch);
         volume.setClip(s.clipZ[0], s.clipZ[1]);
@@ -760,19 +843,20 @@ namespace sirius::app::gui {
         }
         xy.setHint(hint);
         cmpRight.setHint(hint);
-        const bool brush = s.tool == ViewerTool::Paint &&
-                           (s.paintTool == PaintTool::Brush || s.paintTool == PaintTool::Erase || s.paintTool == PaintTool::Lasso);
+        const bool brush = brushLike(s);
         xy.setBrushCursor(brush, s.brushPx / 2.0);
         cmpRight.setBrushCursor(brush, s.brushPx / 2.0);
     }
 
     // Dear ImGui has no open / closed hand or cross cursors: navigate shows
-    // the four-way arrow, paint hides the pointer (the brush outline is the
-    // cursor), the other tools keep the arrow.
-    void Viewer::Impl::setCursorFor(ViewerTool t) {
+    // the four-way arrow, the brush hides the pointer (its outline is the
+    // cursor), the other tools, the paint tools that are a click among them,
+    // keep the arrow.
+    void Viewer::Impl::setCursorFor(const ViewState& s) {
+        const ViewerTool t = s.tool;
         ImGuiMouseCursor shape = ImGuiMouseCursor_Arrow;
         if (t == ViewerTool::Navigate) shape = ImGuiMouseCursor_ResizeAll;
-        else if (t == ViewerTool::Paint) shape = ImGuiMouseCursor_None;
+        else if (brushLike(s)) shape = ImGuiMouseCursor_None;
         xy.setCursor(shape, shape);
         const ImGuiMouseCursor plain = t == ViewerTool::Navigate ? ImGuiMouseCursor_ResizeAll : ImGuiMouseCursor_Arrow;
         cmpLeft.setCursor(plain, plain);
@@ -799,7 +883,13 @@ namespace sirius::app::gui {
             havePrev = true;
             dirty = Dirty{};
         } else {
-            if (s.t != prev.t) dirty = Dirty{};
+            if (s.t != prev.t) {
+                dirty = Dirty{};
+                // the frame left behind is read no further, and its progress
+                // is not the new frame's
+                retainVolumes();
+                sliceNotice.clear();
+            }
             if (s.z != prev.z) dirty.xy = dirty.cmp = true;
             if (s.cx != prev.cx) dirty.yz = true;
             if (s.cy != prev.cy) dirty.xz = true;
@@ -893,13 +983,16 @@ namespace sirius::app::gui {
             }
             cmpLeft.setView(l);
         }
-        // a coarser render is enough when the image is smaller than the pane
-        const int wantFactor = std::max(1, static_cast<int>(std::floor(1.0 / std::max(v.zx, 1e-6))));
+        // a coarser render is enough when the image is smaller than the pane;
+        // a region too long for a texture is sub-sampled further
+        const int xyZoom = std::max(1, static_cast<int>(std::floor(1.0 / std::max(v.zx, 1e-6))));
+        const int wantFactor = textureFactor(xy, xyZoom, nx(), ny());
         if (wantFactor != xyFactor) {
             xyFactor = wantFactor;
             dirty.xy = true;
         }
-        const int cmpWant = std::max(1, static_cast<int>(std::floor(1.0 / std::max(cmpRight.view().zx, 1e-6))));
+        const int cmpZoom = std::max(1, static_cast<int>(std::floor(1.0 / std::max(cmpRight.view().zx, 1e-6))));
+        const int cmpWant = textureFactor(cmpRight, cmpZoom, nx(), ny());
         if (cmpWant != cmpFactor) {
             cmpFactor = cmpWant;
             dirty.cmp = true;
@@ -908,22 +1001,27 @@ namespace sirius::app::gui {
         // size (SIM halves it) a raw voxel covers twice the screen, so it needs
         // half the sub-sampling. Sharing the reconstruction's factor rendered
         // it at half the resolution it deserved and magnified the result.
-        const int cmpLeftWant = std::max(1, static_cast<int>(std::floor(1.0 / std::max(cmpLeft.view().zx, 1e-6))));
+        const int cmpLeftZoom = std::max(1, static_cast<int>(std::floor(1.0 / std::max(cmpLeft.view().zx, 1e-6))));
+        const int cmpLeftWant =
+            rawModel.valid() ? textureFactor(cmpLeft, cmpLeftZoom, rawModel.dims().x, rawModel.dims().y) : cmpLeftZoom;
         if (cmpLeftWant != cmpLeftFactor) {
             cmpLeftFactor = cmpLeftWant;
             dirty.cmp = true;
         }
+        // the MIP is the whole plane fitted to the pane: at most twice the pane's size
         const int mipWant = std::max(1, static_cast<int>(std::floor(1.0 / std::max(mip.view().zx, 1e-6))));
         if (mipWant != mipFactor) {
             mipFactor = mipWant;
             dirty.mip = true;
         }
-        const int xzWant = paneFactor(xz.view());
+        // XZ / YZ stretch z by the voxel aspect, so the factor that suits z
+        // can leave a long x or y at one texel per voxel, too long for a texture
+        const int xzWant = textureFactor(xz, paneFactor(xz.view()), nx(), nz());
         if (xzWant != xzFactor) {
             xzFactor = xzWant;
             dirty.xz = true;
         }
-        const int yzWant = paneFactor(yz.view());
+        const int yzWant = textureFactor(yz, paneFactor(yz.view()), nz(), ny());
         if (yzWant != yzFactor) {
             yzFactor = yzWant;
             dirty.yz = true;
@@ -997,14 +1095,16 @@ namespace sirius::app::gui {
             for (SlicePane* p : {&xy, &yz, &xz, &mip, &cmpLeft, &cmpRight}) p->clearContent();
             xy.setMessage(wb.hasDataset() ? "Nothing to display" : "Open a dataset (File \xE2\x96\xB8 Open dataset\xE2\x80\xA6)");
             volume.clearVolumes();
+            volume.clearLabels();
+            shownVolumeKey = 0;
             dirty = Dirty{};
             return;
         }
-        // the panes have no size before their first frame: render then
-        if (!xy.placed()) {
-            scheduleUpdate();
-            return;
-        }
+        // The panes have no size (before their first frame, or squeezed to
+        // nothing): render when layoutOrtho gives XY a size again, which
+        // queues the update. The dirty flags wait until then; queuing one
+        // here redrew every frame while nothing could be shown.
+        if (!xy.placed()) return;
         xy.setMessage({});
         const ViewState& s = vs();
         const Index t = curT(), z = curZ();
@@ -1017,6 +1117,7 @@ namespace sirius::app::gui {
         const bool needsVolume = s.mode == ViewMode::Ortho;
         bool haveVol = false, haveMip = false;
         if (needsVolume) {
+            retainVolumes();
             volumeReadiness(model, t, haveVol, haveMip);
             const DisplayModel::VolumeState vstate = ensureVolumes(model, t);
             // An in-memory volume small enough is projected inside
@@ -1026,9 +1127,13 @@ namespace sirius::app::gui {
                 volumeReadiness(model, t, haveVol, haveMip);
                 if (haveMip && !hadMip) dirty.mip = true;
             }
-            const std::string notice = !haveVol && vstate == DisplayModel::VolumeState::Wanted
-                                           ? (sliceNotice.empty() ? std::string("Loading\xE2\x80\xA6") : sliceNotice)
-                                           : std::string();
+            // Wanted: a read is on its way. Ready without the volume: a
+            // channel's read failed (failedVolumes). TooLarge says so itself
+            // (refreshHints).
+            const bool wanted = vstate == DisplayModel::VolumeState::Wanted;
+            std::string notice;
+            if (!haveVol && wanted) notice = sliceNotice.empty() ? std::string("Loading\xE2\x80\xA6") : sliceNotice;
+            else if (!haveVol && vstate == DisplayModel::VolumeState::Ready) notice = "could not read the volume";
             if (notice != sliceNotice) {
                 sliceNotice = notice;
                 if (trace)
@@ -1036,8 +1141,22 @@ namespace sirius::app::gui {
                                  haveVol ? (haveMip ? "ready" : "have volume, MIP pending") : "waiting for the volume (Loading...)");
                 refreshHints();
             }
-            if (!haveVol) dirty.xz = dirty.yz = false;
-            if (!haveMip) dirty.mip = false;
+            // What the panes show until then: the previous frame of this
+            // output while a read is coming, nothing when none is (the old
+            // slices no longer followed the crosshair, and a region of
+            // another grid had layoutPanes ask for a render every frame).
+            if (!haveVol) {
+                dirty.xz = dirty.yz = false;
+                if (!wanted) {
+                    xz.clearContent();
+                    yz.clearContent();
+                    xzRegion = yzRegion = RectI{};
+                }
+            }
+            if (!haveMip) {
+                dirty.mip = false;
+                if (!wanted) mip.clearContent();
+            }
             if (playing && nt() > 1) ensureVolumes(model, (t + 1) % nt());
         }
         if (s.mode == ViewMode::Ortho) {
@@ -1184,11 +1303,12 @@ namespace sirius::app::gui {
     void Viewer::Impl::renderVolume() {
         const ViewState& s = vs();
         const Index t = curT();
+        retainVolumes();
         const DisplayModel::VolumeState vstate = ensureVolumes(model, t);
         if (vstate == DisplayModel::VolumeState::TooLarge) {
             volume.clearVolumes();
             volume.setPreparing("Volume too large to render");
-            volumeKey = 0;
+            volumeKey = shownVolumeKey = 0;
             return;
         }
         if (vstate == DisplayModel::VolumeState::Wanted) {
@@ -1198,7 +1318,19 @@ namespace sirius::app::gui {
         // The reduction to <= 256 texels per axis is a pass over every voxel:
         // it runs on the loader thread and the frame only uploads the result.
         std::vector<ViewerLoader::Channel> chans;
-        std::uint64_t key = static_cast<std::uint64_t>(reinterpret_cast<std::uintptr_t>(model.output().get())) ^ (static_cast<std::uint64_t>(t) << 48);
+        // FNV-1a over the output, t and each visible channel's window, in
+        // order: XOR-ing a term per channel cancelled two channels with one
+        // window (a live preview gives every channel the same), and the key
+        // then ignored the window.
+        std::uint64_t key = 0xcbf29ce484222325ull;
+        const auto mix = [&key](std::uint64_t v) { key = (key ^ v) * 0x100000001b3ull; };
+        const auto bits = [](float f) {
+            std::uint32_t u = 0;
+            std::memcpy(&u, &f, sizeof u);
+            return static_cast<std::uint64_t>(u);
+        };
+        mix(static_cast<std::uint64_t>(reinterpret_cast<std::uintptr_t>(model.output().get())));
+        mix(static_cast<std::uint64_t>(t));
         for (Index c = 0; c < model.dims().c; ++c) {
             if (!s.channelOn(c)) continue;
             const float* v = model.volumeIfReady(c, t);
@@ -1218,18 +1350,24 @@ namespace sirius::app::gui {
             } else if (static_cast<std::size_t>(c) < model.meta().channels.size()) {
                 ch.color = model.meta().channels[static_cast<std::size_t>(c)].color;
             }
-            key ^= (static_cast<std::uint64_t>(c + 1) * 0x9e3779b97f4a7c15ull) ^
-                   static_cast<std::uint64_t>(std::hash<float>{}(w.lo) * 31 + std::hash<float>{}(w.hi));
+            mix(static_cast<std::uint64_t>(c + 1));
+            mix(bits(w.lo));
+            mix(bits(w.hi));
             chans.push_back(ch);
         }
         if (chans.empty()) {
             volume.clearVolumes();
             volume.setPreparing(std::string());
-            volumeKey = 0;
+            volumeKey = shownVolumeKey = 0;
         } else if (key != volumeKey) {
             volumeKey = key;
             volume.setPreparing("Preparing volume\xE2\x80\xA6");
             loader.reduce(key, std::move(chans));
+        } else {
+            // The same bricks as before: up already, when the text is left
+            // from a read of another frame (back in 3D after Ortho stepped
+            // through time), or still being reduced.
+            volume.setPreparing(shownVolumeKey == key ? std::string() : std::string("Preparing volume\xE2\x80\xA6"));
         }
         // labels ride along as their own texture, toggled with the Labels box
         const LabelVolume* L = s.labels ? model.labels() : nullptr;
@@ -1367,6 +1505,11 @@ namespace sirius::app::gui {
                 break;
             case ViewerTool::Paint: {
                 if (!canPaint()) return;   // a run holds the pipeline
+                // A click beside the image edits nothing: Fill, Pick, Merge,
+                // Split and Delete would act on the edge voxel it clamps to
+                // (a fill of the whole background). A stroke may start there
+                // and drag in.
+                if (!brushLike(s) && !xy.inside(v)) return;
                 const bool erase = s.paintTool == PaintTool::Erase || (m & ImGuiMod_Alt);
                 switch (s.paintTool) {
                     case PaintTool::Brush:
@@ -1405,8 +1548,20 @@ namespace sirius::app::gui {
                             splitA = {z, y, x};
                             splitPending = labelAt(z, y, x) != 0;
                         } else {
+                            // Both seeds must lie in the one label, which the
+                            // core refuses by throwing. The labels shown can
+                            // lag the workbench's for a frame (an undo, a
+                            // re-run), so the catch stays as well.
                             const std::uint32_t id = labelAt(splitA[0], splitA[1], splitA[2]);
-                            if (id != 0) wb.splitLabel(id, splitA, {z, y, x});
+                            if (id != 0 && labelAt(z, y, x) == id) {
+                                try {
+                                    wb.splitLabel(id, splitA, {z, y, x});
+                                } catch (const std::exception& e) {
+                                    wb.logLine(std::string("Split: ") + e.what());
+                                }
+                            } else {
+                                wb.logLine("Split: both seeds must lie inside one label.");
+                            }
                             splitPending = false;
                         }
                         refreshHints();
@@ -1669,11 +1824,12 @@ namespace sirius::app::gui {
         const float gap = theme::snap(px(static_cast<float>(viewer::kPaneGap)));
         const float s = std::max(theme::scale(), 0.01f);
         const float w = max.x - min.x - gap, h = max.y - min.y - gap;
-        if (orthoCol < 0.0f || orthoRow < 0.0f) {
+        if (!orthoLoaded) {
             // the saved balance, else the design's targets
             const nlohmann::json cols = settings().value(kOrthoColsKey), rows = settings().value(kOrthoRowsKey);
             orthoCol = cols.is_number() ? cols.get<float>() : static_cast<float>(viewer::kYzWidth);
             orthoRow = rows.is_number() ? rows.get<float>() : static_cast<float>(viewer::kXzHeight);
+            orthoLoaded = true;
         }
         const float sideMin = px(static_cast<float>(viewer::kSidePaneMin)), mainMin = px(static_cast<float>(viewer::kMainPaneMin));
         auto side = [&](float want, float total) {
@@ -1683,7 +1839,10 @@ namespace sirius::app::gui {
         const float right = side(orthoCol * s, w), bottom = side(orthoRow * s, h);
         const float x1 = max.x - right - gap, y1 = max.y - bottom - gap;
         const auto resized = [&](SlicePane& p, ImVec2 a, ImVec2 b) { return p.place(a, b); };
-        if (resized(xy, min, ImVec2(x1, y1))) {
+        // XY getting a size back (from none: squeezed, or the first frame)
+        // is what renders the frame applyDirty had to leave
+        const bool xyWasPlaced = xy.placed();
+        if (resized(xy, min, ImVec2(x1, y1)) || xy.placed() != xyWasPlaced) {
             layoutPanes();
             dirty.xy = dirty.xz = dirty.yz = true;
             scheduleUpdate();
@@ -1709,6 +1868,10 @@ namespace sirius::app::gui {
         const float gap = theme::snap(px(static_cast<float>(viewer::kPaneGap)));
         const float s = std::max(theme::scale(), 0.01f);
         const float grip = px(3);
+        // The balance stays within what layoutOrtho can show: pointer travel
+        // past an edge would have to be dragged back before the gap moved.
+        const float sideMin = px(static_cast<float>(viewer::kSidePaneMin)), mainMin = px(static_cast<float>(viewer::kMainPaneMin));
+        const auto within = [&](float want, float total) { return std::clamp(want, sideMin / s, std::max(sideMin, total - mainMin) / s); };
         bool released = false;
         // the column gap
         {
@@ -1716,7 +1879,8 @@ namespace sirius::app::gui {
             ImGui::SetCursorScreenPos(ImVec2(x - grip, min.y));
             ImGui::InvisibleButton("##orthoCols", ImVec2(gap + 2 * grip, max.y - min.y));
             if (ImGui::IsItemHovered() || ImGui::IsItemActive()) ImGui::SetMouseCursor(ImGuiMouseCursor_ResizeEW);
-            if (ImGui::IsItemActive() && ImGui::GetIO().MouseDelta.x != 0.0f) orthoCol -= ImGui::GetIO().MouseDelta.x / s;
+            if (ImGui::IsItemActive() && ImGui::GetIO().MouseDelta.x != 0.0f)
+                orthoCol = within(orthoCol - ImGui::GetIO().MouseDelta.x / s, max.x - min.x - gap);
             released = released || ImGui::IsItemDeactivated();
         }
         // the row gap
@@ -1725,7 +1889,8 @@ namespace sirius::app::gui {
             ImGui::SetCursorScreenPos(ImVec2(min.x, y - grip));
             ImGui::InvisibleButton("##orthoRows", ImVec2(max.x - min.x, gap + 2 * grip));
             if (ImGui::IsItemHovered() || ImGui::IsItemActive()) ImGui::SetMouseCursor(ImGuiMouseCursor_ResizeNS);
-            if (ImGui::IsItemActive() && ImGui::GetIO().MouseDelta.y != 0.0f) orthoRow -= ImGui::GetIO().MouseDelta.y / s;
+            if (ImGui::IsItemActive() && ImGui::GetIO().MouseDelta.y != 0.0f)
+                orthoRow = within(orthoRow - ImGui::GetIO().MouseDelta.y / s, max.y - min.y - gap);
             released = released || ImGui::IsItemDeactivated();
         }
         if (released) {
@@ -2087,6 +2252,13 @@ namespace sirius::app::gui {
                 }
         }
         if (!pressed && (ImGui::IsMouseClicked(ImGuiMouseButton_Left) || ImGui::IsMouseClicked(ImGuiMouseButton_Right))) focused = nullptr;
+        // A pane on a page no longer shown (the mode changed by a key, a menu,
+        // the toolbar or a tool, with no click) gives the keyboard back: it
+        // kept the arrows from the window's actions for a hidden crosshair.
+        bool onPage = false;   // 3D has no slice pane
+        if (mode == ViewMode::Ortho) onPage = focused == &xy || focused == &yz || focused == &xz || focused == &mip;
+        else if (mode == ViewMode::Compare) onPage = focused == &cmpLeft || focused == &cmpRight;
+        if (!onPage) focused = nullptr;
         handleKeys();
 
         // what the input did, then render what is dirty
@@ -2206,7 +2378,13 @@ namespace sirius::app::gui {
         Impl& d = *impl_;
         if (d.previewing) {   // the previewed step's own Auto
             const int i = d.wb.viewedIndex();
-            if (auto up = d.wb.upstreamOutput(i)) d.wb.setStepParams(i, contrastAutoParams(d.wb.pipeline().at(i).params, up->asInput()), "Auto contrast");
+            // the window samples planes of the input, which a lazy source can fail to read
+            try {
+                if (auto up = d.wb.upstreamOutput(i))
+                    d.wb.setStepParams(i, contrastAutoParams(d.wb.pipeline().at(i).params, up->asInput()), "Auto contrast");
+            } catch (const std::exception& e) {
+                d.wb.logLine(std::string("Auto contrast: ") + e.what());
+            }
             return;
         }
         d.model.setWindowMode(DisplayModel::WindowMode::Auto);
@@ -2219,16 +2397,35 @@ namespace sirius::app::gui {
         Impl& d = *impl_;
         if (d.previewing) {
             const int i = d.wb.viewedIndex();
-            if (auto up = d.wb.upstreamOutput(i))
-                d.wb.setStepParams(i, contrastResetParams(d.wb.pipeline().at(i).params, up->asInput()), "Reset contrast");
+            // the range reads planes of the input, which a lazy source can fail to read
+            try {
+                if (auto up = d.wb.upstreamOutput(i))
+                    d.wb.setStepParams(i, contrastResetParams(d.wb.pipeline().at(i).params, up->asInput()), "Reset contrast");
+            } catch (const std::exception& e) {
+                d.wb.logLine(std::string("Reset contrast: ") + e.what());
+            }
             return;
         }
         d.model.setWindowMode(DisplayModel::WindowMode::Full);
         d.rawModel.setWindowMode(DisplayModel::WindowMode::Full);
         // The full range is every voxel: ask for the volumes so the exact
         // one replaces the sampled stand-in as soon as it is read.
+        d.retainVolumes();
         d.ensureVolumes(d.model, d.curT());
-        if (d.rawModel.valid()) d.ensureVolumes(d.rawModel, d.curT());
+        // One output shown by both (the Load step viewed, or a step not run
+        // yet) is read once, for both (onVolumeReady). A lazy one asked for
+        // again was read in full on every click: the raw model never keeps
+        // its volume, so it always wants one. Its exact range comes with the
+        // projection: the raw pane asks only while it lacks that, as it does
+        // at a time point of its own (Sync Z/T off) that the model's read
+        // does not cover. That is the time point retainVolumes() keeps for it.
+        const auto rawHasRanges = [&d] {
+            for (Index c = 0; c < d.rawModel.dims().c; ++c)
+                if (d.vs().channelOn(c) && !d.rawModel.mipIfReady(c, d.compareT())) return false;
+            return true;
+        };
+        if (d.rawModel.valid() && (d.rawModel.output() != d.model.output() || !rawHasRanges()))
+            d.ensureVolumes(d.rawModel, d.compareT());
         d.dirty = Impl::Dirty{};
         d.scheduleUpdate();
     }

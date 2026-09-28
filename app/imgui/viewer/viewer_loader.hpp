@@ -15,14 +15,19 @@
 //     is a texture upload and not a reduction of the whole volume inside
 //     the frame.
 //
-// Lifetime: requests are queued for the loader's own std::thread; every job
-// re-checks the generation it was queued with and returns immediately when
-// the viewer has moved on (a new output, a new time point, a destroyed
-// loader). Results come back through the poster the loader was given
-// (Bridge::post: the GUI thread, at the start of a frame) guarded by a
-// shared "alive" flag, and the destructor bumps the generation, clears the
-// flag and joins the thread, so no job can outlive the loader and a result
-// already posted is dropped when it arrives.
+// Lifetime: requests are queued for the loader's own std::thread, first in
+// first out. Every job re-checks the generation it was queued with, which
+// cancelAll() (a new output) and the destructor move, and returns as soon as
+// it changed. A volume read for a time point the viewer no longer shows is
+// dropped by retain(): taken off the queue before it starts, or, when it is
+// already running, left to finish a read that cannot be interrupted with no
+// progress posted. What such a read produced still comes back (the viewer
+// caches its projection), but it no longer answers a request. Results come
+// back through the poster the loader was given (Bridge::post: the GUI
+// thread, at the start of a frame) guarded by a shared "alive" flag, and
+// the destructor bumps the generation, clears the flag and joins the
+// thread, so no job can outlive the loader and a result already posted is
+// dropped when it arrives.
 
 #include <array>
 #include <atomic>
@@ -30,9 +35,9 @@
 #include <cstdint>
 #include <deque>
 #include <functional>
+#include <map>
 #include <memory>
 #include <mutex>
-#include <set>
 #include <string>
 #include <thread>
 #include <vector>
@@ -77,7 +82,16 @@ namespace sirius::app::gui {
         // while one is pending does nothing. False = already pending.
         bool prepare(const std::shared_ptr<const StepOutput>& out, Index c, Index t);
         bool pending(const std::shared_ptr<const StepOutput>& out, Index c, Index t) const;
-        bool busy() const noexcept { return !pending_.empty() || reductionPending_; }
+        // Drops every pending read of `out` whose t is not in `keepT`: the
+        // queued ones never start, the running one posts no progress (only
+        // what it read, once done, not as the request's answer), and each
+        // can be asked for again at once. Reads the viewer passed over
+        // (scrubbing, play) would otherwise hold up the frame on screen.
+        void retain(const StepOutput* out, const std::vector<Index>& keepT);
+        // Volume reads queued or running. A reduction is not counted: the
+        // viewer's loading state is about reads, and no read is waiting when
+        // only a reduction is.
+        bool busy() const noexcept { return !pending_.empty(); }
 
         // --- 3D textures ------------------------------------------------------
         struct Channel {
@@ -116,21 +130,28 @@ namespace sirius::app::gui {
             }
         };
 
-        void enqueue(std::function<void()> job);
+        // Set by retain() (on the GUI thread) for a read no longer wanted.
+        using Dropped = std::shared_ptr<std::atomic<bool>>;
+        struct Queued {
+            std::function<void()> run;
+            Dropped dropped;   // a volume read's flag; null for a reduction
+        };
+
+        void enqueue(Dropped dropped, std::function<void()> job);
         void run();
 
         Poster post_;
         std::thread thread_;
         std::mutex mutex_;
         std::condition_variable ready_;
-        std::deque<std::function<void()>> queue_;
+        std::deque<Queued> queue_;
         bool quit_ = false;                                        // guarded by mutex_
 
         std::shared_ptr<std::atomic<std::uint64_t>> generation_;   // shared with the jobs
         std::shared_ptr<std::atomic<std::uint64_t>> latestReduction_;   // the key of the newest reduce()
         std::shared_ptr<std::atomic<bool>> alive_;                 // cleared by the destructor
         std::uint64_t gen_ = 1;
-        std::set<Job> pending_;
+        std::map<Job, Dropped> pending_;   // reads queued or running, with their flags (GUI thread)
         bool reductionPending_ = false;
         std::uint64_t reductionKey_ = 0;
     };

@@ -98,10 +98,10 @@ namespace sirius::app::gui {
         if (thread_.joinable()) thread_.join();
     }
 
-    void ViewerLoader::enqueue(std::function<void()> job) {
+    void ViewerLoader::enqueue(Dropped dropped, std::function<void()> job) {
         {
             const std::lock_guard<std::mutex> lock(mutex_);
-            queue_.push_back(std::move(job));
+            queue_.push_back(Queued{std::move(job), std::move(dropped)});
         }
         ready_.notify_one();
     }
@@ -113,7 +113,7 @@ namespace sirius::app::gui {
                 std::unique_lock<std::mutex> lock(mutex_);
                 ready_.wait(lock, [this] { return quit_ || !queue_.empty(); });
                 if (quit_) return;
-                job = std::move(queue_.front());
+                job = std::move(queue_.front().run);
                 queue_.pop_front();
             }
             try {
@@ -143,17 +143,43 @@ namespace sirius::app::gui {
         return pending_.count(Job{out.get(), c, t}) != 0;
     }
 
+    void ViewerLoader::retain(const StepOutput* out, const std::vector<Index>& keepT) {
+        if (!out) return;
+        bool any = false;
+        for (auto it = pending_.begin(); it != pending_.end();) {
+            if (it->first.out == out && std::find(keepT.begin(), keepT.end(), it->first.t) == keepT.end()) {
+                // The flag goes up as the entry goes, both on the GUI thread:
+                // the read, which checks the flag before it erases anything,
+                // cannot remove the entry of a new request for the same volume.
+                it->second->store(true);
+                it = pending_.erase(it);
+                any = true;
+            } else {
+                ++it;
+            }
+        }
+        if (!any) return;
+        const std::lock_guard<std::mutex> lock(mutex_);
+        queue_.erase(std::remove_if(queue_.begin(), queue_.end(), [](const Queued& q) { return q.dropped && q.dropped->load(); }),
+                     queue_.end());
+    }
+
     bool ViewerLoader::prepare(const std::shared_ptr<const StepOutput>& out, Index c, Index t) {
         if (!out) return false;
         const Job job{out.get(), c, t};
-        if (!pending_.insert(job).second) return false;   // already queued or running
+        auto dropped = std::make_shared<std::atomic<bool>>(false);
+        if (!pending_.emplace(job, dropped).second) return false;   // already queued or running
         const std::uint64_t gen = gen_;
         auto generation = generation_;
         auto alive = alive_;
         Poster post = post_;
         ViewerLoader* self = this;
-        enqueue([self, post, alive, generation, gen, out, c, t] {
-            if (generation->load() != gen) return;   // the viewer moved on
+        // Whether the viewer still wants this read: neither a new output
+        // (the generation) nor a time point it moved away from (retain).
+        auto current = [generation, gen] { return generation->load() == gen; };
+        auto wanted = [current, dropped] { return current() && !dropped->load(); };
+        enqueue(dropped, [self, post, alive, current, wanted, dropped, out, c, t] {
+            if (!wanted()) return;   // the viewer moved on
             TraceClock clock;
             auto result = std::make_shared<Volume>();
             result->out = out;
@@ -166,17 +192,21 @@ namespace sirius::app::gui {
                     vol = out->array->plane(c, t, 0);
                 } else if (out->source) {
                     auto buf = std::make_shared<Buffer<float>>(Shape{d.z, d.y, d.x});
+                    // a read that was dropped still runs to its end, silently
                     out->source->readVolume(c, t, buf->data(), [&](double f, const std::string& m) {
-                        if (generation->load() != gen || !alive->load()) return;
-                        post([self, alive, generation, gen, f, m] {
-                            if (!alive->load() || generation->load() != gen) return;
+                        if (!wanted() || !alive->load()) return;
+                        post([self, alive, wanted, f, m] {
+                            if (!alive->load() || !wanted()) return;
                             if (self->volumeProgress) self->volumeProgress(0.9 * f, m);
                         });
                     });
                     vol = buf->data();
                     result->volume = std::move(buf);
                 }
-                if (generation->load() != gen) return;
+                // A read dropped while it ran has cost its time already: its
+                // projection and range still go to the MIP cache (the next
+                // loop of play shows them). An in-memory one has cost nothing.
+                if (!current() || (dropped->load() && !result->volume)) return;
                 if (vol) {
                     auto mip = std::make_shared<Buffer<float>>(Shape{d.y, d.x});
                     projectAndRange(vol, d.z, d.y, d.x, mip->data(), result->lo, result->hi);
@@ -190,10 +220,16 @@ namespace sirius::app::gui {
                 result->error = e.what();
             }
             result->micros = clock.micros();
-            if (generation->load() != gen || !alive->load()) return;
-            post([self, alive, generation, gen, result] {
-                if (!alive->load() || generation->load() != gen) return;
-                self->pending_.erase(Job{result->out.get(), result->c, result->t});
+            if (!current() || !alive->load() || (dropped->load() && !result->ok)) return;
+            post([self, alive, current, dropped, result] {
+                if (!alive->load() || !current()) return;
+                // Dropped (retain() raises the flag and erases the entry
+                // together, on this thread): the entry may belong to a new
+                // request for the same volume by now, so it stays. What was
+                // read is delivered all the same; a failure is not, since
+                // nothing asks for that time point any more.
+                if (!dropped->load()) self->pending_.erase(Job{result->out.get(), result->c, result->t});
+                else if (!result->ok) return;
                 if (self->volumeReady) self->volumeReady(*result);
             });
         });
@@ -212,7 +248,7 @@ namespace sirius::app::gui {
         Poster post = post_;
         ViewerLoader* self = this;
         auto input = std::make_shared<std::vector<Channel>>(std::move(channels));
-        enqueue([self, post, alive, generation, latest, gen, key, input] {
+        enqueue(nullptr, [self, post, alive, generation, latest, gen, key, input] {
             if (generation->load() != gen) return;
             if (latest->load() != key) return;   // a newer request replaced this one before it started
             TraceClock clock;
