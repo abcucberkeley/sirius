@@ -61,8 +61,15 @@ inside a popup, and the only place `App::waitUntil` may be used.
 
 **Keys.** The menu actions own their shortcuts (`App`'s action table). They
 stand back while a text field or a popup has the keyboard, while a non-modal
-dialog has focus, and for a chord a panel claims with `App::claimKey` on the
-frames it uses it itself (Ctrl+C in the log, the arrows in a focused pane).
+dialog has focus, for a chord a panel claims with `App::claimKey` on the
+frames it uses it itself (Ctrl+C in the log, the arrows in a focused pane),
+and for a plain key (no Ctrl, Alt or Super) that a Dear ImGui item owns: plain
+chords fire only when
+`ImGui::IsKeyChordPressed(chord, ImGuiInputFlags_None, ImGuiKeyOwner_NoOwner)`
+holds, so a focused widget that uses plain keys calls
+`ImGui::SetKeyOwner(key, ImGui::GetItemID())` on each frame it has focus (the
+arrows in `widgets::slider` / `sliderInt`, Page Up / Page Down / Home / End in
+the dims strip).
 
 **Design pixels.** Every size in the panels is in the design's pixels and goes
 through `theme::px()`; font sizes are given to `theme::FontScope` /
@@ -73,7 +80,10 @@ ImGui are display pixels. The monitor's content scale (times `ui/scale`, or
 **Drawing.** Custom controls draw into `ImGui::GetWindowDrawList()` with the
 tokens of `theme.hpp`; borders go through `widgets::crispRect` so a 1.5 px line
 is whole pixels at any scale. Images are `gui::Texture`s (`gl.hpp`) drawn with
-`ImDrawList::AddImage(texture.ref(), …)`. Dear ImGui reports API misuse — an
+`texture.draw(dl, a, b)`, which asks the OpenGL backend for its nearest sampler
+when the texture is not smooth; a plain `AddImage(texture.ref(), …)` always
+gets the backend's linear sampler (`setSmooth(false)` is then ignored), so use
+it only for textures that are always smooth. Dear ImGui reports API misuse — an
 unbalanced push / pop, a cursor moved past a window's end — as `[imgui-error]`
 lines instead of crashing; CI's headless run fails on any.
 
