@@ -10,6 +10,7 @@
 
 #include <algorithm>
 #include <chrono>
+#include <csignal>
 #include <cstdio>
 #include <cstdlib>
 #include <exception>
@@ -21,6 +22,10 @@
 #include <vector>
 
 #include <nlohmann/json.hpp>
+
+#ifndef _WIN32
+#include <unistd.h>   // mkdtemp, which macOS declares here
+#endif
 
 #include <sirius/device.hpp>
 
@@ -167,9 +172,48 @@ namespace {
         }
     }
 
+    // A new directory of this process's own under the temporary directory,
+    // "" when none can be made. On POSIX that directory is shared by every
+    // user, so a name another user could have created first must not be
+    // taken over: mkdtemp picks one that did not exist, creates it with mode
+    // 0700 and fails rather than reuse one. %TEMP% on Windows is the user's
+    // own; the directory is still a new one, not an existing one taken over.
+    std::string makeTempDirectory(const std::string& prefix) {
+        std::string parent = platform::tempDirectory();   // Windows' ends in a separator
+        if (!parent.empty() && parent.back() != '/') parent += '/';
+#ifdef _WIN32
+        const std::string base = parent + prefix + std::to_string(platform::processId());
+        for (int n = 0; n < 100; ++n) {
+            const std::string dir = n == 0 ? base : base + "-" + std::to_string(n);
+            const std::filesystem::path path = std::filesystem::u8path(dir);
+            std::error_code ec;
+            if (std::filesystem::create_directory(path, ec)) return dir;
+            // Left by an earlier process with the same id: try the next name.
+            // Anything else (no temporary directory, no permission) will not
+            // change with another name.
+            if (!std::filesystem::exists(path, ec)) return std::string();
+        }
+        return std::string();
+#else
+        const std::string pattern = parent + prefix + "XXXXXX";
+        std::vector<char> name(pattern.begin(), pattern.end());
+        name.push_back('\0');
+        return ::mkdtemp(name.data()) ? std::string(name.data()) : std::string();
+#endif
+    }
+
 } // namespace
 
 int main(int argc, char** argv) {
+#ifndef _WIN32
+    // Before any thread or transfer starts. http.cpp sets CURLOPT_NOSIGNAL
+    // (its transfers run on threads of their own), with which libcurl leaves
+    // SIGPIPE to the application, and a TLS library writing to a socket the
+    // server has closed can still raise it: ignored, that write fails with
+    // EPIPE instead of ending the process. Child processes get the default
+    // back (process.cpp).
+    std::signal(SIGPIPE, SIG_IGN);
+#endif
     platform::attachParentConsole();
     const Arguments args = parse(argc, argv);
     if (!args.error.empty()) {
@@ -219,8 +263,11 @@ int main(int argc, char** argv) {
     if (args.has("settings")) {
         std::string dir = args.value("settings");
         if (dir == "scratch") {
-            dir = platform::tempDirectory() + format("/sirius-settings-%d-%lld", platform::processId(),
-                                                     static_cast<long long>(Clock::now().time_since_epoch().count() % 1000000));
+            dir = makeTempDirectory("sirius-settings-");
+            if (dir.empty()) {
+                std::fprintf(stderr, "cannot create a scratch settings directory in %s\n", platform::tempDirectory().c_str());
+                return 2;
+            }
             scratchSettings.path = dir;
         }
         if (!platform::makePath(dir)) {
@@ -235,8 +282,11 @@ int main(int argc, char** argv) {
     registerBuiltinOperations();
 
     // Per-process scratch for the disk cache and worker files.
-    const std::string scratch = platform::tempDirectory() + format("/sirius-%d", platform::processId());
-    platform::makePath(scratch);
+    const std::string scratch = makeTempDirectory("sirius-");
+    if (scratch.empty()) {
+        std::fprintf(stderr, "cannot create a scratch directory in %s\n", platform::tempDirectory().c_str());
+        return 2;
+    }
 
     int rc = 0;
     {
@@ -247,6 +297,13 @@ int main(int argc, char** argv) {
         // thread, which may be inside the launcher starting that worker.
         WorkerLauncher launcher;
         Bridge bridge(workbench);
+        // The launcher outlives the bridge, and stopping the worker on the way
+        // out makes it write to stderr once more: the handler that posts those
+        // lines into the bridge is taken off before the bridge goes.
+        struct DetachLog {
+            WorkerLauncher& launcher;
+            ~DetachLog() { launcher.setLogHandler({}); }
+        } detachLog{launcher};
         launcher.setLogHandler([&bridge, &workbench](const std::string& line) {
             bridge.post([&workbench, line] { workbench.logLine("worker: " + line); });
         });
@@ -279,6 +336,7 @@ int main(int argc, char** argv) {
             if (wh.size() == 2) {
                 init.width = std::max(640, toInt(wh[0], init.width));
                 init.height = std::max(480, toInt(wh[1], init.height));
+                init.sizeGiven = true;
             }
         }
         if (!app.init(init)) {
@@ -289,8 +347,11 @@ int main(int argc, char** argv) {
 
         // Runs block the caller, not the window: a tool's "run" draws frames
         // until the worker thread is done (scripting and the assistant both
-        // call tools between frames).
-        tools.setRunHook([&app, &bridge](int target) {
+        // call tools between frames). A headless session sets a deadline
+        // (below) that a scripted run must not outlast either; otherwise
+        // there is none.
+        Clock::time_point runDeadline = Clock::time_point::max();
+        tools.setRunHook([&app, &bridge, &runDeadline](int target) {
             bool done = false, ok = false;
             std::string error;
             const Clock::time_point started = Clock::now();
@@ -303,8 +364,13 @@ int main(int argc, char** argv) {
                 bridge.runFinished.disconnect(id);
                 return nlohmann::json{{"ok", false}, {"error", "the run could not start (see the log)"}};
             }
-            app.waitUntil([&] { return done; });
+            app.waitUntil([&] { return done || Clock::now() >= runDeadline; });
             bridge.runFinished.disconnect(id);
+            if (!done && Clock::now() >= runDeadline) {
+                bridge.cancelRun();
+                if (app.exitCode() == 0) app.setExitCode(1);
+                return nlohmann::json{{"ok", false}, {"error", "the run did not finish before the headless deadline"}};
+            }
             if (!done) return nlohmann::json{{"ok", false}, {"error", "the window was closed"}};
             const double seconds = std::chrono::duration<double>(Clock::now() - started).count();
             return nlohmann::json{{"ok", ok}, {"error", error}, {"seconds", seconds}};
@@ -342,7 +408,19 @@ int main(int argc, char** argv) {
             const std::string dataset = args.value("dataset");
             app.defer([&app, dataset] { app.openDatasetPath(dataset); });
         }
-        if (!args.files.empty()) app.defer([&app, files = args.files] { app.dropPaths(files); });
+        // The files named on the command line open once a --dataset is in: a
+        // pipeline or a dataset is refused while that load runs, since the
+        // load would land on top of it. They ask again each frame rather than
+        // wait inside this action, which would hold back the actions deferred
+        // after it.
+        if (!args.files.empty()) {
+            auto open = std::make_shared<std::function<void()>>();
+            *open = [&app, &bridge, files = args.files, open] {
+                if (bridge.taskRunning()) app.defer(*open);
+                else app.dropPaths(files);
+            };
+            app.defer(*open);
+        }
 
         auto runTool = [&](const std::string& call) {
             const nlohmann::json j = nlohmann::json::parse(call, nullptr, false);
@@ -350,11 +428,21 @@ int main(int argc, char** argv) {
                 std::fprintf(stderr, "--tool: not a JSON object: %s\n", call.c_str());
                 return;
             }
-            const std::string name = j.value("name", std::string());
+            // A name that is not a string is no tool's: tools.call answers
+            // "unknown tool" as for any other, where value() would throw.
+            const std::string name = j.contains("name") && j["name"].is_string() ? j["name"].get<std::string>() : std::string();
             const nlohmann::json toolArgs = j.contains("args") && j["args"].is_object() ? j["args"] : nlohmann::json::object();
             const nlohmann::json r = tools.call(name, toolArgs);
-            workbench.logLine("tool " + name + " \xE2\x86\x92 " + r.dump().substr(0, 200));
-            std::fprintf(stderr, "tool %s -> %s\n", name.c_str(), r.dump(2).c_str());
+            // A result may carry text that is not valid UTF-8 (a path, a log
+            // line), which the strict dump throws on; it is replaced instead.
+            const std::string text = r.dump(-1, ' ', false, nlohmann::json::error_handler_t::replace);
+            // Cut on a character boundary, so the log never keeps half a
+            // character that a later get_log would hand back.
+            std::size_t cut = std::min<std::size_t>(text.size(), 200);
+            while (cut > 0 && cut < text.size() && (static_cast<unsigned char>(text[cut]) & 0xC0) == 0x80) --cut;
+            workbench.logLine("tool " + name + " \xE2\x86\x92 " + text.substr(0, cut));
+            std::fprintf(stderr, "tool %s -> %s\n", name.c_str(),
+                         r.dump(2, ' ', false, nlohmann::json::error_handler_t::replace).c_str());
             std::fflush(stderr);
             app.settle();
         };
@@ -388,8 +476,20 @@ int main(int argc, char** argv) {
         };
 
         // An interactive --run just starts; a headless one (below) also decides
-        // the exit code and when the window is grabbed.
-        if (args.has("run") && !headless) app.defer([&app] { app.runAll(); });
+        // the exit code and when the window is grabbed. A --dataset or a file
+        // named on the command line is still loading on the worker thread, and
+        // a run is refused until it is in, so the run waits for it (for as long
+        // as it takes, as a user would). It asks again each frame rather than
+        // wait inside this action, which would hold back the actions deferred
+        // after it (the --quit-after timer) until the load is in.
+        if (args.has("run") && !headless) {
+            auto poll = std::make_shared<std::function<void()>>();
+            *poll = [&app, &bridge, poll] {
+                if (bridge.taskRunning()) app.defer(*poll);
+                else app.runAll();
+            };
+            app.defer(*poll);
+        }
 
         if (args.has("quit-after")) {
             const Clock::time_point at = Clock::now() + std::chrono::milliseconds(toInt(args.value("quit-after"), 0));
@@ -409,6 +509,7 @@ int main(int argc, char** argv) {
                 // was still going when the deadline struck), 2 when it could
                 // not start.
                 const auto deadline = Clock::now() + std::chrono::seconds(600);
+                runDeadline = deadline;   // a scripted run too: nobody is there to stop one that hangs
                 auto waitFor = [&](int ms) {
                     const auto until = Clock::now() + std::chrono::milliseconds(ms);
                     app.waitUntil([&] { return Clock::now() >= until; });
@@ -432,7 +533,17 @@ int main(int argc, char** argv) {
                 } else {
                     waitFor(600);
                 }
-                if (scripted) script();
+                // A step that throws ends the script, not this action: the
+                // grab and quitNow() below must still come, or the process
+                // would idle until it is killed, with no exit code saying why.
+                if (scripted) {
+                    try {
+                        script();
+                    } catch (const std::exception& e) {
+                        std::fprintf(stderr, "scripting stopped: %s\n", e.what());
+                        app.setExitCode(1);
+                    }
+                }
                 if (!shot.empty()) {
                     // a run, or a dataset still loading: the picture waits for either
                     app.waitUntil([&] { return (!bridge.running() && !bridge.taskRunning()) || Clock::now() >= deadline; });

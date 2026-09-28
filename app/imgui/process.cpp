@@ -136,20 +136,47 @@ namespace sirius::app::gui {
         std::wstring env = environmentBlock(options.environment);
         const std::wstring cwd = widen(options.workingDirectory);
 
-        STARTUPINFOW si{};
-        si.cb = sizeof si;
-        si.dwFlags = STARTF_USESTDHANDLES;
-        si.hStdInput = inRead;
-        si.hStdOutput = outWrite;
-        si.hStdError = errWrite;
-        PROCESS_INFORMATION pi{};
-        const BOOL ok = ::CreateProcessW(nullptr, command.data(), nullptr, nullptr, TRUE, CREATE_NO_WINDOW | CREATE_UNICODE_ENVIRONMENT,
-                                         env.data(), cwd.empty() ? nullptr : cwd.c_str(), &si, &pi);
-        if (!ok) {
+        // Only the child's three ends are handed to it. bInheritHandles alone
+        // would pass every inheritable handle of the application as well:
+        // files the CRT opened (a recording still being written) and sockets
+        // (an RPC connection), which the worker would then keep open for the
+        // rest of the session. The list must outlive the attribute list.
+        HANDLE inherited[3] = {inRead, outWrite, errWrite};
+        SIZE_T attributesSize = 0;
+        ::InitializeProcThreadAttributeList(nullptr, 1, 0, &attributesSize);   // fails, and says how much it needs
+        std::vector<unsigned char> attributesBuffer(attributesSize);
+        const auto attributes = reinterpret_cast<LPPROC_THREAD_ATTRIBUTE_LIST>(attributesBuffer.data());
+        if (!attributes || !::InitializeProcThreadAttributeList(attributes, 1, 0, &attributesSize)) {
             if (error) *error = lastErrorText();
             closeAll();
             return false;
         }
+        if (!::UpdateProcThreadAttribute(attributes, 0, PROC_THREAD_ATTRIBUTE_HANDLE_LIST, inherited, sizeof inherited, nullptr,
+                                         nullptr)) {
+            if (error) *error = lastErrorText();
+            ::DeleteProcThreadAttributeList(attributes);
+            closeAll();
+            return false;
+        }
+
+        STARTUPINFOEXW si{};
+        si.StartupInfo.cb = sizeof si;
+        si.StartupInfo.dwFlags = STARTF_USESTDHANDLES;
+        si.StartupInfo.hStdInput = inRead;
+        si.StartupInfo.hStdOutput = outWrite;
+        si.StartupInfo.hStdError = errWrite;
+        si.lpAttributeList = attributes;
+        PROCESS_INFORMATION pi{};
+        const BOOL ok = ::CreateProcessW(nullptr, command.data(), nullptr, nullptr, TRUE,
+                                         CREATE_NO_WINDOW | CREATE_UNICODE_ENVIRONMENT | EXTENDED_STARTUPINFO_PRESENT, env.data(),
+                                         cwd.empty() ? nullptr : cwd.c_str(), &si.StartupInfo, &pi);
+        if (!ok) {
+            if (error) *error = lastErrorText();
+            ::DeleteProcThreadAttributeList(attributes);
+            closeAll();
+            return false;
+        }
+        ::DeleteProcThreadAttributeList(attributes);
         ::CloseHandle(pi.hThread);
         ::CloseHandle(inRead);
         ::CloseHandle(outWrite);
@@ -243,6 +270,48 @@ namespace sirius::app::gui {
 
 #else   // POSIX
 
+    namespace {
+        // A pipe that is close-on-exec from the start: no other program the
+        // application starts (a browser from openUrl) may inherit the
+        // worker's stdin, or the worker would not see it close when the
+        // application ends. Where pipe2 exists this is atomic, so a fork on
+        // another thread cannot catch the ends without the flag either.
+        bool closeOnExecPipe(int fds[2]) {
+#if defined(__linux__) || defined(__FreeBSD__) || defined(__NetBSD__) || defined(__OpenBSD__) || defined(__DragonFly__)
+            return ::pipe2(fds, O_CLOEXEC) == 0;
+#else   // macOS has no pipe2
+            if (::pipe(fds) != 0) return false;
+            ::fcntl(fds[0], F_SETFD, FD_CLOEXEC);
+            ::fcntl(fds[1], F_SETFD, FD_CLOEXEC);
+            return true;
+#endif
+        }
+
+        // In the child, between fork and exec (async-signal-safe calls only).
+        // A pipe end that already is the stream it goes to (the application
+        // was started with that stream closed) is not dup2'ed onto itself,
+        // which would keep its close-on-exec flag: the flag is cleared instead.
+        void redirect(int from, int to) {
+            if (from == to) ::fcntl(to, F_SETFD, 0);
+            else ::dup2(from, to);
+        }
+
+        // In the child, between fork and exec: every descriptor above the
+        // standard streams closes at exec. Files and sockets the application
+        // has open (a recording, an RPC connection) are not the child's, and a
+        // socket it held would not close when the application closes it.
+        // `keep` (close-on-exec already, so exec closes it too) must stay
+        // usable until then; `limit` bounds the loop where close_range is
+        // missing.
+        void closeOthersOnExec(int keep, int limit) {
+#ifdef CLOSE_RANGE_CLOEXEC
+            if (::close_range(3, ~0U, CLOSE_RANGE_CLOEXEC) == 0) return;
+#endif
+            for (int fd = 3; fd < limit; ++fd)
+                if (fd != keep) ::close(fd);
+        }
+    } // namespace
+
     struct ChildProcess::Impl {
         pid_t pid = -1;
         int stdinWrite = -1;
@@ -257,13 +326,14 @@ namespace sirius::app::gui {
             for (int fd : {in[0], in[1], out[0], out[1], err[0], err[1], status[0], status[1]})
                 if (fd >= 0) ::close(fd);
         };
-        if (::pipe(in) != 0 || ::pipe(out) != 0 || ::pipe(err) != 0 || ::pipe(status) != 0) {
+        // All four are close-on-exec: the child gets its three ends as its
+        // standard streams (dup2 clears the flag), and exec closes the rest.
+        // status[1] stays open until exec; a byte on it means exec failed.
+        if (!closeOnExecPipe(in) || !closeOnExecPipe(out) || !closeOnExecPipe(err) || !closeOnExecPipe(status)) {
             if (error) *error = std::string("cannot create pipes: ") + std::strerror(errno);
             closeAll();
             return false;
         }
-        // exec closes it; a byte on it means exec failed
-        ::fcntl(status[1], F_SETFD, FD_CLOEXEC);
 
         std::vector<std::string> argStore;
         argStore.push_back(options.program);
@@ -271,6 +341,11 @@ namespace sirius::app::gui {
         std::vector<char*> argv;
         for (std::string& a : argStore) argv.push_back(a.data());
         argv.push_back(nullptr);
+        // Read before fork: sysconf is not async-signal-safe. Descriptors are
+        // handed out lowest first, so the application's own lie far below the
+        // cap, which keeps the loop short where the limit is huge (containers).
+        const long openMax = ::sysconf(_SC_OPEN_MAX);
+        const int descriptorLimit = openMax > 0 && openMax < 65536 ? static_cast<int>(openMax) : 65536;
 
         const pid_t pid = ::fork();
         if (pid < 0) {
@@ -279,10 +354,13 @@ namespace sirius::app::gui {
             return false;
         }
         if (pid == 0) {
-            ::dup2(in[0], STDIN_FILENO);
-            ::dup2(out[1], STDOUT_FILENO);
-            ::dup2(err[1], STDERR_FILENO);
-            for (int fd : {in[0], in[1], out[0], out[1], err[0], err[1], status[0]}) ::close(fd);
+            redirect(in[0], STDIN_FILENO);
+            redirect(out[1], STDOUT_FILENO);
+            redirect(err[1], STDERR_FILENO);
+            closeOthersOnExec(status[1], descriptorLimit);
+            // The application ignores SIGPIPE (main.cpp); an ignored signal
+            // stays ignored across exec, and the worker should not start so.
+            ::signal(SIGPIPE, SIG_DFL);
             for (const auto& kv : options.environment) ::setenv(kv.first.c_str(), kv.second.c_str(), 1);
             if (!options.workingDirectory.empty() && ::chdir(options.workingDirectory.c_str()) != 0) {
                 const int e = errno;
