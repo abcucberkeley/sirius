@@ -23,6 +23,11 @@ target_compile_definitions(sirius-app PRIVATE
     SIRIUS_APP_SOURCE_DIR="${CMAKE_CURRENT_SOURCE_DIR}/.."
     SIRIUS_VERSION="${PROJECT_VERSION}"
     GLFW_INCLUDE_NONE)
+if(GLFW_BUILD_X11)
+    # imgui/native_dialog.cpp hands the X11 window to the file dialogs as their
+    # parent; a GLFW built for Wayland alone has no X11 functions to call.
+    target_compile_definitions(sirius-app PRIVATE SIRIUS_GLFW_X11)
+endif()
 if(MSVC)
     # The process code page is UTF-8 (see the manifest): the core opens files
     # by their UTF-8 bytes through the narrow Win32 APIs. The linker merges

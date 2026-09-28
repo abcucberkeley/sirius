@@ -109,10 +109,17 @@ set(_marker "installed-tree-marker-7f3a")
 file(APPEND "${_data}/help/load.md" "\n<!-- ${_marker} -->\n")
 set(_home "${PREFIX}/check-home")
 file(MAKE_DIRECTORY "${_home}")
+# Without XAUTHORITY, Xlib reads the X server's cookie from $HOME/.Xauthority
+# (ssh -X, most display managers): name the real one, which the scratch HOME
+# would hide. An exported XAUTHORITY (xvfb-run sets one) passes through as is.
+set(_xauth)
+if(NOT DEFINED ENV{XAUTHORITY} AND DEFINED ENV{HOME})
+    set(_xauth "XAUTHORITY=$ENV{HOME}/.Xauthority")
+endif()
 if(_display)
     execute_process(
         COMMAND "${CMAKE_COMMAND}" -E env --unset=SIRIUS_HELP_DIR --unset=SIRIUS_WORKER_DIR
-                "HOME=${_home}" "XDG_CONFIG_HOME=${_home}/.config" "SIRIUS_PYTHON=${PYTHON}"
+                "HOME=${_home}" "XDG_CONFIG_HOME=${_home}/.config" "SIRIUS_PYTHON=${PYTHON}" ${_xauth}
                 "${PREFIX}/bin/sirius-app" --settings scratch --dataset "${RAW}"
                 --tool "{\"name\":\"get_help\",\"args\":{\"kind\":\"load\"}}" --quit-after 15000
         WORKING_DIRECTORY "${_home}"

@@ -1,12 +1,17 @@
 #include "imgui/platform.hpp"
 
 #include <algorithm>
+#include <atomic>
+#include <chrono>
+#include <clocale>
 #include <cstdio>
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
 #include <sstream>
+#include <string_view>
 #include <system_error>
+#include <thread>
 
 #include <nfd.h>
 
@@ -15,10 +20,14 @@
 #include <shellapi.h>
 #include <process.h>
 #else
+#include <cerrno>
+#include <csignal>
 #include <sys/stat.h>
+#include <sys/wait.h>
 #include <unistd.h>
 #endif
 
+#include "imgui/native_dialog.hpp"
 #include "imgui/strings.hpp"
 
 namespace sirius::app::gui::platform {
@@ -51,26 +60,92 @@ namespace sirius::app::gui::platform {
         }
 #endif
 
+        // Windows paths as the rest of the application writes them. Elsewhere
+        // a backslash is an ordinary character of a file name, left alone.
         std::string forwardSlashes(std::string s) {
+#ifdef _WIN32
             for (char& c : s)
                 if (c == '\\') c = '/';
+#endif
             return s;
         }
 
-        // NFD is initialised on first use and torn down at exit.
-        bool ensureNfd() {
-            static const bool ok = [] {
-                if (NFD_Init() != NFD_OKAY) return false;
-                std::atexit([] { NFD_Quit(); });
-                return true;
-            }();
-            return ok;
+        // Why the last dialog could not be opened (takeDialogError). Dialogs
+        // run on the main thread only, like everything that touches the window.
+        std::string& dialogError() {
+            static std::string error;
+            return error;
         }
 
+        // Inside the frame loop's GLFW event processing (setWithinEventPoll).
+        bool withinEventPoll = false;
+
+        // Keeps NFD's reason for an NFD_ERROR, which callers would otherwise
+        // take for a cancel, and prints it. Clearing it also frees what the
+        // portal backend holds for it.
+        void noteNfdError() {
+            const char* error = NFD_GetError();
+            std::string reason = error ? error : "";
+            while (!reason.empty() && (reason.back() == '.' || reason.back() == ' ')) reason.pop_back();
+            std::string text = "The file dialog could not be opened: " + (reason.empty() ? std::string("unknown error") : reason) + ".";
+#ifdef NFD_PORTAL
+            text += " It goes through xdg-desktop-portal, which needs a FileChooser backend such as "
+                    "xdg-desktop-portal-gtk (a build with libgtk-3-dev installed uses GTK's dialog instead).";
+#endif
+            std::fprintf(stderr, "sirius-app: %s\n", text.c_str());
+            dialogError() = std::move(text);
+            NFD_ClearError();
+        }
+
+        // NFD is initialised on first use and torn down at exit. A failed
+        // initialisation (no session bus yet, say) is tried again by the next
+        // dialog rather than remembered.
+        bool ensureNfd() {
+            static bool initialised = false;
+            if (initialised) return true;
+            // GTK's initialisation sets the whole C locale from the environment;
+            // numbers must go on being written and read with a '.'.
+            const char* before = std::setlocale(LC_NUMERIC, nullptr);
+            const std::string numeric = before ? before : "C";
+            const nfdresult_t result = NFD_Init();
+            const char* after = std::setlocale(LC_NUMERIC, nullptr);
+            if (after == nullptr || numeric != after) std::setlocale(LC_NUMERIC, numeric.c_str());
+            if (result != NFD_OKAY) {
+                noteNfdError();
+                return false;
+            }
+            initialised = true;
+            std::atexit([] { NFD_Quit(); });
+            return true;
+        }
+
+        // Maps what a dialog returned: true when something was chosen. A
+        // cancel is no error; NFD_ERROR is noted for takeDialogError.
+        bool chosen(nfdresult_t result) {
+            if (result == NFD_ERROR) noteNfdError();
+            return result == NFD_OKAY;
+        }
+
+        // Around each dialog: a fresh error, the parent window, and afterwards
+        // the input the application received while it was open dropped.
+        struct DialogScope {
+            nfdwindowhandle_t parent{};
+            DialogScope() {
+                dialogError().clear();
+                parent = native_dialog::parentWindow();
+            }
+            ~DialogScope() { native_dialog::dropQueuedInput(!withinEventPoll); }
+            DialogScope(const DialogScope&) = delete;
+            DialogScope& operator=(const DialogScope&) = delete;
+        };
+
+        // Absolute and without "." or ".." segments: the Windows shell rejects
+        // a start folder such as "..\out" (and NFD then opens no dialog), and
+        // the portal would resolve a relative one against its own directory.
         std::string startDirectory(const std::string& start) {
             if (start.empty()) return std::string();
             std::error_code ec;
-            std::filesystem::path p = fsPath(start);
+            std::filesystem::path p = fsPath(absolutePath(start));
             if (std::filesystem::is_regular_file(p, ec)) p = p.parent_path();
             while (!p.empty() && !std::filesystem::is_directory(p, ec)) {
                 const std::filesystem::path parent = p.parent_path();
@@ -91,6 +166,22 @@ namespace sirius::app::gui::platform {
             const nfdu8filteritem_t* data() const { return items.empty() ? nullptr : items.data(); }
             nfdfiltersize_t size() const { return static_cast<nfdfiltersize_t>(items.size()); }
         };
+
+#ifdef _WIN32
+        // The minor version `name` spells right after `prefix` ("python3." 13
+        // ".exe", "python3" 13 "-arm64"), as a number, with `rest` set to what
+        // follows its digits; -1 when no digits follow the prefix.
+        int minorVersion(std::string_view name, std::string_view prefix, std::string_view& rest) {
+            if (!startsWith(name, prefix)) return -1;
+            std::size_t n = prefix.size();
+            int minor = 0;
+            while (n < name.size() && n - prefix.size() < 3 && name[n] >= '0' && name[n] <= '9')
+                minor = minor * 10 + (name[n++] - '0');
+            if (n == prefix.size()) return -1;
+            rest = name.substr(n);
+            return minor;
+        }
+#endif
     } // namespace
 
     std::string homeDirectory() {
@@ -186,26 +277,41 @@ namespace sirius::app::gui::platform {
             for (const auto& d : dirs)
                 if (usable(d / name)) return forwardSlashes((d / name).u8string());
 #ifdef _WIN32
-        // python3.14.exe and the like (uv, the python.org installer without "Add to PATH")
+        // python3.14.exe and the like (uv, the python.org installer without
+        // "Add to PATH"): the newest in the first directory that has one, by
+        // number (3.13 is newer than 3.9). A free-threaded python3.14t.exe is
+        // not taken for the regular build.
         std::string best;
         for (const auto& d : dirs) {
             if (!std::filesystem::is_directory(d, ec)) continue;
+            int bestMinor = -1;
             for (const auto& entry : std::filesystem::directory_iterator(d, ec)) {
                 const std::string file = toLower(entry.path().filename().u8string());
-                if (startsWith(file, "python3.") && endsWith(file, ".exe") && usable(entry.path())) {
-                    const std::string found = forwardSlashes(entry.path().u8string());
-                    if (best.empty() || fileName(found) > fileName(best)) best = found;
+                std::string_view rest;
+                const int minor = minorVersion(file, "python3.", rest);
+                if (minor > bestMinor && rest == ".exe" && usable(entry.path())) {
+                    bestMinor = minor;
+                    best = forwardSlashes(entry.path().u8string());
                 }
             }
             if (!best.empty()) return best;
         }
+        // The python.org installer's directories (Python313, Python313-32,
+        // Python313-arm64): the newest, and of one version the plain one.
         for (const std::string& root : {environment("LOCALAPPDATA") + "/Programs/Python", std::string("C:/Program Files")}) {
             if (!std::filesystem::is_directory(fsPath(root), ec)) continue;
+            int bestMinor = -1;
+            bool bestPlain = false;
             for (const auto& entry : std::filesystem::directory_iterator(fsPath(root), ec)) {
                 const std::string file = toLower(entry.path().filename().u8string());
-                if (startsWith(file, "python3") && usable(entry.path() / "python.exe")) {
-                    const std::string found = forwardSlashes((entry.path() / "python.exe").u8string());
-                    if (best.empty() || found > best) best = found;
+                std::string_view rest;
+                const int minor = minorVersion(file, "python3", rest);
+                const bool plain = rest.empty();
+                if (minor < 0 || (!plain && rest.front() != '-')) continue;
+                if ((minor > bestMinor || (minor == bestMinor && plain && !bestPlain)) && usable(entry.path() / "python.exe")) {
+                    bestMinor = minor;
+                    bestPlain = plain;
+                    best = forwardSlashes((entry.path() / "python.exe").u8string());
                 }
             }
             if (!best.empty()) return best;
@@ -231,8 +337,11 @@ namespace sirius::app::gui::platform {
 
     bool writeFileAtomic(const std::string& path, const std::string& content, bool ownerOnly) {
         const std::filesystem::path target = fsPath(path);
+        // A name of its own for every call, so two saves at once (from two
+        // threads, or two processes) never write into the same file.
+        static std::atomic<unsigned> calls{0};
         std::filesystem::path tmp = target;
-        tmp += ".tmp" + std::to_string(processId());
+        tmp += ".tmp" + std::to_string(processId()) + "-" + std::to_string(calls.fetch_add(1));
         {
             std::ofstream f(tmp, std::ios::binary | std::ios::trunc);
             if (!f) return false;
@@ -252,19 +361,26 @@ namespace sirius::app::gui::platform {
                 return false;
             }
         }
+        // The target is never removed first: a crash, or a rename that keeps
+        // failing, must leave the previous content whole. Windows refuses the
+        // rename while another handle (a virus scanner, a backup or sync tool)
+        // has either file open, usually for moments only, so it is tried again
+        // for a while; a rename within a directory elsewhere fails for good.
+#ifdef _WIN32
+        constexpr int attempts = 10;
+#else
+        constexpr int attempts = 1;
+#endif
         std::error_code ec;
-        std::filesystem::rename(tmp, target, ec);
-        if (ec) {
-            // Windows refuses to rename over a file another handle holds open
-            std::filesystem::remove(target, ec);
-            ec.clear();
+        for (int attempt = 1;; ++attempt) {
             std::filesystem::rename(tmp, target, ec);
-            if (ec) {
-                std::filesystem::remove(tmp, ec);
-                return false;
-            }
+            if (!ec) return true;
+            if (attempt >= attempts) break;
+            std::this_thread::sleep_for(std::chrono::milliseconds(25));
         }
-        return true;
+        std::error_code ignored;
+        std::filesystem::remove(tmp, ignored);
+        return false;
     }
 
     std::vector<FileFilter> filtersFromQt(const std::string& qtFilter) {
@@ -294,11 +410,17 @@ namespace sirius::app::gui::platform {
 
     std::string openFileDialog(const std::string& /*title*/, const std::string& start,
                                const std::vector<FileFilter>& filters) {
+        const DialogScope scope;
         if (!ensureNfd()) return std::string();
         const NfdFilters f(filters);
         const std::string dir = startDirectory(start);
+        nfdopendialogu8args_t args{};
+        args.filterList = f.data();
+        args.filterCount = f.size();
+        args.defaultPath = dir.empty() ? nullptr : dir.c_str();
+        args.parentWindow = scope.parent;
         nfdu8char_t* out = nullptr;
-        if (NFD_OpenDialogU8(&out, f.data(), f.size(), dir.empty() ? nullptr : dir.c_str()) != NFD_OKAY) return std::string();
+        if (!chosen(NFD_OpenDialogU8_With(&out, &args))) return std::string();
         std::string path = forwardSlashes(out);
         NFD_FreePathU8(out);
         return path;
@@ -306,12 +428,18 @@ namespace sirius::app::gui::platform {
 
     std::vector<std::string> openFilesDialog(const std::string& /*title*/, const std::string& start,
                                              const std::vector<FileFilter>& filters) {
+        const DialogScope scope;
         std::vector<std::string> paths;
         if (!ensureNfd()) return paths;
         const NfdFilters f(filters);
         const std::string dir = startDirectory(start);
+        nfdopendialogu8args_t args{};
+        args.filterList = f.data();
+        args.filterCount = f.size();
+        args.defaultPath = dir.empty() ? nullptr : dir.c_str();
+        args.parentWindow = scope.parent;
         const nfdpathset_t* set = nullptr;
-        if (NFD_OpenDialogMultipleU8(&set, f.data(), f.size(), dir.empty() ? nullptr : dir.c_str()) != NFD_OKAY) return paths;
+        if (!chosen(NFD_OpenDialogMultipleU8_With(&set, &args))) return paths;
         nfdpathsetsize_t n = 0;
         NFD_PathSet_GetCount(set, &n);
         for (nfdpathsetsize_t i = 0; i < n; ++i) {
@@ -327,40 +455,73 @@ namespace sirius::app::gui::platform {
 
     std::string saveFileDialog(const std::string& /*title*/, const std::string& directory, const std::string& defaultName,
                                const std::vector<FileFilter>& filters) {
+        const DialogScope scope;
         if (!ensureNfd()) return std::string();
         const NfdFilters f(filters);
         const std::string dir = startDirectory(directory);
+        nfdsavedialogu8args_t args{};
+        args.filterList = f.data();
+        args.filterCount = f.size();
+        args.defaultPath = dir.empty() ? nullptr : dir.c_str();
+        args.defaultName = defaultName.empty() ? nullptr : defaultName.c_str();
+        args.parentWindow = scope.parent;
         nfdu8char_t* out = nullptr;
-        if (NFD_SaveDialogU8(&out, f.data(), f.size(), dir.empty() ? nullptr : dir.c_str(),
-                             defaultName.empty() ? nullptr : defaultName.c_str()) != NFD_OKAY)
-            return std::string();
+        if (!chosen(NFD_SaveDialogU8_With(&out, &args))) return std::string();
         std::string path = forwardSlashes(out);
         NFD_FreePathU8(out);
         return path;
     }
 
     std::string pickFolderDialog(const std::string& /*title*/, const std::string& start) {
+        const DialogScope scope;
         if (!ensureNfd()) return std::string();
         const std::string dir = startDirectory(start);
+        nfdpickfolderu8args_t args{};
+        args.defaultPath = dir.empty() ? nullptr : dir.c_str();
+        args.parentWindow = scope.parent;
         nfdu8char_t* out = nullptr;
-        if (NFD_PickFolderU8(&out, dir.empty() ? nullptr : dir.c_str()) != NFD_OKAY) return std::string();
+        if (!chosen(NFD_PickFolderU8_With(&out, &args))) return std::string();
         std::string path = forwardSlashes(out);
         NFD_FreePathU8(out);
         return path;
     }
 
+    std::string takeDialogError() {
+        std::string error;
+        error.swap(dialogError());
+        return error;
+    }
+
+    void setWithinEventPoll(bool within) { withinEventPoll = within; }
+
     void openUrl(const std::string& url) {
 #ifdef _WIN32
         ::ShellExecuteW(nullptr, L"open", widen(url).c_str(), nullptr, nullptr, SW_SHOWNORMAL);
 #else
-        // fork + exec rather than system(): the URL never meets a shell
-        if (::fork() == 0) {
+        // fork + exec rather than system(): the URL never meets a shell. Twice:
+        // the child exits at once and is reaped here, and the grandchild that
+        // runs the opener is left to init, so neither lingers as a zombie.
+        const pid_t child = ::fork();
+        if (child == 0) {
+            if (::fork() == 0) {
+                ::setsid();   // not stopped with the terminal sirius-app was started from
+                // The application ignores SIGPIPE (main.cpp), and an ignored
+                // signal stays ignored across exec: the opener and the browser
+                // it starts get the default back.
+                ::signal(SIGPIPE, SIG_DFL);
 #ifdef __APPLE__
-            ::execlp("open", "open", url.c_str(), static_cast<char*>(nullptr));
+                ::execlp("open", "open", url.c_str(), static_cast<char*>(nullptr));
 #else
-            ::execlp("xdg-open", "xdg-open", url.c_str(), static_cast<char*>(nullptr));
+                ::execlp("xdg-open", "xdg-open", url.c_str(), static_cast<char*>(nullptr));
 #endif
-            ::_exit(127);
+                ::_exit(127);
+            }
+            ::_exit(0);
+        }
+        if (child > 0) {
+            int status = 0;
+            while (::waitpid(child, &status, 0) < 0 && errno == EINTR) {
+            }
         }
 #endif
     }

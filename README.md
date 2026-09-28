@@ -520,8 +520,10 @@ with [ImPlot](https://github.com/epezent/implot) for the diagnostics charts
 ImPlot, a text editor widget, native file dialogs and libcurl are fetched and built
 in-tree at pinned revisions (`cmake/Dependencies.cmake`). On Linux the build needs the
 X11 / Wayland development packages GLFW asks for (`xorg-dev libwayland-dev
-libxkbcommon-dev` on Debian and Ubuntu), `libdbus-1-dev` for the file dialogs (they go
-through the desktop portal), and uses the system's libcurl when there is one. The
+libxkbcommon-dev` on Debian and Ubuntu) and, for the file dialogs, `libgtk-3-dev` (GTK's
+dialog, which also works over `ssh -X` and VNC); without GTK they go through the desktop
+portal instead, which needs `libdbus-1-dev` to build and a running xdg-desktop-portal with
+a FileChooser backend to open. It uses the system's libcurl when there is one. The
 `*-app-*` presets also turn on TensorStore (zarr / N5), whose first configure fetches and
 builds it — several minutes, about 1.5 GB, and it needs `nasm` (`conda install -c
 conda-forge nasm` when there is no system package). Add `-DSIRIUS_ENABLE_APP=ON` to a CUDA

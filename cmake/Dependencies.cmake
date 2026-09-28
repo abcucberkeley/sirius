@@ -3,8 +3,11 @@ include(FetchContent)
 # Every dependency is pinned to an immutable revision: git dependencies to the
 # commit a release tag pointed at when it was recorded (the tag is kept as a
 # comment; `git ls-remote <repo> refs/tags/<tag>^{}` resolves a new one) and
-# tarballs to their SHA-256. Shallow clones of a commit work with CMake >= 3.25
-# against GitHub and GitLab.
+# tarballs to their SHA-256. A shallow clone only holds the branch tips and the
+# tagged commits, so GIT_SHALLOW works for a tagged commit alone: a commit no
+# tag points at is fetched as GitHub's tarball of that commit
+# (https://github.com/<owner>/<repo>/archive/<sha>.tar.gz) with its SHA-256, or
+# cloned in full (nanobind).
 
 # Static deps must be PIC-compatible when linked into the Python extension (.so)
 if(SIRIUS_ENABLE_PYTHON_BINDINGS)
@@ -167,6 +170,21 @@ FetchContent_MakeAvailable(nlohmann_json)
 # packages for TensorStore and find_package() is redirected to the targets
 # built above; everything else (abseil, blosc, zstd, riegeli, ...) is fetched
 # and built by the bridge, out of sight.
+#
+# The system's libcurl for sirius-app (Linux distributions ship it with their
+# TLS library and its CA store) is looked for first: the bridge registers its
+# own bundled curl, built without a CA store, as the answer to every later
+# find_package(CURL). When there is a system libcurl, TensorStore shares it.
+if(SIRIUS_ENABLE_APP AND NOT WIN32)
+    if(SIRIUS_ENABLE_TENSORSTORE)
+        # FindCURL's own search, here and in the bridge, not a libcurl's
+        # CURLConfig.cmake: one built with CMake loads the system OpenSSL
+        # (find_dependency) as OpenSSL::SSL and OpenSSL::Crypto, the names the
+        # bridge gives its BoringSSL (third_party/boringssl/workspace.bzl).
+        set(CURL_NO_CURL_CMAKE ON)
+    endif()
+    find_package(CURL QUIET)
+endif()
 if(SIRIUS_ENABLE_TENSORSTORE)
     # The bridge enables the ASM_NASM language (libjpeg-turbo / BoringSSL).
     # Look where package managers put nasm when it is not on PATH; conda-forge's
@@ -189,6 +207,9 @@ if(SIRIUS_ENABLE_TENSORSTORE)
     set(TENSORSTORE_USE_SYSTEM_ZLIB ON CACHE BOOL "" FORCE)
     set(TENSORSTORE_USE_SYSTEM_TIFF ON CACHE BOOL "" FORCE)
     set(TENSORSTORE_USE_SYSTEM_NLOHMANN_JSON ON CACHE BOOL "" FORCE)
+    if(CURL_FOUND)
+        set(TENSORSTORE_USE_SYSTEM_CURL ON CACHE BOOL "" FORCE)
+    endif()
     # find_package(TIFF) / find_package(nlohmann_json) inside the bridge must
     # resolve to our targets: drop config files into the redirects directory
     # CMake consults before any module or installed package (zlib already has
@@ -289,24 +310,22 @@ if(SIRIUS_ENABLE_APP)
         GIT_TAG        b48d1afbe8ee8b238e2961dc363a949dd7304e23   # v1.92.9b-docking
         GIT_SHALLOW    TRUE
     )
+    # These three have no release tags: commits of master, as tarballs.
     FetchContent_Declare(
         implot
-        GIT_REPOSITORY https://github.com/epezent/implot.git
-        GIT_TAG        09e2ba71766e25d88053a2173936c9d1043bae42   # master, 1.92-compatible
-        GIT_SHALLOW    TRUE
+        URL      https://github.com/epezent/implot/archive/09e2ba71766e25d88053a2173936c9d1043bae42.tar.gz   # 1.92-compatible
+        URL_HASH SHA256=17dd3b860237cb95c0d1c0c6accaf92ad4ea4be61add84eca85e3dc077963e12
     )
     FetchContent_Declare(
         imgui_text_editor
-        GIT_REPOSITORY https://github.com/goossens/ImGuiColorTextEdit.git
-        GIT_TAG        133614b0d5e1008527a26f46a93fdb1d751ca115   # master
-        GIT_SHALLOW    TRUE
-        SOURCE_SUBDIR  cmake-not-used
+        URL      https://github.com/goossens/ImGuiColorTextEdit/archive/133614b0d5e1008527a26f46a93fdb1d751ca115.tar.gz
+        URL_HASH SHA256=69e419617763720da3b9619b4d3090f5efc7982e08281a2ecce42f76ddd4bc70
+        SOURCE_SUBDIR cmake-not-used
     )
     FetchContent_Declare(
         stb
-        GIT_REPOSITORY https://github.com/nothings/stb.git
-        GIT_TAG        2c980bb59875b0d32144a71867fbdebb2f77cd20   # master
-        GIT_SHALLOW    TRUE
+        URL      https://github.com/nothings/stb/archive/2c980bb59875b0d32144a71867fbdebb2f77cd20.tar.gz
+        URL_HASH SHA256=9a955b1b49a4410088a2e0ee2a9c057c3c907d0c1d75454144cb980aca0ba515
     )
     FetchContent_MakeAvailable(imgui implot imgui_text_editor stb)
 
@@ -332,6 +351,11 @@ if(SIRIUS_ENABLE_APP)
         # glad's single-header OpenGL 3.3 loader, as GLFW's own examples use it
         ${glfw_SOURCE_DIR}/deps)
     target_compile_features(sirius_imgui PUBLIC cxx_std_17)
+    # 32-bit ImWchar: with the default 16 bits the text editor decodes every
+    # character outside the Basic Multilingual Plane (emoji, CJK extension B)
+    # as U+FFFD and writes that back on save, and typed ones are dropped.
+    # PUBLIC, since every file that includes imgui.h must agree on the type.
+    target_compile_definitions(sirius_imgui PUBLIC IMGUI_USE_WCHAR32)
     if(MSVC)
         # third-party sources: not ours to analyse (cmake/StaticAnalysis.cmake)
         target_compile_options(sirius_imgui PRIVATE /analyze- /w)
@@ -351,18 +375,27 @@ if(SIRIUS_ENABLE_APP)
         set(BUILD_SHARED_LIBS OFF)
         set(NFD_BUILD_TESTS OFF CACHE BOOL "" FORCE)
         set(NFD_INSTALL OFF CACHE BOOL "" FORCE)
-        # xdg-desktop-portal rather than GTK: no GTK development package to
-        # install, and the dialog is the desktop's own
-        set(NFD_PORTAL ON CACHE BOOL "" FORCE)
+        # Linux: GTK 3's dialog where its development package is installed,
+        # since it works wherever the window does (ssh -X, VNC, a bare window
+        # manager). Otherwise xdg-desktop-portal over D-Bus, which needs no GTK
+        # to build but a running portal with a FileChooser backend to open.
+        if(UNIX AND NOT APPLE)
+            find_package(PkgConfig QUIET)
+            if(PkgConfig_FOUND)
+                pkg_check_modules(SIRIUS_GTK3 QUIET gtk+-3.0)
+            endif()
+            if(SIRIUS_GTK3_FOUND)
+                set(NFD_PORTAL OFF CACHE BOOL "" FORCE)
+            else()
+                set(NFD_PORTAL ON CACHE BOOL "" FORCE)
+            endif()
+        endif()
         FetchContent_MakeAvailable(nfd)
     endblock()
 
-    # libcurl: the system's where there is one (Linux distributions ship it
-    # with their TLS library); built in-tree otherwise, against the platform's
-    # TLS (Schannel on Windows), with everything but HTTP(S) turned off.
-    if(NOT WIN32)
-        find_package(CURL QUIET)
-    endif()
+    # libcurl: the system's where there is one (looked for above, before
+    # TensorStore); built in-tree otherwise, against the platform's TLS
+    # (Schannel on Windows), with everything but HTTP(S) turned off.
     if(NOT CURL_FOUND)
         FetchContent_Declare(
             curl

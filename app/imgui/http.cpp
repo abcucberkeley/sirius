@@ -3,6 +3,7 @@
 #include <cctype>
 #include <chrono>
 #include <cstdio>
+#include <cstdlib>
 #include <filesystem>
 #include <fstream>
 #include <mutex>
@@ -23,6 +24,52 @@ namespace sirius::app::gui::http {
             }();
             (void)once;
         }
+
+#if !defined(_WIN32) && LIBCURL_VERSION_NUM >= 0x074600   // curl_version_info_data::cainfo is 7.70's
+#define SIRIUS_HTTP_CA_FALLBACK 1
+        // Where the system keeps its CA certificates, for a libcurl built
+        // without a default store, which verifies no server: TensorStore's
+        // bundled copy, which the application links on Linux when TensorStore
+        // is on and there is no system libcurl. Empty when libcurl has its own.
+        // SSL_CERT_FILE / SSL_CERT_DIR first, as OpenSSL reads them.
+        struct CaStore {
+            std::string path;
+            bool directory = false;
+        };
+        const CaStore& fallbackCaStore() {
+            static const CaStore store = [] {
+                CaStore s;
+                const curl_version_info_data* info = curl_version_info(CURLVERSION_NOW);
+                if (!info || info->age < CURLVERSION_SEVENTH || info->cainfo || info->capath) return s;
+                std::error_code ec;
+                const auto isFile = [&](const char* p) { return p && *p && std::filesystem::is_regular_file(p, ec); };
+                const auto isDirectory = [&](const char* p) { return p && *p && std::filesystem::is_directory(p, ec); };
+                if (const char* file = std::getenv("SSL_CERT_FILE"); isFile(file)) {
+                    s.path = file;
+                    return s;
+                }
+                if (const char* dir = std::getenv("SSL_CERT_DIR"); isDirectory(dir)) {
+                    s.path = dir;
+                    s.directory = true;
+                    return s;
+                }
+                for (const char* bundle : {"/etc/ssl/certs/ca-certificates.crt", "/etc/pki/tls/certs/ca-bundle.crt",
+                                           "/etc/ssl/ca-bundle.pem", "/etc/pki/ca-trust/extracted/pem/tls-ca-bundle.pem",
+                                           "/etc/ssl/cert.pem"}) {
+                    if (isFile(bundle)) {
+                        s.path = bundle;
+                        return s;
+                    }
+                }
+                if (isDirectory("/etc/ssl/certs")) {
+                    s.path = "/etc/ssl/certs";
+                    s.directory = true;
+                }
+                return s;
+            }();
+            return store;
+        }
+#endif
 
         struct Transfer {
             const Callbacks* callbacks = nullptr;
@@ -96,6 +143,12 @@ namespace sirius::app::gui::http {
             curl_easy_setopt(curl, CURLOPT_URL, request.url.c_str());
             curl_easy_setopt(curl, CURLOPT_ERRORBUFFER, errorBuffer);
             curl_easy_setopt(curl, CURLOPT_NOSIGNAL, 1L);
+#ifdef SIRIUS_HTTP_CA_FALLBACK
+            if (const CaStore& ca = fallbackCaStore(); ca.directory)
+                curl_easy_setopt(curl, CURLOPT_CAPATH, ca.path.c_str());
+            else if (!ca.path.empty())
+                curl_easy_setopt(curl, CURLOPT_CAINFO, ca.path.c_str());
+#endif
             curl_easy_setopt(curl, CURLOPT_USERAGENT, "sirius-app/" SIRIUS_VERSION);
             curl_easy_setopt(curl, CURLOPT_ACCEPT_ENCODING, "");
             curl_easy_setopt(curl, CURLOPT_FOLLOWLOCATION, request.followRedirects ? 1L : 0L);
