@@ -5,7 +5,6 @@
 // hint, ▁ ❐ ⛶ controls) and the per-kind body built from the selected
 // step's Diagnostics (image cells, table, curves, histograms, facts) plus
 // the dedicated segmentation-cleanup, track and volume panels.
-// (app/qt/panels/diagnostics_panel.cpp, diagnostic_cells.cpp, track_table.cpp)
 //
 // Docked, floating and maximised are the application's business
 // (App::floatDiagnostics, App::dockDiagnostics,

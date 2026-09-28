@@ -3,7 +3,6 @@
 // on the right the source step, the t / z / c range, the pixel type and
 // scaling rule, the container's own knobs (compression, tiles, pyramid,
 // chunks, codec, sharding), the destination and the sidecar options.
-// (app/qt/dialogs/export_dialog.cpp)
 
 #include "imgui/dialogs/dialogs.hpp"
 
@@ -61,7 +60,7 @@ namespace sirius::app::gui {
             return names;
         }
 
-        // QString::toInt: the whole of the trimmed text has to be a number.
+        // Strict: the whole of the trimmed text has to be a number.
         bool parseInt(const std::string& text, long long& value) {
             const std::string t = trimmed(text);
             if (t.empty()) return false;
@@ -95,7 +94,7 @@ namespace sirius::app::gui {
                 std::string dir = ds.sourcePath.empty() ? std::string() : parentPath(ds.sourcePath);
                 if (dir.empty() || dir == ".") dir = platform::homeDirectory();
 #ifdef _WIN32
-                dir = replaceAll(dir, "\\", "/");   // as QFileInfo::absolutePath writes it
+                dir = replaceAll(dir, "\\", "/");   // forward slashes throughout
 #endif
                 destination_ = dir + "/" + base + "_processed";
                 selectFormat(0);
@@ -334,7 +333,7 @@ namespace sirius::app::gui {
                 if (tiff || zarr) {
                     const float w = columnWidth(2, 10);
                     {
-                        // Qt's spin box says "none" for one level
+                        // one level is no pyramid, and the label says so
                         const Field f(pyramid_ <= 1 ? "Pyramid levels (none)" : "Pyramid levels");
                         widgets::FieldOpts fo;
                         fo.width = design(w);

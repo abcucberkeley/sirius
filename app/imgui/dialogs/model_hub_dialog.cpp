@@ -1,10 +1,10 @@
 // Models for the steps that need one: the local model cache, Hugging Face
 // (search, the files of a repository, download into the cache) and the
 // registry of foundation bundles (.ltb). The chosen model spec is what the
-// step's "model" parameter accepts. (app/qt/dialogs/model_hub_dialog.cpp)
+// step's "model" parameter accepts.
 //
-// Where the Qt dialog asks the Python worker for everything, this one asks it
-// only for what the worker alone can answer:
+// The dialog asks the Python worker only for what the worker alone can
+// answer:
 //   * the cache is a directory on this machine and is read here
 //     (model_hub_cache.hpp, the worker's layout and rules);
 //   * Hugging Face is reached over http::Fetch, one Fetch per kind of request
@@ -394,7 +394,7 @@ namespace sirius::app::gui {
 
         // --- the token ---------------------------------------------------------------
 
-        // QInputDialog::getText with a password field.
+        // A one-line prompt with a password field.
         class TokenPrompt final : public Dialog {
         public:
             TokenPrompt(std::string initial, std::function<void(const std::string&)> accepted)

@@ -2,7 +2,7 @@
 #define SIRIUS_IMGUI_HELP_WINDOW_HPP
 
 // Floating help page (520 x <= 760): "HELP · <step>", Edit page, ✕; the
-// operation's Markdown + LaTeX page. (app/qt/panels/help_window.cpp)
+// operation's Markdown + LaTeX page.
 //
 // The window is its own: draw() begins and ends it (the application calls
 // draw() every frame; nothing is drawn while it is hidden).

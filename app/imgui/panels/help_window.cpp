@@ -35,7 +35,7 @@ namespace sirius::app::gui {
         constexpr float kMaxHeight = 760;
         constexpr float kMinWidth = 360;
         constexpr float kHeaderH = 36;
-        constexpr float kMargin = 22;          // the page's margin (QTextDocument::setDocumentMargin)
+        constexpr float kMargin = 22;          // the page's margin
         constexpr float kFigureH = 170;        // the dashed drop zone
         constexpr double kPollSeconds = 1.0;   // how often the page file is looked at
         constexpr double kSettleSeconds = 0.2; // an editor may write the file in pieces
@@ -278,8 +278,8 @@ namespace sirius::app::gui {
             std::error_code ec;
             const bool exists = fs::exists(page.path, ec);
             const fs::file_time_type t = exists ? fs::last_write_time(page.path, ec) : fs::file_time_type{};
-            // a page that was never on disk is not watched (Qt watches only
-            // an existing file); a page that goes away keeps what is shown
+            // a page that was never on disk is not watched; a page that goes
+            // away keeps what is shown
             if (!exists || (exists == fileExists && t == fileTime)) return;
             reloadAt = now + kSettleSeconds;
             app.requestRedraw(12);
@@ -297,7 +297,7 @@ namespace sirius::app::gui {
         }
 
         // Copies the image next to the page as <kind>-figure.<ext> and
-        // references it from the front matter (the Qt window's drop handler).
+        // references it from the front matter (an image dropped on the window).
         void setFigure(const std::string& file) {
             if (page.path.empty() || !isFigureFile(file)) return;
             const fs::path pagePath(page.path);
@@ -700,7 +700,7 @@ namespace sirius::app::gui {
         Impl& d = *impl_;
         // The application calls this again whenever the selection moves while
         // the window is open. A page the user asked for by name (the manual,
-        // the shortcuts) stays put then, as in the Qt window.
+        // the shortcuts) stays put then.
         const std::uint64_t sel = d.app.bridge().rev().selection;
         const bool followCall = d.visible && sel != d.seenSelection;
         d.seenSelection = sel;

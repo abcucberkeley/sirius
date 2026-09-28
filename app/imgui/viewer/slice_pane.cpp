@@ -16,7 +16,7 @@ namespace sirius::app::gui {
     namespace {
         float lineHeight(float designPx) { return theme::textSize("Ag", designPx).y; }
 
-        // Qt's dash line on a straight segment: dashes of 4 pens, gaps of 2.
+        // A dashed straight segment: dashes of 4 pens, gaps of 2.
         void dashedLine(ImDrawList* dl, ImVec2 a, ImVec2 b, ImU32 color, float thickness) {
             dashedPolyline(dl, {a, b}, color, thickness, 4.0f * thickness, 2.0f * thickness);
         }

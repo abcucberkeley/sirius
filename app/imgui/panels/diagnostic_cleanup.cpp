@@ -92,8 +92,8 @@ namespace sirius::app::gui {
     void SegmentCleanupView::setLabels(std::shared_ptr<LabelVolume> labels) {
         labels_ = std::move(labels);
         orderedFor_ = nullptr;   // the rows are read again
-        // The table follows the view state's label, as the Qt table does on
-        // every refresh: that row alone is selected and brought into view.
+        // The table follows the view state's label on every refresh: that
+        // row alone is selected and brought into view.
         const std::uint32_t id = app_.wb().viewState().selectedLabel;
         seenSelected_ = primary_ = id;
         selected_.clear();
@@ -152,7 +152,7 @@ namespace sirius::app::gui {
             anchorRow_ = displayRow;
         }
         // The view state names one label: the row clicked alone, else the
-        // first row selected (as the Qt table's selectedRows().first()) --
+        // first row selected --
         // kept while it stays selected, so a multi-selection survives.
         if (plain) {
             primary_ = id;
@@ -292,7 +292,7 @@ namespace sirius::app::gui {
         if (ImGui::BeginTable("##labels", 6, flags, ImVec2(r.width(), r.height()))) {
             drawn = true;
             ImGui::TableSetupScrollFreeze(0, 1);
-            // fixed widths: measuring every row would be the 20 s the Qt model avoided
+            // fixed widths: measuring every row would take seconds on a large volume
             auto width = [&](const char* sample, float extra) {
                 return std::max(px(10), theme::textSize(sample, theme::kSmallPx).x + px(extra) - 2.0f * px(6));
             };

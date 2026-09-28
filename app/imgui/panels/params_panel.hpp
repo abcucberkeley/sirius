@@ -5,7 +5,7 @@
 // button, the per-kind parameter body (generic form from ParamSpecs plus
 // bespoke editors for Load, SIM, Einsum, Segmentation and Merge), the
 // BACKEND and CACHE OUTPUT tile rows and the Run step / View / Remove
-// footer. (app/qt/panels/params_panel.cpp)
+// footer.
 
 #include <memory>
 

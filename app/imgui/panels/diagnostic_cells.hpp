@@ -5,7 +5,7 @@
 // workbench: the cells draw a Diagnostics struct (or one of its parts), so
 // the same cells serve every operation kind. Every cell is a bg-coloured box
 // with a 10 px uppercase caption (title left, meta right) on a 2 px
-// divider-coloured grid. (app/qt/panels/diagnostic_cells.cpp)
+// divider-coloured grid.
 //
 // Immediate mode: a cell is a function that draws into a rectangle of the
 // current window. The only state is in DiagnosticsBody, which keeps the

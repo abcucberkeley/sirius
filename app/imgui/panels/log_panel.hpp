@@ -3,7 +3,7 @@
 
 // The session log as a dock: everything Workbench::logLine records.
 // Monospace, selectable, copy and clear, and an auto-scroll that stops
-// following as soon as the reader scrolls up. (app/qt/panels/log_panel.cpp)
+// following as soon as the reader scrolls up.
 
 #include <memory>
 

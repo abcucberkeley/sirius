@@ -22,6 +22,7 @@
 #include <sirius/device.hpp>
 #include <sirius/tiff_io.hpp>
 
+#include "core/app_paths.hpp"
 #include "core/array_source.hpp"
 #include "core/export.hpp"
 #include "core/training_export.hpp"
@@ -739,9 +740,10 @@ namespace sirius::app::gui {
                     ImGui::PushStyleVar(ImGuiStyleVar_FramePadding, px(8, 6));
                     ImGui::SetCursorPosX(ImGui::GetCursorPosX() + px(20));
                     ImGui::PushFont(nullptr, 12);
+                    // The font and the padding are for the item's label, and are
+                    // popped only after the submenu closed: popped inside it, they
+                    // would leave the stack of the window they were pushed in.
                     const bool sub = ImGui::BeginMenu(a.text.c_str());
-                    ImGui::PopFont();
-                    ImGui::PopStyleVar();
                     if (sub) {
                         const std::vector<std::string> recent = App::recentFiles();
                         if (recent.empty()) {
@@ -768,6 +770,8 @@ namespace sirius::app::gui {
                         }
                         ImGui::EndMenu();
                     }
+                    ImGui::PopFont();
+                    ImGui::PopStyleVar();
                     continue;
                 }
                 if (drawMenuItem(a) && a.run) {
@@ -1351,7 +1355,7 @@ namespace sirius::app::gui {
         d.visible = options.visible;
         glfwSetErrorCallback([](int code, const char* text) { std::fprintf(stderr, "glfw error %d: %s\n", code, text ? text : ""); });
         if (!glfwInit()) {
-            std::fprintf(stderr, "sirius-imgui: cannot initialise the window system (no display?)\n");
+            std::fprintf(stderr, "sirius-app: cannot initialise the window system (no display?)\n");
             return false;
         }
         d.glfwReady = true;
@@ -1361,6 +1365,11 @@ namespace sirius::app::gui {
         glfwWindowHint(GLFW_OPENGL_FORWARD_COMPAT, GLFW_TRUE);
         glfwWindowHint(GLFW_VISIBLE, GLFW_FALSE);        // shown once it is sized and placed
         glfwWindowHint(GLFW_SCALE_TO_MONITOR, GLFW_FALSE);
+        // The window's app id on Wayland and its WM_CLASS on X11: how a desktop
+        // matches the window to sirius-app.desktop for its icon and name.
+        glfwWindowHintString(GLFW_WAYLAND_APP_ID, "sirius-app");
+        glfwWindowHintString(GLFW_X11_CLASS_NAME, "sirius-app");
+        glfwWindowHintString(GLFW_X11_INSTANCE_NAME, "sirius-app");
 
         // The design's 1600 x 960 at this monitor's scale, inside its work area.
         float xs = 1.0f, ys = 1.0f;
@@ -1381,14 +1390,34 @@ namespace sirius::app::gui {
         }
         d.window = glfwCreateWindow(w, h, "SIRIUS", nullptr, nullptr);
         if (!d.window) {
-            std::fprintf(stderr, "sirius-imgui: cannot create a window with an OpenGL 3.3 context\n");
+            std::fprintf(stderr, "sirius-app: cannot create a window with an OpenGL 3.3 context\n");
             return false;
+        }
+        {
+            // The icon in every size there is a rendition of (app/resources/icons),
+            // beside the executable or in an installed tree; Wayland ignores it
+            // and takes the .desktop entry's.
+            std::string dir = besideApplication("icons");
+            if (dir.empty()) dir = installedDataDirectory("icons");
+            std::vector<std::vector<std::uint8_t>> pixels;
+            std::vector<GLFWimage> images;
+            for (int px : {16, 24, 32, 48, 64, 128, 256}) {
+                std::vector<std::uint8_t> rgba;
+                int iw = 0, ih = 0;
+                if (dir.empty() || !readImage(dir + format("/sirius-app-%d.png", px), rgba, iw, ih)) continue;
+                pixels.push_back(std::move(rgba));
+                images.push_back(GLFWimage{iw, ih, pixels.back().data()});
+            }
+            // after the loop: the vector of pixels no longer moves
+            for (std::size_t i = 0; i < images.size(); ++i) images[i].pixels = pixels[i].data();
+            if (!images.empty() && glfwGetPlatform() != GLFW_PLATFORM_WAYLAND)
+                glfwSetWindowIcon(d.window, static_cast<int>(images.size()), images.data());
         }
         if (mw > 0 && mh > 0) glfwSetWindowPos(d.window, mx + std::max(0, (mw - w) / 2), my + std::max(32, (mh - h) / 2));
         glfwMakeContextCurrent(d.window);
         glfwSwapInterval(1);
         if (!gladLoadGL(glfwGetProcAddress)) {
-            std::fprintf(stderr, "sirius-imgui: cannot load OpenGL\n");
+            std::fprintf(stderr, "sirius-app: cannot load OpenGL\n");
             return false;
         }
         glfwSetWindowUserPointer(d.window, this);

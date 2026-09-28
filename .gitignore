@@ -1,6 +1,6 @@
 # Build trees, generated files and local scratch. Trimmed from the generic
 # GitHub Python template: only what this repository (CMake/C++/CUDA library,
-# Qt app, nanobind wheel, Python worker) actually produces. `lib/`, `*.spec`
+# workbench app, nanobind wheel, Python worker) actually produces. `lib/`, `*.spec`
 # and `*.manifest` are deliberately NOT ignored: they would hide legitimate
 # directories and files. `.vscode/` is tracked.
 

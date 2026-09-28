@@ -38,8 +38,7 @@ namespace sirius::app::gui::dataset_dialogs {
 
     // The folder dialog as the Open dialog's Folder… raises it: `opened` is
     // called when the dataset has started to open, so the Open dialog under
-    // it closes too (and remembers the folder), as the Qt dialog did after
-    // its nested exec() came back accepted. (folder_dataset_dialog.cpp)
+    // it closes too (and remembers the folder). (folder_dataset_dialog.cpp)
     std::shared_ptr<Dialog> makeFolderDatasetDialog(App& app, const std::string& folder, std::function<void()> opened);
 
     // --- paths ---------------------------------------------------------------
@@ -270,8 +269,8 @@ namespace sirius::app::gui::dataset_dialogs {
         line.end();
     }
 
-    // widgets::tooltip for an item that may be disabled: a Qt widget keeps its
-    // tool tip when it is disabled, and says why it is.
+    // widgets::tooltip for an item that may be disabled: a disabled control
+    // keeps its tool tip, which says why it is disabled.
     inline void tooltipEvenDisabled(const std::string& s) {
         if (s.empty() || !ImGui::IsItemHovered(ImGuiHoveredFlags_ForTooltip | ImGuiHoveredFlags_AllowWhenDisabled)) return;
         ImGui::PushStyleColor(ImGuiCol_Border, theme::kText);

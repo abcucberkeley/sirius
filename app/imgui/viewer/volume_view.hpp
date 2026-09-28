@@ -11,11 +11,9 @@
 // projection) in the channel's colour. The bounding box, the corner label,
 // the view presets, the yaw / pitch sliders and the Z clip range are drawn
 // or laid over the rendering exactly as in the design.
-// (app/qt/viewer/volume_view.*)
 //
 // The overlay controls live in child windows of their own, so a figure
-// grabbed from the viewer's draw list shows the rendering without them --
-// as QOpenGLWidget::grabFramebuffer did.
+// grabbed from the viewer's draw list shows the rendering without them.
 
 #include <array>
 #include <cstdint>

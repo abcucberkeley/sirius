@@ -4,7 +4,7 @@
 // Left dock: "OPERATIONS · ANY ORDER" header, the step rows (enable box /
 // pin, name + kind label, cache glyph + summary, ▲▼, ◉), the "Add a
 // processing step" row with its grouped dropdown, the legend and the
-// Run all / Export footer. (app/qt/panels/ops_panel.cpp)
+// Run all / Export footer.
 
 #include <memory>
 

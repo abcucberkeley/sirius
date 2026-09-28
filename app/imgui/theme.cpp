@@ -30,7 +30,7 @@ namespace sirius::app::gui::theme {
             for (const std::string& d : {besideApplication("fonts"), installedDataDirectory("fonts")})
                 if (!d.empty()) dirs.push_back(d);
 #ifdef SIRIUS_APP_SOURCE_DIR
-            dirs.push_back(std::string(SIRIUS_APP_SOURCE_DIR) + "/qt/resources/fonts");
+            dirs.push_back(std::string(SIRIUS_APP_SOURCE_DIR) + "/resources/fonts");
 #endif
             for (const std::string& d : dirs)
                 if (isFile(d + "/Archivo-Regular.ttf")) return d;

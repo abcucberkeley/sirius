@@ -184,7 +184,7 @@ namespace sirius::app::gui {
         req.headers.emplace_back("HTTP-Referer", "https://github.com/abcucberkeley/sirius");
         req.headers.emplace_back("X-Title", "SIRIUS workbench");
         req.bearer = request_.apiKey;
-        // ten minutes without a byte, as the Qt client's transfer timeout: a
+        // ten minutes without a byte: a
         // model that loads first is silent for a minute or two
         req.stallSeconds = 10 * 60;
         req.body = dump(body);

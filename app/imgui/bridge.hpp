@@ -4,8 +4,7 @@
 // The one object between the GUI-free Workbench and the panels: it observes
 // the workbench, runs RunJobs and other long tasks on a worker thread and
 // brings their outcome back to the GUI thread. Every panel takes a Bridge&
-// and talks to `wb()` directly for reads and edits. (The Qt application's
-// WorkbenchBridge, without the QObject.)
+// and talks to `wb()` directly for reads and edits.
 //
 // Immediate mode changes how a change reaches a panel. A panel that draws
 // straight from the workbench needs no notification at all: next frame it

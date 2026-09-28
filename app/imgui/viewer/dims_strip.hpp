@@ -4,7 +4,6 @@
 // The strip below the viewer: Z with its µm readout, slider and "n / max";
 // T with the 20 x 20 play / pause button, the seconds readout, slider and
 // "n / max". The T row hides itself when the data has one time point.
-// (app/qt/viewer/dims_strip.*)
 
 #include <functional>
 

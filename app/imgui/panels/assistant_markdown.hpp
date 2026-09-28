@@ -1,11 +1,11 @@
 #ifndef SIRIUS_IMGUI_ASSISTANT_MARKDOWN_HPP
 #define SIRIUS_IMGUI_ASSISTANT_MARKDOWN_HPP
 
-// The assistant's answers are Markdown with $..$ math. The Qt panel turns
-// them into HTML for a rich-text label (core/help_pages: helpMarkdownToHtml);
-// here the same subset -- headings, paragraphs, lists, bold, italic, code,
-// links, tables, inline and display math -- is parsed into blocks of styled
-// spans, broken into lines for a width and drawn into the draw list. Fenced
+// The assistant's answers are Markdown with $..$ math. The subset that
+// core/help_pages turns into HTML (helpMarkdownToHtml) -- headings,
+// paragraphs, lists, bold, italic, code, links, tables, inline and display
+// math -- is parsed here into blocks of styled spans, broken into lines for
+// a width and drawn into the draw list. Fenced
 // code blocks, which language models write and the help pages do not, are
 // set in the monospace face on the surface colour.
 //

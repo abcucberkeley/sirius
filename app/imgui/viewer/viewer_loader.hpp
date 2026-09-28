@@ -22,7 +22,7 @@
 // (Bridge::post: the GUI thread, at the start of a frame) guarded by a
 // shared "alive" flag, and the destructor bumps the generation, clears the
 // flag and joins the thread, so no job can outlive the loader and a result
-// already posted is dropped when it arrives. (app/qt/viewer/viewer_loader.*)
+// already posted is dropped when it arrives.
 
 #include <array>
 #include <atomic>

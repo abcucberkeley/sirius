@@ -4,7 +4,7 @@
 // Help pages are Markdown files with $...$ / $$...$$ LaTeX and images,
 // one per operation, stored in app/help next to the operation code and
 // installed beside the executable so users can edit them. The core locates
-// and parses them; the Qt layer renders the HTML.
+// and parses them; the GUI renders them.
 
 #include <string>
 #include <vector>
@@ -45,7 +45,7 @@ namespace sirius::app {
     // commands keep their name.
     std::string latexToHtml(const std::string& tex, bool display);
     // Markdown with $..$ math to HTML (headings, paragraphs, lists, bold,
-    // italic, code, tables, images), for QTextBrowser. Also accepts the
+    // italic, code, tables, images), for an HTML view. Also accepts the
     // \(..\) and \[..\] delimiters language models favour.
     std::string helpMarkdownToHtml(const std::string& markdown, const std::string& baseDir);
     // \(..\) -> $..$ and \[..\] -> $$..$$ outside code and existing math.

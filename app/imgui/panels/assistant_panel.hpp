@@ -6,7 +6,6 @@
 // "Ask before acting" toggle. Talks to an OpenAI-compatible chat endpoint
 // (Ollama, OpenRouter) with the ToolApi's tools; every tool call is applied
 // through the workbench and shown as a card.
-// (app/qt/panels/assistant_panel.cpp, llm_client.cpp)
 
 #include <memory>
 #include <string>

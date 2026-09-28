@@ -1,11 +1,11 @@
-# clang-format configuration for SIRIUS (C++17, CUDA, Qt).
+# clang-format configuration for SIRIUS (C++17, CUDA).
 #
 # Written to reproduce the style the tree already uses, so that formatting a
 # file does not turn into a wholesale rewrite: 4-space indentation with the
 # namespace body indented, attached braces, `const T& x` / `T* p`, short
 # functions, ifs and loops on one line where the author put them, generous
 # column limit, includes left in the author's grouping (own header, std,
-# third-party / Qt, sirius, app core). CI formats only the files a change
+# third-party, sirius, app core). CI formats only the files a change
 # touches (see .github/workflows/dev-tests.yml and .pre-commit-config.yaml).
 ---
 Language: Cpp
@@ -76,13 +76,3 @@ EmptyLineBeforeAccessModifier: LogicalBlock
 SortIncludes: Never
 IncludeBlocks: Preserve
 SortUsingDeclarations: Never
-
-# Qt
-StatementMacros:
-  - Q_OBJECT
-  - Q_UNUSED
-  - Q_DECLARE_METATYPE
-ForEachMacros:
-  - foreach
-  - Q_FOREACH
-  - BOOST_FOREACH

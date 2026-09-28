@@ -4,10 +4,8 @@
 // Client for OpenAI-compatible chat completion endpoints (Ollama's /v1,
 // OpenRouter, anything else speaking the same JSON) with tool calling and
 // server-sent-event streaming. One request at a time; the caller (the
-// assistant panel) runs the tool loop on top of onFinished.
-// (app/qt/panels/llm_client.cpp, over http::Fetch instead of
-// QNetworkAccessManager: every callback arrives on the GUI thread, between
-// two frames.)
+// assistant panel) runs the tool loop on top of onFinished. Over
+// http::Fetch: every callback arrives on the GUI thread, between two frames.
 
 #include <functional>
 #include <map>
@@ -75,7 +73,7 @@ namespace sirius::app::gui {
         };
         static std::string errorMessageOf(const std::string& body, const std::string& fallback);
 
-        // --- what the Qt client emits as signals -----------------------------
+        // --- events, on the GUI thread ---------------------------------------
         std::function<void(const std::string& text)> onDelta;               // streamed content fragment
         std::function<void(const nlohmann::json& message)> onFinished;      // complete assistant message
         std::function<void(const std::string& error)> onFailed;

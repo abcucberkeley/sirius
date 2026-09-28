@@ -4,7 +4,7 @@
 # SIRIUS_WARNINGS_AS_ERRORS adds /WX or -Werror to the library and the app
 # core only -- that is, to the units they are made of (cmake/Units.cmake:
 # sirius_lib_<unit>, sirius_core_<unit>) -- so a new warning in the code CI
-# compiles is a build failure while the tests and the Qt layer keep building.
+# compiles is a build failure while the tests and the GUI keep building.
 function(target_set_warnings tgt)
   if(MSVC)
     target_compile_options(${tgt} PRIVATE

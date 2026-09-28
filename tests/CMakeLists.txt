@@ -61,10 +61,9 @@ sirius_lib_test(sim_reconstruction test_reconstruction.cpp
     UNITS lib/otf_io lib/otf_ideal lib/legacy_config lib/tiff_io)
 
 # --- the workbench core ----------------------------------------------------------
-# The GUI's Qt-free model is tested the same way when either application is
-# enabled; the Widgets layer itself stays untested here (tools/gui_tests.py
-# drives it).
-if(SIRIUS_ENABLE_APP OR SIRIUS_ENABLE_IMGUI_APP)
+# The GUI's core is tested the same way when the application is enabled; the
+# GUI layer itself is exercised by CI's headless run of the bundled pipeline.
+if(SIRIUS_ENABLE_APP)
     include(app_tests.cmake)
 endif()
 
@@ -76,7 +75,7 @@ endif()
 get_property(_sirius_test_objects GLOBAL PROPERTY SIRIUS_TEST_OBJECTS)
 add_executable(sirius_tests)
 target_link_libraries(sirius_tests PRIVATE ${_sirius_test_objects} sirius Catch2::Catch2WithMain)
-if(SIRIUS_ENABLE_APP OR SIRIUS_ENABLE_IMGUI_APP)
+if(SIRIUS_ENABLE_APP)
     target_link_libraries(sirius_tests PRIVATE sirius::app_core)
 endif()
 sirius_finish_test_executable(sirius_tests)

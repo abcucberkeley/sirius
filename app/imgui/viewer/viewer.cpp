@@ -47,8 +47,7 @@ namespace sirius::app::gui {
         using viewer::kWheelZoomBase;
 
         // The ortho splitters' saved balance: the side column's width and the
-        // bottom row's height, in design pixels (Qt kept QSplitter states
-        // under the same keys).
+        // bottom row's height, in design pixels.
         const char* const kOrthoRowsKey = "viewer/orthoRows";
         const char* const kOrthoColsKey = "viewer/orthoCols";
 
@@ -473,8 +472,8 @@ namespace sirius::app::gui {
         stepConnection = bridge.stepChanged.connect([this](int index) { changedSteps.push_back(index); });
     }
 
-    // The Qt widget followed the bridge's signals; here the revisions tell
-    // what moved since the last look, and the same handlers run.
+    // The bridge's revisions tell what moved since the last look, and the
+    // handler for each change runs.
     void Viewer::Impl::sync() {
         const Revisions r = bridge.rev();
         bool rebuild = r.dataset != seen.dataset || r.viewedStep != seen.viewedStep || r.outputs != seen.outputs || r.pipeline != seen.pipeline;
@@ -1021,8 +1020,7 @@ namespace sirius::app::gui {
             volumeReadiness(model, t, haveVol, haveMip);
             const DisplayModel::VolumeState vstate = ensureVolumes(model, t);
             // An in-memory volume small enough is projected inside
-            // ensureVolumes: it is ready now. (The Qt widget only drew it on
-            // the pane's next resize, which its first show always brought.)
+            // ensureVolumes: it is ready now.
             if (vstate == DisplayModel::VolumeState::Ready && (!haveVol || !haveMip)) {
                 const bool hadMip = haveMip;
                 volumeReadiness(model, t, haveVol, haveMip);
@@ -2008,7 +2006,7 @@ namespace sirius::app::gui {
             std::string tip;
             int which;
         };
-        // the tool tips name the keys the Qt application printed: + - 0
+        // the tool tips name the keys: + - 0
         const ZoomButton zooms[] = {{Icon::Plus, "##zoomIn", "Zoom in (+)", 0},
                                     {Icon::Minus, "##zoomOut", "Zoom out (-)", 1},
                                     {Icon::Fit, "##zoomFit", "Fit to view" + shortcutSuffix(ImGuiKey_0), 2}};
@@ -2058,7 +2056,7 @@ namespace sirius::app::gui {
         const ImVec2 stripMin(canvasMin.x + g, canvasMin.y + g), stripMax(stripMin.x + theme::snap(px(theme::kToolStripW)), canvasMax.y - g);
         const ImVec2 stackMin(stripMax.x + g, canvasMin.y + g), stackMax(std::max(stripMax.x + g + 1.0f, canvasMax.x - g), std::max(canvasMin.y + g + 1.0f, canvasMax.y - g));
 
-        // every page has the stack's geometry (the hidden ones as well, as in a QStackedWidget)
+        // every page has the stack's geometry (the hidden ones as well)
         layoutOrtho(stackMin, stackMax);
         {
             const float half = std::floor((stackMax.x - stackMin.x - g) * 0.5f);
@@ -2125,7 +2123,7 @@ namespace sirius::app::gui {
     bool Viewer::Impl::grab(std::vector<std::uint8_t>& rgba, int& width, int& height) {
         // The views as the last frame drew them: that frame's draw list,
         // replayed into a target the size of the views -- the overlays, the
-        // crosshair and the labels with them, as QWidget::grab() had them.
+        // crosshair and the labels with them.
         // The 3D view's controls live in child windows and stay out.
         const bool fresh = grabList && app.frameCount() == grabFrame + 1 && grabMax.x > grabMin.x && grabMax.y > grabMin.y;
         if (!fresh) {
@@ -2246,7 +2244,7 @@ namespace sirius::app::gui {
 
     // Scripting: the press, moves and release a mouse would make on the XY
     // pane, through the pane's own bookkeeping and the same handlers; what
-    // they changed is applied between the moves, as the Qt event loop did.
+    // they changed is applied between the moves, as between frames.
     void Viewer::syntheticStroke(double x0, double y0, double x1, double y1, int moves) {
         Impl& d = *impl_;
         SlicePane& pane = d.xy;

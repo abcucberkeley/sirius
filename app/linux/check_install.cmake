@@ -50,6 +50,8 @@ foreach(_file
         share/sirius/python/slurm/sirius_worker.sbatch
         share/sirius/python/workbench.py
         share/sirius/python/op_schema.json
+        share/sirius/fonts/Archivo-Regular.ttf
+        share/sirius/icons/sirius-app-48.png
         share/applications/sirius-app.desktop
         share/icons/hicolor/scalable/apps/sirius-app.svg
         share/icons/hicolor/48x48/apps/sirius-app.png)
@@ -93,23 +95,34 @@ if(_ldd)
 endif()
 
 # --- the installed application reads its own help pages ------------------------
+# The application opens a window (GLFW, OpenGL 3.3), so this part needs a
+# display: CI runs the test under xvfb-run. Without one it is skipped, loudly.
+set(_display FALSE)
+if(DEFINED ENV{DISPLAY} OR DEFINED ENV{WAYLAND_DISPLAY})
+    set(_display TRUE)
+endif()
+if(NOT _display)
+    message(WARNING "install check: no DISPLAY / WAYLAND_DISPLAY, so the installed application is not started "
+                    "(run the test under xvfb-run to include it)")
+endif()
 set(_marker "installed-tree-marker-7f3a")
 file(APPEND "${_data}/help/load.md" "\n<!-- ${_marker} -->\n")
 set(_home "${PREFIX}/check-home")
 file(MAKE_DIRECTORY "${_home}")
-execute_process(
-    COMMAND "${CMAKE_COMMAND}" -E env --unset=SIRIUS_HELP_DIR --unset=SIRIUS_WORKER_DIR
-            QT_QPA_PLATFORM=offscreen QT_FORCE_STDERR_LOGGING=1
-            "HOME=${_home}" "XDG_CONFIG_HOME=${_home}/.config" "SIRIUS_PYTHON=${PYTHON}"
-            "${PREFIX}/bin/sirius-app" --dataset "${RAW}"
-            --tool "{\"name\":\"get_help\",\"args\":{\"kind\":\"load\"}}" --quit-after 5000
-    WORKING_DIRECTORY "${_home}"
-    RESULT_VARIABLE _rc OUTPUT_VARIABLE _out ERROR_VARIABLE _err TIMEOUT 120)
-if(NOT _rc EQUAL 0)
-    fail("the installed sirius-app exited with ${_rc}:\n${_out}${_err}")
-endif()
-if(NOT "${_out}${_err}" MATCHES "${_marker}")
-    fail("get_help did not return the installed page (the checkout's instead?):\n${_out}${_err}")
+if(_display)
+    execute_process(
+        COMMAND "${CMAKE_COMMAND}" -E env --unset=SIRIUS_HELP_DIR --unset=SIRIUS_WORKER_DIR
+                "HOME=${_home}" "XDG_CONFIG_HOME=${_home}/.config" "SIRIUS_PYTHON=${PYTHON}"
+                "${PREFIX}/bin/sirius-app" --settings scratch --dataset "${RAW}"
+                --tool "{\"name\":\"get_help\",\"args\":{\"kind\":\"load\"}}" --quit-after 15000
+        WORKING_DIRECTORY "${_home}"
+        RESULT_VARIABLE _rc OUTPUT_VARIABLE _out ERROR_VARIABLE _err TIMEOUT 120)
+    if(NOT _rc EQUAL 0)
+        fail("the installed sirius-app exited with ${_rc}:\n${_out}${_err}")
+    endif()
+    if(NOT "${_out}${_err}" MATCHES "${_marker}")
+        fail("get_help did not return the installed page (the checkout's instead?):\n${_out}${_err}")
+    endif()
 endif()
 
 # --- the installed worker starts ----------------------------------------------

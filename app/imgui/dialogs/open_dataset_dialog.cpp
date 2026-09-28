@@ -4,7 +4,7 @@
 // A recent-files table sits below for one-click reopening. "Folder…" picks a
 // folder of TIFF files: one with a manifest (core/manifest.hpp) opens like a
 // file; one without goes through the folder dialog, which opens the dataset
-// itself. (The port of app/qt/dialogs/open_dataset_dialog.cpp.)
+// itself.
 //
 // The probe reads headers only, but on a network drive even that takes its
 // time: it runs on the dialog's own thread, 250 ms after the last edit of
@@ -84,7 +84,7 @@ namespace sirius::app::gui {
             return format("%s %d %02d:%02d", months[std::clamp(tm.tm_mon, 0, 11)], tm.tm_mday, tm.tm_hour, tm.tm_min);
         }
 
-        // The whole of `s` as a number, as QString::toDouble reads it.
+        // The whole of `s` as a number, nothing left over.
         bool toNumber(const std::string& s, double& out) {
             if (s.empty()) return false;
             char* end = nullptr;

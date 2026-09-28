@@ -8,7 +8,7 @@
 // inside one file stay there; these are the ones two files would otherwise
 // disagree about. Theme tokens (colours, fonts, dock metrics) live in
 // imgui/theme.hpp -- this header is the viewer's own geometry, in design
-// pixels. (app/qt/viewer/viewer_constants.hpp)
+// pixels.
 
 #include <sirius/buffer.hpp>
 

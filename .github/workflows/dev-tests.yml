@@ -5,7 +5,7 @@
 #   app-tests     the workbench + a headless run, with worker  (~15 min)
 #   python-tests  the wheel, the binding tests, worker tests   (~15 min)
 #   sanitizers    the library tests under ASan + UBSan         (~20 min)
-#   windows       MSVC + Qt 6, library and workbench           (~35 min)
+#   windows       MSVC, library and workbench (build + tests)  (~35 min)
 #   cuda-build    the CUDA paths compile; GPU cases skip       (~25 min)
 #
 # The formatting checks only look at the files a change touches: the tree
@@ -143,21 +143,30 @@ jobs:
         run: bash tools/ci_failed_tests.sh build/linux-gcc-dev
 
   app-tests:
-    # The workbench (Qt Widgets) with its Qt-free core tests, plus a headless
-    # smoke run of the bundled SIM pipeline. TensorStore stays off here: its
-    # build needs nasm and a quarter of an hour; the zarr tests skip.
-    name: Workbench build and tests (Linux, Qt 6)
+    # The workbench (sirius-app: Dear ImGui, GLFW, OpenGL 3.3) with its core
+    # tests and the install check, plus a headless run of the bundled SIM
+    # pipeline. There is no display on the runner: Xvfb provides one and Mesa's
+    # llvmpipe the OpenGL 3.3 context. TensorStore stays off here: its build
+    # needs nasm and a quarter of an hour; the zarr tests skip.
+    name: Workbench build and tests (Linux)
     runs-on: ubuntu-latest
     timeout-minutes: 45
     steps:
       - uses: actions/checkout@v4
 
+      # GLFW builds for X11 and Wayland (their headers and wayland-scanner),
+      # the file dialogs go through the desktop portal (D-Bus), the assistant
+      # and the model hub use the system's libcurl; xvfb, Mesa and
+      # desktop-file-validate are for the runs below.
       - name: Install build dependencies
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
-            build-essential cmake ninja-build gcc g++ \
-            qt6-base-dev libgl1-mesa-dev libglx-dev libxkbcommon-dev
+            build-essential cmake ninja-build gcc g++ pkg-config \
+            libgl1-mesa-dev libglx-dev libgl1-mesa-dri xorg-dev \
+            libwayland-dev libwayland-bin wayland-protocols libxkbcommon-dev \
+            libdbus-1-dev libcurl4-openssl-dev \
+            xvfb xauth desktop-file-utils
 
       - uses: actions/setup-python@v5
         id: python
@@ -170,17 +179,15 @@ jobs:
       # an interpreter that has numpy. The step library is loaded from the
       # checkout (app/python/sirius_worker/steps.py), so no install is needed;
       # scipy enables the classical-segmentation steps. torch is not installed
-      # -- the TorchScript segmentation case skips. Pillow and tifffile are for
-      # tools/gui_tests.py, which reads colours back out of screenshots and
-      # writes a folder of TIFFs, and skips those scenarios without them.
+      # -- the TorchScript segmentation case skips.
       - name: Install the worker's Python dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install numpy scipy pillow tifffile
+          pip install numpy scipy
 
       - uses: hendrikmuhs/ccache-action@v1
         with:
-          key: app-tests-linux-qt6
+          key: app-tests-linux
 
       - name: Configure
         run: |
@@ -191,10 +198,12 @@ jobs:
       - name: Build
         run: cmake --build --preset linux-gcc-app-dev
 
+      # Under Xvfb: the install check (sirius::app.install) starts the
+      # installed application, which opens a window.
       - name: Test
         env:
           SIRIUS_PYTHON: ${{ steps.python.outputs.python-path }}
-        run: ctest --preset linux-gcc-app-dev
+        run: xvfb-run -a -s "-screen 0 1920x1200x24" ctest --preset linux-gcc-app-dev
 
       # The job log needs a GitHub login; annotations do not. See the script.
       - name: Name the failed tests
@@ -203,21 +212,30 @@ jobs:
         shell: bash
         run: bash tools/ci_failed_tests.sh build/linux-gcc-app-dev
 
+      # The whole window: the pipeline runs, every panel draws, and the
+      # scripted steps go through the same code as the menus. The exit code is
+      # 1 when the run fails and 2 when it cannot start; the screenshot and the
+      # log are kept as artifacts for a look at what the run produced.
       - name: Headless smoke run
+        shell: bash
         run: |
-          QT_QPA_PLATFORM=offscreen build/linux-gcc-app-dev/app/sirius-app \
-            --pipeline examples/sim_bundled.sirius.toml --run --screenshot smoke.png
+          set -o pipefail
+          xvfb-run -a -s "-screen 0 1920x1200x24" build/linux-gcc-app-dev/app/sirius-app --settings scratch \
+            --pipeline examples/sim_bundled.sirius.toml --run \
+            --tool '{"name":"set_view","args":{"mode":"3d"}}' --action "Export result" \
+            --screenshot smoke.png 2>&1 | tee smoke.log
           test -s smoke.png
-
-      # The widgets, driven through the scripting hooks: the view modes, the
-      # compare panes, painting, the wheel, drag and drop, menu actions.
-      - name: GUI tests
-        run: python3 tools/gui_tests.py --app build/linux-gcc-app-dev/app/sirius-app
+          # Dear ImGui reports API misuse (an unbalanced push / pop, a cursor
+          # moved past a window) instead of crashing; any report fails the run.
+          if grep -q "imgui-error" smoke.log; then grep "imgui-error" smoke.log | sort | uniq -c; exit 1; fi
 
       - uses: actions/upload-artifact@v4
+        if: always()
         with:
           name: workbench-smoke
-          path: smoke.png
+          path: |
+            smoke.png
+            smoke.log
 
   python-tests:
     name: Python binding tests
@@ -312,11 +330,13 @@ jobs:
         run: bash tools/ci_failed_tests.sh build/linux-clang-dev
 
   windows:
-    # MSVC, the library and the workbench. Configured without a preset: the
+    # MSVC, the library and the workbench (built and unit-tested; the hosted
+    # runners have no OpenGL 3.3 driver, so the application itself is started
+    # only by the Linux job, on Mesa). Configured without a preset: the
     # checked-in Windows presets pin the Visual Studio generators of the
     # developer machines (VS 18 / VS 17), which the runner image does not
     # have. Ninja + the cl from the runner's toolchain instead.
-    name: Build and tests (Windows, MSVC + Qt 6)
+    name: Build and tests (Windows, MSVC)
     runs-on: windows-latest
     timeout-minutes: 60
     defaults:
@@ -326,14 +346,6 @@ jobs:
       - uses: actions/checkout@v4
 
       - uses: ilammy/msvc-dev-cmd@v1
-
-      - uses: jurplel/install-qt-action@v4
-        with:
-          version: "6.8.1"
-          host: windows
-          target: desktop
-          arch: win64_msvc2022_64
-          cache: true
 
       # No preset, so the cache variables the dev preset would set are spelled
       # out. TensorStore is off (nasm, ~15 min); the Python bindings are off
@@ -349,8 +361,7 @@ jobs:
             -DSIRIUS_ENABLE_WARNINGS=ON \
             -DSIRIUS_ENABLE_PYTHON_BINDINGS=OFF \
             -DSIRIUS_ENABLE_APP=ON \
-            -DSIRIUS_ENABLE_TENSORSTORE=OFF \
-            -DCMAKE_PREFIX_PATH="$QT_ROOT_DIR"
+            -DSIRIUS_ENABLE_TENSORSTORE=OFF
 
       - name: Build
         run: cmake --build build/ci-windows
@@ -364,22 +375,6 @@ jobs:
         # Git Bash on Windows; a bare `bash` there may resolve to WSL
         shell: bash
         run: bash tools/ci_failed_tests.sh build/ci-windows
-
-      # The same run as the Linux app job. QT_PLUGIN_PATH comes from
-      # install-qt-action, so the offscreen platform plugin is found whether or
-      # not windeployqt copied it next to the executable.
-      - name: Headless smoke run
-        env:
-          QT_QPA_PLATFORM: offscreen
-        run: |
-          ./build/ci-windows/app/sirius-app.exe \
-            --pipeline examples/sim_bundled.sirius.toml --run --screenshot smoke-windows.png
-          test -s smoke-windows.png
-
-      - uses: actions/upload-artifact@v4
-        with:
-          name: workbench-smoke-windows
-          path: smoke-windows.png
 
   cuda-build:
     # Hosted runners have no GPU: this compiles the CUDA paths (cuFFT, nvTIFF,

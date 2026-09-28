@@ -31,8 +31,7 @@ namespace sirius::app::gui {
             return f ? f : ImGui::GetFont();
         }
 
-        // `text` broken at `wrap` display pixels, every line centred in `r`
-        // (Qt's AlignCenter | TextWordWrap).
+        // `text` broken at `wrap` display pixels, every line centred in `r`.
         void drawWrappedCentered(ImDrawList* dl, const cells::Rect& r, const std::string& text, float designPx, ImU32 color) {
             if (text.empty() || r.width() <= 1.0f || r.height() <= 1.0f) return;
             ImFont* f = bodyFont();
@@ -76,7 +75,7 @@ namespace sirius::app::gui {
         }
 
         // The plots are pictures, not instruments: no frame, no padding, no
-        // axes, no interaction -- the flat cells of the Qt dock.
+        // axes, no interaction: flat cells.
         struct PlotLook {
             PlotLook() {
                 ImPlot::PushStyleVar(ImPlotStyleVar_PlotPadding, ImVec2(0, 0));
@@ -281,7 +280,7 @@ namespace sirius::app::gui {
                         break;
                 }
                 if (!m.text.empty()) {
-                    // Qt draws from the baseline at (7, -4)
+                    // the label's baseline sits at (7, -4) from the mark
                     const float size = fontPx(theme::kCaptionPx);
                     dl->AddText(bodyFont(), size, ImVec2(theme::snap(at.x + px(7)), theme::snap(at.y - px(4) - size * 0.85f)), c,
                                 m.text.c_str(), m.text.c_str() + m.text.size());
@@ -311,7 +310,7 @@ namespace sirius::app::gui {
             std::vector<double> xs(n), ys(n);
             for (std::size_t i = 0; i < n; ++i) {
                 xs[i] = ownX ? c->x[i] : static_cast<double>(i);
-                // a log axis has no place for zero: the floor the Qt cell uses
+                // a log axis has no place for zero: floored at 1e-12
                 ys[i] = c->logY ? std::max(c->y[i], 1e-12) : c->y[i];
             }
             double xmin = 0.0, xmax = static_cast<double>(n - 1);
@@ -692,7 +691,7 @@ namespace sirius::app::gui {
             static const std::vector<DiagnosticMark> none;
             const bool present = index < d_.images.size();
             // An image that is there but empty (a plane of no pixels) is a
-            // black cell, as in Qt; the placeholder is for the missing one.
+            // black cell; the placeholder is for the missing one.
             cells::image(r, present ? texture(index) : nullptr, present ? d_.images[index].marks : none, present ? std::string() : placeholder);
         };
         out.push_back(std::move(cell));

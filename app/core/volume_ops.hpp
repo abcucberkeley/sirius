@@ -1,7 +1,7 @@
 #ifndef SIRIUS_APP_VOLUME_OPS_HPP
 #define SIRIUS_APP_VOLUME_OPS_HPP
 
-// Qt-free helpers behind the stack viewer: cropping, orthogonal re-slicing,
+// GUI-free helpers behind the stack viewer: cropping, orthogonal re-slicing,
 // centered magnitude spectra, expansion of the reconstruction's half-spectrum
 // bands, an OTF rendered onto the data grid, and the frequency-space overlay
 // geometry. Everything works on (depth, rows, cols) host volumes so it can be
@@ -51,7 +51,9 @@ namespace sirius::app {
     // Which complex band to form from the reconstruction's stored cosine (re)
     // and sine (im) parts of an order: re + i im is the +order side band,
     // re - i im the -order one; order 0 has only re.
-    enum class BandSide { Plus, Minus, ReOnly };
+    enum class BandSide { Plus,
+                          Minus,
+                          ReOnly };
 
     // Centered |band| of plane z from the half spectra of SimDiagnostics:
     // `re` and `im` point at one band's (nz, ny, nx / 2 + 1) storage (`im`

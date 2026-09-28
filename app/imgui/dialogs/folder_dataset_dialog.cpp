@@ -4,7 +4,6 @@
 // layout does not need a new regex. An existing manifest can be loaded to
 // recover its pattern; a sidecar is written only when the mapping is new or
 // the TIFF folder cannot hold one (then a local cache file with files_folder).
-// (The port of app/qt/dialogs/folder_dataset_dialog.cpp.)
 //
 // A folder of an acquisition holds thousands of files, often on a network
 // drive, and std::regex is not quick: the directory is listed, the pattern
@@ -113,7 +112,7 @@ namespace sirius::app::gui {
             return none;
         }
 
-        // The whole of `s` as a number, as QString::toDouble reads it.
+        // The whole of the trimmed `s` as a number, nothing left over.
         bool toNumber(const std::string& s, double& out) {
             const std::string t = trimmed(s);
             if (t.empty()) return false;
@@ -358,7 +357,7 @@ namespace sirius::app::gui {
             ~FolderDatasetDialog() override { alive_->store(false); }
 
             std::string title() const override { return kTitle; }
-            // Qt's 720 x 780 grew to the layout's minimum, about 880 high
+            // tall enough for the layout's minimum, about 880
             ImVec2 size() const override { return ImVec2(720, 900); }
             bool resizable() const override { return true; }
 
@@ -1211,12 +1210,14 @@ namespace sirius::app::gui {
                 ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, px(12, 10));
                 if (ImGui::BeginPopup("##picker")) {
                     widgets::text("Colour for channel " + token, 12, theme::kText, theme::Weight::SemiBold);
-                    const theme::FontScope font(12);
-                    ImGui::SetNextItemWidth(px(220));
-                    if (ImGui::ColorPicker3("##rgb", ch.info.color.data(),
-                                            ImGuiColorEditFlags_NoSidePreview | ImGuiColorEditFlags_NoSmallPreview |
-                                                ImGuiColorEditFlags_DisplayHex | ImGuiColorEditFlags_NoLabel))
-                        ch.customColor = true;
+                    {   // the font is popped inside the popup it was pushed in
+                        const theme::FontScope font(12);
+                        ImGui::SetNextItemWidth(px(220));
+                        if (ImGui::ColorPicker3("##rgb", ch.info.color.data(),
+                                                ImGuiColorEditFlags_NoSidePreview | ImGuiColorEditFlags_NoSmallPreview |
+                                                    ImGuiColorEditFlags_DisplayHex | ImGuiColorEditFlags_NoLabel))
+                            ch.customColor = true;
+                    }
                     ImGui::EndPopup();
                 }
                 ImGui::PopStyleVar(2);

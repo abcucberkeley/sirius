@@ -29,7 +29,7 @@
 // came from move. Selection, outputs and the run state refresh at once; edits
 // of the pipeline, a step, the dataset or the labels arrive in bursts (a
 // slider being dragged, a brush stroke) and refresh 150 ms after the last
-// one, as the Qt panel's single-shot timer did.
+// one.
 
 namespace sirius::app::gui {
 
@@ -309,14 +309,16 @@ namespace sirius::app::gui {
             ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, px(4, 4));
             int picked = -1;
             if (ImGui::BeginPopup("##moreTabs")) {
-                const theme::FontScope f(12);
-                for (std::size_t i = 0; i < tabs.size(); ++i) {
-                    if (std::find(visible.begin(), visible.end(), static_cast<int>(i)) != visible.end()) continue;
-                    ImGui::PushID(static_cast<int>(i));
-                    if (ImGui::Selectable(tabs[i].c_str(), static_cast<int>(i) == tab, ImGuiSelectableFlags_None,
-                                          ImVec2(std::max(px(140), theme::textSize(tabs[i], 12).x + px(16)), px(24))))
-                        picked = static_cast<int>(i);
-                    ImGui::PopID();
+                {   // the font is popped inside the popup it was pushed in
+                    const theme::FontScope f(12);
+                    for (std::size_t i = 0; i < tabs.size(); ++i) {
+                        if (std::find(visible.begin(), visible.end(), static_cast<int>(i)) != visible.end()) continue;
+                        ImGui::PushID(static_cast<int>(i));
+                        if (ImGui::Selectable(tabs[i].c_str(), static_cast<int>(i) == tab, ImGuiSelectableFlags_None,
+                                              ImVec2(std::max(px(140), theme::textSize(tabs[i], 12).x + px(16)), px(24))))
+                            picked = static_cast<int>(i);
+                        ImGui::PopID();
+                    }
                 }
                 ImGui::EndPopup();
             }

@@ -2,8 +2,7 @@
 #define SIRIUS_IMGUI_PANELS_MARKDOWN_VIEW_HPP
 
 // Rich text for the help pages: Markdown with $...$ LaTeX, laid out with
-// Dear ImGui's fonts and drawn into an ImDrawList. (The Qt application hands
-// the same pages to a QTextBrowser as HTML; there is no such widget here.)
+// Dear ImGui's fonts and drawn into an ImDrawList.
 //
 // Three steps, kept apart so that a page is parsed and measured once and
 // then only drawn:

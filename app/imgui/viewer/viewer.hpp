@@ -6,7 +6,7 @@
 // ortho / 3D / compare views and the dims strip (Z, T with play). It draws
 // whatever wb().displayOutput() returns and writes every interaction back
 // into the workbench's ViewState, so the assistant and the menus see the
-// same state the mouse produces. (app/qt/viewer/*)
+// same state the mouse produces.
 
 #include <cstdint>
 #include <memory>

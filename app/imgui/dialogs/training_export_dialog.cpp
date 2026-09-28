@@ -2,7 +2,6 @@
 // folder -- instance masks, a semantic mask, bounding boxes, optionally one
 // image and one YOLO file per plane -- and appends the sample to the index so
 // many exports accumulate into one training set.
-// (app/qt/dialogs/training_export_dialog.cpp)
 
 #include "imgui/dialogs/dialogs.hpp"
 
@@ -43,7 +42,7 @@ namespace sirius::app::gui {
                 std::string dir = ds.sourcePath.empty() ? std::string() : parentPath(ds.sourcePath);
                 if (dir.empty() || dir == ".") dir = platform::homeDirectory();
 #ifdef _WIN32
-                dir = replaceAll(dir, "\\", "/");   // as QFileInfo::absolutePath writes it
+                dir = replaceAll(dir, "\\", "/");   // forward slashes throughout
 #endif
                 directory_ = dir + "/training-data";
                 sample_ = ds.name.empty() ? std::string("sample") : ds.name;

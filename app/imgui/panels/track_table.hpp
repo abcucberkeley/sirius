@@ -6,7 +6,7 @@
 // ends, how many frames it is missing, how fast and how far it moves, and
 // its parent and children. Like the diagnostics cells it knows nothing about
 // the workbench: it shows a vector of TrackSummary and reports which track
-// was chosen. (app/qt/panels/track_table.cpp)
+// was chosen.
 //
 // Division counts come from the model's geometric rule, which under-calls on
 // real detections (docs/foundation_model_integration.md, section 4), and the

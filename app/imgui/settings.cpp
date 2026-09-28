@@ -46,7 +46,7 @@ namespace sirius::app::gui {
         return st.dir.empty() ? defaultDirectory() : st.dir;
     }
 
-    std::string Settings::filePath() const { return directory() + "/sirius-imgui.json"; }
+    std::string Settings::filePath() const { return directory() + "/sirius-app.json"; }
 
     std::string Settings::layoutPath() const { return directory() + "/imgui.ini"; }
 
@@ -54,9 +54,11 @@ namespace sirius::app::gui {
         State& st = state();
         if (st.loaded) return;
         st.loaded = true;
-        const std::string path = (st.dir.empty() ? defaultDirectory() : st.dir) + "/sirius-imgui.json";
+        const std::string dir = st.dir.empty() ? defaultDirectory() : st.dir;
         std::string text;
-        if (!platform::readFile(path, text)) return;
+        // sirius-imgui.json: the name the file had before the application took
+        // over sirius-app's name; read once, then saved under the new one
+        if (!platform::readFile(dir + "/sirius-app.json", text) && !platform::readFile(dir + "/sirius-imgui.json", text)) return;
         const nlohmann::json j = nlohmann::json::parse(text, nullptr, false);
         if (j.is_object()) st.data = j;
     }
@@ -168,7 +170,7 @@ namespace sirius::app::gui {
             dir = st.dir.empty() ? defaultDirectory() : st.dir;
         }
         platform::makePath(dir);
-        platform::writeFileAtomic(dir + "/sirius-imgui.json", text + "\n");
+        platform::writeFileAtomic(dir + "/sirius-app.json", text + "\n");
     }
 
 } // namespace sirius::app::gui

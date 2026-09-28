@@ -10,11 +10,9 @@
 // viewer decides what they mean. A pane that was clicked has the keyboard:
 // the arrow keys walk the crosshair over its own two axes, page up / down
 // step the third (the viewer asks keyNavigation() for them).
-// (app/qt/viewer/slice_pane.*)
 //
 // Coordinates: "local" positions are display pixels from the pane's
-// top-left corner (what Qt's widget coordinates were); voxel positions are
-// columns / rows of the pane's plane.
+// top-left corner; voxel positions are columns / rows of the pane's plane.
 
 #include <functional>
 #include <memory>
@@ -39,7 +37,7 @@ namespace sirius::app::gui {
                           float designPx = 11);
     // `text` word-wrapped and centred in (min, max), each line on its own.
     void drawCenteredWrapped(ImDrawList* dl, ImVec2 min, ImVec2 max, const std::string& text, float designPx, ImU32 color);
-    // A rectangle outline in dashes (Qt's dash line: 4 on, 2 off, in pens).
+    // A rectangle outline in dashes (4 on, 2 off, in pens).
     void dashedOutline(ImDrawList* dl, ImVec2 a, ImVec2 b, ImU32 color, float thickness);
 
     class SlicePane {

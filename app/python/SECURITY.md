@@ -171,8 +171,9 @@ the request and be inherited by every subprocess the worker starts, `pip` and
 `conda` included -- and the desktop launcher does not put it there either.
 
 On the application side, the worker token, the Hugging Face token and the
-assistant's API key are stored through `app/qt/secret_store.hpp` (DPAPI on
-Windows, a `0600` file elsewhere) rather than as plain text in `QSettings`.
+assistant's API key are stored through `app/imgui/secret_store.hpp` (DPAPI
+blobs in the application's settings file on Windows, `~/.sirius/secrets.json`
+created `0600` elsewhere) rather than as plain text in the settings.
 
 ## Reporting
 

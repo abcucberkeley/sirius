@@ -530,7 +530,7 @@ namespace sirius::app {
     } // namespace
 
     // naturalLess above is what puts "f2" before "f10".
-    // Names only: QDir and directory_entry::is_regular_file stat every entry.
+    // Names only: directory_entry::is_regular_file stats every entry.
     // On NFS / Vast, readdir reports DT_UNKNOWN, so a Files filter skips the
     // TIFFs unless each one is stated — and stating hundreds of 300 MB stacks
     // hangs the GUI. Extension of the name is enough here.

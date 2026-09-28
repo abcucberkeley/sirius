@@ -16,8 +16,8 @@
 //
 // All buffers persist between calls so scrubbing through a stack allocates
 // nothing; a change of output, t or channel invalidates only what depends
-// on it. (app/qt/viewer/display_model.*; the QImage is an Image here, whose
-// pixels are laid out the way a texture upload wants them.)
+// on it. A plane comes out as an Image, whose pixels are laid out the way a
+// texture upload wants them.
 
 #include <array>
 #include <cstdint>

@@ -6,7 +6,7 @@
 // Diagnostics / Log / Assistant docks around the viewer, the status bar,
 // every menu action and keyboard shortcut, layout persistence, the file
 // dialogs and the message boxes. All state lives in the Workbench; this
-// class only routes. (The Qt application's MainWindow.)
+// class only routes.
 //
 // One frame:
 //     bridge.update()      posted functions, run progress, finished jobs
@@ -14,9 +14,9 @@
 //     ImGui frame          title bar, dock windows -> panel.draw(), dialogs
 //     render + swap
 //
-// Panels never block. What the Qt application did with a modal exec() is a
-// Dialog here: showDialog() puts it on screen, the frame loop keeps running,
-// and the dialog calls back when it is accepted. ask() and message() are the
+// Panels never block. A modal dialog is a Dialog: showDialog() puts it on
+// screen, the frame loop keeps running, and the dialog calls back when it
+// is accepted. ask() and message() are the
 // message boxes, answered through a callback the same way.
 //
 // Anything that changes what is on screen in a way Dear ImGui must not see

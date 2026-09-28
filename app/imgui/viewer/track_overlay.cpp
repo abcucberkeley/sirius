@@ -142,7 +142,7 @@ namespace sirius::app::gui {
                     const ImU32 c = theme::withAlpha(path->color, alpha);
                     const float w = px(future ? width - 0.5f : width);
                     if (runStyle == Style::PastGap || runStyle == Style::FutureGap) {
-                        // Qt's dot line: a dot a pen wide, two pens of gap
+                        // dotted: a dot a pen wide, two pens of gap
                         dashedPolyline(dl, run, c, w, w, 2.0f * w);
                     } else {
                         dl->AddPolyline(run.data(), static_cast<int>(run.size()), c, w, ImDrawFlags_None);

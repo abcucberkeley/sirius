@@ -3,17 +3,16 @@
 
 // Where the application keeps the secrets the user types into it: the HPC
 // worker token, the Hugging Face token and the assistant's API key. Never
-// the settings file as plain text. The key names are the Qt application's
-// ("hpc/token", "hub/token", "assistant/apiKey").
+// the settings file as plain text. The keys are "hpc/token", "hub/token"
+// and "assistant/apiKey".
 //
 // Windows: DPAPI (CryptProtectData) with the key name as entropy, base64 in
 // the settings under secrets/<key>. Only this user on this machine can read
 // it back, and only under the key it was written for.
 //
-// Everywhere else: ~/.sirius/secrets.json, created 0600 -- the file the Qt
-// application uses, in its format, so a token entered in one is there in the
-// other. The values in that file are obfuscated, NOT encrypted: the file
-// mode is the actual protection. The file is replaced atomically, and one
+// Everywhere else: ~/.sirius/secrets.json, created 0600. The values in that
+// file are obfuscated, NOT encrypted: the file mode is the actual
+// protection. The file is replaced atomically, and one
 // that exists but does not parse is never written over.
 
 #include <string>

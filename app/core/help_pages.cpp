@@ -20,7 +20,7 @@ namespace sirius::app {
     // --- small string helpers -------------------------------------------------
 
     namespace {
-        // Design tokens (docs/design/README.md); the core is Qt-free, so the
+        // Design tokens (docs/design/README.md); the core is GUI-free, so the
         // HTML carries them as literals.
         constexpr const char* kSurface = "#eae9e9";
         constexpr const char* kText = "#201e1d";
@@ -1031,8 +1031,8 @@ namespace sirius::app {
                 std::size_t level = 0;
                 while (level < t.size() && t[level] == '#') ++level;
                 const std::string title = inlineMarkdownToHtml(trim(t.substr(level)), baseDir);
-                // paragraphs rather than <h*>: QTextDocument keeps its own
-                // heading sizes and ignores a font-size on them
+                // paragraphs rather than <h*>: an HTML view may keep its own
+                // heading sizes and ignore a font-size on them
                 const int px = level <= 1 ? 20 : level == 2 ? 15
                                                             : 13;
                 html += "<p style=\"font-size: " + std::to_string(px) +

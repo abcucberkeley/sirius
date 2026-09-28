@@ -1,20 +1,10 @@
 option(SIRIUS_ENABLE_MPI "Enable MPI" OFF)
 option(SIRIUS_ENABLE_CUDA "Enable CUDA (device buffers, cuFFT, nvTIFF)" OFF)
 option(SIRIUS_ENABLE_PYTHON_BINDINGS "Enable nanobind python bindings" OFF)
-# Qt desktop application (app/). Qt is found on the system, not fetched: see
-# cmake/Dependencies.cmake for how to point CMake at an installation.
-option(SIRIUS_ENABLE_APP "Build the Qt GUI application (needs Qt 6 or Qt 5 Widgets)" OFF)
-# On Windows the Qt DLLs and plugins are copied next to sirius-app with
-# windeployqt after every link, so the build tree runs without PATH changes.
-# Turn off for Qt builds windeployqt cannot handle (e.g. conda-forge's Qt with
-# its renamed Qt5*_conda.dll) and run with the Qt bin directory on PATH.
+# The workbench application (app/): Dear ImGui over GLFW and OpenGL 3.3, with
+# ImPlot and friends, all fetched and built in-tree (cmake/Dependencies.cmake).
+option(SIRIUS_ENABLE_APP "Build the sirius-app GUI (fetches GLFW, Dear ImGui, ImPlot, libcurl)" OFF)
 include(CMakeDependentOption)
-cmake_dependent_option(SIRIUS_APP_DEPLOY_QT "Run windeployqt on sirius-app after linking" ON
-                       "SIRIUS_ENABLE_APP;WIN32" OFF)
-# The same workbench over Dear ImGui (app/imgui): GLFW, OpenGL 3.3, ImPlot and
-# friends, all fetched and built in-tree, so it needs no Qt installation. It
-# shares app/core with the Qt application; either, both or neither can be on.
-option(SIRIUS_ENABLE_IMGUI_APP "Build the Dear ImGui GUI application (fetches GLFW, Dear ImGui, ImPlot)" OFF)
 
 # nvTIFF decodes TIFF strips/tiles straight into device memory. It is an NVIDIA
 # redistributable (no source), fetched from developer.download.nvidia.com by

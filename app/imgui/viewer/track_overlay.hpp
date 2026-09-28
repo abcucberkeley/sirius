@@ -10,7 +10,6 @@
 //
 // Built once per label change (trackPaths), drawn every frame
 // (paintTrackPaths): the pane never walks the label index itself.
-// (app/qt/viewer/track_overlay.*)
 
 #include <cstdint>
 #include <functional>
@@ -32,8 +31,8 @@ namespace sirius::app::gui {
         DPoint operator*(double f) const noexcept { return {x * f, y * f}; }
     };
 
-    // An axis-aligned rectangle of voxels; "null" (the Qt sense) when it has
-    // neither width nor height.
+    // An axis-aligned rectangle of voxels; "null" when it has neither width
+    // nor height.
     struct DRect {
         double x0 = 0.0, y0 = 0.0, x1 = 0.0, y1 = 0.0;
         double width() const noexcept { return x1 - x0; }

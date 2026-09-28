@@ -96,7 +96,7 @@ namespace sirius::app::gui::http {
             curl_easy_setopt(curl, CURLOPT_URL, request.url.c_str());
             curl_easy_setopt(curl, CURLOPT_ERRORBUFFER, errorBuffer);
             curl_easy_setopt(curl, CURLOPT_NOSIGNAL, 1L);
-            curl_easy_setopt(curl, CURLOPT_USERAGENT, "sirius-imgui/" SIRIUS_VERSION);
+            curl_easy_setopt(curl, CURLOPT_USERAGENT, "sirius-app/" SIRIUS_VERSION);
             curl_easy_setopt(curl, CURLOPT_ACCEPT_ENCODING, "");
             curl_easy_setopt(curl, CURLOPT_FOLLOWLOCATION, request.followRedirects ? 1L : 0L);
             curl_easy_setopt(curl, CURLOPT_MAXREDIRS, 10L);

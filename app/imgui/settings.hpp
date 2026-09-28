@@ -2,9 +2,8 @@
 #define SIRIUS_IMGUI_SETTINGS_HPP
 
 // The application's persistent settings: one JSON object in one file, keyed
-// by the same "group/name" strings the Qt application keeps in QSettings
-// ("worker/python", "recent/datasets", "assistant/model" ...), so the two
-// read alike. The file is <config dir>/sirius/sirius-imgui.json unless
+// by "group/name" strings ("worker/python", "recent/datasets",
+// "assistant/model" ...). The file is <config dir>/sirius/sirius-app.json unless
 // main() moved it (--settings <dir>); Dear ImGui's own window layout
 // (imgui.ini) sits beside it.
 //

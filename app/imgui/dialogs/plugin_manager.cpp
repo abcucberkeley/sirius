@@ -287,10 +287,9 @@ def run(data, params, meta, ctx):
             }
             const bool focusedHere = ImGui::IsWindowFocused(ImGuiFocusedFlags_RootAndChildWindows);
             if (focusedHere) {
-                // The Qt dialog is a window of its own: the main window's
-                // shortcuts (Backspace removes a step, Ctrl+S saves the
-                // pipeline) do not reach past it. Here they would, so while
-                // this dialog has the keyboard the application is told that
+                // The main window's shortcuts (Backspace removes a step,
+                // Ctrl+S saves the pipeline) would reach past this dialog,
+                // so while it has the keyboard the application is told that
                 // text is being typed, which keeps its shortcuts off.
                 ImGui::GetCurrentContext()->PlatformImeData.WantTextInput = true;
                 if (ImGui::IsKeyChordPressed(ImGuiMod_Ctrl | ImGuiKey_S)) {

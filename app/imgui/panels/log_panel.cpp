@@ -23,7 +23,7 @@
 // and a log that jumps away mid-read is unreadable).
 //
 // The view keeps its own copy of the lines: "Clear" empties the view while
-// the session's own log is kept, as in the Qt panel.
+// the session's own log is kept.
 
 namespace sirius::app::gui {
 
@@ -364,7 +364,7 @@ namespace sirius::app::gui {
                 const float ty = theme::snap(at.y + (lineH - size) * 0.5f);
                 dl->AddText(font, size, ImVec2(theme::snap(at.x), ty), theme::kNeutral700, s.c_str(), s.c_str() + s.size());
                 if (showSel && i >= a.line && i <= b.line) {
-                    // selected text: paper on the accent, as the Qt text views draw it
+                    // selected text: paper on the accent
                     const std::size_t from = i == a.line ? std::min(a.col, s.size()) : 0;
                     const std::size_t to = i == b.line ? std::min(b.col, s.size()) : s.size();
                     const float x0 = at.x + measureRange(s, from);

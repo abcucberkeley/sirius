@@ -2,8 +2,8 @@
 #define SIRIUS_APP_DISPLAY_MAPPING_HPP
 
 // Intensity mapping for on-screen display of double-precision volumes. Pure
-// functions over raw pointers (no Qt) so they are unit-testable and the GUI
-// only wraps the resulting 8-bit planes in a QImage.
+// functions over raw pointers (no GUI types) so they are unit-testable and
+// the GUI only has to display the resulting 8-bit planes.
 
 #include <cstddef>
 #include <cstdint>

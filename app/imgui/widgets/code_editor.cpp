@@ -18,10 +18,10 @@ namespace sirius::app::gui::widgets {
 
     namespace {
 
-        constexpr float kCodePx = 13;   // the Qt editor's monospace size
+        constexpr float kCodePx = 13;   // the editor's monospace size
 
-        // Python as the editor ships it, plus the names the Qt highlighter
-        // singles out: the builtins (and numpy) in a quieter ink, and the
+        // Python as the editor ships it, plus the names worth singling out:
+        // the builtins (and numpy) in a quieter ink, and the
         // plugin contract (STEP, run) in the accent.
         const TextEditor::Language* python() {
             static TextEditor::Language language = [] {
@@ -37,8 +37,7 @@ namespace sirius::app::gui::widgets {
             return &language;
         }
 
-        // The theme's colours in the editor's palette: the same roles the Qt
-        // highlighter gives them (keywords accent-700, numbers accent-600,
+        // The theme's colours in the editor's palette (keywords accent-700, numbers accent-600,
         // strings neutral-700, comments neutral-500, the contract accent).
         TextEditor::Palette palette() {
             TextEditor::Palette p = TextEditor::GetLightPalette();
@@ -95,7 +94,7 @@ namespace sirius::app::gui::widgets {
             editor.SetInsertSpacesOnTabs(true);
             // The editor's own auto-indent adds a tab after '{' and '[' and
             // nothing after ':'; Python wants the opposite, so the indent is
-            // done here (draw()), as the Qt editor does it.
+            // done here (draw()).
             editor.SetAutoIndentEnabled(false);
             editor.SetShowWhitespacesEnabled(false);
             editor.SetShowLineNumbersEnabled(true);

@@ -4,8 +4,7 @@
 // The segmentation cleanup page of the diagnostics dock: the 4 x 2 tool grid
 // with the brush size and "Paint in 3D", the label table (one row per label:
 // id with its colour chip, class, voxels, confidence, flag, and the merge /
-// split / delete links) and the review queue. (The SegmentCleanupView of
-// app/qt/panels/diagnostics_panel.cpp.)
+// split / delete links) and the review queue.
 //
 // Tens of thousands of labels are common: the table reads the statistics of
 // the viewed label volume in place and draws only the rows on screen, so a
@@ -29,7 +28,7 @@ namespace sirius::app::gui {
 
         // The labels on show (the viewed step's), after anything that may
         // have replaced them or edited them. The table's selection becomes
-        // the view state's label alone, as a refresh of the Qt table did.
+        // the view state's label alone.
         void setLabels(std::shared_ptr<LabelVolume> labels);
         // Fills the rest of the current window.
         void draw();

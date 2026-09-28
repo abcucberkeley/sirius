@@ -132,7 +132,7 @@ namespace sirius::app::gui {
             return r;
         }
 
-        // QMatrix4x4::perspective
+        // The OpenGL perspective projection (gluPerspective's matrix).
         Mat4 perspective(float fovYDeg, float aspect, float nearPlane, float farPlane) {
             Mat4 r;
             const float half = fovYDeg / 2.0f * static_cast<float>(sirius::kPi) / 180.0f;
@@ -158,7 +158,7 @@ namespace sirius::app::gui {
         }
         float dot(V3 a, V3 b) { return a.x * b.x + a.y * b.y + a.z * b.z; }
 
-        // QMatrix4x4::lookAt
+        // The view matrix from `eye` towards `centre` (gluLookAt's).
         Mat4 lookAt(V3 eye, V3 centre, V3 up) {
             const V3 f = normalized(sub(centre, eye));
             const V3 s = normalized(cross(f, up));
@@ -553,7 +553,7 @@ namespace sirius::app::gui {
             // the right and dragging down tips its top towards the viewer. The
             // camera orbits at (sin yaw, sin pitch, cos yaw), so both angles move
             // against the drag to make the volume follow the pointer. (Degrees
-            // per design pixel, as the Qt view counted its logical pixels.)
+            // per design pixel, so the display scale does not change the speed.)
             const double s = 1.0 / std::max(0.01, static_cast<double>(theme::scale()));
             if (io.MouseDelta.x != 0.0f || io.MouseDelta.y != 0.0f)
                 applyOrientation(yaw_ - static_cast<double>(io.MouseDelta.x) * 0.5 * s, pitch_ + static_cast<double>(io.MouseDelta.y) * 0.5 * s, true);

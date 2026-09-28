@@ -3,9 +3,9 @@
 
 // The icon set of docs/design/README.md ("Icons: Lucide (thin, 1.5-2 px
 // stroke)"), drawn into an ImDrawList from a table of paths on Lucide's
-// 24 x 24 grid: flat strokes, no gradients, no radius, one colour. The same
-// table as app/qt/widgets/icons.cpp, so the two applications show the same
-// glyphs whatever fonts the platform has.
+// 24 x 24 grid: flat strokes, no gradients, no radius, one colour. Drawn,
+// not taken from a font, so the glyphs are the same whatever fonts the
+// platform has.
 
 #include <imgui.h>
 

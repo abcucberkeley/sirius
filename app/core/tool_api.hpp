@@ -17,7 +17,11 @@
 namespace sirius::app {
 
     struct ActionRecord {
-        enum class Kind { Param, Run, View, Edit, Info };
+        enum class Kind { Param,
+                          Run,
+                          View,
+                          Edit,
+                          Info };
         Kind kind = Kind::Info;
         std::string text;                 // "Step 02 · Wiener 0.001 → 0.002"
         std::string link;                 // "undo", "view", "log", ""
@@ -41,7 +45,7 @@ namespace sirius::app {
         std::string systemPrompt() const;
 
         // Runs are asynchronous in the app: the hook starts one and returns
-        // its JSON outcome once finished (the Qt layer blocks the assistant
+        // its JSON outcome once finished (the application blocks the assistant
         // loop, not the GUI). Without a hook, run tools report "unavailable".
         void setRunHook(std::function<nlohmann::json(int targetIndex)> hook) { runHook_ = std::move(hook); }
         // Help page lookup (markdown text for a kind).

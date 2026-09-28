@@ -32,8 +32,8 @@ namespace sirius::app::gui {
 
         // `rgba` is width * height * 4 bytes, rows top to bottom.
         void upload(const std::uint8_t* rgba, int width, int height, bool smooth = false);
-        // 0xAARRGGBB pixels as the slice renderers produce them (QImage's
-        // Format_RGB32 layout): converted on the way in.
+        // 0xAARRGGBB pixels as the slice renderers produce them: converted on
+        // the way in.
         void uploadArgb32(const std::uint32_t* argb, int width, int height, bool smooth = false);
         // One byte per pixel, shown as grey.
         void uploadGray(const std::uint8_t* gray, int width, int height, bool smooth = false);

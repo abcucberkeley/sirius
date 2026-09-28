@@ -4,7 +4,7 @@
 // SIRIUS_TRACE_VIEW=1 prints what the hot UI paths cost. ScopedTrace starts
 // a timer when it is constructed and logs "<what> N us" when it leaves the
 // scope; with the variable unset it does nothing at all, so a trace can sit
-// in a paint or drag path. (app/qt/trace.hpp)
+// in a paint or drag path.
 //
 //     ScopedTrace trace("layoutPanes");
 

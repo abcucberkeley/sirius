@@ -2,7 +2,7 @@
 #define SIRIUS_APP_SESSION_HPP
 
 // Application model of one reconstruction session: the raw stack, the OTF,
-// the parameters and the reconstructor built from them. Qt-free so it can be
+// the parameters and the reconstructor built from them. GUI-free so it can be
 // unit-tested and driven from a worker thread; the GUI owns one instance and
 // serializes access to it (edit on the GUI thread, reconstruct on the worker,
 // never both at once).
@@ -26,7 +26,8 @@ namespace sirius::app {
 
     // --- parameter files -------------------------------------------------
 
-    enum class ParameterFormat { Toml, Legacy };
+    enum class ParameterFormat { Toml,
+                                 Legacy };
 
     // .toml files are TOML; otherwise the first significant line decides: a
     // `[table]` header means TOML, anything else the flat cudasirecon

@@ -155,7 +155,7 @@ namespace sirius::app::gui {
         if (ImGui::BeginTable("##tracks", ColumnCount, flags, ImVec2(r.width(), r.height()))) {
             drawn = true;
             ImGui::TableSetupScrollFreeze(0, 1);
-            // fixed widths, as the Qt table sets them (they include the 6 px cell padding)
+            // fixed widths (they include the 6 px cell padding)
             auto width = [&](const char* sample, float extra) {
                 return std::max(px(10), theme::textSize(sample, theme::kSmallPx).x + px(extra) - 2.0f * px(6));
             };

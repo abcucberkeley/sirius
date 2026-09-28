@@ -2,7 +2,6 @@
 // connection, the Python interpreter for the local worker, and the
 // assistant provider (Ollama / OpenRouter / custom OpenAI-compatible
 // endpoint). Values live in the settings; the workbench is updated on Save.
-// (app/qt/dialogs/preferences_dialog.cpp)
 
 #include "imgui/dialogs/dialogs.hpp"
 

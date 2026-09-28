@@ -474,7 +474,7 @@ namespace sirius::app::gui {
             y = theme::snap(y) + t;
         }
 
-        // Grouped dropdown, inline under the add row as in the Qt panel: it
+        // Grouped dropdown, inline under the add row: it
         // pushes the legend down and scrolls with the rows, so a long list
         // (descriptions on, many user operations) is never cut by the window.
         // 2 px ink border, the design's shadow-md, 8 px in from the dock.

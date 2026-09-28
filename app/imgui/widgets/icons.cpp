@@ -207,7 +207,7 @@ namespace sirius::app::gui {
                     p.poly({{10, 10}, {5, 15}, {10, 20}});
                     break;
                 case Icon::Recompute: {   // the Recompute cache policy
-                    // Qt: arc of the circle in (4, 4, 16, 16) from 65 degrees, sweeping -295
+                    // the arc of the circle in (4, 4, 16, 16) from 65 degrees, sweeping -295
                     // (clockwise on screen); angles are counter-clockwise with y up.
                     const float a0 = 65.0f * kPi / 180.0f, a1 = (65.0f - 295.0f) * kPi / 180.0f;
                     p.dl->PathClear();

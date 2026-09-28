@@ -1,7 +1,7 @@
-// sirius-imgui: the SIRIUS microscopy workbench (docs/design/README.md) over
-// Dear ImGui. The same command line as the Qt application:
+// sirius-app: the SIRIUS microscopy workbench (docs/design/README.md) over
+// Dear ImGui, GLFW and OpenGL 3.3.
 //
-//   sirius-imgui [--dataset stack.tif] [--pipeline steps.sirius.toml] [--run] [files...]
+//   sirius-app [--dataset stack.tif] [--pipeline steps.sirius.toml] [--run] [files...]
 //
 // Everything can also be opened from the File menu; --run runs every
 // enabled step as soon as the window is up. Files named without an option
@@ -142,7 +142,7 @@ namespace {
     }
 
     void printHelp() {
-        std::printf("Usage: sirius-imgui [options] [files...]\nSIRIUS microscopy processing workbench\n\nOptions:\n");
+        std::printf("Usage: sirius-app [options] [files...]\nSIRIUS microscopy processing workbench\n\nOptions:\n");
         for (const Option& o : kOptions) {
             std::string left = std::string("  --") + o.name;
             if (o.takesValue) left += std::string(" <") + o.valueName + ">";
@@ -173,7 +173,7 @@ int main(int argc, char** argv) {
     platform::attachParentConsole();
     const Arguments args = parse(argc, argv);
     if (!args.error.empty()) {
-        std::fprintf(stderr, "sirius-imgui: %s\n", args.error.c_str());
+        std::fprintf(stderr, "sirius-app: %s\n", args.error.c_str());
         return 2;
     }
     if (args.has("help")) {
@@ -181,7 +181,7 @@ int main(int argc, char** argv) {
         return 0;
     }
     if (args.has("version")) {
-        std::printf("sirius-imgui %s\n", SIRIUS_VERSION);
+        std::printf("sirius-app %s\n", SIRIUS_VERSION);
         return 0;
     }
     if (args.has("list-cuda")) {

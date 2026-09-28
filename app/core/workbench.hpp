@@ -2,7 +2,7 @@
 #define SIRIUS_APP_WORKBENCH_HPP
 
 // The session: one dataset, one pipeline, the executor's cached outputs,
-// the undo history and the viewer state, behind a single Qt-free facade that
+// the undo history and the viewer state, behind a single GUI-free facade that
 // the widgets, the assistant's tool API and the tests all drive the same
 // way. Every edit goes through here so it is undoable and observed.
 //
@@ -130,7 +130,7 @@ namespace sirius::app {
     };
 
     // Connects to (starting when needed) the local Python worker; installed
-    // by the Qt layer, called on the thread that executes the run.
+    // by the GUI, called on the thread that executes the run.
     using LocalWorkerLauncher = std::function<std::unique_ptr<RemoteWorker>()>;
 
     // One run, prepared on the GUI thread, executed anywhere.
@@ -204,7 +204,7 @@ namespace sirius::app {
 
     class Workbench {
     public:
-        // What changed; the Qt layer forwards these as signals. Called on the
+        // What changed; the GUI forwards these to its panels. Called on the
         // GUI thread, never during a run's worker execution.
         class Observer {
         public:
@@ -362,12 +362,12 @@ namespace sirius::app {
         void setRemoteConfig(RemoteConfig c);
         // Steps that need the Python worker (Operation::needsWorker) get a
         // local worker from this launcher when the backend is not HPC; the
-        // Qt layer installs one that spawns app/python/sirius_worker. A run
+        // GUI installs one that spawns app/python/sirius_worker. A run
         // job calls it on its own thread; loadPlugins calls it here.
         using WorkerLauncher = LocalWorkerLauncher;
         void setLocalWorkerLauncher(WorkerLauncher launcher) { launcher_ = std::move(launcher); }
         // The Hugging Face token a run hands the steps that download models
-        // (StepContext::hubToken); the Qt layer reads it from the secret
+        // (StepContext::hubToken); the GUI reads it from the secret
         // store when a run is created.
         void setHubTokenProvider(std::function<std::string()> provider) { hubToken_ = std::move(provider); }
         // Starts the local worker (through the launcher, synchronously: this

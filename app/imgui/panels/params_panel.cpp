@@ -133,8 +133,8 @@ namespace sirius::app::gui {
 
         // What a text or number field holds while it is being typed into: the
         // value it shows is the parameter's until the field takes the
-        // keyboard, and the edit is committed when it lets go of it (Qt's
-        // editingFinished), not on every keystroke.
+        // keyboard, and the edit is committed when it lets go of it, not on
+        // every keystroke.
         struct FieldBuf {
             double d = 0.0;
             std::int64_t i = 0;
@@ -150,7 +150,7 @@ namespace sirius::app::gui {
         int runFinishedSlot = 0;
         std::uint64_t runsFinished = 0;
 
-        // What the Qt panel rebuilt its widgets for: the step, its kind, the
+        // What resets the form's buffers when it changes: the step, its kind, the
         // values its visibility rules read, and every dataset change and
         // finished run (diagnostics-driven notes may have changed).
         int builtFor = -2;
@@ -195,7 +195,7 @@ namespace sirius::app::gui {
         std::vector<std::function<void()>> actions;
         bool firstItem = true;
         // Every parameter edit is refused while a run holds the pipeline, so
-        // the whole form is drawn disabled, as the Qt panel disables its scroll area.
+        // the whole form is drawn disabled.
         bool formEnabled = true;
         ImU32 dim(ImU32 c) const { return formEnabled ? c : theme::withAlpha(c, 0.45f); }
         float formX = 0.0f, formW = 1.0f;

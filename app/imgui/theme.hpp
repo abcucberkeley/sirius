@@ -2,10 +2,9 @@
 #define SIRIUS_IMGUI_THEME_HPP
 
 // The Modernist design tokens (docs/design/README.md) as the single source
-// of colours, fonts and metrics for the Dear ImGui layer -- the same values
-// app/qt/theme.hpp holds for the Qt one. Widgets read these constants when
-// they draw; everything stock-ImGui is styled through the ImGuiStyle that
-// applyTheme() installs. Flat: 0 px radius, 2 px rules between regions, 1 px
+// of colours, fonts and metrics for the application. Widgets read these
+// constants when they draw; everything stock-ImGui is styled through the
+// ImGuiStyle that applyTheme() installs. Flat: 0 px radius, 2 px rules between regions, 1 px
 // between rows, shadows only on floating panels.
 //
 // Sizes: every metric here and in the panels is in design pixels, the ones
@@ -41,7 +40,7 @@ namespace sirius::app::gui::theme {
     inline constexpr ImU32 kNeutral500 = rgb(0x9b, 0x97, 0x97);
     // The design's neutral-600 is #7d7979, which is 3.9:1 on the background:
     // below the 4.5:1 WCAG AA asks of the 10-12 px captions that use it.
-    // Darkened to 5.0:1, as in the Qt theme.
+    // Darkened to 5.0:1.
     inline constexpr ImU32 kNeutral600 = rgb(0x6b, 0x67, 0x67);
     // Text that has to stay the accent (11 px errors, links, the parameters
     // kicker): the same red, dark enough to pass. Fills and rules keep kAccent.

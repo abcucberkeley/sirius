@@ -256,42 +256,14 @@ if(SIRIUS_ENABLE_MPI)
     find_package(MPI REQUIRED)
 endif()
 
-# Qt (GUI application only). Like the CUDA toolkit, Qt is a large prebuilt
-# system dependency rather than something FetchContent should build: it is
-# found via its CMake package config. Qt 6 is preferred, Qt 5.15 works too.
-# Point CMake at an installation with one of
-#   -DCMAKE_PREFIX_PATH=/path/to/Qt/6.x/gcc_64        (the *-app-* presets set
-#                                                       this from $SIRIUS_QT_DIR)
-#   -DQt6_DIR=/path/to/Qt/6.x/gcc_64/lib/cmake/Qt6    (or Qt5_DIR)
-# Prefer the Qt*_DIR form for a Qt that lives inside a larger prefix (e.g. a
-# conda environment): a prefix path would also expose that environment's
-# libjpeg/zstd/... to libtiff's own find_package calls and drag in DLLs.
-# The app links the sirius::qt interface target, which resolves to the right
-# major version's Widgets module.
-if(SIRIUS_ENABLE_APP)
-    find_package(QT NAMES Qt6 Qt5 REQUIRED COMPONENTS Widgets HINTS ${Qt6_DIR} ${Qt5_DIR})
-    if(QT_VERSION_MAJOR EQUAL 6)
-        find_package(Qt6 REQUIRED COMPONENTS Widgets OpenGL OpenGLWidgets Network)
-        set(_sirius_qt_libs Qt6::Widgets Qt6::OpenGL Qt6::OpenGLWidgets Qt6::Network)
-    else()
-        # Qt 5: QOpenGLWidget lives in Widgets
-        find_package(Qt5 REQUIRED COMPONENTS Widgets Network)
-        set(_sirius_qt_libs Qt5::Widgets Qt5::Network)
-    endif()
-    add_library(sirius_qt INTERFACE)
-    target_link_libraries(sirius_qt INTERFACE ${_sirius_qt_libs})
-    add_library(sirius::qt ALIAS sirius_qt)
-    message(STATUS "Qt ${Qt${QT_VERSION_MAJOR}_VERSION} (Widgets, OpenGL, Network) for the SIRIUS app")
-endif()
-
-# Dear ImGui application (app/imgui). Unlike Qt everything here is small enough
-# to fetch and build in-tree, pinned like the rest: GLFW for the window and the
+# The application (app/imgui). Everything it needs is small enough to fetch
+# and build in-tree, pinned like the rest: GLFW for the window and the
 # OpenGL context, Dear ImGui (docking branch: dockable, floatable panels) with
 # its GLFW and OpenGL 3 backends, ImPlot for the diagnostics charts, a text
 # editor widget for the plugin files, native file dialogs, stb for PNG in and
 # out, and libcurl for the assistant and the model hub. Dear ImGui, ImPlot and
 # the editor ship no CMake project, so their targets are described here.
-if(SIRIUS_ENABLE_IMGUI_APP)
+if(SIRIUS_ENABLE_APP)
     find_package(OpenGL REQUIRED)
 
     FetchContent_Declare(
@@ -424,7 +396,7 @@ if(SIRIUS_ENABLE_IMGUI_APP)
             FetchContent_MakeAvailable(curl)
         endblock()
     endif()
-    message(STATUS "Dear ImGui (docking), ImPlot, GLFW and libcurl for the SIRIUS ImGui app")
+    message(STATUS "Dear ImGui (docking), ImPlot, GLFW and libcurl for sirius-app")
 endif()
 
 if(SIRIUS_ENABLE_CUDA)

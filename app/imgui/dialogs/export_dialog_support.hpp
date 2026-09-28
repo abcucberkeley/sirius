@@ -3,7 +3,7 @@
 
 // What the export, training export and preferences dialogs lay their forms
 // out with: labelled fields side by side in equal columns, a spin box with
-// the prefix the Qt one carries inside its frame ("t 0", "level 6"), the
+// a prefix inside its frame ("t 0", "level 6"), the
 // wrapped 11 px notes, and the row of actions at the bottom (Cancel, then
 // the primary action, flush right, Enter accepting as a default button does).
 //
@@ -141,7 +141,7 @@ namespace sirius::app::gui::dialog_support {
                         Accept };
 
     // "Cancel" (ghost) and the primary action, flush right. Enter accepts
-    // when nothing is being edited, as the default button of a QDialog does.
+    // when nothing is being edited, as a dialog's default button does.
     inline Action actionRow(const std::string& primary, bool enabled) {
         const float gap = theme::px(8);
         const float total = buttonWidth("Cancel", widgets::ButtonKind::Ghost) + gap + buttonWidth(primary, widgets::ButtonKind::Primary);
