@@ -2192,9 +2192,10 @@ namespace sirius::app::gui {
     }
 
     void Viewer::Impl::draw() {
-        const ImVec2 wmin = ImGui::GetWindowPos();
-        const ImVec2 wsize = ImGui::GetWindowSize();
-        const ImVec2 wmax(wmin.x + wsize.x, wmin.y + wsize.y);
+        // Below the window's tab or title bar: the window has no padding, so
+        // the cursor starts where the viewer's own room does.
+        const ImVec2 wmin = ImGui::GetCursorScreenPos();
+        const ImVec2 wmax(ImGui::GetWindowPos().x + ImGui::GetWindowSize().x, ImGui::GetWindowPos().y + ImGui::GetWindowSize().y);
         ImDrawList* dl = ImGui::GetWindowDrawList();
         const ViewState& s0 = vs();
 

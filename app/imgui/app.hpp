@@ -2,8 +2,8 @@
 #define SIRIUS_IMGUI_APP_HPP
 
 // The window shell of docs/design: title/menu bar (brand, seven menus,
-// dataset · GPU readout, ✦ Assistant), the Operations / Parameters /
-// Diagnostics / Log / Assistant docks around the viewer, the status bar,
+// dataset · GPU readout, ✦ Assistant), the Operations / Parameters / viewer /
+// Diagnostics / Log / Assistant docks (each moved by its tab), the status bar,
 // every menu action and keyboard shortcut, layout persistence, the file
 // dialogs and the message boxes. All state lives in the Workbench; this
 // class only routes.

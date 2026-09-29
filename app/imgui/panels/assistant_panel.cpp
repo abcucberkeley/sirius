@@ -1004,7 +1004,7 @@ namespace sirius::app::gui {
             const float margin = px(14);
             const float innerW = std::max(px(40), avail.x - 2 * margin);
 
-            // header: ✦ Assistant · context · ✕
+            // header: ✦ Assistant · context (the dock tab closes the panel)
             const float headerH = theme::snap(px(40));
             {
                 const float cy = origin.y + headerH * 0.5f;
@@ -1014,19 +1014,11 @@ namespace sirius::app::gui {
                 const ImVec2 ts = theme::textSize("Assistant", 13, theme::Weight::ExtraBold);
                 widgets::drawText(dl, ImVec2(x, cy - ts.y * 0.5f), "Assistant", 13, theme::kText, theme::Weight::ExtraBold);
                 x += ts.x + px(10);
-                const float closeSide = px(18);
-                const float closeX = origin.x + avail.x - margin - closeSide;
-                const float room = closeX - px(10) - x;
+                const float room = origin.x + avail.x - margin - x;
                 if (room > px(12)) {
                     place(x, cy - lineHeight(theme::kSmallPx) * 0.5f);
                     widgets::elided(contextLine(), room, theme::kSmallPx, theme::kNeutral600);
                 }
-                place(closeX, cy - closeSide * 0.5f);
-                widgets::GlyphOpts close;
-                close.borderless = true;
-                close.iconPx = 11;
-                close.tooltip = "Close the assistant";
-                if (widgets::glyphButton("##closeAssistant", Icon::Close, 18, close)) app.setAssistantVisible(false);
                 dl->AddRectFilled(ImVec2(origin.x, origin.y + headerH), ImVec2(origin.x + avail.x, origin.y + headerH + rule), theme::kDivider);
             }
 

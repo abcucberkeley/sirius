@@ -59,6 +59,23 @@ through `Bridge::post`; `http::Fetch` does that for requests. `App::defer(fn)`
 runs `fn` between two frames — the place for anything that opens dialogs from
 inside a popup, and the only place `App::waitUntil` may be used.
 
+**Docks.** Operations, Parameters, the viewer, Diagnostics, the log and the
+assistant are plain Dear ImGui dock windows in one dockspace over the main
+window (`App::Impl::drawDockWindows`), and every dock shows its tab bar, even
+for one panel: the tab is how a panel is moved. Dropped on another dock's
+centre target it becomes a tab there, on an edge target it splits that dock,
+and dragged away it floats; out of the main window it gets a window of its own
+where multi-viewport works (not on Wayland, and not while the monitors have
+different scales: `App::Impl::updateViewports`), and those windows take
+dropped files as the main window does. A floating panel docks again by its
+title bar. `buildDefaultLayout` makes the design's arrangement, the viewer in
+the central node, when there is no saved one and for *Window ▸ Reset layout*;
+after that the arrangement is the user's. The Window menu shows and hides the
+panels (the viewer has no close box). Nothing may assume where a panel is: the
+maximised diagnostics cover the viewer, below its tab bar, only while it is
+docked in the main window with its tab in front, and a viewer that is not
+drawn does not keep the frame loop awake for its playback.
+
 **Keys.** The menu actions own their shortcuts (`App`'s action table). They
 stand back while a text field or a popup has the keyboard, while a non-modal
 dialog has focus, for a chord a panel claims with `App::claimKey` on the
@@ -92,7 +109,9 @@ lines instead of crashing; CI's headless run fails on any.
 `Settings` (`settings.hpp`) is one JSON object in
 `<config>/sirius/sirius-app.json` (`%APPDATA%` on Windows, `$XDG_CONFIG_HOME` or
 `~/.config` elsewhere), keyed `group/name` (`worker/python`, `recent/datasets`,
-`assistant/model`, …). Dear ImGui's window layout is `imgui.ini` beside it.
+`assistant/model`, …). Dear ImGui's window layout is `imgui.ini` beside it
+(`Settings::layoutPath`); a layout saved when the docks hid their tabs is
+loaded with them shown again, and written back so.
 Secrets never go there as plain text: `secrets::read / write` keeps them as
 DPAPI-encrypted blobs in that file on Windows and in `~/.sirius/secrets.json`
 (mode 0600) elsewhere.
