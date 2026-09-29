@@ -2,13 +2,14 @@
 #define SIRIUS_IMGUI_DIAGNOSTICS_PANEL_HPP
 
 // Bottom dock content: header (▼/▶ toggle, "DIAGNOSTICS · <step>", tab row,
-// hint, ▁ ❐ ⛶ controls) and the per-kind body built from the selected
-// step's Diagnostics (image cells, table, curves, histograms, facts) plus
-// the dedicated segmentation-cleanup, track and volume panels.
+// hint) and the per-kind body built from the selected step's Diagnostics
+// (image cells, table, curves, histograms, facts) plus the dedicated
+// segmentation-cleanup, track and volume panels.
 //
 // Docked, floating and maximised are the application's business
 // (App::floatDiagnostics, App::dockDiagnostics,
-// App::setDiagnosticsMaximized): the header's controls call those.
+// App::setDiagnosticsMaximized): the window controls on the panel's tab
+// bar, which the application draws, call those.
 
 #include <memory>
 

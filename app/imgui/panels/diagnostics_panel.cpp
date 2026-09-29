@@ -21,9 +21,10 @@
 #include "imgui/widgets/icons.hpp"
 
 // The bottom dock: a 34 px header (▼/▶ toggle, "DIAGNOSTICS · <step>", the
-// tab row, a hint, the ▁ ❐ ⛶ controls) over the page for the selected step:
-// the per-kind grid of cells (DiagnosticsBody), the segmentation cleanup
-// tools, or the track table of tracked labels.
+// tab row, a hint) over the page for the selected step: the per-kind grid of
+// cells (DiagnosticsBody), the segmentation cleanup tools, or the track table
+// of tracked labels. Dock, float and maximise are the window controls on the
+// panel's tab bar, as for every panel (App).
 //
 // Immediate mode: what the page shows is derived again when the revisions it
 // came from move. Selection, outputs and the run state refresh at once; edits
@@ -195,46 +196,13 @@ namespace sirius::app::gui {
         const float margin = px(14), spacing = px(16);
         const float left = origin.x + margin, right = origin.x + width - margin;
         const float cy = origin.y + h * 0.5f;
-
-        // --- ▁ ❐ ⛶ on the right ----------------------------------------------
-        const bool floating = app.diagnosticsFloating();
-        const bool maximized = app.diagnosticsMaximized();
-        const float bw = theme::snap(px(24)), bh = theme::snap(px(22)), bgap = theme::snap(px(2));
-        const float buttonsW = 3.0f * bw + 2.0f * bgap;
-        {
-            float x = right - buttonsW;
-            const float y = theme::snap(cy - bh * 0.5f);
-            auto modeButton = [&](const char* id, Icon icon, bool active, const char* tip) {
-                ImGui::SetCursorScreenPos(ImVec2(x, y));
-                widgets::GlyphOpts o;
-                o.active = active;
-                o.dimmed = true;
-                o.tooltip = tip;
-                const bool pressed = widgets::glyphButton(id, icon, ImVec2(24, 22), o);
-                x += bw + bgap;
-                return pressed;
-            };
-            if (modeButton("##dock", Icon::Dock, !floating && !maximized, "Dock to bottom")) {
-                app.setDiagnosticsMaximized(false);
-                app.dockDiagnostics();
-                setCollapsed(false);
-            }
-            if (modeButton("##float", Icon::Float, floating, "Undock as floating window")) {
-                app.setDiagnosticsMaximized(false);
-                setCollapsed(false);
-                app.floatDiagnostics();
-            }
-            if (modeButton("##max", Icon::Maximize, maximized, "Maximize over viewer")) {
-                setCollapsed(false);
-                if (floating) app.dockDiagnostics();
-                app.setDiagnosticsMaximized(!maximized);
-            }
-        }
+        // the "more tabs" button's box
+        const float bw = theme::snap(px(24)), bh = theme::snap(px(22));
 
         // --- the toggle and the caption on the left ---------------------------
         const float chevron = theme::snap(px(12));
         const std::string cap = captionCase(captionText);
-        const float leftRoom = std::max(px(20), right - buttonsW - spacing - left - chevron - px(8));
+        const float leftRoom = std::max(px(20), right - left - chevron - px(8));
         ImFont* cf = theme::captionFont() ? theme::captionFont() : ImGui::GetFont();
         const std::string shownCap = cells::elideIn(cf, theme::kCaptionPx, cap, leftRoom);
         const float capW = std::ceil(captionWidth(shownCap));
@@ -255,7 +223,7 @@ namespace sirius::app::gui {
         // The header clips rather than widening the window, so it decides
         // itself what to show when squeezed: tabs that do not fit are dropped
         // from the right (behind "…"), the hint goes first.
-        const float avail = width - 2.0f * margin - leftW - spacing - buttonsW - spacing;
+        const float avail = width - 2.0f * margin - leftW - spacing;
         std::vector<float> widths(tabs.size());
         float total = 0.0f;
         for (std::size_t i = 0; i < tabs.size(); ++i) {
@@ -330,7 +298,7 @@ namespace sirius::app::gui {
 
         // --- the hint, when there is room for it -------------------------------
         const std::string hint = collapsed ? "Click to expand" : "Updates live as parameters change";
-        const float rest = right - buttonsW - spacing - x;
+        const float rest = right - x;
         if (rest >= px(80)) {
             const std::string shown = widgets::elideText(hint, rest, theme::kSmallPx);
             widgets::drawTextIn(dl, ImVec2(x, origin.y), ImVec2(x + rest, origin.y + h), shown, theme::kSmallPx, theme::kNeutral600,

@@ -1,6 +1,7 @@
 #include "imgui/app.hpp"
 
 #include <algorithm>
+#include <array>
 #include <chrono>
 #include <cmath>
 #include <cstdio>
@@ -59,6 +60,23 @@ namespace sirius::app::gui {
         constexpr const char* kLogWindow = "Log";
         constexpr const char* kAssistantWindow = "Assistant";
         constexpr const char* kViewerWindow = "Viewer";
+        // A maximised panel's stand-in window: its name plus this, so its tab
+        // reads the same.
+        constexpr const char* kStandInSuffix = "##maximized";
+
+        // The dock windows, in the order they are drawn.
+        enum class Panel { Viewer,
+                           Ops,
+                           Params,
+                           Assistant,
+                           Log,
+                           Diag };
+        constexpr std::size_t kPanelCount = 6;
+
+        // What the Float and Dock controls ask of a panel's window at its next Begin.
+        enum class Move { None,
+                          Float,
+                          Dock };
 
         using Clock = std::chrono::steady_clock;
 
@@ -157,11 +175,53 @@ namespace sirius::app::gui {
 
         // --- docks -------------------------------------------------------------
 
+        constexpr ImGuiWindowFlags kPanelFlags = ImGuiWindowFlags_NoCollapse | ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoScrollWithMouse;
+
+        // Every panel keeps a tab bar, floating as well as docked: its tab is
+        // how it is moved, and its tab bar holds its window controls. So a
+        // floating panel is a dock of its own, and Dear ImGui's dock window
+        // (with the tab bar, no title bar) is the floating window.
+        const ImGuiWindowClass& panelClass() {
+            static const ImGuiWindowClass c = [] {
+                ImGuiWindowClass k;
+                k.DockingAlwaysTabBar = true;
+                return k;
+            }();
+            return c;
+        }
+
+        // A maximised panel's stand-in: a tab bar too, and a class of its own,
+        // so it docks into nothing and nothing docks into it (not even another
+        // stand-in), and its tab cannot be dragged out of its dock.
+        const ImGuiWindowClass& standInClass() {
+            static const ImGuiWindowClass c = [] {
+                ImGuiWindowClass k;
+                k.ClassId = ImHashStr("SiriusMaximizedPanel");
+                k.DockingAllowUnclassed = false;
+                k.DockingAlwaysTabBar = true;
+                k.DockNodeFlagsOverrideSet = ImGuiDockNodeFlags_NoDockingOverMe | ImGuiDockNodeFlags_NoUndocking;
+                return k;
+            }();
+            return c;
+        }
+
         // Whether a dock node is part of the main dockspace, rather than of a
         // group floating on its own (possibly on another monitor).
         bool inDockspace(const ImGuiDockNode* node, ImGuiID dockspace) {
             while (node && node->ParentNode) node = node->ParentNode;
             return node && node->ID == dockspace;
+        }
+
+        // The central node of the dock tree under `node`, found by walking the
+        // tree. Not DockBuilderGetCentralNode: that reads a pointer the root
+        // refreshes only when the dockspace is laid out, and a merge since then
+        // (the last panel floated out of a dock beside the central node) may
+        // have freed the node it points to.
+        ImGuiDockNode* centralNode(ImGuiDockNode* node) {
+            if (!node) return nullptr;
+            if (node->IsLeafNode()) return node->IsCentralNode() ? node : nullptr;
+            if (ImGuiDockNode* found = centralNode(node->ChildNodes[0])) return found;
+            return centralNode(node->ChildNodes[1]);
         }
 
         // The docks' sizes are display pixels: scaled with the design pixels,
@@ -382,20 +442,74 @@ namespace sirius::app::gui {
         bool forcePlaceAssistant = false;
         ImGuiID dockspace = 0;
         ImGuiID assistantDockTarget = 0;       // the node right of Parameters
+        // The diagnostics' maximise: they cover the viewer (the design's
+        // "maximise over viewer"), where every other panel covers the whole
+        // main window (Place::maximized).
         bool diagMaximized = false;
-        bool diagFloating = false;             // not in the main dockspace (alone, or in a floating group)
-        int diagFloatRequest = 0;              // 1 = float, 2 = dock back
-        ImGuiID diagDockId = 0;                // where Diagnostics was last docked in the dockspace, to put it back
+        // Where each panel is, as its window was last drawn, and where the
+        // controls on its tab bar send it (indexed by Panel). Docked means
+        // docked in the main dockspace: a group floating on its own (on
+        // another monitor, say) is floating. A maximised panel is drawn by a
+        // stand-in window over the main window; its own window is not drawn
+        // meanwhile and keeps its place, its dock or where it floats, to go
+        // back to (and that place is what the layout saves).
+        struct Place {
+            const char* window;                // its window's name
+            ImGuiDir home;                     // the side it docks to when its dock is gone (None: the central node; dockTarget)
+            float across;                      // its design size across that side
+            ImGuiID dock = 0;                  // the dock of the main window it was last in, to put it back
+            bool floating = false;             // not in the main dockspace
+            bool maximized = false;            // over the main window, in its stand-in (never the diagnostics)
+            Move request = Move::None;         // what its window's next Begin does
+            ImVec2 min{0, 0}, max{0, 0};       // its window, as last drawn in front
+        };
+        std::array<Place, kPanelCount> places{{{kViewerWindow, ImGuiDir_None, 0.0f},
+                                               {kOpsWindow, ImGuiDir_Left, theme::kOpsDockW},
+                                               {kParamsWindow, ImGuiDir_Right, theme::kParamsDockW},
+                                               {kAssistantWindow, ImGuiDir_Right, theme::kAssistantW},
+                                               {kLogWindow, ImGuiDir_Down, theme::kDiagnosticsH},
+                                               {kDiagWindow, ImGuiDir_Down, theme::kDiagnosticsH}}};
+        Place& placeOf(Panel p) { return places[static_cast<std::size_t>(p)]; }
+        // Dear ImGui gives a new dock the lowest id no dock has, so the id of a
+        // dock that is gone soon names another one, where Dock would put the
+        // panel as a tab. A panel's dock is forgotten once it is gone, before
+        // new docks are made: before the docks asked for are found and after
+        // the dockspace is laid out, on every frame.
+        void forgetLostDocks() {
+            for (Place& pl : places)
+                if (pl.dock && !ImGui::DockBuilderGetNode(pl.dock)) pl.dock = 0;
+        }
+        // One panel at a time is maximised: every maximised panel but `keep`
+        // goes back to its place.
+        void restoreMaximized(Panel keep) {
+            for (std::size_t i = 0; i < kPanelCount; ++i) {
+                if (static_cast<Panel>(i) == keep || !places[i].maximized) continue;
+                places[i].maximized = false;
+                self.requestRedraw();
+            }
+        }
+        // The panel's Window-menu flag; the viewer has none, it is always shown.
+        bool* shownFlag(Panel p) {
+            switch (p) {
+                case Panel::Ops: return &showOps;
+                case Panel::Params: return &showParams;
+                case Panel::Assistant: return &showAssistant;
+                case Panel::Log: return &showLog;
+                case Panel::Diag: return &showDiag;
+                case Panel::Viewer: break;
+            }
+            return nullptr;
+        }
         // The panel's collapsed state as the window's size last followed it,
         // the height it was collapsed to, the height to give back on
         // expanding, and the height of what sits above the panel's header in
-        // its window (its dock's tab bar, or its title bar while it floats).
+        // its window (the tab bar of its dock, docked or floating).
         // diagFitPlace is where the window was then: its dock node, or 0 on
         // its own.
         bool diagCollapsed = false;
         float diagCollapsedH = 0.0f, diagExpandedH = 0.0f, diagInset = 0.0f;
         ImGuiID diagFitPlace = 0;
-        ImVec2 viewerMin{0, 0}, viewerMax{0, 0}, diagMin{0, 0}, diagMax{0, 0};
+        ImVec2 viewerMin{0, 0}, viewerMax{0, 0};
         // The viewer was drawn docked in the main window with its tab in
         // front (this frame once it is drawn, the last one between frames):
         // viewerMin / viewerMax are its room below the tab bar now, which
@@ -453,7 +567,7 @@ namespace sirius::app::gui {
 
         void buildActions();
         void buildDefaultLayout(ImGuiID dockspaceId, ImVec2 size);
-        ImGuiID diagnosticsDockTarget();
+        ImGuiID dockTarget(Panel p);
         void followDiagnosticsCollapse();
         bool fitDiagnosticsToCollapse(bool collapsed);
 
@@ -465,6 +579,13 @@ namespace sirius::app::gui {
         bool drawMenuItem(Action& a);
         void drawStatusBar();
         void drawDockWindows();
+        bool beginPanel(Panel p, bool* open, ImGuiID dockTo);
+        bool beginStandIn(Panel p, bool* open, ImVec2 min, ImVec2 max);
+        void endStandIn(Panel p, ImVec2 min, ImVec2 max);
+        void drawWindowControls(Panel p, ImGuiWindow* panelWindow, bool standIn);
+        void dockPanel(Panel p);
+        void floatPanel(Panel p);
+        void toggleMaximized(Panel p);
         void drawDialogs(std::size_t index);
         void drawDialogBody(Dialog& d);
         void handleShortcuts();
@@ -702,8 +823,8 @@ namespace sirius::app::gui {
         }).checked = [this] { return showDiag; };
         add("Window", "Help page", {ImGuiMod_Alt | ImGuiKey_4}, [this] { self.toggleHelp(); }).checked = [this] { return self.helpOpen(); };
         separator();
+        // The Float and Maximise controls on the diagnostics' tab bar, from the menu.
         add("Window", "Float diagnostics", {}, [this] { self.floatDiagnostics(); });
-        // The maximise control of the diagnostics header, from the keyboard.
         add("Window", "Maximise diagnostics", {}, [this] { self.setDiagnosticsMaximized(!diagMaximized); }, "Let the diagnostics cover the viewer").checked = [this] { return diagMaximized; };
         add("Window", "Reset layout", {}, [this] { self.resetLayout(); });
         add("Window", "Save layout as default", {}, [this] {
@@ -751,6 +872,9 @@ namespace sirius::app::gui {
         ImGui::DockBuilderDockWindow(kLogWindow, bottom);
         ImGui::DockBuilderDockWindow(kViewerWindow, centre);
         ImGui::DockBuilderFinish(id);
+        // The docks the panels were last in are gone, and the new ones may
+        // have their ids: each panel notes its new dock once it is drawn.
+        for (Place& pl : places) pl.dock = 0;
         assistantPlaced = false;
         forcePlaceAssistant = true;
         diagFrontFrames = 3;
@@ -760,43 +884,70 @@ namespace sirius::app::gui {
         diagExpandedH = 0.0f;
     }
 
-    // Where Dock to bottom puts the diagnostics: the dock they were last in,
-    // else the log's, else a new split at the bottom of the central node --
-    // under the viewer while it is there; the node may as well hold another
-    // panel, or nothing when the viewer floats, and keeps what it has. Only
-    // docks of the main dockspace count: a group floating on its own is not
-    // "the bottom".
-    ImGuiID App::Impl::diagnosticsDockTarget() {
+    // Where Dock puts a panel back into the main window: the dock it was last
+    // in there, else (for the diagnostics and the log, which share the bottom
+    // by design) the other one's. Else its side at its design size, as the
+    // default arrangement has it: Operations, Parameters and the assistant
+    // as a column the main window's full height at the dockspace's outer
+    // edge (as a tab dropped on the outer edge target docks: queued, and
+    // done by Dear ImGui at the next frame's start, when 0 is returned); the
+    // diagnostics and the log in a new split at the bottom of the central
+    // node -- under the viewer while it is there; the node may as well hold
+    // another panel, or nothing when the viewer floats, and keeps what it
+    // has. The viewer goes into the central node itself. Only docks of the
+    // main dockspace count: a group floating on its own is not "the main
+    // window". The request is done with, unless 0 is returned without one
+    // queued: then there was no place.
+    ImGuiID App::Impl::dockTarget(Panel p) {
         auto usable = [this](ImGuiID id) {
             ImGuiDockNode* node = id ? ImGui::DockBuilderGetNode(id) : nullptr;
             return node && node->IsLeafNode() && inDockspace(node, dockspace);
         };
-        if (usable(diagDockId)) return diagDockId;
-        if (ImGuiWindow* lw = ImGui::FindWindowByName(kLogWindow); lw && showLog && usable(lw->DockId)) return lw->DockId;
-        ImGuiDockNode* centre = ImGui::DockBuilderGetCentralNode(dockspace);
+        Place& pl = placeOf(p);
+        if (usable(pl.dock)) return pl.dock;
+        const Panel partner = p == Panel::Diag ? Panel::Log : Panel::Diag;
+        if (p == Panel::Diag || p == Panel::Log) {
+            ImGuiWindow* pw = ImGui::FindWindowByName(placeOf(partner).window);
+            if (pw && *shownFlag(partner) && usable(pw->DockId)) return pw->DockId;
+        }
+        if (pl.home == ImGuiDir_Left || pl.home == ImGuiDir_Right) {
+            ImGuiDockNode* root = ImGui::DockBuilderGetNode(dockspace);
+            ImGuiWindow* w = ImGui::FindWindowByName(pl.window);
+            if (root && root->HostWindow && w && w != root->HostWindow) {
+                // the ratio is the left (first) node's, as DockBuilderSplitNode hands it on
+                const float ratio = std::clamp(px(pl.across) / std::max(root->Size.x, 1.0f), 0.05f, 0.6f);
+                ImGui::DockContextQueueDock(GImGui, root->HostWindow, root, w, pl.home, pl.home == ImGuiDir_Left ? ratio : 1.0f - ratio, true);
+                pl.request = Move::None;
+                return 0;
+            }
+        }
+        ImGuiDockNode* centre = centralNode(ImGui::DockBuilderGetNode(dockspace));
         if (!centre) return 0;
-        ImGuiID bottom = 0, rest = 0;
-        ImGui::DockBuilderSplitNode(centre->ID, ImGuiDir_Down, std::clamp(px(theme::kDiagnosticsH) / std::max(centre->Size.y, 1.0f), 0.05f, 0.6f),
-                                    &bottom, &rest);
+        if (pl.home == ImGuiDir_None) return centre->ID;
+        const float extent = pl.home == ImGuiDir_Left || pl.home == ImGuiDir_Right ? centre->Size.x : centre->Size.y;
+        ImGuiID side = 0, rest = 0;
+        ImGui::DockBuilderSplitNode(centre->ID, pl.home, std::clamp(px(pl.across) / std::max(extent, 1.0f), 0.05f, 0.6f), &side, &rest);
         ImGui::DockBuilderFinish(dockspace);
-        return bottom;
+        return side;
     }
 
     // Asked before the dockspace is laid out, every frame. The panel collapses
     // its window while the panel is what the window shows: with the log's tab
     // in front of it, the shared dock is the log's, at its full height. A
     // collapsed window is fitted again when what sits above the header
-    // changes height (at another scale) and when it moves (floated from the
-    // Window menu, dropped into another dock): docked, its dock's tab bar is
-    // above the header, floating, its title bar, and the two are the same
-    // height, so the header alone does not tell.
+    // changes height (at another scale) and when it moves (floated, docked,
+    // dropped into another dock): a tab bar of the same height sits above
+    // the header wherever it is, so the header alone does not tell.
     void App::Impl::followDiagnosticsCollapse() {
         if (!diagnostics) return;
         const ImGuiWindow* dw = ImGui::FindWindowByName(kDiagWindow);
         const bool behindTab = dw && dw->DockIsActive && dw->DockNode && dw->DockNode->VisibleWindow && dw->DockNode->VisibleWindow != dw;
         const bool collapse = showDiag && diagnostics->isCollapsed() && !behindTab;
         const float collapsedH = diagInset + theme::snap(px(theme::kDiagnosticsHeaderH));
-        const ImGuiID place = dw && dw->DockIsActive && dw->DockNode ? dw->DockNode->ID : 0;
+        // Its dock, or 0 on its own. Not DockIsActive: Dear ImGui clears
+        // that for a panel alone in its dock until its next Begin, which for a
+        // floating dock is before this.
+        const ImGuiID place = dw && dw->DockNode ? dw->DockNode->ID : 0;
         if (collapse != diagCollapsed || (collapse && (std::abs(collapsedH - diagCollapsedH) > 0.5f || place != diagFitPlace)))
             fitDiagnosticsToCollapse(collapse);
     }
@@ -805,10 +956,11 @@ namespace sirius::app::gui {
     // only the header, and the viewer takes the room; expanded, it gets its
     // height back. Docked, the dock node is sized (locked once, as a splitter
     // drag does, so the other side of the split takes the difference);
-    // floating, the window. False
-    // when there is nothing to size (yet): a window between two docks (the
-    // frame a layout is rebuilt), one in a floating group, or a dock side by
-    // side with another; the next frame tries again.
+    // floating in a dock of its own (a floating panel keeps its tab bar), that
+    // dock, which is the floating window. False when there is nothing to size
+    // (yet): a window between two docks (the frame a layout is rebuilt), one
+    // in a split floating group, or a dock side by side with another; the
+    // next frame tries again.
     bool App::Impl::fitDiagnosticsToCollapse(bool collapsed) {
         ImGuiWindow* dw = ImGui::FindWindowByName(kDiagWindow);
         if (!dw) return false;
@@ -819,22 +971,31 @@ namespace sirius::app::gui {
             if (!diagCollapsed) diagExpandedH = std::max(current, collapsedH + px(60));
             return collapsedH;
         };
-        if (dw->DockIsActive && dw->DockNode && inDockspace(dw->DockNode, dockspace)) {
+        ImGuiDockNode* node = dw->DockNode;
+        if (dw->DockIsActive && node && inDockspace(node, dockspace)) {
             // Only a dock stacked above or below another: in a row, its height is the row's.
-            ImGuiDockNode* node = dw->DockNode;
             if (!node->ParentNode || node->ParentNode->SplitAxis != ImGuiAxis_Y) return false;
             node->Size.y = node->SizeRef.y = heightFor(node->Size.y);
             node->WantLockSizeOnce = true;
-        } else if (!dw->DockIsActive && (dw->DockNode || dw->DockId == 0)) {
-            // On its own. A dock id without a node is a window about to be
-            // docked (or hidden from its dock): its node is sized once it is in.
+        } else if (node && node->IsRootNode() && node->HostWindow && !inDockspace(node, dockspace)) {
+            // Floating in a dock of its own (with the log as a tab, maybe):
+            // the dock is the floating window. The window's own size is set
+            // too: the layout keeps that one for a panel floating alone.
+            const ImVec2 size(node->Size.x, heightFor(node->Size.y));
+            if (size.x > 0.0f && size.y > 0.0f) ImGui::DockBuilderSetNodeSize(node->ID, size);
+            ImGui::SetWindowSize(kDiagWindow, size, ImGuiCond_Always);
+        } else if (!dw->DockIsActive && ((node && !node->HostWindow) || dw->DockId == 0)) {
+            // On its own: just floated, before its dock has a window (which
+            // then takes this window's size). A dock id without a node is a
+            // window about to be docked (or hidden from its dock): its node is
+            // sized once it is in.
             ImGui::SetWindowSize(kDiagWindow, ImVec2(dw->Size.x, heightFor(dw->Size.y)), ImGuiCond_Always);
         } else {
             return false;
         }
         // The collapsed panel left the dock it had collapsed: what stays there
         // (the log) gets the height back.
-        const ImGuiID place = dw->DockIsActive && dw->DockNode ? dw->DockNode->ID : 0;
+        const ImGuiID place = node ? node->ID : 0;
         if (diagCollapsed && diagFitPlace != 0 && diagFitPlace != place) {
             ImGuiDockNode* left = ImGui::DockBuilderGetNode(diagFitPlace);
             if (left && left->IsLeafNode() && inDockspace(left, dockspace) && left->ParentNode && left->ParentNode->SplitAxis == ImGuiAxis_Y) {
@@ -1290,16 +1451,27 @@ namespace sirius::app::gui {
             layoutBuilt = true;
             rebuildLayout = false;
         }
-        // Before the dockspace is laid out, so a new split or size shows this frame.
-        // Only for a panel that is shown: a target found for a hidden one would
-        // split the central node again on every frame until it is shown.
-        ImGuiID diagTarget = 0;
-        if (diagFloatRequest == 2 && showDiag) {
-            diagTarget = diagnosticsDockTarget();
-            if (!diagTarget) {
+        // Where the panels asked to dock go, before the dockspace is laid out,
+        // so a new split or size shows this frame. Only for a panel that is
+        // shown: a target found for a hidden one would split the central node
+        // again on every frame until it is shown.
+        forgetLostDocks();
+        // A panel asked to the front while another one is maximised would get
+        // the keyboard out of sight, under the stand-in: the maximised one is
+        // restored first.
+        const std::array<bool, kPanelCount> focusing{false, focusOps || openAddMenu, false, focusAssistant, focusLog, focusDiag};
+        for (std::size_t i = 0; i < kPanelCount; ++i)
+            if (focusing[i] && !places[i].maximized) restoreMaximized(static_cast<Panel>(i));
+        std::array<ImGuiID, kPanelCount> dockTo{};
+        for (std::size_t i = 0; i < kPanelCount; ++i) {
+            const bool* shown = shownFlag(static_cast<Panel>(i));
+            if (places[i].request != Move::Dock || (shown && !*shown)) continue;
+            dockTo[i] = dockTarget(static_cast<Panel>(i));
+            if (!dockTo[i] && places[i].request == Move::Dock) {
                 // no central node to split: the last resort is the default arrangement
+                places[i].request = Move::None;
                 rebuildLayout = true;
-                wb().logLine("Layout reset to the default arrangement: the diagnostics had no place to dock back to.");
+                wb().logLine(std::string("Layout reset to the default arrangement: ") + places[i].window + " had no place to dock back to.");
             }
         }
         followDiagnosticsCollapse();
@@ -1313,33 +1485,26 @@ namespace sirius::app::gui {
         // Panels lay out their own margins: the docks have none.
         ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(0, 0));
         ImGui::PushStyleVar(ImGuiStyleVar_WindowMinSize, px(120, 60));
-        const ImGuiWindowFlags panel = ImGuiWindowFlags_NoCollapse | ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoScrollWithMouse;
-        // Floating, a panel has the design's floating frame, 2 px of ink, as
-        // the help window and the dialogs do; docked, the rules between the
-        // docks are its edges. The border is fixed from Begin on, so where the
-        // window was last frame decides: DockNodeIsVisible, which only Begin
-        // sets. Not DockIsActive: the dockspace, laid out above, clears that
-        // for a panel alone in its dock, and a docked window given a border
-        // draws none but is clipped by it on three sides.
-        const auto beginPanel = [&](const char* name, bool* open) {
-            const ImGuiWindow* w = ImGui::FindWindowByName(name);
-            ImGui::PushStyleColor(ImGuiCol_Border, theme::kText);
-            ImGui::PushStyleVar(ImGuiStyleVar_WindowBorderSize, w && !w->DockNodeIsVisible ? theme::crispPen(2) : 0.0f);
-            const bool shown = ImGui::Begin(name, open, panel);
-            ImGui::PopStyleVar();
-            ImGui::PopStyleColor();
-            return shown;
-        };
+        // A maximised panel covers the main window between the title bar and
+        // the status bar.
+        const ImVec2 workMin = vp->WorkPos;
+        const ImVec2 workMax(vp->WorkPos.x + vp->WorkSize.x, vp->WorkPos.y + vp->WorkSize.y);
 
         // The viewer: a panel like the others, which the default arrangement
         // puts in the central node. It has no close box, as nothing would
         // show it again.
         bool covered = false;   // by the maximised diagnostics, this frame
-        {
-            ImGui::PushStyleColor(ImGuiCol_WindowBg, theme::kBg);
-            viewerInFront = false;
-            viewerDrawn = false;
-            if (beginPanel(kViewerWindow, nullptr)) {
+        viewerInFront = false;
+        viewerDrawn = false;
+        ImGui::PushStyleColor(ImGuiCol_WindowBg, theme::kBg);
+        if (placeOf(Panel::Viewer).maximized) {
+            if (beginStandIn(Panel::Viewer, nullptr, workMin, workMax)) {
+                viewer->draw();
+                viewerDrawn = true;
+            }
+            endStandIn(Panel::Viewer, workMin, workMax);
+        } else {
+            if (beginPanel(Panel::Viewer, nullptr, dockTo[static_cast<std::size_t>(Panel::Viewer)])) {
                 // A tab about to come to the front is drawn a frame early, from
                 // behind: Begin alone does not say the viewer is on screen.
                 const ImGuiWindow* vw = ImGui::GetCurrentWindow();
@@ -1352,143 +1517,351 @@ namespace sirius::app::gui {
                 viewerDrawn = !covered;
             }
             ImGui::End();
-            ImGui::PopStyleColor();
+            drawWindowControls(Panel::Viewer, ImGui::FindWindowByName(kViewerWindow), false);
         }
+        ImGui::PopStyleColor();
 
-        if (showOps) {
-            if (focusOps) ImGui::SetNextWindowFocus();
-            focusOps = false;
-            if (beginPanel(kOpsWindow, &showOps)) {
-                if (openAddMenu) {
-                    openAddMenu = false;
-                    ops->openAddMenu();
+        // A panel in its own window, or maximised in its stand-in; `focus` is
+        // a request to give it the keyboard, which `body` may read too.
+        const auto drawPanel = [&](Panel p, bool& focus, const auto& body) {
+            Place& pl = placeOf(p);
+            bool* open = shownFlag(p);
+            if (!*open) {
+                // hidden: its maximise, and a move asked for it as it was, lapse
+                pl.maximized = false;
+                pl.request = Move::None;
+                focus = false;
+                return;
+            }
+            if (focus) ImGui::SetNextWindowFocus();
+            if (pl.maximized) {
+                if (beginStandIn(p, open, workMin, workMax)) body();
+                endStandIn(p, workMin, workMax);
+            } else {
+                if (beginPanel(p, open, dockTo[static_cast<std::size_t>(p)])) body();
+                ImGui::End();
+                drawWindowControls(p, ImGui::FindWindowByName(pl.window), false);
+            }
+            focus = false;
+        };
+        drawPanel(Panel::Ops, focusOps, [&] {
+            if (openAddMenu) {
+                openAddMenu = false;
+                ops->openAddMenu();
+            }
+            ops->draw();
+        });
+        bool noFocus = false;
+        drawPanel(Panel::Params, noFocus, [&] { params->draw(); });
+        // Not while Parameters are maximised: their window, which it is placed
+        // beside, is not drawn then and has no dock; it waits for Restore.
+        if (showAssistant && !assistantPlaced && !placeOf(Panel::Assistant).maximized && !placeOf(Panel::Params).maximized) {
+            // right of Parameters, the design's 330 px, the first time it is
+            // shown and after the layout was rebuilt; not into Parameters
+            // floating on their own (a dock of their own too), which it would
+            // widen and split
+            assistantPlaced = true;
+            const bool place = forcePlaceAssistant || !ImGui::FindWindowSettingsByID(ImHashStr(kAssistantWindow));
+            forcePlaceAssistant = false;
+            if (ImGuiWindow* pw = ImGui::FindWindowByName(kParamsWindow)) {
+                if (pw->DockNode && inDockspace(pw->DockNode, dockspace) && place) {
+                    ImGuiID target = pw->DockNode->ID, side = 0, rest = 0;
+                    forgetLostDocks();   // the dockspace was laid out since: the split may take a lost dock's id
+                    const float total = pw->DockNode->Size.x + px(theme::kAssistantW);
+                    ImGui::DockBuilderSetNodeSize(target, ImVec2(total, pw->DockNode->Size.y));
+                    ImGui::DockBuilderSplitNode(target, ImGuiDir_Right, px(theme::kAssistantW) / std::max(total, 1.0f), &side, &rest);
+                    ImGui::DockBuilderDockWindow(kAssistantWindow, side);
+                    ImGui::DockBuilderFinish(dockspace);
                 }
-                ops->draw();
             }
-            ImGui::End();
         }
-        if (showParams) {
-            if (beginPanel(kParamsWindow, &showParams)) params->draw();
-            ImGui::End();
-        }
-        if (showAssistant) {
-            if (!assistantPlaced) {
-                // right of Parameters, the design's 330 px, the first time it is
-                // shown and after the layout was rebuilt
-                assistantPlaced = true;
-                const bool place = forcePlaceAssistant || !ImGui::FindWindowSettingsByID(ImHashStr(kAssistantWindow));
-                forcePlaceAssistant = false;
-                if (ImGuiWindow* pw = ImGui::FindWindowByName(kParamsWindow)) {
-                    if (pw->DockNode && place) {
-                        ImGuiID target = pw->DockNode->ID, side = 0, rest = 0;
-                        const float total = pw->DockNode->Size.x + px(theme::kAssistantW);
-                        ImGui::DockBuilderSetNodeSize(target, ImVec2(total, pw->DockNode->Size.y));
-                        ImGui::DockBuilderSplitNode(target, ImGuiDir_Right, px(theme::kAssistantW) / std::max(total, 1.0f), &side, &rest);
-                        ImGui::DockBuilderDockWindow(kAssistantWindow, side);
-                        ImGui::DockBuilderFinish(dockspace);
-                    }
-                }
-            }
-            if (focusAssistant) ImGui::SetNextWindowFocus();
-            if (beginPanel(kAssistantWindow, &showAssistant)) {
-                if (focusAssistant) assistant->focusInput();
-                assistant->draw();
-            }
-            focusAssistant = false;
-            ImGui::End();
-        }
+        drawPanel(Panel::Assistant, focusAssistant, [&] {
+            if (focusAssistant) assistant->focusInput();
+            assistant->draw();
+        });
         // The log before the diagnostics: a dock tab that appears later
         // selects itself, and the diagnostics are the tab to start on.
-        if (showLog) {
-            if (focusLog) ImGui::SetNextWindowFocus();
-            if (beginPanel(kLogWindow, &showLog)) {
-                if (focusLog) log->showLatest();
-                log->draw();
-            }
-            focusLog = false;
-            ImGui::End();
-        }
+        drawPanel(Panel::Log, focusLog, [&] {
+            if (focusLog) log->showLatest();
+            log->draw();
+        });
+
         bool diagInFront = false;
-        if (showDiag) {
-            if (diagFloatRequest == 1) {
-                ImGui::SetNextWindowDockID(0, ImGuiCond_Always);
-                ImGui::SetNextWindowSize(ImVec2(std::max(px(480), diagMax.x - diagMin.x), std::max(px(360), diagMax.y - diagMin.y)),
-                                         ImGuiCond_Always);
-                ImGui::SetNextWindowPos(ImVec2(diagMin.x + px(40), std::max(vp->WorkPos.y + px(40), diagMin.y - px(160))), ImGuiCond_Always);
-                ImGui::SetNextWindowFocus();
-            } else if (diagFloatRequest == 2 && diagTarget) {
-                ImGui::SetNextWindowDockID(diagTarget, ImGuiCond_Always);
-            }
-            diagFloatRequest = 0;
+        Place& diag = placeOf(Panel::Diag);
+        // Floating under the cover, the panel's window is not drawn: the cover
+        // shows the panel, and the window keeps its place for Restore.
+        const bool diagUnderCover = covered && showDiag && diag.floating && diag.request == Move::None;
+        if (diagUnderCover) {
+            focusDiag = false;
+        } else if (showDiag) {
             if (focusDiag) ImGui::SetNextWindowFocus();
             focusDiag = false;
             const bool toFront = diagFrontFrames > 0;
             // collapsed to its header, a floating diagnostics window is lower than a panel may otherwise be
             ImGui::PushStyleVar(ImGuiStyleVar_WindowMinSize, ImVec2(px(120), diagCollapsed ? px(theme::kDiagnosticsHeaderH) : px(60)));
-            const bool open = beginPanel(kDiagWindow, &showDiag);
+            const bool open = beginPanel(Panel::Diag, &showDiag, dockTo[static_cast<std::size_t>(Panel::Diag)]);
             ImGui::PopStyleVar();
-            {
-                // Docked means docked in the main dockspace: a group floating on
-                // its own (on another monitor, say) is floating for the maximise
-                // cover and for Dock to bottom. Where it is docked is remembered
-                // on every frame, to dock it back there.
-                ImGuiWindow* dw = ImGui::GetCurrentWindow();
-                diagFloating = !(dw->DockIsActive && dw->DockNode && inDockspace(dw->DockNode, dockspace));
-                if (!diagFloating) diagDockId = dw->DockId;
-                // Behind another tab, the rectangle below is the one last shown.
-                diagInFront = open && (!dw->DockIsActive || dw->DockTabIsVisible);
-            }
+            ImGuiWindow* dw = ImGui::GetCurrentWindow();
+            // Behind another tab, the rectangle it had is the one last shown.
+            diagInFront = open && (!dw->DockIsActive || dw->DockTabIsVisible);
             if (toFront) {
                 // selected in its tab bar without taking the keyboard from the viewer
-                if (ImGuiWindow* dw = ImGui::GetCurrentWindow()) {
-                    if (dw->DockNode && dw->DockNode->TabBar) {
-                        dw->DockNode->TabBar->NextSelectedTabId = dw->TabId;
-                        dw->DockNode->SelectedTabId = dw->TabId;
-                        --diagFrontFrames;   // counted once the tab bar exists
-                    }
+                if (dw->DockNode && dw->DockNode->TabBar) {
+                    dw->DockNode->TabBar->NextSelectedTabId = dw->TabId;
+                    dw->DockNode->SelectedTabId = dw->TabId;
+                    --diagFrontFrames;   // counted once the tab bar exists
                 }
                 self.requestRedraw(2);
             }
             if (open) {
-                diagMin = ImGui::GetWindowPos();
-                diagMax = ImVec2(diagMin.x + ImGui::GetWindowSize().x, diagMin.y + ImGui::GetWindowSize().y);
-                diagInset = ImGui::GetCursorScreenPos().y - diagMin.y;
+                diagInset = ImGui::GetCursorScreenPos().y - dw->Pos.y;
                 if (!covered) diagnostics->draw();
             }
             ImGui::End();
+            drawWindowControls(Panel::Diag, dw, false);
         } else {
             // hidden: a float or dock request made for the panel as it was lapses
             diagMaximized = false;
-            diagFloatRequest = 0;
+            diag.request = Move::None;
         }
 
         // Maximised: the diagnostics take the viewer's room below its tab bar
-        // until they are restored. The arrangement underneath is left as it
-        // is, and the tabs of the viewer's dock stay usable. While the viewer
-        // is behind another tab or floating, the main window has no room of
-        // the viewer's to give: the diagnostics stay in their own window,
-        // still maximised, and cover the viewer once it is docked there with
-        // its tab in front again.
+        // until they are restored, in their stand-in with its own tab bar. The
+        // arrangement underneath is left as it is, and the tabs of the viewer's
+        // dock stay usable. While the viewer is behind another tab, floating
+        // or maximised itself, the main window has no room of the viewer's to
+        // give: the diagnostics stay in their own window, still maximised, and
+        // cover the viewer once it is docked there with its tab in front again.
         if (covered && showDiag) {
             // The cover takes the diagnostics' own room as well only when they
             // are docked right under the viewer; otherwise it keeps to the
             // viewer, and never spreads over Parameters or another monitor.
-            const bool under = diagInFront && !diagFloating && diagMax.x > diagMin.x && std::abs(diagMin.y - viewerMax.y) <= px(4) &&
-                               diagMin.x < viewerMax.x && diagMax.x > viewerMin.x;
+            const bool under = diagInFront && !diag.floating && diag.max.x > diag.min.x && std::abs(diag.min.y - viewerMax.y) <= px(4) &&
+                               diag.min.x < viewerMax.x && diag.max.x > viewerMin.x;
             const ImVec2 min(viewerMin.x, viewerMin.y);
-            const ImVec2 max(viewerMax.x, std::max(viewerMax.y, under ? diagMax.y : viewerMax.y));
-            ImGui::SetNextWindowPos(min);
-            ImGui::SetNextWindowSize(ImVec2(max.x - min.x, max.y - min.y));
+            const ImVec2 max(viewerMax.x, std::max(viewerMax.y, under ? diag.max.y : viewerMax.y));
             ImGui::PushStyleColor(ImGuiCol_WindowBg, theme::kBg);
-            const ImGuiWindowFlags cover = ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoSavedSettings |
-                                           ImGuiWindowFlags_NoDocking | ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoScrollWithMouse;
-            if (ImGui::Begin("##diagnosticsMaximized", nullptr, cover)) diagnostics->draw();
-            ImGui::End();
+            if (beginStandIn(Panel::Diag, &showDiag, min, max)) diagnostics->draw();
+            endStandIn(Panel::Diag, min, max);
             ImGui::PopStyleColor();
         }
         ImGui::PopStyleVar(2);
+        // Docks laid out this frame may have been merged away: forgotten
+        // before the next frame can hand their ids to new docks.
+        forgetLostDocks();
 
         help->draw();
+    }
+
+    // A panel's own window. It applies what the panel's Dock or Float control
+    // asked (`dockTo`: the dock found for a Dock), and notes where the window
+    // is now.
+    bool App::Impl::beginPanel(Panel p, bool* open, ImGuiID dockTo) {
+        Place& pl = placeOf(p);
+        const ImGuiViewport* vp = ImGui::GetMainViewport();
+        const ImGuiWindow* w = ImGui::FindWindowByName(pl.window);
+        // Floating, a panel has the design's floating frame, 2 px of ink, as
+        // the help window and the dialogs do (drawWindowControls draws it
+        // round its dock, the floating window); docked, the rules between the
+        // docks are its edges. A docked window given a border draws none but
+        // keeps its content inside it on three sides: clear of the frame. The
+        // border is fixed from Begin on, so where the window goes this frame
+        // decides, or else where it was last frame.
+        bool framed = w && !inDockspace(w->DockId ? ImGui::DockBuilderGetNode(w->DockId) : nullptr, dockspace);
+        if (pl.request == Move::Float) {
+            // Out of its dock into a window of its own near where it was: the
+            // size it had, within reason (at least 480 x 360, at most 80 % of
+            // the main window's work area), a little down and right of where
+            // it was, inside the main window.
+            const ImVec2 most(vp->WorkSize.x * 0.8f, vp->WorkSize.y * 0.8f);
+            const ImVec2 least(std::min(px(480), most.x), std::min(px(360), most.y));
+            const ImVec2 size(std::clamp(pl.max.x - pl.min.x, least.x, most.x), std::clamp(pl.max.y - pl.min.y, least.y, most.y));
+            const ImVec2 room(std::max(vp->WorkPos.x, vp->WorkPos.x + vp->WorkSize.x - size.x),
+                              std::max(vp->WorkPos.y, vp->WorkPos.y + vp->WorkSize.y - size.y));
+            ImGui::SetNextWindowDockID(0, ImGuiCond_Always);
+            ImGui::SetNextWindowSize(size, ImGuiCond_Always);
+            ImGui::SetNextWindowPos(ImVec2(std::clamp(pl.min.x + px(40), vp->WorkPos.x, room.x), std::clamp(pl.min.y + px(40), vp->WorkPos.y, room.y)),
+                                    ImGuiCond_Always);
+            ImGui::SetNextWindowFocus();
+            framed = true;
+        } else if (pl.request == Move::Dock && dockTo) {
+            ImGui::SetNextWindowDockID(dockTo, ImGuiCond_Always);
+            framed = false;
+        }
+        pl.request = Move::None;
+        ImGui::PushStyleColor(ImGuiCol_Border, theme::kText);
+        ImGui::PushStyleVar(ImGuiStyleVar_WindowBorderSize, framed ? theme::crispPen(2) : 0.0f);
+        ImGui::SetNextWindowClass(&panelClass());
+        const bool shown = ImGui::Begin(pl.window, open, kPanelFlags);
+        ImGui::PopStyleVar();
+        ImGui::PopStyleColor();
+        // Where it is docked is remembered on every frame, to dock it back there.
+        const ImGuiWindow* cw = ImGui::GetCurrentWindow();
+        pl.floating = !(cw->DockIsActive && cw->DockNode && inDockspace(cw->DockNode, dockspace));
+        if (!pl.floating) pl.dock = cw->DockId;
+        // Floating, the window the user resizes is its dock's, which Dear
+        // ImGui begins before this with its own minimum size (32 px), not the
+        // panels' one pushed around this: the dock is held to the panels' from
+        // the next frame on.
+        if (pl.floating && cw->DockIsActive && cw->DockNode) {
+            const ImGuiDockNode* root = ImGui::DockNodeGetRootNode(cw->DockNode);
+            const ImVec2 least = ImGui::GetStyle().WindowMinSize;
+            if (root->HostWindow && (root->Size.x < least.x - 0.5f || root->Size.y < least.y - 0.5f))
+                ImGui::DockBuilderSetNodeSize(root->ID, ImMax(root->Size, least));
+        }
+        // Behind another tab, the rectangle it had is the one last shown.
+        if (shown) {
+            pl.min = cw->Pos;
+            pl.max = ImVec2(cw->Pos.x + cw->Size.x, cw->Pos.y + cw->Size.y);
+        }
+        return shown;
+    }
+
+    // A maximised panel is drawn in a stand-in window pinned over `min` -
+    // `max` (the main window's work area; the viewer's room for the
+    // diagnostics), on top of the rest, with a tab bar of its own for its
+    // controls. Its own window is not drawn meanwhile, and keeps its place.
+    bool App::Impl::beginStandIn(Panel p, bool* open, ImVec2 min, ImVec2 max) {
+        // Until Dear ImGui gives its dock a window, the stand-in is a window
+        // on its own for a frame, placed here; after that endStandIn places
+        // its dock.
+        ImGui::SetNextWindowPos(min, ImGuiCond_Always);
+        ImGui::SetNextWindowSize(ImVec2(std::max(max.x - min.x, 1.0f), std::max(max.y - min.y, 1.0f)), ImGuiCond_Always);
+        ImGui::SetNextWindowClass(&standInClass());
+        ImGui::PushStyleVar(ImGuiStyleVar_WindowBorderSize, 0.0f);
+        const bool shown = ImGui::Begin((std::string(placeOf(p).window) + kStandInSuffix).c_str(), open,
+                                        kPanelFlags | ImGuiWindowFlags_NoSavedSettings | ImGuiWindowFlags_NoMove);
+        ImGui::PopStyleVar();
+        return shown;
+    }
+
+    void App::Impl::endStandIn(Panel p, ImVec2 min, ImVec2 max) {
+        ImGuiWindow* w = ImGui::GetCurrentWindow();
+        ImGui::End();
+        // Its dock is the floating window: pinned from the next frame on, as
+        // the main window is resized; dragging its tab moves it nowhere.
+        if (w->DockNode && w->DockNode->IsRootNode() && max.x > min.x && max.y > min.y) {
+            ImGui::DockBuilderSetNodePos(w->DockNode->ID, min);
+            ImGui::DockBuilderSetNodeSize(w->DockNode->ID, ImVec2(max.x - min.x, max.y - min.y));
+        }
+        drawWindowControls(p, w, true);
+    }
+
+    // The window controls at the right end of a dock's tab bar: Dock, Float
+    // and Maximise, for the panel whose tab is in front there (in a dock the
+    // log shares with the diagnostics, the set follows the tab). The control
+    // of where the panel is now -- docked in the main window, floating, or
+    // maximised -- is drawn active, as the diagnostics header drew its mode.
+    // A floating dock also gets the design's 2 px ink frame here, round its
+    // tab bar and its edges: it is drawn by the dock's own window, on top of
+    // its tab bar, and the panels in it keep their content inside the frame
+    // (beginPanel).
+    void App::Impl::drawWindowControls(Panel p, ImGuiWindow* panelWindow, bool standIn) {
+        if (!panelWindow || !panelWindow->Active || !panelWindow->DockNode || panelWindow->DockNode->VisibleWindow != panelWindow) return;
+        ImGuiDockNode* node = panelWindow->DockNode;
+        if (!ImGui::DockNodeBeginAmendTabBar(node)) return;
+        ImDrawList* dl = ImGui::GetWindowDrawList();
+        const ImGuiDockNode* root = ImGui::DockNodeGetRootNode(node);
+        if (!standIn && root->HostWindow && !inDockspace(node, dockspace)) {
+            const ImGuiWindow* host = root->HostWindow;
+            widgets::crispRect(dl, host->Pos, ImVec2(host->Pos.x + host->Size.x, host->Pos.y + host->Size.y), theme::kText, 2);
+        }
+
+        const Place& pl = placeOf(p);
+        const bool maximized = p == Panel::Diag ? diagMaximized : pl.maximized;
+        const bool floating = !maximized && pl.floating;
+        const bool docked = !maximized && !floating;
+        // Drawn over the tab's own rectangle, which is left empty: bordered
+        // squares, the accent fill and a paper icon when active, the accent
+        // border when hovered.
+        ImGui::PushStyleColor(ImGuiCol_TabHovered, theme::kTransparent);
+        // Dear ImGui lays the trailing tabs out right after the other tabs
+        // (further left only when those overflow). Each control is moved to
+        // the right end before it is submitted, as far from it as the first
+        // tab is from the left one: from this frame's layout and tab bar, so
+        // the controls keep to the edge while a dock is resized, and never
+        // left of where the layout put them, onto the tabs.
+        ImGuiTabBar* bar = node->TabBar;
+        const float gap = ImGui::GetStyle().ItemInnerSpacing.x, buttonW = theme::snap(px(24));
+        const float margin = std::max(bar->BarRect.Min.x - node->Pos.x, px(4));
+        const float end = bar->BarRect.GetWidth() - margin;   // tab offsets are from the bar's left end
+        int index = 0;
+        const auto control = [&](const char* id, Icon icon, bool active, const char* tip) {
+            const float after = static_cast<float>(2 - index++);   // controls right of this one
+            if (ImGuiTabItem* tab = ImGui::TabBarFindTabByID(bar, ImGui::GetID(id)))
+                tab->Offset = std::max(tab->Offset, std::floor(end - buttonW - after * (buttonW + gap)));
+            ImGui::SetNextItemWidth(buttonW);
+            const bool pressed = ImGui::TabItemButton(id, ImGuiTabItemFlags_Trailing | ImGuiTabItemFlags_NoTooltip);
+            const ImVec2 a = ImGui::GetItemRectMin(), b = ImGui::GetItemRectMax();
+            if (b.x - a.x < 1.0f) return false;   // its first frame: taken into the tab bar, not laid out yet
+            const bool hovered = ImGui::IsItemHovered();
+            if (hovered) ImGui::SetMouseCursor(ImGuiMouseCursor_Hand);
+            const float h = theme::snap(px(22));
+            const ImVec2 min(a.x, theme::snap((a.y + b.y - h) * 0.5f));
+            const ImVec2 max(b.x, min.y + h);
+            if (active) dl->AddRectFilled(min, max, theme::kAccent);
+            widgets::crispRect(dl, min, max, active || hovered ? theme::kAccent : theme::kNeutral400);
+            drawIcon(dl, ImVec2((min.x + max.x) * 0.5f, (min.y + max.y) * 0.5f), theme::snap(px(15)), icon,
+                     active ? theme::kBg : theme::kNeutral600, px(1.5f));
+            widgets::tooltip(tip);
+            return pressed;
+        };
+        if (control("##dock", Icon::Dock, docked, docked ? "Docked in the main window" : "Dock in the main window")) dockPanel(p);
+        if (control("##float", Icon::Float, floating, floating ? "Floating outside the main window" : "Float in a window of its own"))
+            floatPanel(p);
+        const char* maximize = p == Panel::Diag ? "Maximise over the viewer" : "Maximise over the main window";
+        if (control("##maximize", Icon::Maximize, maximized, maximized ? "Restore" : maximize)) toggleMaximized(p);
+        ImGui::PopStyleColor();
+        ImGui::DockNodeEndAmendTabBar();
+    }
+
+    // The window controls' commands. The diagnostics' are App's (the Window
+    // menu and the tool calls use them too), their maximise the cover over
+    // the viewer; a change of mode shows them expanded, as a collapsed panel
+    // would be a strip in its new place.
+    void App::Impl::dockPanel(Panel p) {
+        Place& pl = placeOf(p);
+        if (p == Panel::Diag) {
+            if (diagMaximized || pl.floating) diagnostics->setCollapsed(false);
+            self.dockDiagnostics();
+            return;
+        }
+        // maximised, it goes back to its dock if it had one; floating, it docks
+        pl.maximized = false;
+        if (pl.floating) pl.request = Move::Dock;
+        self.requestRedraw();
+    }
+
+    void App::Impl::floatPanel(Panel p) {
+        Place& pl = placeOf(p);
+        if (p == Panel::Diag) {
+            if (diagMaximized || !pl.floating) {
+                diagnostics->setCollapsed(false);
+                self.floatDiagnostics();
+            }
+            return;
+        }
+        pl.maximized = false;
+        if (!pl.floating) pl.request = Move::Float;
+        self.requestRedraw();
+    }
+
+    void App::Impl::toggleMaximized(Panel p) {
+        Place& pl = placeOf(p);
+        if (p == Panel::Diag) {
+            // Floating, the panel keeps its window, not drawn under the cover,
+            // and Restore shows it there again.
+            diagnostics->setCollapsed(false);
+            self.setDiagnosticsMaximized(!diagMaximized);
+            return;
+        }
+        pl.maximized = !pl.maximized;
+        pl.request = Move::None;
+        if (pl.maximized) {
+            restoreMaximized(p);
+            diagMaximized = false;
+        }
+        self.requestRedraw();
     }
 
     // --- dialogs ----------------------------------------------------------------------
@@ -2552,7 +2925,7 @@ namespace sirius::app::gui {
             // The slices are grabbed as the last frame drew them, which it
             // does not while the viewer is behind a tab or under the cover.
             wb().logLine(impl_->viewerDrawn ? "Export figure: the view could not be grabbed."
-                                            : "Export figure: the viewer is not on screen (behind another tab, or under the maximised diagnostics).");
+                                            : "Export figure: the viewer is not on screen (behind another tab, or under a maximised panel).");
             return;
         }
         std::string path = platform::saveFileDialog("Export figure", impl_->lastDir, "figure.png", {{"PNG", "png"}});
@@ -2783,10 +3156,14 @@ namespace sirius::app::gui {
     }
 
     void App::setDiagnosticsMaximized(bool on) {
+        // The cover over the viewer is the one maximised panel. A maximised
+        // viewer goes back into its dock, where the cover finds it.
+        const bool viewerComesBack = on && impl_->placeOf(Panel::Viewer).maximized;
+        if (on) impl_->restoreMaximized(Panel::Diag);
         impl_->diagMaximized = on;
         if (on) impl_->showDiag = true;
         // otherwise nothing on screen would say why nothing changed
-        if (on && !impl_->viewerInFront)
+        if (on && !impl_->viewerInFront && !viewerComesBack)
             wb().logLine("Diagnostics maximised: they cover the viewer once it is docked in the main window with its tab in front.");
         requestRedraw();
     }
@@ -2796,18 +3173,19 @@ namespace sirius::app::gui {
     void App::floatDiagnostics() {
         impl_->showDiag = true;
         impl_->diagMaximized = false;
-        impl_->diagFloatRequest = 1;
+        // Floating already (under the cover, say), it stays where it floats.
+        if (!impl_->placeOf(Panel::Diag).floating) impl_->placeOf(Panel::Diag).request = Move::Float;
         requestRedraw();
     }
 
-    bool App::diagnosticsFloating() const { return impl_->diagFloating; }
+    bool App::diagnosticsFloating() const { return impl_->placeOf(Panel::Diag).floating; }
 
     void App::dockDiagnostics() {
         impl_->showDiag = true;
         impl_->diagMaximized = false;
         // Only the diagnostics move (drawDockWindows finds them a dock): the
         // rest of the arrangement stays as the user left it.
-        if (impl_->diagFloating) impl_->diagFloatRequest = 2;
+        if (impl_->placeOf(Panel::Diag).floating) impl_->placeOf(Panel::Diag).request = Move::Dock;
         requestRedraw();
     }
 
@@ -2816,6 +3194,10 @@ namespace sirius::app::gui {
         d.rebuildLayout = true;
         d.showOps = d.showParams = d.showDiag = d.showLog = true;
         d.diagMaximized = false;
+        for (Impl::Place& p : d.places) {
+            p.maximized = false;
+            p.request = Move::None;
+        }
         wb().logLine("Layout reset to the default arrangement.");
         requestRedraw();
     }

@@ -3,7 +3,8 @@
 
 // The window shell of docs/design: title/menu bar (brand, seven menus,
 // dataset · GPU readout, ✦ Assistant), the Operations / Parameters / viewer /
-// Diagnostics / Log / Assistant docks (each moved by its tab), the status bar,
+// Diagnostics / Log / Assistant docks (each moved by its tab, and docked,
+// floated or maximised by the controls on its tab bar), the status bar,
 // every menu action and keyboard shortcut, layout persistence, the file
 // dialogs and the message boxes. All state lives in the Workbench; this
 // class only routes.
