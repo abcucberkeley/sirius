@@ -143,8 +143,8 @@ namespace sirius::app {
                 const Validation v = validate(p, input.meta);
                 if (!v.ok()) throw std::runtime_error(v.firstError());
                 if (!ctx.remote)
-                    throw std::runtime_error("The foundation model needs the Python worker: start it from "
-                                             "Preferences ▸ Worker, or choose the HPC backend");
+                    throw std::runtime_error("The foundation model needs the Python worker, which is not available here "
+                                             "(see the worker message in the log), or the HPC backend");
                 if (!ctx.remote->supports("foundation"))
                     throw std::runtime_error("The connected worker does not implement the foundation model (" +
                                              ctx.remote->capabilities().hostname +

@@ -13,9 +13,9 @@ $$
 
 | Parameter | Explanation |
 |---|---|
-| **Min · Max** <br> data range | The window: values at or below min map to 0, at or above max to 1. The sliders span the input's intensity range; the histogram panel greys out the clipped tails. |
+| **Min · Max** <br> data range | The window: values at or below min map to 0, at or above max to 1. The sliders span the input's intensity range; the histogram panel greys out the clipped tails. A max at or below min leaves the window automatic: the auto percentiles of the input, taken when the step runs. |
 | **Gamma** <br> 0.1 – 5 | Below 1 lifts dim structures; above 1 emphasises bright ones. |
-| **Auto** <br> button | Sets min and max to the *auto percentiles* (0.2 and 99.8 by default, under *More parameters…*) of the input, over every channel. A newly added step starts this way. |
+| **Auto** <br> button | Sets min and max to the *auto percentiles* (0.2 and 99.8 by default, under *More parameters…*) of the input, over every channel. A step added when its input has been computed starts this way; one added before, or through `sirius-cli` or an agent, starts automatic. |
 | **Reset** <br> button | Min and max over the input's full range, gamma 1: no clipping. |
 
 ## Note

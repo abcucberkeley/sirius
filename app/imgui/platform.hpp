@@ -8,29 +8,23 @@
 #include <string>
 #include <vector>
 
+#include "core/host.hpp"
+
 namespace sirius::app::gui::platform {
 
-    std::string homeDirectory();
-    std::string configDirectory();      // %APPDATA% / $XDG_CONFIG_HOME / ~/.config
-    std::string tempDirectory();
-    std::string executableDirectory();  // of the running program
-    int processId();
-    // "" when the variable is not set.
-    std::string environment(const char* name);
-    bool hasEnvironment(const char* name);
-    // The Python interpreter to start the worker with when nothing names one:
-    // the first of python3 / python on PATH (on Windows also python3.x.exe and
-    // the py launcher's installs), skipping the Microsoft Store alias that
-    // only prints how to install Python. "" when there is none.
-    std::string findPython();
-    // Creates the directory and its parents; true when it exists afterwards.
-    bool makePath(const std::string& dir);
-    // Reads / writes a whole file; read returns false when it cannot be opened.
-    bool readFile(const std::string& path, std::string& out);
-    // Written beside the file and renamed over it, so a crash leaves the
-    // previous content whole. False when it could not be written; the
-    // previous content is then left as it was.
-    bool writeFileAtomic(const std::string& path, const std::string& content, bool ownerOnly = false);
+    // The part without a window lives in core (core/host.hpp), which
+    // sirius-cli shares; these keep the GUI's `platform::` spelling.
+    using host::configDirectory;
+    using host::environment;
+    using host::executableDirectory;
+    using host::findPython;
+    using host::hasEnvironment;
+    using host::homeDirectory;
+    using host::makePath;
+    using host::processId;
+    using host::readFile;
+    using host::tempDirectory;
+    using host::writeFileAtomic;
 
     // --- native dialogs (blocking; the window waits as under a modal dialog) ---
     struct FileFilter {

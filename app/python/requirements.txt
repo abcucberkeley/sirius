@@ -1,0 +1,3 @@
+# What the SIRIUS worker (sirius_worker) needs to start. SIRIUS installs this
+# into its own Python environment (sirius-cli worker setup / Preferences > Compute).
+numpy

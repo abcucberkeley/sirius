@@ -18,8 +18,9 @@ include(Dependencies)
 
 add_subdirectory(src)
 
-# before tests: the app's GUI-free core library is unit-tested there
-if(SIRIUS_ENABLE_APP)
+# before tests: the app's GUI-free core library is unit-tested there. The core
+# and sirius-cli need no window, so SIRIUS_ENABLE_CLI builds them without the GUI.
+if(SIRIUS_ENABLE_APP OR SIRIUS_ENABLE_CLI)
     add_subdirectory(app)
 endif()
 

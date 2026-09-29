@@ -142,6 +142,11 @@ endif()
 # OpenMP (provided by the host compiler)
 find_package(OpenMP REQUIRED)
 
+# Threads: the app core's child processes and worker connections, sirius-cli
+# and the tests all use Threads::Threads, so it is found once, here, for every
+# directory.
+find_package(Threads REQUIRED)
+
 # toml++ : TOML parser/serializer
 FetchContent_Declare(
     tomlplusplus
@@ -277,13 +282,30 @@ if(SIRIUS_ENABLE_MPI)
     find_package(MPI REQUIRED)
 endif()
 
+# stb (a commit of master, as a tarball): PNG in and out for the GUI's icons
+# and screenshots, and PNG / JPEG out for the app core's renders, which
+# sirius-cli hands to scripts and agents -- so it is fetched for either
+# executable. Header-only; the one source file of each that holds an
+# implementation defines it there.
+if(SIRIUS_ENABLE_APP OR SIRIUS_ENABLE_CLI)
+    FetchContent_Declare(
+        stb
+        URL      https://github.com/nothings/stb/archive/2c980bb59875b0d32144a71867fbdebb2f77cd20.tar.gz
+        URL_HASH SHA256=9a955b1b49a4410088a2e0ee2a9c057c3c907d0c1d75454144cb980aca0ba515
+    )
+    FetchContent_MakeAvailable(stb)
+    add_library(sirius_stb INTERFACE)
+    # SYSTEM: excluded from warnings and MSVC /analyze, like the other deps.
+    target_include_directories(sirius_stb SYSTEM INTERFACE ${stb_SOURCE_DIR})
+endif()
+
 # The application (app/imgui). Everything it needs is small enough to fetch
 # and build in-tree, pinned like the rest: GLFW for the window and the
 # OpenGL context, Dear ImGui (docking branch: dockable, floatable panels) with
 # its GLFW and OpenGL 3 backends, ImPlot for the diagnostics charts, a text
-# editor widget for the plugin files, native file dialogs, stb for PNG in and
-# out, and libcurl for the assistant and the model hub. Dear ImGui, ImPlot and
-# the editor ship no CMake project, so their targets are described here.
+# editor widget for the plugin files, native file dialogs, and libcurl for
+# the assistant and the model hub (stb is fetched above). Dear ImGui, ImPlot
+# and the editor ship no CMake project, so their targets are described here.
 if(SIRIUS_ENABLE_APP)
     find_package(OpenGL REQUIRED)
 
@@ -310,7 +332,7 @@ if(SIRIUS_ENABLE_APP)
         GIT_TAG        b48d1afbe8ee8b238e2961dc363a949dd7304e23   # v1.92.9b-docking
         GIT_SHALLOW    TRUE
     )
-    # These three have no release tags: commits of master, as tarballs.
+    # These two have no release tags: commits of master, as tarballs.
     FetchContent_Declare(
         implot
         URL      https://github.com/epezent/implot/archive/09e2ba71766e25d88053a2173936c9d1043bae42.tar.gz   # 1.92-compatible
@@ -322,12 +344,7 @@ if(SIRIUS_ENABLE_APP)
         URL_HASH SHA256=69e419617763720da3b9619b4d3090f5efc7982e08281a2ecce42f76ddd4bc70
         SOURCE_SUBDIR cmake-not-used
     )
-    FetchContent_Declare(
-        stb
-        URL      https://github.com/nothings/stb/archive/2c980bb59875b0d32144a71867fbdebb2f77cd20.tar.gz
-        URL_HASH SHA256=9a955b1b49a4410088a2e0ee2a9c057c3c907d0c1d75454144cb980aca0ba515
-    )
-    FetchContent_MakeAvailable(imgui implot imgui_text_editor stb)
+    FetchContent_MakeAvailable(imgui implot imgui_text_editor)
 
     add_library(sirius_imgui STATIC
         ${imgui_SOURCE_DIR}/imgui.cpp

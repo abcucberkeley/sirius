@@ -4,6 +4,10 @@ option(SIRIUS_ENABLE_PYTHON_BINDINGS "Enable nanobind python bindings" OFF)
 # The workbench application (app/): Dear ImGui over GLFW and OpenGL 3.3, with
 # ImPlot and friends, all fetched and built in-tree (cmake/Dependencies.cmake).
 option(SIRIUS_ENABLE_APP "Build the sirius-app GUI (fetches GLFW, Dear ImGui, ImPlot, libcurl)" OFF)
+# sirius-cli (app/cli): the workbench core without a window, for scripts and agents
+# (command line, JSON-lines session, MCP server). Always built with SIRIUS_ENABLE_APP;
+# ON builds it on its own, e.g. on a cluster node without X11 / Wayland.
+option(SIRIUS_ENABLE_CLI "Build sirius-cli (always built when SIRIUS_ENABLE_APP is ON)" OFF)
 include(CMakeDependentOption)
 
 # nvTIFF decodes TIFF strips/tiles straight into device memory. It is an NVIDIA

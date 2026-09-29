@@ -1,9 +1,12 @@
 # Installs the app component into a scratch prefix and runs what was installed.
 #
 #   cmake -DBUILD_DIR=<build> -DPREFIX=<scratch> [-DCONFIG=<cfg>] -DRAW=<raw.tif>
-#         [-DPYTHON=<interpreter with numpy>] -P check_install.cmake
+#         [-DHAS_APP=ON|OFF] [-DPYTHON=<interpreter with numpy>] -P check_install.cmake
 #
-# PYTHON defaults to $SIRIUS_PYTHON; without either the worker is not started.
+# sirius-cli and the data both executables share are always checked; the GUI
+# (sirius-app, its fonts, icons and desktop file) when HAS_APP is on, which it
+# is by default. PYTHON defaults to $SIRIUS_PYTHON; without either the worker
+# is not started.
 #
 # Registered as a test by tests/CMakeLists.txt. The binary is built with its
 # source tree compiled in as a fallback, so an installed copy on this machine
@@ -28,6 +31,9 @@ endfunction()
 if(NOT PYTHON AND DEFINED ENV{SIRIUS_PYTHON})
     set(PYTHON "$ENV{SIRIUS_PYTHON}")
 endif()
+if(NOT DEFINED HAS_APP)
+    set(HAS_APP ON)
+endif()
 
 file(REMOVE_RECURSE "${PREFIX}")
 set(_config_args)
@@ -43,18 +49,25 @@ endif()
 
 # --- the layout ---------------------------------------------------------------
 set(_data "${PREFIX}/share/sirius")
-foreach(_file
+set(_files
+    bin/sirius-cli
+    share/sirius/help/load.md
+    share/sirius/python/sirius_worker/__main__.py
+    share/sirius/python/requirements.txt
+    share/sirius/python/requirements-extra.txt
+    share/sirius/python/slurm/sirius_worker.sbatch
+    share/sirius/python/workbench.py
+    share/sirius/python/op_schema.json)
+if(HAS_APP)
+    list(APPEND _files
         bin/sirius-app
-        share/sirius/help/load.md
-        share/sirius/python/sirius_worker/__main__.py
-        share/sirius/python/slurm/sirius_worker.sbatch
-        share/sirius/python/workbench.py
-        share/sirius/python/op_schema.json
         share/sirius/fonts/Archivo-Regular.ttf
         share/sirius/icons/sirius-app-48.png
         share/applications/sirius-app.desktop
         share/icons/hicolor/scalable/apps/sirius-app.svg
         share/icons/hicolor/48x48/apps/sirius-app.png)
+endif()
+foreach(_file IN LISTS _files)
     if(NOT EXISTS "${PREFIX}/${_file}")
         fail("${_file} was not installed")
     endif()
@@ -72,7 +85,7 @@ if(_pycache)
 endif()
 
 find_program(_validate desktop-file-validate)
-if(_validate)
+if(_validate AND HAS_APP)
     execute_process(COMMAND "${_validate}" "${PREFIX}/share/applications/sirius-app.desktop"
                     RESULT_VARIABLE _rc OUTPUT_VARIABLE _out ERROR_VARIABLE _err)
     if(NOT _rc EQUAL 0 OR NOT "${_out}${_err}" STREQUAL "")
@@ -83,25 +96,32 @@ endif()
 # every shared library resolves without the build tree's RUNPATH
 find_program(_ldd ldd)
 if(_ldd)
-    execute_process(COMMAND "${_ldd}" "${PREFIX}/bin/sirius-app" RESULT_VARIABLE _rc OUTPUT_VARIABLE _out ERROR_VARIABLE _err)
-    if(NOT _rc EQUAL 0 OR _out MATCHES "not found")
-        fail("the installed sirius-app does not load:\n${_out}${_err}")
+    set(_executables sirius-cli)
+    if(HAS_APP)
+        list(APPEND _executables sirius-app)
     endif()
-    # the scratch prefix may itself sit in the build tree (the test puts it there)
-    string(REPLACE "${PREFIX}" "<prefix>" _outside_prefix "${_out}")
-    if(_outside_prefix MATCHES "${BUILD_DIR}")
-        fail("the installed sirius-app still loads a library from the build tree:\n${_out}")
-    endif()
+    foreach(_exe IN LISTS _executables)
+        execute_process(COMMAND "${_ldd}" "${PREFIX}/bin/${_exe}" RESULT_VARIABLE _rc OUTPUT_VARIABLE _out ERROR_VARIABLE _err)
+        if(NOT _rc EQUAL 0 OR _out MATCHES "not found")
+            fail("the installed ${_exe} does not load:\n${_out}${_err}")
+        endif()
+        # the scratch prefix may itself sit in the build tree (the test puts it there)
+        string(REPLACE "${PREFIX}" "<prefix>" _outside_prefix "${_out}")
+        if(_outside_prefix MATCHES "${BUILD_DIR}")
+            fail("the installed ${_exe} still loads a library from the build tree:\n${_out}")
+        endif()
+    endforeach()
 endif()
 
-# --- the installed application reads its own help pages ------------------------
-# The application opens a window (GLFW, OpenGL 3.3), so this part needs a
-# display: CI runs the test under xvfb-run. Without one it is skipped, loudly.
+# --- the installed executables read their own help pages -----------------------
+# The GUI opens a window (GLFW, OpenGL 3.3), so its part needs a display: CI
+# runs the test under xvfb-run. Without one it is skipped, loudly. sirius-cli
+# needs none, so it is always started.
 set(_display FALSE)
 if(DEFINED ENV{DISPLAY} OR DEFINED ENV{WAYLAND_DISPLAY})
     set(_display TRUE)
 endif()
-if(NOT _display)
+if(HAS_APP AND NOT _display)
     message(WARNING "install check: no DISPLAY / WAYLAND_DISPLAY, so the installed application is not started "
                     "(run the test under xvfb-run to include it)")
 endif()
@@ -109,6 +129,20 @@ set(_marker "installed-tree-marker-7f3a")
 file(APPEND "${_data}/help/load.md" "\n<!-- ${_marker} -->\n")
 set(_home "${PREFIX}/check-home")
 file(MAKE_DIRECTORY "${_home}")
+
+# sirius-cli prints the raw page, so the marker is in its stdout.
+execute_process(
+    COMMAND "${CMAKE_COMMAND}" -E env --unset=SIRIUS_HELP_DIR --unset=SIRIUS_WORKER_DIR
+            "HOME=${_home}" "XDG_CONFIG_HOME=${_home}/.config" "XDG_DATA_HOME=${_home}/.local/share"
+            "${PREFIX}/bin/sirius-cli" help load --markdown
+    WORKING_DIRECTORY "${_home}"
+    RESULT_VARIABLE _rc OUTPUT_VARIABLE _out ERROR_VARIABLE _err TIMEOUT 120)
+if(NOT _rc EQUAL 0)
+    fail("the installed sirius-cli exited with ${_rc}:\n${_out}${_err}")
+endif()
+if(NOT "${_out}" MATCHES "${_marker}")
+    fail("sirius-cli help did not print the installed page (the checkout's instead?):\n${_out}${_err}")
+endif()
 # Without XAUTHORITY, Xlib reads the X server's cookie from $HOME/.Xauthority
 # (ssh -X, most display managers): name the real one, which the scratch HOME
 # would hide. An exported XAUTHORITY (xvfb-run sets one) passes through as is.
@@ -116,7 +150,7 @@ set(_xauth)
 if(NOT DEFINED ENV{XAUTHORITY} AND DEFINED ENV{HOME})
     set(_xauth "XAUTHORITY=$ENV{HOME}/.Xauthority")
 endif()
-if(_display)
+if(HAS_APP AND _display)
     execute_process(
         COMMAND "${CMAKE_COMMAND}" -E env --unset=SIRIUS_HELP_DIR --unset=SIRIUS_WORKER_DIR
                 "HOME=${_home}" "XDG_CONFIG_HOME=${_home}/.config" "SIRIUS_PYTHON=${PYTHON}" ${_xauth}
@@ -143,6 +177,20 @@ if(PYTHON)
         RESULT_VARIABLE _rc OUTPUT_VARIABLE _out ERROR_VARIABLE _err TIMEOUT 120)
     if(NOT _rc EQUAL 0 OR NOT "${_out}${_err}" MATCHES "listening on")
         fail("the installed worker did not start (${_rc}):\n${_out}${_err}")
+    endif()
+
+    # ... and sirius-cli starts it from there and says hello. SIRIUS_PYTHON
+    # names the interpreter, and the Python environment lives in the scratch
+    # home, so the user's own is never looked at.
+    execute_process(
+        COMMAND "${CMAKE_COMMAND}" -E env --unset=SIRIUS_WORKER_DIR --unset=SIRIUS_WORKBENCH_PY
+                "HOME=${_home}" "SIRIUS_PYTHON=${PYTHON}" "SIRIUS_PYTHON_ENV=${_home}/python-env"
+                "${PREFIX}/bin/sirius-cli" worker check
+        WORKING_DIRECTORY "${_home}"
+        INPUT_FILE /dev/null
+        RESULT_VARIABLE _rc OUTPUT_VARIABLE _out ERROR_VARIABLE _err TIMEOUT 120)
+    if(NOT _rc EQUAL 0 OR NOT "${_out}" MATCHES "\"ok\": *true")
+        fail("sirius-cli worker check failed with the installed worker (${_rc}):\n${_out}${_err}")
     endif()
 endif()
 

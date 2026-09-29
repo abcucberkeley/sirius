@@ -1,10 +1,12 @@
 #include "core/tool_api.hpp"
 
+#include "core/cancel.hpp"
 #include "core/training_export.hpp"
 
 #include <algorithm>
 #include <cmath>
 #include <cctype>
+#include <cstdio>
 #include <stdexcept>
 
 namespace sirius::app {
@@ -12,6 +14,121 @@ namespace sirius::app {
     using json = nlohmann::json;
 
     namespace {
+        // What call() answers for a failure (tool_api.hpp).
+        json failure(const std::string& code, const std::string& message, const std::string& hint = {},
+                     const json& data = nullptr) {
+            json r = {{"error", message.empty() ? code : message}, {"error_kind", code}};
+            if (!hint.empty()) r["hint"] = hint;
+            if (!data.is_null()) r["data"] = data;
+            return r;
+        }
+
+        // A help page is a file named after the kind, so a kind the caller
+        // names must not reach outside the help directory. Letters, digits,
+        // '_' and '-' are always fine; a registered operation's kind is too,
+        // since a plugin's may have a '.' in it ("user.denoise"), which the
+        // worker allows, but never a separator.
+        bool helpKindAllowed(const std::string& kind) {
+            if (kind.empty()) return false;
+            bool plain = true;
+            for (const char c : kind) {
+                if (c == '/' || c == '\\' || c == ':' || c == '\0') return false;
+                if (!std::isalnum(static_cast<unsigned char>(c)) && c != '_' && c != '-') plain = false;
+            }
+            if (plain) return true;
+            return kind.front() != '.' && findOperation(kind) != nullptr;
+        }
+
+        // The parameter `key` of `op`, for a value a caller gives. An unknown
+        // key fails the call rather than being dropped: the step would run
+        // with something other than what was asked, and nothing would say so.
+        const ParamSpec& callerSpec(const Operation& op, const std::string& key) {
+            std::string known;
+            for (const ParamSpec& s : op.info().params) {
+                if (s.key == key) return s;
+                known += (known.empty() ? "" : ", ") + s.key;
+            }
+            throw ToolFailure("invalid_argument", "unknown parameter '" + key + "' for " + op.info().kind,
+                              "the parameters of " + op.info().kind + " are " + known + " (describe_operation explains each)");
+        }
+
+        // A caller's value coerced to its spec. A number outside the spec's
+        // range is clamped to it, and a line in `clamped` says so: the step
+        // runs with a value the caller did not give.
+        ParamValue callerValue(const ParamSpec& spec, const json& value, json& clamped) {
+            const ParamValue v = coerceToSpec(spec, value);
+            if (spec.type != ParamType::Double && spec.type != ParamType::Int && spec.type != ParamType::Channel) return v;
+            double given = 0.0;
+            if (value.is_number()) given = value.get<double>();
+            else if (value.is_string()) {
+                try {
+                    given = std::stod(value.get<std::string>());
+                } catch (...) { return v; }
+            } else return v;
+            if (given >= spec.min && given <= spec.max) return v;
+            char range[96];
+            std::snprintf(range, sizeof range, "%g to %g", spec.min, spec.max);
+            clamped.push_back("parameter '" + spec.key + "': " + value.dump() + " is outside " + range + ", so " +
+                              toDisplayString(v) + " is used");
+            return v;
+        }
+
+        // The hints of each tool, applied after the tools are built so the
+        // positional add({...}) calls stay as they are. refusedWhileRunning:
+        // an edit the workbench refuses during a run, with only a log line
+        // to say so; readOnly: changes nothing; idempotent: a repeat changes
+        // nothing more; destructive: writes files; bigResult: may answer
+        // with a long text (MCP clients cut long results unless told).
+        struct ToolTraits {
+            const char* name;
+            const char* title;
+            bool refusedWhileRunning, readOnly, idempotent, destructive, bigResult;
+        };
+        constexpr ToolTraits kToolTraits[] = {
+            {"get_state", "Workbench state", false, true, false, false, false},
+            {"list_operations", "List operations", false, true, false, false, true},
+            {"get_step", "Step details", false, true, false, false, false},
+            {"add_step", "Add a step", true, false, false, false, false},
+            {"remove_step", "Remove a step", true, false, false, false, false},
+            {"move_step", "Move a step", true, false, false, false, false},
+            {"set_step_enabled", "Enable or skip a step", true, false, true, false, false},
+            {"set_params", "Set step parameters", true, false, true, false, false},
+            {"apply_preset", "Apply a preset", true, false, true, false, false},
+            {"set_cache", "Set a step's cache policy", true, false, true, false, false},
+            {"run", "Run the pipeline", false, false, false, false, false},
+            {"view_step", "View a step", false, false, false, false, false},
+            {"select_step", "Select a step", false, false, false, false, false},
+            {"set_view", "Change the viewer", false, false, false, false, false},
+            {"list_tracks", "List tracks", false, true, false, false, false},
+            {"focus_track", "Focus a track", false, false, false, false, false},
+            {"get_diagnostics", "Step diagnostics", false, true, false, false, false},
+            {"get_help", "Help page", false, true, false, false, true},
+            {"undo", "Undo", true, false, false, false, false},
+            {"redo", "Redo", true, false, false, false, false},
+            {"set_backend", "Compute backend", false, false, true, false, false},
+            {"load_example_pipeline", "Load the example pipeline", true, false, false, false, false},
+            {"export_training_data", "Export training data", true, false, false, true, false},
+            {"get_log", "Workbench log", false, true, false, false, true},
+        };
+        // MCP's Tool._meta key for how long a result a client should keep
+        // (Claude Code otherwise cuts at its default), and the length asked.
+        constexpr const char* kMaxResultSizeKey = "anthropic/maxResultSizeChars";
+        constexpr int kMaxResultSizeChars = 200000;
+
+        void applyTraits(std::vector<ToolSpec>& tools) {
+            for (const ToolTraits& tr : kToolTraits)
+                for (ToolSpec& t : tools) {
+                    if (t.name != tr.name) continue;
+                    t.title = tr.title;
+                    t.refusedWhileRunning = tr.refusedWhileRunning;
+                    t.readOnly = tr.readOnly;
+                    t.idempotent = tr.idempotent;
+                    t.destructive = tr.destructive;
+                    t.openWorld = false;   // nothing here reaches beyond this machine
+                    if (tr.bigResult) t.meta[kMaxResultSizeKey] = kMaxResultSizeChars;
+                }
+        }
+
         json stepParam() {
             return {{"type", {"integer", "string"}},
                     {"description", "Step number as shown in the operations list (1 = Load, 2 = second step, ...) or a step name"}};
@@ -85,8 +202,13 @@ namespace sirius::app {
                  j["warnings"] = v.warnings;
                  j["output_shape"] = wb_.outputMetaOf(i).shapeString();
                  if (auto out = wb_.output(i)) {
-                     j["has_output"] = true;
-                     j["output_fresh"] = wb_.outputFresh(i);
+                     // A step cached as recompute keeps only a shell of its
+                     // output (diagnostics, note) once the steps below have
+                     // read it: there is no data to look at, which is what
+                     // has_output says, not that the step did not run.
+                     const bool fresh = wb_.outputFresh(i);
+                     j["has_output"] = fresh || out->array != nullptr || out->source != nullptr;
+                     j["output_fresh"] = fresh;
                      j["diagnostics_summary"] = out->diagnostics.summary;
                      j["note"] = out->note;
                  } else {
@@ -95,35 +217,61 @@ namespace sirius::app {
                  return j;
              }});
         add({"add_step",
-             "Append a processing step of the given kind (see list_operations); becomes selected and viewed. Optional parameters are applied.",
+             "Append a processing step of the given kind (see list_operations); becomes selected and viewed. An optional "
+             "preset is applied first, then the optional parameters; an optional name renames the step.",
              obj({{"kind", {{"type", "string"}}},
                   {"params", {{"type", "object"}, {"description", "parameter key/value pairs to set"}}},
+                  {"preset", {{"type", "string"}, {"description", "one of the operation's presets (list_operations gives them)"}}},
+                  {"name", {{"type", "string"}, {"description", "the step's name, by which later calls can address it"}}},
                   {"at", {{"type", "integer"}, {"description", "1-based position to insert at (default: end)"}}}},
                  {"kind"}),
              [this](const json& a) {
                  const std::string kind = a.value("kind", "");
                  const Operation* op = findOperation(kind);
-                 if (!op || op->info().missing) throw std::invalid_argument("unknown operation kind '" + kind + "'");
-                 if (!wb_.canEdit()) throw std::runtime_error("a run is in progress: cancel it or wait before editing the pipeline");
+                 if (!op || op->info().missing)
+                     throw ToolFailure("unknown_operation", "unknown operation kind '" + kind + "'", "list_operations gives the kinds");
+                 if (!wb_.canEdit()) throw ToolFailure("busy", "A run is in progress: cancel it or wait before editing the pipeline.");
                  int at = -1;
                  if (a.contains("at") && a["at"].is_number_integer()) at = a["at"].get<int>() - 1;
-                 const StepId id = wb_.addStep(kind, at);
-                 const int i = wb_.pipeline().indexOf(id);
-                 if (a.contains("params") && a["params"].is_object() && !a["params"].empty()) {
-                     ParamSet p = wb_.pipeline().at(i).params;
-                     for (auto it = a["params"].begin(); it != a["params"].end(); ++it) {
-                         bool known = false;
-                         for (const ParamSpec& s : wb_.pipeline().at(i).op().info().params)
-                             if (s.key == it.key()) {
-                                 p.set(s.key, coerceToSpec(s, it.value()));
-                                 known = true;
-                             }
-                         if (!known) throw std::invalid_argument("unknown parameter '" + it.key() + "' for " + kind);
+                 // Everything the caller gave is checked before the step goes
+                 // in, so that a refused call leaves the pipeline as it was.
+                 const std::string preset = a.contains("preset") && a["preset"].is_string() ? a["preset"].get<std::string>() : std::string();
+                 if (!preset.empty()) {
+                     std::string known;
+                     bool found = false;
+                     for (const ParamPreset& p : op->info().presets) {
+                         found = found || p.name == preset;
+                         known += (known.empty() ? "" : ", ") + p.name;
                      }
+                     if (!found)
+                         throw std::invalid_argument(known.empty() ? kind + " has no presets"
+                                                                   : "no preset '" + preset + "' for " + kind + "; it has " + known);
+                 }
+                 json clamped = json::array();
+                 std::vector<std::pair<std::string, ParamValue>> values;
+                 if (a.contains("params") && a["params"].is_object())
+                     for (auto it = a["params"].begin(); it != a["params"].end(); ++it) {
+                         const ParamSpec& spec = callerSpec(*op, it.key());
+                         values.emplace_back(spec.key, callerValue(spec, it.value(), clamped));
+                     }
+                 const std::string name = a.contains("name") && a["name"].is_string() ? a["name"].get<std::string>() : std::string();
+                 // Not seeded from the data on hand: that is not yet this
+                 // step's input (a SIM step above has not run), and an
+                 // automatic window left as it is follows the real input at
+                 // run time, in this run and in a saved pipeline.
+                 const StepId id = wb_.addStep(kind, at, false);
+                 const int i = wb_.pipeline().indexOf(id);
+                 if (!preset.empty()) wb_.applyPreset(i, preset);
+                 if (!values.empty()) {
+                     ParamSet p = wb_.pipeline().at(i).params;
+                     for (const auto& [key, value] : values) p.set(key, value);
                      wb_.setStepParams(i, p, "Set parameters of " + wb_.pipeline().at(i).name);
                  }
+                 if (!name.empty()) wb_.renameStep(i, name);
                  actions_.push_back({ActionRecord::Kind::Param, "Added step " + Step::number(i) + " · " + wb_.pipeline().at(i).name, "undo", {}, "add_step"});
-                 return stepJson(i);
+                 json out = stepJson(i);
+                 if (!clamped.empty()) out["clamped"] = clamped;
+                 return out;
              }});
         add({"remove_step", "Remove a step (never the Load step).", obj({{"step", stepParam()}}, {"step"}),
              [this](const json& a) {
@@ -161,12 +309,10 @@ namespace sirius::app {
                  const Step& s = wb_.pipeline().at(i);
                  ParamSet p = s.params;
                  std::string changes;
+                 json clamped = json::array();
                  for (auto it = a["params"].begin(); it != a["params"].end(); ++it) {
-                     const ParamSpec* spec = nullptr;
-                     for (const ParamSpec& sp : s.op().info().params)
-                         if (sp.key == it.key()) spec = &sp;
-                     if (!spec) throw std::invalid_argument("unknown parameter '" + it.key() + "' for " + s.kind);
-                     const ParamValue v = coerceToSpec(*spec, it.value());
+                     const ParamSpec* spec = &callerSpec(s.op(), it.key());
+                     const ParamValue v = callerValue(*spec, it.value(), clamped);
                      const ParamValue* old = p.find(spec->key);
                      if (!changes.empty()) changes += ", ";
                      changes += spec->label + " " + (old ? toDisplayString(*old) : "—") + " → " + toDisplayString(v);
@@ -187,6 +333,7 @@ namespace sirius::app {
                      out["ignored"] = {{"keys", ignored},
                                        {"why", "stored, but the step's current settings do not read these; they apply again "
                                                "when the settings that gate them change back"}};
+                 if (!clamped.empty()) out["clamped"] = clamped;
                  return out;
              }});
         add({"apply_preset",
@@ -200,7 +347,7 @@ namespace sirius::app {
                  // told apart here, because applyPreset answers false to both
                  // and "Nuclei does not exist" would be a lie during a run
                  if (!wb_.canEdit())
-                     throw std::runtime_error("A run is in progress: cancel it or wait before applying a preset.");
+                     throw ToolFailure("busy", "A run is in progress: cancel it or wait before applying a preset.");
                  if (!wb_.applyPreset(i, name)) {
                      std::string known;
                      for (const ParamPreset& p : s.op().info().presets) known += (known.empty() ? "" : ", ") + p.name;
@@ -223,16 +370,19 @@ namespace sirius::app {
         add({"run", "Run the pipeline up to a step (default: all enabled steps). Blocks until finished; returns timings or the error.",
              obj({{"step", stepParam()}}),
              [this](const json& a) {
+                 // A failure, not a value: an {"error"} result would read as
+                 // a run that failed, where nothing could run at all.
+                 if (!runHook_) throw ToolFailure("unsupported", "running is not available in this context");
                  const int target = a.contains("step") ? resolveStep(a) : wb_.pipeline().size() - 1;
-                 if (!runHook_) return json{{"error", "running is not available in this context"}};
                  json r = runHook_(target);
                  std::string text = "Ran to step " + Step::number(target) + " · " + wb_.pipeline().at(target).name;
-                 if (r.contains("seconds")) {
+                 if (r.contains("seconds") && r["seconds"].is_number()) {
                      char buf[32];
                      std::snprintf(buf, sizeof buf, " · %.1f s", r["seconds"].get<double>());
                      text += buf;
                  }
-                 if (r.contains("error") && !r["error"].get<std::string>().empty()) text += " · failed: " + r["error"].get<std::string>();
+                 if (r.contains("error") && r["error"].is_string() && !r["error"].get<std::string>().empty())
+                     text += " · failed: " + r["error"].get<std::string>();
                  actions_.push_back({ActionRecord::Kind::Run, text, "log", {}, "run"});
                  return r;
              }});
@@ -405,7 +555,18 @@ namespace sirius::app {
              obj({{"kind", {{"type", "string"}}}}),
              [this](const json& a) {
                  std::string kind = a.value("kind", "");
-                 if (kind.empty()) kind = wb_.pipeline().at(wb_.selectedIndex()).kind;
+                 if (!kind.empty() && !helpKindAllowed(kind))
+                     throw ToolFailure("invalid_argument", "'" + kind + "' is not an operation kind",
+                                       "a kind is letters, digits, '_' and '-', or a registered kind (list_operations gives them)");
+                 if (kind.empty()) {
+                     // A pipeline file may give a step any kind at all (a
+                     // stand-in keeps it), so the selected step's kind is
+                     // held to the same rule as a kind the caller names.
+                     kind = wb_.pipeline().at(wb_.selectedIndex()).kind;
+                     if (!helpKindAllowed(kind))
+                         throw ToolFailure("not_found", "the selected step's kind '" + kind + "' has no help page",
+                                           "name a kind (list_operations gives them)");
+                 }
                  if (!helpHook_) return json{{"kind", kind}, {"markdown", "(help pages are not available in this context)"}};
                  return json{{"kind", kind}, {"markdown", helpHook_(kind)}};
              }});
@@ -460,10 +621,10 @@ namespace sirius::app {
                  // ArraySource a running job may be reading; keep it under the
                  // run-state rule every other entry point follows.
                  if (!wb_.canEdit())
-                     throw std::runtime_error("A run is in progress: cancel it or wait before exporting training data.");
+                     throw ToolFailure("busy", "A run is in progress: cancel it or wait before exporting training data.");
                  const int i = a.contains("step") ? resolveStep(a) : wb_.viewedIndex();
                  std::shared_ptr<const StepOutput> out = wb_.output(i);
-                 if (!out) throw std::invalid_argument("step " + Step::number(i) + " has not been computed yet; run it first");
+                 if (!out) throw ToolFailure("not_computed", "step " + Step::number(i) + " has not been computed yet", "run it first");
                  if (!out->labels || out->labels->empty()) throw std::invalid_argument("step " + Step::number(i) + " produced no labels");
                  TrainingExportOptions o;
                  o.directory = a.value("directory", std::string());
@@ -514,66 +675,128 @@ namespace sirius::app {
                  for (std::size_t i = log.size() > static_cast<std::size_t>(n) ? log.size() - static_cast<std::size_t>(n) : 0; i < log.size(); ++i) out.push_back(log[i]);
                  return out;
              }});
+        applyTraits(tools_);
     }
 
-    void ToolApi::add(Tool t) { tools_.push_back(std::move(t)); }
+    ToolFailure::ToolFailure(std::string code, const std::string& message, std::string hint, nlohmann::json data)
+        : std::runtime_error(message), code_(std::move(code)), hint_(std::move(hint)), data_(std::move(data)) {}
+
+    const std::string& ToolFailure::code() const noexcept { return code_; }
+
+    const std::string& ToolFailure::hint() const noexcept { return hint_; }
+
+    const nlohmann::json& ToolFailure::data() const noexcept { return data_; }
+
+    void ToolApi::add(ToolSpec t) { tools_.push_back(std::move(t)); }
+
+    void ToolApi::addTool(ToolSpec spec) {
+        for (ToolSpec& t : tools_) {
+            if (t.name != spec.name) continue;
+            t = std::move(spec);
+            return;
+        }
+        tools_.push_back(std::move(spec));
+    }
+
+    bool ToolApi::removeTool(const std::string& name) {
+        const auto it = std::find_if(tools_.begin(), tools_.end(), [&](const ToolSpec& t) { return t.name == name; });
+        if (it == tools_.end()) return false;
+        tools_.erase(it);
+        return true;
+    }
+
+    const ToolSpec* ToolApi::findTool(const std::string& name) const {
+        for (const ToolSpec& t : tools_)
+            if (t.name == name) return &t;
+        return nullptr;
+    }
+
+    const std::vector<ToolSpec>& ToolApi::tools() const noexcept { return tools_; }
+
+    void ToolApi::noteAction(ActionRecord r) { actions_.push_back(std::move(r)); }
 
     json ToolApi::schemas() const {
         json out = json::array();
-        for (const Tool& t : tools_)
+        for (const ToolSpec& t : tools_)
             out.push_back({{"type", "function"}, {"function", {{"name", t.name}, {"description", t.description}, {"parameters", t.parameters}}}});
         return out;
     }
 
     std::vector<std::string> ToolApi::toolNames() const {
         std::vector<std::string> names;
-        for (const Tool& t : tools_) names.push_back(t.name);
+        for (const ToolSpec& t : tools_) names.push_back(t.name);
         return names;
     }
 
     json ToolApi::call(const std::string& name, const json& args) {
-        for (const Tool& t : tools_) {
-            if (t.name != name) continue;
-            const std::size_t firstRecord = actions_.size();
-            const std::uint64_t before = wb_.history().revision();
-            json result;
-            try {
-                result = t.fn(args.is_object() ? args : json::object());
-            } catch (const std::exception& e) {
-                result = json{{"error", e.what()}};
-            }
-            // An "undo" card undoes its own call's change, not whatever is
-            // newest by then: it keeps the revisions around the call. A call
-            // that pushed nothing (a value set to what it was, an edit
-            // refused during a run) has nothing of its own to undo.
-            const std::uint64_t after = wb_.history().revision();
-            for (std::size_t i = firstRecord; i < actions_.size(); ++i) {
-                ActionRecord& r = actions_[i];
-                if (r.link != "undo") continue;
-                if (after == before) {
-                    r.link.clear();
-                } else {
-                    r.revBefore = before;
-                    r.revAfter = after;
-                }
-            }
-            return result;
+        const ToolSpec* spec = findTool(name);
+        if (!spec) return failure("unknown_tool", "unknown tool '" + name + "'");
+        // The gate comes before the tool reads its arguments: during a run
+        // the workbench refuses these edits with a log line and a quiet
+        // return, which the tool would have reported as done.
+        if (spec->refusedWhileRunning && !wb_.canEdit())
+            return failure("busy", "A run is in progress: cancel it or wait for it to finish before calling " + name + ".");
+        // A copy: a tool may add or remove tools, which moves the table.
+        const std::function<json(const json&)> fn = spec->fn;
+        const std::size_t firstRecord = actions_.size();
+        const std::uint64_t before = wb_.history().revision();
+        json result;
+        try {
+            result = fn(args.is_object() ? args : json::object());
+        } catch (const ToolFailure& e) {
+            result = failure(e.code(), e.what(), e.hint(), e.data());
+        } catch (const WorkerStartError& e) {
+            result = failure("worker_unavailable", e.what(), e.hint, e.toJson());
+        } catch (const std::invalid_argument& e) {
+            result = failure("invalid_argument", e.what());
+        } catch (const std::out_of_range& e) {
+            result = failure("invalid_argument", e.what());
+        } catch (const json::exception& e) {
+            // an argument of another type than the schema says (a string
+            // where a number goes), found by the tool's get<>()
+            result = failure("invalid_argument", e.what());
+        } catch (const std::exception& e) {
+            // isCancellation also recognises the library's untyped "cancelled"
+            result = failure(isCancellation(e) ? "cancelled" : "failed", e.what());
+        } catch (...) {
+            result = failure("failed", "unknown error");
         }
-        return json{{"error", "unknown tool '" + name + "'"}};
+        // An "undo" card undoes its own call's change, not whatever is
+        // newest by then: it keeps the revisions around the call. A call
+        // that pushed nothing (a value set to what it was, an edit
+        // refused during a run) has nothing of its own to undo.
+        const std::uint64_t after = wb_.history().revision();
+        for (std::size_t i = firstRecord; i < actions_.size(); ++i) {
+            ActionRecord& r = actions_[i];
+            if (r.link != "undo") continue;
+            if (after == before) {
+                r.link.clear();
+            } else {
+                r.revBefore = before;
+                r.revAfter = after;
+            }
+        }
+        return result;
     }
 
-    int ToolApi::resolveStep(const json& args, const char* key) const {
-        if (!args.contains(key)) throw std::invalid_argument(std::string("missing '") + key + "'");
+    int ToolApi::resolveStep(const json& args, const char* key) const { return resolveStepIndex(wb_.pipeline(), args, key); }
+
+    int ToolApi::resolveStepIndex(const Pipeline& p, const json& args, const char* key) {
+        const std::string there = " (there are " + std::to_string(p.size()) + ", 1 is Load)";
+        if (!args.is_object() || !args.contains(key)) throw ToolFailure("invalid_argument", std::string("missing '") + key + "'");
         const json& v = args[key];
-        const Pipeline& p = wb_.pipeline();
         // a model writes 2 as 2.0 now and then: an integral number is a number
         if (v.is_number() && (v.is_number_integer() || v.get<double>() == std::floor(v.get<double>()))) {
-            const int i = static_cast<int>(v.get<double>()) - 1;
-            if (i < 0 || i >= p.size()) throw std::invalid_argument("no step " + std::to_string(i + 1) + " (there are " + std::to_string(p.size()) + ")");
-            return i;
+            // compared as a double first: a huge number does not fit an int
+            const double n = v.get<double>();
+            if (!(n >= 1.0 && n <= static_cast<double>(p.size())))
+                throw ToolFailure("unknown_step", "no step " + v.dump() + there, "get_state lists the steps");
+            return static_cast<int>(n) - 1;
         }
         if (v.is_string()) {
             const std::string s = v.get<std::string>();
+            // "" is a part of every name: it would pick the Load step
+            if (s.empty()) throw ToolFailure("invalid_argument", std::string("'") + key + "' is empty");
             try {
                 const int i = std::stoi(s) - 1;
                 if (i >= 0 && i < p.size()) return i;
@@ -584,9 +807,9 @@ namespace sirius::app {
                 if (lower(p.at(i).name) == ls || lower(p.at(i).kind) == ls) return i;
             for (int i = 0; i < p.size(); ++i)
                 if (lower(p.at(i).name).find(ls) != std::string::npos) return i;
-            throw std::invalid_argument("no step named '" + s + "'");
+            throw ToolFailure("unknown_step", "no step named '" + s + "'" + there, "get_state lists the steps");
         }
-        throw std::invalid_argument("'step' must be a number or a name");
+        throw ToolFailure("invalid_argument", std::string("'") + key + "' must be a number or a name");
     }
 
     json ToolApi::stepJson(int i) const {

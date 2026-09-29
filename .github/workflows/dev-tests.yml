@@ -3,6 +3,7 @@
 #   lint          formatting, ruff, versions, unit graph        (~2 min)
 #   cpp-tests     the library, GCC, warnings are errors        (~10 min)
 #   app-tests     the workbench + a headless run, with worker  (~15 min)
+#   cli-headless  the core and sirius-cli without the GUI       (~20 min)
 #   python-tests  the wheel, the binding tests, worker tests   (~15 min)
 #   sanitizers    the library tests under ASan + UBSan         (~20 min)
 #   windows       MSVC, library and workbench (build + tests)  (~35 min)
@@ -212,6 +213,30 @@ jobs:
         shell: bash
         run: bash tools/ci_failed_tests.sh build/linux-gcc-app-dev
 
+      # The same pipeline without a window (no xvfb): what a script or an
+      # agent does with sirius-cli. stdout is one JSON document; the rendered
+      # projection and the document are kept with the smoke artifacts.
+      - name: CLI smoke run
+        shell: bash
+        run: |
+          set -o pipefail
+          build/linux-gcc-app-dev/app/sirius-cli --backend cpu --plugins off run \
+            --pipeline examples/sim_bundled.sirius.toml --render cli-mip.png --plane mip --stats | tee cli-run.json
+          test -s cli-mip.png
+
+      - uses: astral-sh/setup-uv@v10
+
+      # SIRIUS's own Python environment for the worker, set up from nothing
+      # with uv into a scratch directory, then started: the only automated
+      # proof that the missing-numpy fix works on a clean machine.
+      - name: Worker environment from scratch (uv)
+        shell: bash
+        run: |
+          export SIRIUS_PYTHON_ENV="$RUNNER_TEMP/sirius-env"
+          unset SIRIUS_PYTHON
+          build/linux-gcc-app-dev/app/sirius-cli worker setup --yes --base-python "${{ steps.python.outputs.python-path }}"
+          build/linux-gcc-app-dev/app/sirius-cli worker check
+
       # The whole window: the pipeline runs, every panel draws, and the
       # scripted steps go through the same code as the menus. The exit code is
       # 1 when the run fails and 2 when it cannot start; the screenshot and the
@@ -236,6 +261,8 @@ jobs:
           path: |
             smoke.png
             smoke.log
+            cli-mip.png
+            cli-run.json
 
   python-tests:
     name: Python binding tests
@@ -366,8 +393,11 @@ jobs:
       - name: Build
         run: cmake --build build/ci-windows
 
+      # cli.slow: sirius-cli's run of the bundled SIM pipeline, unmeasured in
+      # an MSVC Debug build; the Linux jobs run it, and the contrast-only CLI
+      # run covers Windows.
       - name: Test
-        run: ctest --test-dir build/ci-windows --output-on-failure -R "^sirius::"
+        run: ctest --test-dir build/ci-windows --output-on-failure -R "^sirius::" -LE "cli\.slow"
 
       # The job log needs a GitHub login; annotations do not. See the script.
       - name: Name the failed tests
@@ -375,6 +405,58 @@ jobs:
         # Git Bash on Windows; a bare `bash` there may resolve to WSL
         shell: bash
         run: bash tools/ci_failed_tests.sh build/ci-windows
+
+      # SIRIUS's own Python environment, from the runner's Python with the
+      # standard library's venv and pip (no uv), into a scratch directory.
+      - name: Worker environment from scratch (pip)
+        run: |
+          export SIRIUS_PYTHON_ENV="$RUNNER_TEMP/sirius-env"
+          unset SIRIUS_PYTHON
+          build/ci-windows/app/sirius-cli.exe worker setup --yes --no-uv
+          build/ci-windows/app/sirius-cli.exe worker check
+
+  cli-headless:
+    # The core and sirius-cli alone (SIRIUS_ENABLE_CLI): no GLFW, OpenGL,
+    # X11 / Wayland, nfd or curl is installed, so a GUI dependency that crept
+    # into the core fails to build here, as it would on a cluster node. Its
+    # tests are the core's and the CLI's, and the install check of a
+    # CLI-only tree.
+    name: Core and sirius-cli without the GUI (Linux)
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential \
+            cmake \
+            ninja-build
+
+      - uses: hendrikmuhs/ccache-action@v1
+        with:
+          key: cli-headless-linux
+
+      - name: Configure
+        run: |
+          cmake --preset linux-gcc-dev \
+            -DSIRIUS_ENABLE_CLI=ON -DSIRIUS_ENABLE_PYTHON_BINDINGS=OFF \
+            -DCMAKE_C_COMPILER_LAUNCHER=ccache -DCMAKE_CXX_COMPILER_LAUNCHER=ccache
+
+      - name: Build
+        run: cmake --build --preset linux-gcc-dev
+
+      - name: Test
+        run: ctest --preset linux-gcc-dev -L "^(app|cli)"
+
+      # The job log needs a GitHub login; annotations do not. See the script.
+      - name: Name the failed tests
+        if: failure()
+        # Git Bash on Windows; a bare `bash` there may resolve to WSL
+        shell: bash
+        run: bash tools/ci_failed_tests.sh build/linux-gcc-dev
 
   cuda-build:
     # Hosted runners have no GPU: this compiles the CUDA paths (cuFFT, nvTIFF,

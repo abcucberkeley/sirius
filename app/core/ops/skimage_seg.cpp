@@ -90,8 +90,9 @@ namespace sirius::app {
                 const Validation v = validate(p, input.meta);
                 if (!v.ok()) throw std::runtime_error(v.firstError());
                 if (!ctx.remote)
-                    throw std::runtime_error("scikit-image segmentation runs in the Python worker: start it in "
-                                             "Preferences ▸ Python, or choose Classical segmentation, which runs here");
+                    throw std::runtime_error("scikit-image segmentation runs in the Python worker, which is not available "
+                                             "here (see the worker message in the log); Classical segmentation runs "
+                                             "without it");
                 if (!ctx.remote->supports("skimage_seg"))
                     throw std::runtime_error("The connected worker does not implement skimage_seg (" +
                                              ctx.remote->capabilities().hostname + "); it is older than this build");

@@ -1,0 +1,3 @@
+# Optional: label clean-up in the worker, the scikit-image segmentation step, some plugins.
+scipy
+scikit-image

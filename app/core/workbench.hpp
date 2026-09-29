@@ -38,6 +38,7 @@
 #include "core/pipeline.hpp"
 #include "core/rpc.hpp"
 #include "core/tracks.hpp"
+#include "core/worker_error.hpp"
 
 namespace sirius::app {
 
@@ -130,8 +131,24 @@ namespace sirius::app {
     };
 
     // Connects to (starting when needed) the local Python worker; installed
-    // by the GUI, called on the thread that executes the run.
+    // by the host (the window, sirius-cli), called on the thread that
+    // executes the run. It throws WorkerStartError when the worker cannot
+    // start, which the run and the plugin load keep for the host.
     using LocalWorkerLauncher = std::function<std::unique_ptr<RemoteWorker>()>;
+
+    // Why the last createRun() returned null, for a caller that answers
+    // with more than the log line (the headless tools map it to an error
+    // code). None after a createRun() that made a job.
+    struct RunRefusal {
+        enum class Kind { None,
+                          Running,
+                          NoDataset,
+                          Invalid,
+                          NoLauncher };
+        Kind kind = Kind::None;
+        int step = -1;               // Invalid: the step that cannot run (its index, 0 = Load)
+        std::string message;         // the line that was logged
+    };
 
     // One run, prepared on the GUI thread, executed anywhere.
     //
@@ -175,6 +192,14 @@ namespace sirius::app {
             requireFinished("seconds");
             return seconds_;
         }
+        // After finished(): the worker failure the run stopped on, if that was
+        // the reason (a local worker that did not start). error() then reads
+        // "Worker unavailable: <its message> <its hint>". Empty for every
+        // other failure, and for a run that was cancelled.
+        const std::optional<WorkerStartError>& workerFailure() const {
+            requireFinished("workerFailure");
+            return workerFailure_;
+        }
 
     private:
         friend class Workbench;
@@ -189,6 +214,7 @@ namespace sirius::app {
         bool needsWorker_ = false;                     // a step wants the Python worker
         LocalWorkerLauncher launcher_;
         RemoteConfig remoteConfig_;                    // Backend::Hpc
+        std::string workerHint_;                       // Workbench::setWorkerHint, when the job was made
         std::unique_ptr<RemoteWorker> ownedRemote_;    // the job's connection
         RunProgress progress_;
         std::atomic<bool> cancelled_{false};
@@ -200,6 +226,7 @@ namespace sirius::app {
         std::vector<StepReport> reports_;
         std::shared_ptr<const StepOutput> output_;
         double seconds_ = 0.0;
+        std::optional<WorkerStartError> workerFailure_;
     };
 
     class Workbench {
@@ -262,7 +289,10 @@ namespace sirius::app {
         // caches, history, labels) is then refused with a log line.
         bool canEdit() const noexcept { return !running(); }
         const Pipeline& pipeline() const noexcept { return pipeline_; }
-        StepId addStep(const std::string& kind, int at = -1);        // 0 when refused
+        // 0 when refused. seedParams false keeps the operation's defaults
+        // instead of seeding them from the step's current input (the tool API
+        // does that: an automatic window follows its input when it runs).
+        StepId addStep(const std::string& kind, int at = -1, bool seedParams = true);
         void removeStep(int index);
         bool moveStep(int index, int delta);
         StepId duplicateStep(int index);
@@ -379,7 +409,8 @@ namespace sirius::app {
         // blocks until the worker answers), registers the user operations it
         // finds (app/python/sirius_worker/plugins.py) and logs the outcome;
         // returns the number registered. `reload` re-imports the files.
-        // Refused (0) while a run is active: the registry is in use.
+        // Refused (0, and pluginError() says so) while a run is active: the
+        // registry is in use. The plugins loaded before stay registered.
         int loadPlugins(bool reload);
         struct PluginInfo {
             std::string kind, name, file, error;   // error non-empty when the file did not load
@@ -395,6 +426,19 @@ namespace sirius::app {
         bool running() const noexcept { return static_cast<bool>(activeRun_); }
         std::shared_ptr<RunJob> activeRun() const noexcept { return activeRun_; }
         void cancelRun();
+        const RunRefusal& lastRunRefusal() const noexcept { return lastRunRefusal_; }
+        // Why the last loadPlugins() found none: its message ("" after one
+        // that reached the worker, never after a refused one), and the
+        // worker start failure behind it.
+        const std::string& pluginError() const noexcept { return pluginError_; }   // "" after a successful loadPlugins
+        const std::optional<WorkerStartError>& pluginWorkerFailure() const noexcept { return pluginWorkerFailure_; }
+        // The host's next step when a worker is unavailable ("Preferences ...
+        // sets the interpreter" in the window), appended to the generic
+        // worker errors of runs, plugin loads and the missing launcher. A
+        // WorkerStartError brings a hint of its own, which wins. The core
+        // names no window or command of its own: "" (the default) adds
+        // nothing.
+        void setWorkerHint(std::string hint) { workerHint_ = std::move(hint); }   // appended to generic worker errors; "" = none
 
         // --- labels (undoable, on the viewed output) -------------------------
         // The volume shown for the viewed step. It belongs to that step's
@@ -451,6 +495,8 @@ namespace sirius::app {
         Diagnostics previewDiagnostics(int index) const;
         // True (with a log line naming `what`) when a run is active.
         bool refuseIfRunning(const char* what);
+        // createRun's null: logs `line` and keeps it as lastRunRefusal().
+        std::shared_ptr<RunJob> refuseRun(RunRefusal::Kind kind, int step, const std::string& line);
         void installDataset(std::shared_ptr<ArraySource> source, DatasetMeta meta, std::string note);
         // Open `path` with `options`; the Load step's parameters become
         // `loadParams` with the options written into them.
@@ -506,6 +552,10 @@ namespace sirius::app {
         std::function<std::string()> hubToken_;
         std::vector<PluginInfo> plugins_;
         std::vector<std::string> pluginDirs_;
+        RunRefusal lastRunRefusal_;
+        std::string pluginError_;
+        std::optional<WorkerStartError> pluginWorkerFailure_;
+        std::string workerHint_;
         // The first "before" of the merge group the top history entry belongs
         // to (History::mergesWith decides whether it still applies).
         std::optional<std::pair<std::string, Snapshot>> mergeFirst_;

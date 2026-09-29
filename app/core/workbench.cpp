@@ -58,6 +58,15 @@ namespace sirius::app {
             std::transform(s.begin(), s.end(), s.begin(), [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
             return s;
         }
+
+        // A worker message and the host's next step as one text:
+        // "<message>. <hint>". The message ends in a full stop either way,
+        // as the other log lines do.
+        std::string withHint(std::string message, const std::string& hint) {
+            if (!message.empty() && message.back() != '.' && message.back() != '!' && message.back() != '?') message += '.';
+            if (!hint.empty()) message += (message.empty() ? "" : " ") + hint;
+            return message;
+        }
     } // namespace
 
     std::optional<ViewMode> viewModeFromString(const std::string& s) noexcept {
@@ -197,11 +206,20 @@ namespace sirius::app {
         // start a worker it will never use.
         try {
             if (!cancelled_.load()) connectWorker();
+        } catch (const WorkerStartError& e) {
+            // Kept whole: the host can offer what would fix it (a Python
+            // environment to set up, another interpreter), and its hint is
+            // that host's own next step.
+            workerFailure_ = e;
+            error_ = "Worker unavailable: " + withHint(e.what(), e.hint.empty() ? workerHint_ : e.hint);
         } catch (const std::exception& e) {
-            error_ = std::string("Worker unavailable: ") + e.what() +
-                     " (Preferences ▸ Worker sets the Python interpreter; Preferences ▸ HPC the remote host).";
+            // A start that gave up because the run was cancelled (a launcher
+            // may stop waiting for the worker then) is a cancellation, not
+            // an unavailable worker.
+            if (isCancellation(e)) cancelledResult_ = true;
+            else error_ = "Worker unavailable: " + withHint(e.what(), workerHint_);
         }
-        if (error_.empty()) {
+        if (error_.empty() && !cancelledResult_) {
             // Steps that will actually run, for an overall progress fraction.
             int toRun = 0;
             for (int i = 0; i <= target_; ++i) {
@@ -240,7 +258,11 @@ namespace sirius::app {
             }
         }
         if (cancelled_.load()) cancelledResult_ = true;
-        if (cancelledResult_) error_ = "cancelled";
+        if (cancelledResult_) {
+            // the run ended because it was asked to, whatever else went wrong
+            error_ = "cancelled";
+            workerFailure_.reset();
+        }
         seconds_ = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
         progress_.set(1.0, -1, "");
         // The worker serves one client at a time: the connection is closed
@@ -555,13 +577,22 @@ namespace sirius::app {
 
     // --- pipeline edits -------------------------------------------------------------
 
-    StepId Workbench::addStep(const std::string& kind, int at) {
+    StepId Workbench::addStep(const std::string& kind, int at, bool seedParams) {
         if (refuseIfRunning("add a step")) return 0;
         const Snapshot before = snapshot();
         const StepId id = pipeline_.add(kind, at);
         const int index = pipeline_.indexOf(id);
-        // let the operation seed its parameters from the data it will see
-        if (auto upstream = upstreamOutput(index)) {
+        // Let the operation seed its parameters from the data it will see, and
+        // only from that: the nearest enabled step above, with an output that
+        // is current. An older output further up (the raw data under a SIM
+        // step that has not run yet) is not what this step will get, and a
+        // window taken from it froze a range the real input does not have.
+        // Without a current input the defaults stay, which work it out at run time.
+        int actual = -1;
+        const std::shared_ptr<const StepOutput> upstream = seedParams ? upstreamOutput(index, &actual) : nullptr;
+        int nearest = index - 1;
+        while (nearest > 0 && !pipeline_.at(nearest).enabled) --nearest;
+        if (upstream && actual == nearest && outputFresh(actual)) {
             try {
                 Step& s = pipeline_.at(index);
                 s.params = s.op().initialParams(s.params, upstream->asInput());
@@ -766,9 +797,10 @@ namespace sirius::app {
                 const std::filesystem::path beside = base / v;
                 // beside the pipeline file, unless it only exists relative to
                 // the working directory; a missing file is named where the
-                // pipeline expects it, so validation can say so
+                // pipeline expects it, so validation can say so. With forward
+                // slashes, as every other path the application reports.
                 if (std::filesystem::exists(beside, ec) || !std::filesystem::exists(std::filesystem::path(v), ec))
-                    s.params.set(spec.key, beside.lexically_normal().string());
+                    s.params.set(spec.key, beside.lexically_normal().generic_string());
             }
         }
         const ParamSet loadBefore = pipeline_.at(0).params;
@@ -796,7 +828,7 @@ namespace sirius::app {
             // the pipeline's own Load parameters, not the defaults: its light-sheet
             // angle is not an open option, and must not be lost to the open
             const ParamSet wanted = pipeline_.at(0).params;
-            openDatasetAs(resolved.string(), openOptionsFromLoadParams(wanted), wanted);
+            openDatasetAs(resolved.generic_string(), openOptionsFromLoadParams(wanted), wanted);
         } catch (const std::exception& e) {
             logLine("The pipeline's dataset could not be opened: " + std::string(e.what()));
             // The data on screen is still the previous dataset: the Load
@@ -1256,9 +1288,17 @@ namespace sirius::app {
     }
 
     int Workbench::loadPlugins(bool reload) {
-        if (refuseIfRunning("load plugins")) return 0;
+        pluginError_.clear();
+        pluginWorkerFailure_.reset();
+        // A refused attempt says so too: an empty pluginError() would read
+        // as a load that reached the worker and found nothing.
+        if (refuseIfRunning("load plugins")) {
+            pluginError_ = "a run is in progress";
+            return 0;
+        }
         if (!launcher_) {
-            logLine("Plugins: no Python worker launcher configured.");
+            pluginError_ = "no Python worker launcher configured";
+            logLine("Plugins: " + withHint(pluginError_, workerHint_));
             return 0;
         }
         try {
@@ -1295,33 +1335,46 @@ namespace sirius::app {
                 notify(&Observer::outputsChanged);
             }
             return static_cast<int>(r.kinds.size());
+        } catch (const WorkerStartError& e) {
+            // The start failure is kept whole, as a run keeps it: the host
+            // offers its fix from there (the window's Python set-up prompt).
+            pluginError_ = e.what();
+            pluginWorkerFailure_ = e;
+            logLine("Plugins unavailable: " + withHint(e.what(), e.hint.empty() ? workerHint_ : e.hint));
+            return 0;
         } catch (const std::exception& e) {
-            logLine(std::string("Plugins unavailable: ") + e.what());
+            pluginError_ = e.what();
+            logLine("Plugins unavailable: " + withHint(e.what(), workerHint_));
             return 0;
         }
     }
 
+    std::shared_ptr<RunJob> Workbench::refuseRun(RunRefusal::Kind kind, int step, const std::string& line) {
+        lastRunRefusal_.kind = kind;
+        lastRunRefusal_.step = step;
+        lastRunRefusal_.message = line;
+        logLine(line);
+        return nullptr;
+    }
+
     std::shared_ptr<RunJob> Workbench::createRun(int target) {
-        if (activeRun_) {
-            logLine("A run is already in progress.");
-            return nullptr;
-        }
-        if (!source_) {
-            logLine("Open a dataset before running.");
-            return nullptr;
-        }
+        lastRunRefusal_ = RunRefusal{};
+        if (activeRun_) return refuseRun(RunRefusal::Kind::Running, -1, "A run is already in progress.");
+        if (!source_) return refuseRun(RunRefusal::Kind::NoDataset, -1, "Open a dataset before running.");
         if (target < 0 || target >= pipeline_.size()) target = pipeline_.size() - 1;
         bool needsWorker = false;
         for (int i = 1; i <= target; ++i) {
             const Step& s = pipeline_.at(i);
             if (!s.enabled) continue;
             const Validation v = stepValidation(i);
-            if (!v.ok()) {
-                logLine("Step " + Step::number(i) + " " + s.name + " cannot run: " + v.firstError());
-                return nullptr;
-            }
+            if (!v.ok())
+                return refuseRun(RunRefusal::Kind::Invalid, i, "Step " + Step::number(i) + " " + s.name + " cannot run: " + v.firstError());
             if (s.op().needsWorker(s.params) && !executor_.isFresh(pipeline_, i)) needsWorker = true;
         }
+        // Refused before anything is prepared, as the refusals above are.
+        if (backend_ != Backend::Hpc && needsWorker && !launcher_)
+            return refuseRun(RunRefusal::Kind::NoLauncher, -1,
+                             "Worker unavailable: " + withHint("no Python worker launcher configured", workerHint_));
         endPaintStroke();
         auto job = std::make_shared<RunJob>();
         job->pipeline_ = pipeline_;
@@ -1340,10 +1393,7 @@ namespace sirius::app {
         job->needsWorker_ = needsWorker;
         job->launcher_ = launcher_;
         job->remoteConfig_ = remote_;
-        if (backend_ != Backend::Hpc && needsWorker && !launcher_) {
-            logLine("Worker unavailable: no Python worker launcher configured (Preferences ▸ Worker sets the interpreter).");
-            return nullptr;
-        }
+        job->workerHint_ = workerHint_;
         activeRun_ = job;
         if (backend_ == Backend::Cuda && cudaDevice_ == kAllCudaDevices && cudaAvailable())
             logLine("Run to step " + Step::number(target) + " on CUDA · all " +

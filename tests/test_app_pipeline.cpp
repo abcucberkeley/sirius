@@ -1579,6 +1579,31 @@ TEST_CASE("A drag interrupted by a label edit starts a new undo group", "[app][w
     CHECK(wb.pipeline().at(2).params.getDouble("factor") == 2.0);
 }
 
+TEST_CASE("A new step seeds its parameters only from its own current input", "[app][workbench]") {
+    registerTestOps();
+    if (!findOperation("contrast")) SKIP("built-in operations not registered");
+    Scratch scratch;
+    Workbench wb(scratch.dir);
+    wb.setDataset(syntheticSource());
+    while (wb.pipeline().size() > 1) wb.removeStep(1);
+    wb.addStep("test_scale");
+    const auto automatic = [&wb](int i) {
+        const ParamSet& p = wb.pipeline().at(i).params;
+        return !(p.getDouble("max", 0.0) > p.getDouble("min", 0.0));
+    };
+    // step 1 has not run: the Load step's data is not what the new step gets
+    int i = wb.pipeline().indexOf(wb.addStep("contrast"));
+    CHECK(automatic(i));
+    wb.removeStep(i);
+    runSync(wb, 1);
+    // asked not to seed (the tool API), it stays automatic all the same
+    i = wb.pipeline().indexOf(wb.addStep("contrast", -1, false));
+    CHECK(automatic(i));
+    wb.removeStep(i);
+    i = wb.pipeline().indexOf(wb.addStep("contrast"));
+    CHECK_FALSE(automatic(i));
+}
+
 TEST_CASE("A live-preview step is displayed on its input until it runs", "[app][workbench][preview]") {
     registerTestOps();
     if (!findOperation("contrast")) SKIP("built-in operations not registered");

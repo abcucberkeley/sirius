@@ -1,12 +1,19 @@
 // File ▸ Preferences…: default backend and CUDA device, the HPC worker
-// connection, the Python interpreter for the local worker, and the
-// assistant provider (Ollama / OpenRouter / custom OpenAI-compatible
-// endpoint). Values live in the settings; the workbench is updated on Save.
+// connection, the Python interpreter for the local worker and SIRIUS's own
+// Python environment, and the assistant provider (Ollama / OpenRouter /
+// custom OpenAI-compatible endpoint). Values live in the settings; the
+// workbench is updated on Save. The environment's buttons act at once: they
+// open the setup dialog over this one, or remove the environment.
 
 #include "imgui/dialogs/dialogs.hpp"
 
 #include <algorithm>
+#include <atomic>
 #include <exception>
+#include <memory>
+#include <mutex>
+#include <optional>
+#include <stdexcept>
 #include <string>
 #include <utility>
 #include <vector>
@@ -15,6 +22,8 @@
 
 #include <sirius/device.hpp>
 
+#include "core/python_env.hpp"
+#include "core/rpc.hpp"
 #include "imgui/dialogs/export_dialog_support.hpp"
 #include "imgui/panels/assistant_panel.hpp"
 #include "imgui/panels/llm_client.hpp"
@@ -52,6 +61,32 @@ namespace sirius::app::gui {
             return b == Backend::Cuda && !cudaAvailable() ? Backend::Cpu : b;
         }
 
+        // "the requirements changed." -> "the requirements changed", to go before one of ours.
+        std::string withoutStop(std::string s) {
+            s = trimmed(s);
+            while (!s.empty() && s.back() == '.') s.pop_back();
+            return s;
+        }
+
+        // "Removed C:/…" -> "removed C:/…", to follow "Python environment: ".
+        // A first word in capitals (a name, a path) stays as it is.
+        std::string continuing(std::string s) {
+            if (s.size() > 1 && s[0] >= 'A' && s[0] <= 'Z' && s[1] >= 'a' && s[1] <= 'z') s[0] = static_cast<char>(s[0] - 'A' + 'a');
+            return s;
+        }
+
+        // What the Python environment's section shares with the threads and
+        // dialogs that work for it; it outlives the Preferences dialog.
+        struct EnvironmentShared {
+            std::atomic<bool> stale{false};   // an action changed the environment: look again
+            std::mutex mutex;
+            std::optional<pyenv::EnvironmentStatus> checked;   // Check's answer
+            std::string checkError;
+            // The dialog has closed: a Check still running then leaves the
+            // Bridge alone, which may be going too.
+            bool gone = false;
+        };
+
         class PreferencesDialog : public Dialog {
         public:
             explicit PreferencesDialog(App& app) {
@@ -84,8 +119,9 @@ namespace sirius::app::gui {
                 token_ = wb.remoteConfig().token;
                 openedToken_ = token_;
                 // Empty unless the user chose one: a default written back by Save
-                // is a choice nobody made (see WorkerLauncher::python).
+                // is a choice nobody made (see pyenv::workerInterpreter).
                 python_ = settings().getString("worker/python");
+                pythonTaken_ = python_;
                 envPython_ = platform::environment("SIRIUS_PYTHON");
                 hfToken_ = secrets::read("hub/token");
                 openedHfToken_ = hfToken_;
@@ -105,7 +141,24 @@ namespace sirius::app::gui {
                 // get revisited far more often than the compute ones)
                 tab_ = std::clamp(settings().getInt("prefs/tab", 0), 0, 1);
                 refreshModelList();   // the list on opening, without blocking the dialog
+
+                useUv_ = settings().getBool("worker/useUv", true);
+                offerEnvironment_ = settings().getBool("worker/offerEnvironment", true);
+                offerTaken_ = offerEnvironment_;
+                scriptDir_ = app.launcher().scriptDir();
+                if (scriptDir_.empty()) scriptDir_ = settings().getString("worker/dir");
+                if (scriptDir_.empty()) scriptDir_ = workerScriptPath();
+                lookAtEnvironment();
             }
+
+            // A Check still running is not waited for (checker_ hands its thread over).
+            ~PreferencesDialog() override {
+                const std::lock_guard<std::mutex> g(env_->mutex);
+                env_->gone = true;
+            }
+
+            PreferencesDialog(const PreferencesDialog&) = delete;
+            PreferencesDialog& operator=(const PreferencesDialog&) = delete;
 
             std::string title() const override { return "Preferences"; }
             ImVec2 size() const override { return ImVec2(560, 0); }
@@ -121,7 +174,7 @@ namespace sirius::app::gui {
                 widgets::vspace(4);
                 {
                     const Spacing spacing(8, 12);
-                    if (tab_ == 0) drawCompute();
+                    if (tab_ == 0) drawCompute(app);
                     else drawAssistant();
                 }
                 widgets::vspace(6);
@@ -138,7 +191,19 @@ namespace sirius::app::gui {
         private:
             std::string providerKey() const { return kProviders[std::clamp(provider_, 0, 2)]; }
 
-            void drawCompute() {
+            // Dialogs over this one change settings it shows: the setup's "Use
+            // SIRIUS's environment instead" takes the configured interpreter
+            // away, an offer's "Don't ask again" turns the offer off. A field
+            // the user has not touched follows them, and Save writes only what
+            // the user changed, so it never puts back what they took away.
+            void followSettings() {
+                if (python_ == pythonTaken_) python_ = pythonTaken_ = settings().getString("worker/python");
+                if (offerEnvironment_ == offerTaken_)
+                    offerEnvironment_ = offerTaken_ = settings().getBool("worker/offerEnvironment", true);
+            }
+
+            void drawCompute(App& app) {
+                followSettings();
                 {
                     const float w = columnWidth(2, 10);
                     widgets::FieldOpts fo;
@@ -181,13 +246,13 @@ namespace sirius::app::gui {
                 {
                     const Field f("Python for the local worker");
                     widgets::FieldOpts fo;
-                    fo.hint = envPython_.empty() ? std::string("python3") : envPython_ + " (from $SIRIUS_PYTHON)";
+                    fo.hint = pythonHint_;
                     widgets::inputText("##python", &python_, fo);
-                    widgets::tooltip(envPython_.empty() ? "Interpreter with numpy (and torch for segmentation); empty = python3. "
-                                                          "$SIRIUS_PYTHON, when set, overrides this field"
-                                                        : "Interpreter with numpy (and torch for segmentation). $SIRIUS_PYTHON is set "
-                                                          "and overrides this field");
+                    widgets::tooltip("Interpreter for the local worker. Empty = SIRIUS's own Python environment when it is "
+                                     "set up, otherwise the first python3 on PATH. $SIRIUS_PYTHON, when set, overrides this "
+                                     "field.");
                 }
+                drawEnvironment(app);
                 {
                     const Field f("Hugging Face access token (optional)");
                     widgets::FieldOpts fo;
@@ -196,6 +261,209 @@ namespace sirius::app::gui {
                     widgets::tooltip("Access token for gated or private Hugging Face repositories (huggingface.co ▸ Settings ▸ "
                                      "Access Tokens); sent with each request that downloads a model");
                 }
+            }
+
+            // --- SIRIUS's Python environment -------------------------------------------------
+            //
+            // Looked at on opening and after each action, never every frame:
+            // the status reads the marker and the requirement files.
+
+            void lookAtEnvironment() {
+                try {
+                    envStatus_ = pyenv::environmentStatus(scriptDir_, false);
+                    envError_.clear();
+                } catch (const std::exception& e) {
+                    envStatus_ = pyenv::EnvironmentStatus();
+                    envError_ = e.what();
+                }
+                pyenv::Interpreter unset;
+                try {
+                    unset = pyenv::workerInterpreter(std::string(), std::string());
+                } catch (const std::exception&) {
+                    // the hint falls back to what is on PATH
+                }
+                envDirExists_ = !envStatus_.dir.empty() && isDirectory(envStatus_.dir);
+                found_ = platform::findPython();
+                // what an empty field means, as the worker would pick it now
+                const std::string version = envStatus_.marker ? envStatus_.marker->pythonVersion : std::string();
+                if (!envPython_.empty()) pythonHint_ = envPython_ + " (from $SIRIUS_PYTHON)";
+                else if (unset.source == pyenv::Source::Managed)
+                    pythonHint_ = "SIRIUS environment" + (version.empty() ? std::string() : " \xC2\xB7 Python " + version);
+                else if (!unset.path.empty()) pythonHint_ = unset.path;
+                else pythonHint_ = found_.empty() ? std::string("python3") : found_;
+            }
+
+            // What the worker runs without the environment: the environment
+            // variable, the field, the first Python on PATH.
+            std::string interpreterWithout() const {
+                if (!envPython_.empty()) return envPython_;
+                if (std::string field = trimmed(python_); !field.empty()) return field;
+                if (!found_.empty()) return found_;
+#ifdef _WIN32
+                return "python";
+#else
+                return "python3";
+#endif
+            }
+
+            std::string problemOr(const char* otherwise) const {
+                const std::string problem = withoutStop(envStatus_.problem);
+                return problem.empty() ? std::string(otherwise) : problem;
+            }
+
+            std::string environmentLine() const {
+                if (!envError_.empty()) return "Cannot tell: " + envError_;
+                const pyenv::EnvironmentStatus& s = envStatus_;
+                switch (s.state) {
+                    case pyenv::State::Ready: {
+                        std::string line = "Ready";
+                        if (s.marker) {
+                            if (!s.marker->pythonVersion.empty()) line += " \xC2\xB7 Python " + s.marker->pythonVersion;
+                            for (const char* name : {"numpy", "scipy"}) {
+                                const auto it = s.marker->packages.find(name);
+                                const bool known = it != s.marker->packages.end() && !it->second.empty();
+                                const std::string version = known ? it->second : std::string("\xE2\x80\x94");
+                                line += std::string(" \xC2\xB7 ") + name + " " + version;
+                            }
+                        }
+                        return line + " \xC2\xB7 " + s.dir;
+                    }
+                    case pyenv::State::Absent: return "Not set up. The worker runs " + interpreterWithout() + ".";
+                    case pyenv::State::Incomplete: return "Incomplete (a setup did not finish).";
+                    case pyenv::State::Outdated: return "Update needed: " + problemOr("the requirements changed") + ".";
+                    case pyenv::State::Broken: return "Needs repair: " + problemOr("it does not run") + ".";
+                }
+                return std::string();
+            }
+
+            // Check's answer, or an action that changed the environment.
+            void takeEnvironmentNews() {
+                if (checking_) {
+                    std::optional<pyenv::EnvironmentStatus> checked;
+                    std::string error;
+                    {
+                        const std::lock_guard<std::mutex> g(env_->mutex);
+                        checked.swap(env_->checked);
+                        error = env_->checkError;
+                    }
+                    if (checked || !error.empty()) {
+                        checking_ = false;
+                        lookAtEnvironment();
+                        if (checked) envStatus_ = *checked;   // with what running its Python found
+                        if (!error.empty()) envError_ = error;
+                    }
+                }
+                if (env_->stale.exchange(false)) lookAtEnvironment();
+            }
+
+            void drawEnvironment(App& app) {
+                takeEnvironmentNews();
+                const pyenv::EnvironmentStatus& s = envStatus_;
+                // Closer together than the fields around it: the tab is tall
+                // enough already, and these lines belong together.
+                const Spacing section(6, 6);
+                widgets::caption("SIRIUS's Python environment");
+                widgets::textWrapped(checking_ ? std::string("Checking\xE2\x80\xA6") : environmentLine(), 12, theme::kText);
+                if (s.state != pyenv::State::Absent && envError_.empty() && (!envPython_.empty() || !trimmed(python_).empty())) {
+                    const char* who = envPython_.empty() ? "the field above" : "$SIRIUS_PYTHON";
+                    note(std::string("Not used: ") + who + " names the interpreter.");
+                }
+                {
+                    widgets::ButtonOpts o;
+                    o.small = true;
+                    const char* action = "Recreate\xE2\x80\xA6";
+                    if (s.state == pyenv::State::Absent) action = "Set up\xE2\x80\xA6";
+                    else if (s.state == pyenv::State::Outdated) action = "Update\xE2\x80\xA6";
+                    else if (s.state == pyenv::State::Incomplete || s.state == pyenv::State::Broken)
+                        action = "Repair\xE2\x80\xA6";
+                    o.tooltip = "Say what would be downloaded and where, then do it";
+                    if (widgets::button(action, o)) openSetup(app);
+                    ImGui::SameLine();
+                    o.enabled = s.state != pyenv::State::Absent && !checking_;
+                    o.tooltip = "Run the environment's Python and see that the worker's packages import";
+                    if (widgets::button("Check", o)) startCheck(app);
+                    ImGui::SameLine();
+                    o.enabled = s.state != pyenv::State::Absent && !app.bridge().busy();
+                    o.tooltip = app.bridge().running()       ? std::string("Finish or cancel the run first")
+                                : app.bridge().taskRunning() ? "Wait for " + app.bridge().taskLabel() + " to finish"
+                                                             : std::string("Delete the environment's folder");
+                    if (widgets::button("Remove", o)) askRemove(app);
+                    ImGui::SameLine();
+                    o.enabled = envDirExists_;
+                    o.tooltip = s.dir;
+                    if (widgets::button("Open folder", o)) platform::openInFileManager(s.dir);
+                }
+                widgets::checkbox("Use uv to download when it is installed", &useUv_);
+                {
+                    // the field below keeps its usual distance
+                    const Spacing field(8, 12);
+                    widgets::checkbox("Offer to set up Python when the worker cannot start", &offerEnvironment_);
+                }
+            }
+
+            void openSetup(App& app) {
+                PythonEnvRequest r;
+                r.state = envStatus_.state;
+                r.problem = envStatus_.problem;
+                r.useUv = useUv_;   // as ticked here, saved or not
+                const std::shared_ptr<EnvironmentShared> env = env_;
+                r.finished = [env] { env->stale.store(true); };
+                app.showDialog(makePythonEnvDialog(app, std::move(r)));
+            }
+
+            // `<envpy> -m sirius_worker --check` starts a Python: on a thread.
+            void startCheck(App& app) {
+                if (checking_) return;   // one at a time: start() joins the last, which has answered
+                {
+                    const std::lock_guard<std::mutex> g(env_->mutex);
+                    env_->checked.reset();
+                    env_->checkError.clear();
+                }
+                checking_ = true;
+                const std::shared_ptr<EnvironmentShared> env = env_;
+                const std::string scriptDir = scriptDir_;
+                Bridge& bridge = app.bridge();   // only while the dialog is there (EnvironmentShared::gone)
+                checker_.start([env, scriptDir, &bridge] {
+                    std::optional<pyenv::EnvironmentStatus> status;
+                    std::string error;
+                    try {
+                        status = pyenv::environmentStatus(scriptDir, true);
+                    } catch (const std::exception& e) {
+                        error = e.what();
+                    }
+                    const std::lock_guard<std::mutex> g(env->mutex);
+                    env->checked = std::move(status);
+                    env->checkError = error.empty() && !env->checked ? std::string("no answer") : error;
+                    if (!env->gone) bridge.wake();
+                });
+            }
+
+            void askRemove(App& app) {
+                const std::string dir = envStatus_.dir;
+                const std::shared_ptr<EnvironmentShared> env = env_;
+                app.ask("Remove the Python environment",
+                        "Remove SIRIUS's Python environment (" + dir + ")? The worker then runs " + interpreterWithout() +
+                            " until it is set up again.",
+                        {"Cancel", "Remove"}, [&app, dir, env](int answer) {
+                            if (answer != 1) return;
+                            WorkerLauncher& worker = app.launcher();
+                            // What remove() did, in its words: a folder removed, one
+                            // with files left for the next setup, or none there.
+                            const auto outcome = std::make_shared<std::string>();
+                            const bool started = app.bridge().startTask(
+                                "Removing the Python environment",
+                                [&worker, dir, env, outcome](const Bridge::TaskProgress&, const Bridge::TaskCancelled&) {
+                                    // A worker running from it holds its files (on Windows the DLLs cannot go).
+                                    worker.stop();
+                                    const pyenv::SetupResult r = pyenv::remove(dir);
+                                    env->stale.store(true);
+                                    const std::string text = r.message + (r.hint.empty() ? std::string() : " " + r.hint);
+                                    if (!r.ok) throw std::runtime_error(text);
+                                    *outcome = text;   // read by the completion, after the task has ended
+                                },
+                                [&app, outcome] { app.wb().logLine("Python environment: " + continuing(*outcome)); });
+                            if (!started) env->stale.store(true);
+                        });
             }
 
             void drawAssistant() {
@@ -322,8 +590,13 @@ namespace sirius::app::gui {
                 // is not the user's to store.
                 std::vector<std::string> notStored;
                 if (token_ != openedToken_ && !secrets::write("hpc/token", token_)) notStored.emplace_back("the HPC token");
-                if (const std::string python = trimmed(python_); python.empty()) s.remove("worker/python");
-                else s.set("worker/python", python);
+                // These two only when changed here (followSettings).
+                if (python_ != pythonTaken_) {
+                    if (const std::string python = trimmed(python_); python.empty()) s.remove("worker/python");
+                    else s.set("worker/python", python);
+                }
+                s.set("worker/useUv", useUv_);
+                if (offerEnvironment_ != offerTaken_) s.set("worker/offerEnvironment", offerEnvironment_);
                 if (hfToken_ != openedHfToken_ && !secrets::write("hub/token", trimmed(hfToken_)))
                     notStored.emplace_back("the Hugging Face token");
                 AssistantSettings as;
@@ -375,6 +648,20 @@ namespace sirius::app::gui {
             std::string openedToken_, openedHfToken_, openedApiKey_;
             bool fetching_ = false;                   // Refresh is disabled until the server answers
             int generation_ = 0;
+            // SIRIUS's Python environment
+            std::string scriptDir_;
+            pyenv::EnvironmentStatus envStatus_;
+            std::string envError_;                    // the status could not be read
+            bool envDirExists_ = false;
+            std::string found_;                       // the first Python on PATH
+            std::string pythonHint_;                  // what an empty Python field means
+            bool useUv_ = true, offerEnvironment_ = true;
+            // The settings as the Python field and the offer's checkbox last took them.
+            std::string pythonTaken_;
+            bool offerTaken_ = true;
+            bool checking_ = false;
+            std::shared_ptr<EnvironmentShared> env_ = std::make_shared<EnvironmentShared>();
+            DialogThread checker_;
             // Last, so its requests are cancelled before what their callbacks write to goes.
             LlmClient client_;
         };

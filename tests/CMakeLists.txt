@@ -61,9 +61,19 @@ sirius_lib_test(sim_reconstruction test_reconstruction.cpp
     UNITS lib/otf_io lib/otf_ideal lib/legacy_config lib/tiff_io)
 
 # --- the workbench core ----------------------------------------------------------
-# The GUI's core is tested the same way when the application is enabled; the
-# GUI layer itself is exercised by CI's headless run of the bundled pipeline.
-if(SIRIUS_ENABLE_APP)
+# The GUI's core is tested the same way when the application or sirius-cli is
+# enabled; the GUI layer itself is exercised by CI's headless run of the bundled
+# pipeline.
+if(SIRIUS_ENABLE_APP OR SIRIUS_ENABLE_CLI)
+    # What the child-process, Python-environment and worker tests start: a
+    # stdlib-only program whose argv picks what it does (echo stdin, print,
+    # sleep, exit with a code, print a variable, start a grandchild), so they
+    # need no shell and no CMake newer than the minimum on any platform.
+    add_executable(sirius_test_child tools/sirius_test_child.cpp)
+    if(SIRIUS_ENABLE_WARNINGS)
+        target_set_warnings(sirius_test_child)
+    endif()
+    sirius_finish_test_executable(sirius_test_child)
     include(app_tests.cmake)
 endif()
 
@@ -75,21 +85,84 @@ endif()
 get_property(_sirius_test_objects GLOBAL PROPERTY SIRIUS_TEST_OBJECTS)
 add_executable(sirius_tests)
 target_link_libraries(sirius_tests PRIVATE ${_sirius_test_objects} sirius Catch2::Catch2WithMain)
-if(SIRIUS_ENABLE_APP)
+if(SIRIUS_ENABLE_APP OR SIRIUS_ENABLE_CLI)
     target_link_libraries(sirius_tests PRIVATE sirius::app_core)
+    add_dependencies(sirius_tests sirius_test_child)
 endif()
 sirius_finish_test_executable(sirius_tests)
 
 # The workbench as `cmake --install` lays it out, run from there (Linux only;
-# see app/CMakeLists.txt). With $SIRIUS_PYTHON set when the test runs it also
-# starts the installed worker.
-if(SIRIUS_ENABLE_APP AND UNIX AND NOT APPLE)
+# see app/CMakeLists.txt): sirius-cli always, the GUI when it is built. With
+# $SIRIUS_PYTHON set when the test runs it also starts the installed worker.
+if((SIRIUS_ENABLE_APP OR SIRIUS_ENABLE_CLI) AND UNIX AND NOT APPLE)
+    if(SIRIUS_ENABLE_APP)
+        set(_has_app ON)
+    else()
+        set(_has_app OFF)
+    endif()
     add_test(NAME sirius::app.install
         COMMAND ${CMAKE_COMMAND}
             -DBUILD_DIR=${PROJECT_BINARY_DIR}
             -DPREFIX=${CMAKE_CURRENT_BINARY_DIR}/install-check
             -DCONFIG=$<CONFIG>
             -DRAW=${PROJECT_SOURCE_DIR}/tests/data/raw.tif
+            -DHAS_APP=${_has_app}
             -P ${PROJECT_SOURCE_DIR}/app/linux/check_install.cmake)
     set_tests_properties(sirius::app.install PROPERTIES TIMEOUT 300 LABELS app)
+endif()
+
+# --- sirius-cli, end to end ------------------------------------------------------
+# The executable as a script or an agent drives it: one-shot commands, the
+# JSON-lines session and the MCP server, over pipes (tests/cli/check_cli.cmake
+# reads what comes back line by line; tests/cli/agent_client.py talks to it
+# interactively). Each mode works in a directory of its own, and
+# SIRIUS_PYTHON_ENV points into it, so no test ever reads or changes the
+# user's own Python environment. The bundled SIM run is labelled cli.slow:
+# unmeasured in an MSVC Debug build, it is left to the Linux jobs there
+# (ctest -LE cli.slow). A test that cannot run here prints "SKIPPED:".
+if(TARGET sirius-cli)
+    function(sirius_cli_test mode)
+        cmake_parse_arguments(PARSE_ARGV 1 C "" "TIMEOUT" "LABELS")
+        set(_work ${CMAKE_CURRENT_BINARY_DIR}/cli-work/${mode})
+        add_test(NAME sirius::cli.${mode}
+            COMMAND ${CMAKE_COMMAND}
+                -DCLI=$<TARGET_FILE:sirius-cli>
+                -DSRC=${PROJECT_SOURCE_DIR}
+                -DWORK=${_work}
+                -DMODE=${mode}
+                -P ${PROJECT_SOURCE_DIR}/tests/cli/check_cli.cmake)
+        if(NOT C_LABELS)
+            set(C_LABELS cli)
+        endif()
+        if(NOT C_TIMEOUT)
+            set(C_TIMEOUT 300)
+        endif()
+        set_tests_properties(sirius::cli.${mode} PROPERTIES
+            LABELS "${C_LABELS}"
+            TIMEOUT ${C_TIMEOUT}
+            SKIP_REGULAR_EXPRESSION "SKIPPED:"
+            ENVIRONMENT "SIRIUS_PYTHON_ENV=${_work}/pyenv")
+    endfunction()
+
+    sirius_cli_test(oneshot)
+    sirius_cli_test(run_contrast)
+    sirius_cli_test(run_bundled LABELS cli cli.slow TIMEOUT 900)
+    sirius_cli_test(session)
+    sirius_cli_test(mcp_legacy)
+    sirius_cli_test(mcp_modern)
+    sirius_cli_test(worker_check)
+
+    # The agent's side of the protocols, interactive over pipes (stdlib only).
+    find_package(Python3 COMPONENTS Interpreter)
+    if(Python3_Interpreter_FOUND)
+        set(_work ${CMAKE_CURRENT_BINARY_DIR}/cli-work/agent_client)
+        add_test(NAME sirius::cli.agent_client
+            COMMAND ${Python3_EXECUTABLE} ${PROJECT_SOURCE_DIR}/tests/cli/agent_client.py
+                --cli $<TARGET_FILE:sirius-cli> --data ${PROJECT_SOURCE_DIR})
+        set_tests_properties(sirius::cli.agent_client PROPERTIES
+            LABELS cli
+            TIMEOUT 600
+            SKIP_REGULAR_EXPRESSION "SKIPPED:"
+            ENVIRONMENT "SIRIUS_PYTHON_ENV=${_work}/pyenv")
+    endif()
 endif()

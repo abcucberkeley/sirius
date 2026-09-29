@@ -23,14 +23,11 @@
 
 #include <nlohmann/json.hpp>
 
-#ifndef _WIN32
-#include <unistd.h>   // mkdtemp, which macOS declares here
-#endif
-
 #include <sirius/device.hpp>
 
 #include "core/app_paths.hpp"
 #include "core/help_pages.hpp"
+#include "core/host.hpp"
 #include "core/operation.hpp"
 #include "core/ops/builtin.hpp"
 #include "core/tool_api.hpp"
@@ -172,36 +169,6 @@ namespace {
         }
     }
 
-    // A new directory of this process's own under the temporary directory,
-    // "" when none can be made. On POSIX that directory is shared by every
-    // user, so a name another user could have created first must not be
-    // taken over: mkdtemp picks one that did not exist, creates it with mode
-    // 0700 and fails rather than reuse one. %TEMP% on Windows is the user's
-    // own; the directory is still a new one, not an existing one taken over.
-    std::string makeTempDirectory(const std::string& prefix) {
-        std::string parent = platform::tempDirectory();   // Windows' ends in a separator
-        if (!parent.empty() && parent.back() != '/') parent += '/';
-#ifdef _WIN32
-        const std::string base = parent + prefix + std::to_string(platform::processId());
-        for (int n = 0; n < 100; ++n) {
-            const std::string dir = n == 0 ? base : base + "-" + std::to_string(n);
-            const std::filesystem::path path = std::filesystem::u8path(dir);
-            std::error_code ec;
-            if (std::filesystem::create_directory(path, ec)) return dir;
-            // Left by an earlier process with the same id: try the next name.
-            // Anything else (no temporary directory, no permission) will not
-            // change with another name.
-            if (!std::filesystem::exists(path, ec)) return std::string();
-        }
-        return std::string();
-#else
-        const std::string pattern = parent + prefix + "XXXXXX";
-        std::vector<char> name(pattern.begin(), pattern.end());
-        name.push_back('\0');
-        return ::mkdtemp(name.data()) ? std::string(name.data()) : std::string();
-#endif
-    }
-
 } // namespace
 
 int main(int argc, char** argv) {
@@ -263,7 +230,7 @@ int main(int argc, char** argv) {
     if (args.has("settings")) {
         std::string dir = args.value("settings");
         if (dir == "scratch") {
-            dir = makeTempDirectory("sirius-settings-");
+            dir = host::makeTempDirectory("sirius-settings-");
             if (dir.empty()) {
                 std::fprintf(stderr, "cannot create a scratch settings directory in %s\n", platform::tempDirectory().c_str());
                 return 2;
@@ -282,7 +249,7 @@ int main(int argc, char** argv) {
     registerBuiltinOperations();
 
     // Per-process scratch for the disk cache and worker files.
-    const std::string scratch = makeTempDirectory("sirius-");
+    const std::string scratch = host::makeTempDirectory("sirius-");
     if (scratch.empty()) {
         std::fprintf(stderr, "cannot create a scratch directory in %s\n", platform::tempDirectory().c_str());
         return 2;
@@ -327,6 +294,22 @@ int main(int argc, char** argv) {
         const bool headless = scripted || args.has("screenshot");
 
         App app(bridge, tools, launcher);
+        // Where a worker error that is not about packages sends the user: the
+        // interpreter and the HPC host are set in the GUI, not by flags.
+        workbench.setWorkerHint("Preferences \xE2\x96\xB8 Compute sets the Python interpreter and the HPC host.");
+        // A worker that cannot start for want of packages or of a Python is
+        // offered SIRIUS's own environment. The handler runs on whichever
+        // thread was connecting (a run's, the model hub's, this one during the
+        // plugin load), with the launcher's start lock held, so it only posts;
+        // this one hook covers them all. It is taken off before the window
+        // goes, as the log handler is before the bridge.
+        launcher.setStartFailureHandler([&bridge, &app](const WorkerStartError& e) {
+            if (e.setupWouldHelp()) bridge.post([&app, e] { offerPythonEnvironment(app, e); });
+        });
+        struct DetachFailureHandler {
+            WorkerLauncher& launcher;
+            ~DetachFailureHandler() { launcher.setStartFailureHandler({}); }
+        } detachFailure{launcher};
         InitOptions init;
         // Nobody is at the keyboard in any of these modes, so the window must
         // not ask whether to cancel a running job on the way out.
@@ -560,6 +543,10 @@ int main(int argc, char** argv) {
 
         rc = app.run();
     }
+    // A dialog closed while it was probing an interpreter left that thread
+    // running: it is joined here, with the dialogs all gone, rather than
+    // while the process's statics are being destroyed.
+    finishDialogThreads();
     std::error_code ec;
     std::filesystem::remove_all(std::filesystem::u8path(scratch), ec);
     return rc;

@@ -145,8 +145,8 @@ namespace sirius::app {
                 const Validation v = validate(p, input.meta);
                 if (!v.ok()) throw std::runtime_error(v.firstError());
                 if (!ctx.remote)
-                    throw std::runtime_error("Segmentation needs the Python worker: start it from Preferences ▸ Worker "
-                                             "or choose the HPC backend");
+                    throw std::runtime_error("Segmentation needs the Python worker, which is not available here (see the "
+                                             "worker message in the log), or the HPC backend");
                 if (!ctx.remote->supports("torch_segment"))
                     throw std::runtime_error("The connected worker does not implement torch_segment (" +
                                              ctx.remote->capabilities().hostname + ")");

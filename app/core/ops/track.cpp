@@ -184,7 +184,8 @@ namespace sirius::app {
             // into the application.
             StepOutput runBtrack(const StepInput& input, const ParamSet& p, const StepContext& ctx, StepOutput out) const {
                 if (!ctx.remote)
-                    throw std::runtime_error("btrack tracking needs the Python worker: start it in Preferences ▸ Python");
+                    throw std::runtime_error("btrack tracking needs the Python worker, which is not available here (see the "
+                                             "worker message in the log); the built-in tracker runs without it");
                 const LabelVolume& in = *input.labels;
                 const Index frames = in.t(), volume = in.z() * in.y() * in.x();
                 std::vector<std::uint32_t> flat(static_cast<std::size_t>(frames * volume));

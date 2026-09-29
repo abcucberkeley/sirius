@@ -44,8 +44,7 @@ if(WIN32)
     # crypt32: DPAPI (CryptProtectData) behind imgui/secret_store.cpp
     target_link_libraries(sirius-app PRIVATE crypt32 shell32)
 endif()
-find_package(Threads REQUIRED)
-target_link_libraries(sirius-app PRIVATE Threads::Threads)
+target_link_libraries(sirius-app PRIVATE Threads::Threads)   # found in cmake/Dependencies.cmake
 if(SIRIUS_ENABLE_WARNINGS)
     target_set_warnings(sirius-app)
 endif()
@@ -53,41 +52,31 @@ if(SIRIUS_ENABLE_SANITIZERS)
     target_enable_sanitizers(sirius-app)
 endif()
 
-# Help pages, the Python worker, the example plugins, the fonts and the window
-# icons live next to the executable so users can edit the pages and launch the
-# worker from the build tree.
+# The fonts and the window icons live next to the executable, as the help
+# pages, the Python worker and the example plugins do: those, and the NVIDIA
+# runtime DLLs on Windows, are copied by sirius_app_runtime_files
+# (app/CMakeLists.txt), which sirius-cli shares.
 add_custom_command(TARGET sirius-app POST_BUILD
-    COMMAND ${CMAKE_COMMAND} -E copy_directory
-            ${CMAKE_CURRENT_SOURCE_DIR}/../help $<TARGET_FILE_DIR:sirius-app>/help
-    COMMAND ${CMAKE_COMMAND} -E copy_directory
-            ${CMAKE_CURRENT_SOURCE_DIR}/../python $<TARGET_FILE_DIR:sirius-app>/python
-    COMMAND ${CMAKE_COMMAND} -E copy_directory
-            ${CMAKE_CURRENT_SOURCE_DIR}/../plugins $<TARGET_FILE_DIR:sirius-app>/plugins
     COMMAND ${CMAKE_COMMAND} -E copy_directory
             ${CMAKE_CURRENT_SOURCE_DIR}/../resources/fonts $<TARGET_FILE_DIR:sirius-app>/fonts
     COMMAND ${CMAKE_COMMAND} -E copy_directory
             ${CMAKE_CURRENT_SOURCE_DIR}/../resources/icons $<TARGET_FILE_DIR:sirius-app>/icons
-    COMMENT "Copying help pages, the Python worker, the example plugins, fonts and icons next to sirius-app"
+    COMMENT "Copying fonts and icons next to sirius-app"
     VERBATIM)
-
-# Runtime DLLs on Windows: the NVIDIA libraries (as for the tests and
-# benchmarks), so the executable starts from the build tree without PATH
-# changes. Everything else is linked statically.
-sirius_copy_runtime_dlls(sirius-app)
+add_dependencies(sirius-app sirius_app_runtime_files)
 
 # --- install (Linux) --------------------------------------------------------
 #
 #   cmake --install <build> --component app --prefix <prefix>
 #
 #   bin/sirius-app
-#   share/sirius/{help,python,plugins,fonts,icons}  what the build copies beside the executable
-#   share/sirius/python/workbench.py       the step library (and its op_schema.json) the
-#                                          worker loads when no sirius package is importable
+#   share/sirius/{fonts,icons}             what the build copies beside the executable
 #   share/applications/sirius-app.desktop  the menu entry and "Open with" for TIFFs
 #   share/icons/hicolor/*/apps/sirius-app.{png,svg}
-#   lib/sirius/                            nvTIFF / nvCOMP of a CUDA build, found via $ORIGIN
 #
-# tests/CMakeLists.txt installs this into the build tree and runs the result
+# The help pages, the worker, the plugins and the nv libraries both
+# executables share are installed by app/CMakeLists.txt. tests/CMakeLists.txt
+# installs this into the build tree and runs the result
 # (app/linux/check_install.cmake). Windows runs from the build tree; a macOS
 # bundle would need a layout of its own.
 if(UNIX AND NOT APPLE)
@@ -100,17 +89,9 @@ if(UNIX AND NOT APPLE)
 
     set(_app_dir ${CMAKE_CURRENT_SOURCE_DIR}/..)
     install(TARGETS sirius-app RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR} COMPONENT app)
-    install(DIRECTORY ${_app_dir}/help ${_app_dir}/python ${_app_dir}/plugins
-        DESTINATION ${SIRIUS_APP_INSTALL_DATADIR} COMPONENT app
-        PATTERN __pycache__ EXCLUDE
-        PATTERN "python/tests" EXCLUDE)
     install(DIRECTORY ${_app_dir}/resources/fonts ${_app_dir}/resources/icons
         DESTINATION ${SIRIUS_APP_INSTALL_DATADIR} COMPONENT app
         PATTERN README.md EXCLUDE)
-    install(FILES
-        ${PROJECT_SOURCE_DIR}/bindings/python/sirius/workbench.py
-        ${PROJECT_SOURCE_DIR}/bindings/python/sirius/op_schema.json
-        DESTINATION ${SIRIUS_APP_INSTALL_DATADIR}/python COMPONENT app)
     install(FILES ${_app_dir}/linux/sirius-app.desktop DESTINATION ${CMAKE_INSTALL_DATADIR}/applications COMPONENT app)
     install(FILES ${_app_dir}/resources/icons/sirius-app.svg
         DESTINATION ${CMAKE_INSTALL_DATADIR}/icons/hicolor/scalable/apps COMPONENT app)
@@ -118,13 +99,5 @@ if(UNIX AND NOT APPLE)
         install(FILES ${_app_dir}/resources/icons/sirius-app-${_px}.png
             DESTINATION ${CMAKE_INSTALL_DATADIR}/icons/hicolor/${_px}x${_px}/apps
             RENAME sirius-app.png COMPONENT app)
-    endforeach()
-    # The redistributables ship "libnvtiff.so.0 -> libnvtiff.so.0.8.0.82"
-    # symlinks; install the real file under the soname the executable needs
-    # (as bindings/CMakeLists.txt does for the wheel).
-    foreach(_lib IN LISTS SIRIUS_NVTIFF_RUNTIME_LIBS SIRIUS_NVCOMP_RUNTIME_LIBS)
-        get_filename_component(_soname "${_lib}" NAME)
-        file(REAL_PATH "${_lib}" _real)
-        install(FILES "${_real}" DESTINATION ${CMAKE_INSTALL_LIBDIR}/sirius COMPONENT app RENAME "${_soname}")
     endforeach()
 endif()

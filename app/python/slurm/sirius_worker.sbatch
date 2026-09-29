@@ -16,8 +16,9 @@
 #
 #     ssh -N -L 7645:<node>:7645 <login-node>
 #
-# and point the app at localhost:7645 with the same token (Preferences ▸ HPC).
-# See README.md next to this file.
+# and point the app at localhost:7645 with the same token (Preferences ▸
+# Compute, HPC worker; or sirius-cli --hpc localhost:7645 with the token in
+# SIRIUS_HPC_TOKEN). See README.md next to this file.
 
 set -euo pipefail
 
@@ -26,7 +27,14 @@ module load python
 module load cmake 2>/dev/null || true
 module load nvhpc 2>/dev/null || true
 # A Python with numpy (and torch for segmentation models); the sirius wheel
-# enables SIM reconstruction on the node. Uncomment for a venv/conda:
+# enables SIM reconstruction on the node. Install what the worker needs into
+# that environment once, before submitting (share/sirius/python/ in an
+# installed tree):
+#     pip install -r app/python/requirements.txt          # numpy
+#     pip install -r app/python/requirements-extra.txt    # optional: scipy, scikit-image
+# Without numpy the worker exits with code 3 and a missing_packages line in
+# the log. Uncomment for a venv/conda (or SIRIUS's own environment, which
+# `sirius-cli worker setup` makes under ~/.local/share/sirius/python-env):
 # source "$HOME/venvs/sirius/bin/activate"
 
 # --- worker ------------------------------------------------------------------

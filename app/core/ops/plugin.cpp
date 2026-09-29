@@ -126,7 +126,8 @@ namespace sirius::app {
             StepOutput run(const StepInput& input, const ParamSet& params, const StepContext& ctx) const override {
                 if (!ctx.remote)
                     throw std::runtime_error("The plugin '" + info_.name +
-                                             "' runs in the Python worker: start it from Preferences ▸ Worker or choose the HPC backend");
+                                             "' runs in the Python worker, which is not available here (see the worker "
+                                             "message in the log), or on the HPC backend");
                 if (!ctx.remote->supports("plugin"))
                     throw std::runtime_error("The connected worker does not run plugins (update app/python/sirius_worker)");
                 const DatasetMeta& meta = input.meta;

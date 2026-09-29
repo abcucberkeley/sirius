@@ -109,12 +109,12 @@ namespace sirius::app {
             group = std::move(g);
             return *this;
         }
-        ParamSpec& visibleWhen(std::string key, std::vector<std::string> values) {
-            visibility.push_back({std::move(key), std::move(values), false});
+        ParamSpec& visibleWhen(std::string otherKey, std::vector<std::string> values) {
+            visibility.push_back({std::move(otherKey), std::move(values), false});
             return *this;
         }
-        ParamSpec& hiddenWhen(std::string key, std::vector<std::string> values) {
-            visibility.push_back({std::move(key), std::move(values), true});
+        ParamSpec& hiddenWhen(std::string otherKey, std::vector<std::string> values) {
+            visibility.push_back({std::move(otherKey), std::move(values), true});
             return *this;
         }
         // Whether this parameter should be shown for the given settings.

@@ -1,13 +1,17 @@
-# The SIRIUS workbench (docs/design/README.md). Gated by SIRIUS_ENABLE_APP at
-# the top level; Dear ImGui, GLFW, ImPlot and friends are fetched in
-# cmake/Dependencies.cmake as sirius::imgui.
+# The SIRIUS workbench (docs/design/README.md). Gated by SIRIUS_ENABLE_APP or
+# SIRIUS_ENABLE_CLI at the top level; Dear ImGui, GLFW, ImPlot and friends are
+# fetched in cmake/Dependencies.cmake as sirius::imgui, for the GUI only.
 #
 #   sirius_app_core  static, GUI-free: array model, operations, pipeline,
-#                    executor, workbench, tool API, worker protocol, export.
-#                    Built as a graph of units (cmake/Units.cmake), each with
-#                    a test executable of its own in tests/app_tests.cmake.
-#   sirius-app       the executable (app/imgui/**), globbed (CONFIGURE_DEPENDS)
-#                    so adding a panel is adding a file.
+#                    executor, workbench, tool API, worker protocol, export,
+#                    and what sirius-cli drives (rendering, statistics, the
+#                    session and MCP protocols). Built as a graph of units
+#                    (cmake/Units.cmake), each with a test executable of its
+#                    own in tests/app_tests.cmake.
+#   sirius-app       the GUI (app/imgui/**), globbed (CONFIGURE_DEPENDS) so
+#                    adding a panel is adding a file; SIRIUS_ENABLE_APP only.
+#   sirius-cli       the core without a window, for scripts and agents
+#                    (app/cli); built whenever this directory is.
 
 include(Units)
 
@@ -47,6 +51,11 @@ function(sirius_core_unit name)
         # Library-wide, as when this was one target: OpenMP (Eigen reads
         # _OPENMP, so a unit without a pragma still has to agree).
         target_link_libraries(sirius_core_${name} PRIVATE OpenMP::OpenMP_CXX)
+        # getenv and strerror are the portable spellings the core uses on
+        # purpose; MSVC's _s replacements exist only on Windows.
+        if(MSVC)
+            target_compile_definitions(sirius_core_${name} PRIVATE _CRT_SECURE_NO_WARNINGS)
+        endif()
     endif()
 endfunction()
 
@@ -69,6 +78,12 @@ sirius_core_unit(app_paths
     HEADERS app_paths.hpp
     SOURCES app_paths.cpp
     DEFINES SIRIUS_APP_DATADIR_FROM_BINDIR="${_sirius_app_datadir_from_bindir}")
+
+# What the application asks of the operating system without a window (the
+# user's directories, the environment, PATH, whole files), and child processes
+# with their standard streams on pipes.
+sirius_core_unit(host              HEADERS host.hpp          SOURCES host.cpp)
+sirius_core_unit(process           HEADERS process.hpp       SOURCES process.cpp       LINK Threads::Threads)
 
 sirius_core_unit(history      HEADERS history.hpp      SOURCES history.cpp)
 sirius_core_unit(session_log  HEADERS session_log.hpp  SOURCES session_log.cpp  PUBLIC_LINK nlohmann_json::nlohmann_json)
@@ -130,6 +145,14 @@ sirius_core_unit(rpc
 if(WIN32)
     target_link_libraries(sirius_core_rpc PRIVATE ws2_32)
 endif()
+
+# Why the worker did not come up, SIRIUS's own Python environment for it, and
+# the launcher that starts it as a child process.
+sirius_core_unit(worker_error      HEADERS worker_error.hpp  SOURCES worker_error.cpp  PUBLIC_LINK nlohmann_json::nlohmann_json)
+sirius_core_unit(python_env        HEADERS python_env.hpp    SOURCES python_env.cpp
+                                   DEPENDS host process app_paths PUBLIC_LINK nlohmann_json::nlohmann_json)
+sirius_core_unit(local_worker      HEADERS local_worker.hpp  SOURCES local_worker.cpp
+                                   DEPENDS rpc process python_env worker_error host cancel app_paths LINK Threads::Threads)
 
 # --- steps and the pipeline ---------------------------------------------------------
 
@@ -251,14 +274,37 @@ sirius_core_unit(workbench
     HEADERS workbench.hpp
     SOURCES workbench.cpp
     DEPENDS array_source dataset executor history labels operation pipeline rpc session_log tracks
-            cancel ops_registry ops_factories ops_load_api plugin
+            cancel ops_registry ops_factories ops_load_api plugin worker_error
     PUBLIC_LINK nlohmann_json::nlohmann_json)
 
 sirius_core_unit(tool_api
     HEADERS tool_api.hpp
     SOURCES tool_api.cpp
-    DEPENDS workbench training_export
+    DEPENDS workbench training_export worker_error cancel
     PUBLIC_LINK nlohmann_json::nlohmann_json)
+
+# --- headless: what sirius-cli drives --------------------------------------------
+# The viewer's display model (so a render is what the viewer draws), image
+# encoding, statistics, the JSON-lines session and MCP protocols, and the
+# window-less workbench that serves one tool table to all of them.
+
+sirius_core_unit(image_encode      HEADERS image_encode.hpp  SOURCES image_encode.cpp  LINK sirius_stb)
+sirius_core_unit(display_model     HEADERS display_model.hpp SOURCES display_model.cpp
+                                   DEPENDS byte_budget_lru operation workbench array_source cancel)
+sirius_core_unit(statistics        HEADERS statistics.hpp    SOURCES statistics.cpp
+                                   DEPENDS operation array_source labels tracks cancel dataset lib/pixel_type
+                                   PUBLIC_LINK nlohmann_json::nlohmann_json)
+sirius_core_unit(agent_protocol    HEADERS agent_protocol.hpp agent_server.hpp
+                                   SOURCES agent_protocol.cpp agent_session.cpp agent_mcp.cpp
+                                   PUBLIC_LINK nlohmann_json::nlohmann_json LINK Threads::Threads)
+sirius_core_unit(headless          HEADERS headless.hpp
+                                   SOURCES headless.cpp headless_tools.cpp headless_render.cpp headless_export.cpp
+                                   DEPENDS agent_protocol workbench tool_api display_model statistics image_encode export
+                                           training_export help_pages ops_schema ops_registry ops_factories plugin
+                                           local_worker python_env worker_error host array_source pipeline dataset params
+                                           labels tracks diagnostics display_mapping cancel app_paths rpc executor
+                                           lib/tiff_io lib/device
+                                   PUBLIC_LINK nlohmann_json::nlohmann_json LINK Threads::Threads)
 
 # --- the archive -------------------------------------------------------------
 
@@ -270,7 +316,7 @@ target_include_directories(sirius_app_core PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
 # The units compile; the archive is what consumers link, so the libraries the
 # objects need are named once more here, for them.
 target_link_libraries(sirius_app_core
-    PUBLIC sirius nlohmann_json::nlohmann_json
+    PUBLIC sirius nlohmann_json::nlohmann_json Threads::Threads
     PRIVATE OpenMP::OpenMP_CXX TIFF::TIFF tomlplusplus::tomlplusplus)
 if(WIN32)
     target_link_libraries(sirius_app_core PRIVATE ws2_32)
@@ -279,7 +325,72 @@ if(SIRIUS_ENABLE_SANITIZERS)
     target_enable_sanitizers(sirius_app_core)
 endif()
 
-# --- the application ------------------------------------------------------------
-# Dear ImGui, GLFW, OpenGL 3.3 and ImPlot over the core (app/imgui/README.md);
-# its build and install rules are in app/imgui/CMakeLists.txt.
-add_subdirectory(imgui)
+# --- what both executables find beside them ----------------------------------------
+# Help pages, the Python worker and the example plugins sit next to sirius-app
+# and sirius-cli, so users can edit the pages and start the worker from the
+# build tree. One target copies them for both executables: two POST_BUILD steps
+# of a parallel build would copy the same files at the same time. On Windows it
+# also brings the NVIDIA runtime DLLs (as for the tests), so either executable
+# starts from the build tree without PATH changes; everything else is linked
+# statically.
+get_property(_sirius_multi_config GLOBAL PROPERTY GENERATOR_IS_MULTI_CONFIG)
+if(_sirius_multi_config)
+    set(SIRIUS_APP_RUNTIME_DIR "${PROJECT_BINARY_DIR}/app/$<CONFIG>")
+else()
+    set(SIRIUS_APP_RUNTIME_DIR "${PROJECT_BINARY_DIR}/app")
+endif()
+set(_runtime_copies
+    COMMAND ${CMAKE_COMMAND} -E copy_directory ${CMAKE_CURRENT_SOURCE_DIR}/help    ${SIRIUS_APP_RUNTIME_DIR}/help
+    COMMAND ${CMAKE_COMMAND} -E copy_directory ${CMAKE_CURRENT_SOURCE_DIR}/python  ${SIRIUS_APP_RUNTIME_DIR}/python
+    COMMAND ${CMAKE_COMMAND} -E copy_directory ${CMAKE_CURRENT_SOURCE_DIR}/plugins ${SIRIUS_APP_RUNTIME_DIR}/plugins)
+if(WIN32)
+    foreach(_dll IN LISTS SIRIUS_NVTIFF_RUNTIME_LIBS SIRIUS_NVCOMP_RUNTIME_LIBS)
+        list(APPEND _runtime_copies COMMAND ${CMAKE_COMMAND} -E copy_if_different "${_dll}" ${SIRIUS_APP_RUNTIME_DIR})
+    endforeach()
+endif()
+add_custom_target(sirius_app_runtime_files ${_runtime_copies}
+    COMMENT "Copying help pages, the Python worker, the example plugins (and nv DLLs) beside the executables"
+    VERBATIM)
+
+# --- install (Linux): what both executables share -----------------------------------
+#
+#   cmake --install <build> --component app --prefix <prefix>
+#
+#   share/sirius/{help,python,plugins}     what the build copies beside the executables
+#   share/sirius/python/workbench.py       the step library (and its op_schema.json) the
+#                                          worker loads when no sirius package is importable
+#   lib/sirius/                            nvTIFF / nvCOMP of a CUDA build, found via $ORIGIN
+#
+# The executables' own rules (bin/, and the GUI's fonts, icons and desktop
+# file) are in imgui/ and cli/. tests/CMakeLists.txt installs this into the
+# build tree and runs the result (app/linux/check_install.cmake). Windows runs
+# from the build tree; a macOS bundle would need a layout of its own.
+if(UNIX AND NOT APPLE)
+    install(DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}/help ${CMAKE_CURRENT_SOURCE_DIR}/python
+                      ${CMAKE_CURRENT_SOURCE_DIR}/plugins
+        DESTINATION ${SIRIUS_APP_INSTALL_DATADIR} COMPONENT app
+        PATTERN __pycache__ EXCLUDE
+        PATTERN "python/tests" EXCLUDE)
+    install(FILES
+        ${PROJECT_SOURCE_DIR}/bindings/python/sirius/workbench.py
+        ${PROJECT_SOURCE_DIR}/bindings/python/sirius/op_schema.json
+        DESTINATION ${SIRIUS_APP_INSTALL_DATADIR}/python COMPONENT app)
+    # The redistributables ship "libnvtiff.so.0 -> libnvtiff.so.0.8.0.82"
+    # symlinks; install the real file under the soname the executables need
+    # (as bindings/CMakeLists.txt does for the wheel). A CLI-only CUDA build
+    # needs them as much as the GUI does.
+    foreach(_lib IN LISTS SIRIUS_NVTIFF_RUNTIME_LIBS SIRIUS_NVCOMP_RUNTIME_LIBS)
+        get_filename_component(_soname "${_lib}" NAME)
+        file(REAL_PATH "${_lib}" _real)
+        install(FILES "${_real}" DESTINATION ${CMAKE_INSTALL_LIBDIR}/sirius COMPONENT app RENAME "${_soname}")
+    endforeach()
+endif()
+
+# --- the executables ------------------------------------------------------------------
+# The GUI: Dear ImGui, GLFW, OpenGL 3.3 and ImPlot over the core
+# (app/imgui/README.md); its build and install rules are in
+# app/imgui/CMakeLists.txt. sirius-cli (app/cli) needs none of them.
+if(SIRIUS_ENABLE_APP)
+    add_subdirectory(imgui)
+endif()
+add_subdirectory(cli)

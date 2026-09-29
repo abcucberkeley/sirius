@@ -156,14 +156,6 @@ namespace sirius::app {
         std::chrono::milliseconds cancelGrace_{15000};
     };
 
-    // Launches the bundled worker as a child process on a free local port
-    // (Backend::Cuda / Cpu steps that need Python, e.g. Torch models).
-    struct LocalWorkerConfig {
-        std::string python = "python3";        // interpreter; env SIRIUS_PYTHON overrides
-        std::string scriptDir;                 // directory holding sirius_worker/; empty = next to the executable
-        int port = 0;                          // 0 = pick a free port
-        std::string device = "auto";           // "cuda", "cpu", "auto"
-    };
     // The first directory holding sirius_worker/__main__.py of: `scriptDir`,
     // an installed tree's share/sirius/python, the copy beside the executable
     // (core/app_paths.hpp), $SIRIUS_WORKER_DIR, ./python, the source tree's

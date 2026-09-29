@@ -1,16 +1,70 @@
-#include "imgui/viewer/display_model.hpp"
+#include "core/display_model.hpp"
 
 #include <algorithm>
 #include <array>
 #include <cmath>
 #include <limits>
 #include <memory>
+#include <stdexcept>
+#include <string>
 
 #include "core/array_source.hpp"
+#include "core/cancel.hpp"
 
-namespace sirius::app::gui {
+namespace sirius::app::display {
 
     namespace {
+        // The z maximum projection and the exact value range of a (z, y, x)
+        // volume, accumulated one (y, x) plane at a time, so a projection
+        // never needs more of the volume in memory than the plane it adds.
+        // NaNs are skipped by both. A volume without a range (constant, or
+        // nothing but NaN) gets lo .. lo + 1, and a pixel that never saw a
+        // finite value gets lo: what the viewer's loader always did.
+        class Projection {
+        public:
+            Projection(float* mip, Index n) : mip_(mip), n_(n) { std::fill_n(mip_, n_, -std::numeric_limits<float>::infinity()); }
+
+            void add(const float* p) {
+                for (Index i = 0; i < n_; ++i) {
+                    const float v = p[i];
+                    if (std::isnan(v)) continue;
+                    if (v > mip_[i]) mip_[i] = v;
+                    if (v < lo_) lo_ = v;
+                    if (v > hi_) hi_ = v;
+                }
+            }
+
+            void finish(float& lo, float& hi) {
+                if (!(hi_ > lo_)) {
+                    lo_ = std::isfinite(lo_) ? lo_ : 0.0f;
+                    hi_ = lo_ + 1.0f;
+                }
+                for (Index i = 0; i < n_; ++i)
+                    if (!std::isfinite(mip_[i])) mip_[i] = lo_;
+                lo = lo_;
+                hi = hi_;
+            }
+
+        private:
+            float* mip_;
+            Index n_;
+            float lo_ = std::numeric_limits<float>::infinity();
+            float hi_ = -std::numeric_limits<float>::infinity();
+        };
+
+        void throwIfCancelled(const std::function<bool()>& cancelled) {
+            if (cancelled && cancelled()) throw CancelledError();
+        }
+
+        // The headless preparation takes (c, t) from its caller, so a wrong
+        // one is the caller's error rather than an empty picture.
+        void checkVolumeIndex(bool valid, const Dims5& d, Index c, Index t, const char* who) {
+            if (!valid) throw std::runtime_error(std::string(who) + ": there is no output to display");
+            if (c < 0 || c >= d.c || t < 0 || t >= d.t)
+                throw std::out_of_range(std::string(who) + ": (c " + std::to_string(c) + ", t " + std::to_string(t) + ") is outside " +
+                                        d.toString());
+        }
+
         // Robust window from the [0.1, 99.9] percentiles of a sub-sample.
         DisplayWindow robustWindow(const std::vector<float>& samples) {
             std::vector<float> s;
@@ -234,25 +288,8 @@ namespace sirius::app::gui {
         const float* v = volumeIfReady(c, t);
         if (!v) return VolumeState::Wanted;
         auto m = std::make_shared<Buffer<float>>(Shape{d.y, d.x});
-        float lo = std::numeric_limits<float>::infinity(), hi = -lo;
-        std::fill_n(m->data(), n, -std::numeric_limits<float>::infinity());
-        for (Index z = 0; z < d.z; ++z) {
-            const float* p = v + z * n;
-            float* o = m->data();
-            for (Index i = 0; i < n; ++i) {
-                const float x = p[i];
-                if (std::isnan(x)) continue;
-                if (x > o[i]) o[i] = x;
-                if (x < lo) lo = x;
-                if (x > hi) hi = x;
-            }
-        }
-        if (!(hi > lo)) {
-            lo = std::isfinite(lo) ? lo : 0.0f;
-            hi = lo + 1.0f;
-        }
-        for (Index i = 0; i < n; ++i)
-            if (!std::isfinite(m->data()[i])) m->data()[i] = lo;
+        float lo = 0.0f, hi = 1.0f;
+        projectAndRange(v, d.z, d.y, d.x, m->data(), lo, hi);
         storeMip(key, std::move(m));
         // the same pass gives the exact range the full-range window wants
         ranges_[key] = Range{lo, hi};
@@ -565,4 +602,107 @@ namespace sirius::app::gui {
                 vs.soloLabel ? vs.selectedLabel : 0u, img);
     }
 
-} // namespace sirius::app::gui
+    // --- headless preparation ----------------------------------------------------------
+    // What the viewer asks ViewerLoader for off the GUI thread, done on the
+    // calling thread for a caller that has no event loop to post back to
+    // (sirius-cli). The results go through installVolume(), as the loader's
+    // do, so the renderers cannot tell the two apart.
+    //
+    // "Already there" is the projection, not the range: every producer makes
+    // the two together and the ranges are never evicted, but installVolume()
+    // keeps no range that is empty in float (a constant volume at 2^24 or
+    // more, where lo + 1 == lo), and asking for one would read such a volume
+    // again on every call.
+
+    bool DisplayModel::prepareVolumeSync(Index c, Index t, const std::function<bool()>& cancelled) {
+        checkVolumeIndex(valid(), meta_.dims, c, t, "DisplayModel::prepareVolumeSync");
+        const Dims5& d = meta_.dims;
+        const Key key{c, t};
+        const Index n = d.y * d.x;
+        const bool haveVolume = out_->array || volumes_.count(key) != 0;
+        const bool haveMip = mips_.count(key) != 0;
+        if (haveVolume && haveMip) {
+            tooLarge_ = false;
+            return true;
+        }
+        std::shared_ptr<Buffer<float>> read;   // a lazy source's volume, read here
+        const float* vol = volumeIfReady(c, t);
+        if (!vol) {
+            // The cap volumeState() applies: a volume above it is never read.
+            const std::size_t bytes = static_cast<std::size_t>(d.z * n) * sizeof(float);
+            if (bytes > kVolumeCacheLimit) {
+                tooLarge_ = true;
+                return false;
+            }
+            throwIfCancelled(cancelled);
+            // installVolume() drops the other time points' volumes once this
+            // one is in; the viewer keeps them until then because one of them
+            // is on screen. Nothing is on screen here, so they go before the
+            // read, and memory peaks at one time point's volumes, not two.
+            evictOtherTimePoints(t);
+            read = std::make_shared<Buffer<float>>(Shape{d.z, d.y, d.x});
+            // The source's own volume read, which takes consecutive pages in
+            // one pass where it can. Its progress callback is where a read is
+            // cancelled, as in a load: it is called between planes.
+            out_->source->readVolume(c, t, read->data(), [&cancelled](double, const std::string&) { throwIfCancelled(cancelled); });
+            vol = read->data();
+        }
+        if (haveMip) {
+            // prepareProjectionSync() made the projection and its range from
+            // the same planes: only the volume was missing, and projecting it
+            // again would cost a second pass over every voxel. An empty range
+            // leaves the stored one as it is.
+            installVolume(c, t, std::move(read), nullptr, 0.0f, 0.0f);
+            tooLarge_ = false;
+            return true;
+        }
+        auto mip = std::make_shared<Buffer<float>>(Shape{d.y, d.x});
+        Projection projection(mip->data(), n);
+        for (Index z = 0; z < d.z; ++z) {
+            throwIfCancelled(cancelled);
+            projection.add(vol + z * n);
+        }
+        float lo = 0.0f, hi = 1.0f;
+        projection.finish(lo, hi);
+        installVolume(c, t, std::move(read), std::move(mip), lo, hi);
+        tooLarge_ = false;
+        return true;
+    }
+
+    void DisplayModel::prepareProjectionSync(Index c, Index t, const std::function<bool()>& cancelled) {
+        checkVolumeIndex(valid(), meta_.dims, c, t, "DisplayModel::prepareProjectionSync");
+        if (mips_.count(Key{c, t}) != 0) return;
+        const Dims5& d = meta_.dims;
+        const Index n = d.y * d.x;
+        auto mip = std::make_shared<Buffer<float>>(Shape{d.y, d.x});
+        Projection projection(mip->data(), n);
+        if (const float* vol = volumeIfReady(c, t)) {
+            for (Index z = 0; z < d.z; ++z) {
+                throwIfCancelled(cancelled);
+                projection.add(vol + z * n);
+            }
+        } else {
+            // One plane at a time, straight from the source: a volume far
+            // above kVolumeCacheLimit costs one plane of memory, and a plane
+            // that cannot be read is an error, not a gap in the projection
+            // (plane() would hide it).
+            Buffer<float> buf(Shape{d.y, d.x});
+            for (Index z = 0; z < d.z; ++z) {
+                throwIfCancelled(cancelled);
+                out_->source->readPlane(c, t, z, buf.data());
+                projection.add(buf.data());
+            }
+        }
+        float lo = 0.0f, hi = 1.0f;
+        projection.finish(lo, hi);
+        installVolume(c, t, nullptr, std::move(mip), lo, hi);
+    }
+
+    void projectAndRange(const float* vol, Index nz, Index ny, Index nx, float* mip, float& lo, float& hi) {
+        const Index n = ny * nx;
+        Projection projection(mip, n);
+        for (Index z = 0; z < nz; ++z) projection.add(vol + z * n);
+        projection.finish(lo, hi);
+    }
+
+} // namespace sirius::app::display

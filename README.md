@@ -443,8 +443,10 @@ structure (`app/help/seg.md` gives the measurement on the bundled SIM reconstruc
 
 **Backends**: CUDA (when the build has it and a device is present), CPU, or HPC — a
 Python worker on a cluster node reached over TCP (see "Python worker and HPC backend").
-Torch models always go through the worker; the app starts one locally from
-Preferences ▸ Python when a segmentation step runs.
+Torch models always go through the worker; the app starts one locally shortly
+after its window opens, to load the user operations (at once when it is given a
+pipeline), in SIRIUS's own Python environment unless Preferences ▸ Compute or
+`SIRIUS_PYTHON` names an interpreter.
 
 **Assistant**: any OpenAI-compatible chat endpoint with tool calling; presets for
 Ollama (`http://localhost:11434/v1`, the model list is fetched) and OpenRouter (API
@@ -486,14 +488,15 @@ cmake --install build/linux-gcc-app-dev --component app --prefix ~/.local   # or
 update-desktop-database ~/.local/share/applications                         # optional: refresh "Open with"
 ```
 
-That gives `bin/sirius-app`, `share/sirius/{help,python,plugins,fonts,icons}`,
-`share/applications/sirius-app.desktop` (the menu entry, and *Open with* for TIFF files)
-and the icon in the hicolor theme; a CUDA build's nvTIFF / nvCOMP go to `lib/sirius` and
-are found relative to the executable. The installed application reads its own help pages
-and starts its own copy of the worker (`ctest -R app.install` checks both; the part that
-starts the application needs a display, so run it under `xvfb-run` on a headless
-machine). Files named on the command line open as though dropped on the window:
-`sirius-app stack.tif` or `sirius-app steps.sirius.toml`.
+That gives `bin/sirius-app`, `bin/sirius-cli`,
+`share/sirius/{help,python,plugins,fonts,icons}`, `share/applications/sirius-app.desktop`
+(the menu entry, and *Open with* for TIFF files) and the icon in the hicolor theme; a CUDA
+build's nvTIFF / nvCOMP go to `lib/sirius` and are found relative to the executables. The
+installed application and `sirius-cli` read their own help pages and start their own copy
+of the worker (`ctest -R app.install` checks both; the part that starts the application
+needs a display, so run it under `xvfb-run` on a headless machine). Files named on the
+command line open as though dropped on the window: `sirius-app stack.tif` or
+`sirius-app steps.sirius.toml`.
 
 Command line: `--dataset`, `--pipeline`, `--run`, `[files...]`, and for scripting and smoke tests
 `--tool '{"name":"set_view","args":{"mode":"3d"}}'` (any assistant tool), `--action
@@ -511,7 +514,8 @@ the monitor's scale. The application needs a display with OpenGL 3.3; on a headl
 
 Layout: `app/core` is GUI-free and unit-tested without a display (`tests/test_app_*.cpp`:
 array model, parameters, pipeline files, executor caching, workbench and undo, tool API,
-worker protocol, I/O, help pages, labels, every operation); `app/imgui` is the GUI over
+worker protocol, I/O, help pages, labels, every operation); `app/cli` is `sirius-cli`,
+the core without a window (next section); `app/imgui` is the GUI over
 [Dear ImGui](https://github.com/ocornut/imgui) (docking branch), GLFW and OpenGL 3.3,
 with [ImPlot](https://github.com/epezent/implot) for the diagnostics charts
 (`theme.cpp` holds every colour, font and metric of the design);
@@ -531,6 +535,26 @@ preset for the GPU backend. Settings live in `<config>/sirius/sirius-app.json`
 (`%APPDATA%` on Windows, `~/.config` elsewhere) with the dock layout in `imgui.ini`
 beside it; secrets are never stored as plain text (DPAPI-encrypted in that file on
 Windows, `~/.sirius/secrets.json` with mode 0600 elsewhere).
+
+## Command line and agents (`sirius-cli`)
+
+`sirius-cli` is the workbench without a window: the same datasets, operations,
+pipelines and rendering as `sirius-app`, for scripts and for agents. One tool table
+serves three modes: one-shot commands that print one JSON document each (`info`, `run`,
+`render`, `stats`, `export` …), a JSON-lines session that keeps one workbench alive, and
+an MCP server on stdio, through which an agent such as Claude Code opens data, builds
+and runs pipelines, looks at slices and projections as images and exports results.
+
+```
+build/linux-gcc-app-dev/app/sirius-cli run --pipeline examples/sim_bundled.sirius.toml --render mip.png --plane mip --stats
+claude mcp add --transport stdio --scope user sirius -- /opt/sirius/bin/sirius-cli mcp
+```
+
+It is built with the workbench, and alone with `-DSIRIUS_ENABLE_CLI=ON`, which needs
+none of the GUI's packages (a cluster node without X11 will do).
+[app/cli/README.md](app/cli/README.md) is the reference — options, commands, exit
+codes, the session and MCP protocols — and [docs/agent-guide.md](docs/agent-guide.md)
+the guide for connecting an agent and working with it.
 
 ## Python Bindings
 Dev install
@@ -639,6 +663,20 @@ python -m sirius_worker --host 127.0.0.1 --port 0 --token X --device auto   # pr
 python -m unittest discover -s app/python/tests -v
 ```
 
+**SIRIUS's own Python.** The application sets up a Python environment of its own for
+the worker, so it does not depend on whichever Python happens to be on PATH having
+numpy: a virtual environment in the user's data directory
+(`%LOCALAPPDATA%/sirius/python-env`, `~/.local/share/sirius/python-env`,
+`~/Library/Application Support/sirius/python-env`; `SIRIUS_PYTHON_ENV` moves it) with
+what `app/python/requirements.txt` lists, and optionally scipy and scikit-image. It is
+made once, with your consent, from a Python found on the machine (with uv when it is
+installed, otherwise `venv` and pip): `sirius-cli worker setup`, or the offer
+`sirius-app` makes when the worker cannot start for want of numpy; Preferences ▸ Compute
+updates, repairs or removes it. When it exists, both executables run the worker in it.
+An interpreter you name still comes first: `--python` for `sirius-cli`, `SIRIUS_PYTHON`,
+or the Python field in Preferences ▸ Compute (`sirius-app` only). The order and the
+worker's start-up check are in [app/python/README.md](app/python/README.md).
+
 **Read [app/python/SECURITY.md](app/python/SECURITY.md) before you expose a
 worker.** Whoever holds the token can run code on the worker's host: plugins
 are imported from directories the client names, `--allow-install` (off unless
@@ -659,5 +697,6 @@ runs the numpy, SIM (via the bindings) and Torch steps, raising
 
 On a cluster, submit [app/python/slurm/sirius_worker.sbatch](app/python/slurm/sirius_worker.sbatch)
 with `SIRIUS_TOKEN` set, tunnel the port (`ssh -N -L 7645:<node>:7645 <login-node>`)
-and enter host, port and token under Preferences ▸ HPC; see
+and enter host, port and token under Preferences ▸ Compute (HPC worker), or start
+`sirius-cli` with `--hpc localhost:7645` and the token in `SIRIUS_HPC_TOKEN`; see
 [app/python/slurm/README.md](app/python/slurm/README.md).

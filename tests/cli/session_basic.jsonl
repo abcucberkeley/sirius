@@ -1,0 +1,18 @@
+{"id":1,"method":"ping"}
+{"jsonrpc":"2.0","id":2,"method":"status","params":{}}
+{"id":3,"method":"open_dataset","params":{"path":"@SRC@/tests/data/raw.tif"}}
+{"id":4,"method":"get_state"}
+{"id":5,"method":"add_step","params":{"kind":"contrast"}}
+{"id":6,"method":"undo"}
+{"id":7,"method":"render","params":{"plane":"xy"}}
+{"id":8,"method":"render","params":{"plane":"mip","inline":true,"max_size":64}}
+{"id":9,"method":"statistics","params":{"step":1}}
+{"id":10,"method":"get_step","params":{"step":99}}
+{"id":11,"method":"no_such_method","params":{}}
+{"id":12,"method":"get_state","params":{"workspace":"ws_000000000000"}}
+this line is not JSON
+{"method":"ping"}
+{"id":"s-13","method":"tools"}
+{"id":14,"method":"subscribe","params":{"progress":true,"log":false}}
+{"id":15,"method":"load_pipeline","params":{"path":"@SRC@/examples/sim_bundled.sirius.toml"}}
+{"id":16,"method":"run","params":{"wait_s":0}}

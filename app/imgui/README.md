@@ -27,14 +27,47 @@ command line: `--dataset`, `--pipeline`, `--run`, `--tool`, `--action`, `--ask`,
 | `bridge.hpp/.cpp` | workbench observer → revisions and signals; runs and tasks on a worker thread |
 | `theme.hpp/.cpp` | design tokens, fonts, the ImGui / ImPlot style |
 | `widgets/controls`, `widgets/icons`, `widgets/code_editor` | the design's controls, icon set and the plugin editor |
-| `settings`, `secret_store`, `platform`, `process`, `worker_launcher`, `http`, `gl` | services: persistent settings, secrets, OS dialogs and paths, child processes, the Python worker, HTTP(S), textures and PNG |
+| `settings`, `secret_store`, `platform`, `worker_launcher`, `http`, `gl` | services: persistent settings, secrets, OS dialogs, the Python worker, HTTP(S), textures and PNG |
 | `viewer/*` | toolbar, tool strip, ortho / 3D / compare views, dims strip, the volume loader and ray caster |
 | `panels/*` | operations, parameters, diagnostics, log, help, assistant |
-| `dialogs/*` | open, folder dataset, export, training export, preferences, model hub, plugin manager |
+| `dialogs/*` | open, folder dataset, export, training export, preferences, model hub, plugin manager, the Python environment offer (`python_env_dialog.cpp`) |
 
 Everything is in namespace `sirius::app::gui`; includes are written from `app/`
 (`"core/workbench.hpp"`, `"imgui/theme.hpp"`). The fonts and the icons are in
 `app/resources`, copied beside the executable by the build and installed with it.
+
+What `sirius-cli` needs as well lives in the core, and the GUI uses it from
+there under the names it had:
+
+- `platform.hpp` keeps the file dialogs and re-exports the OS helpers of
+  `core/host.hpp` it uses (the home, config and temporary directories, the
+  executable's directory, the process id, the environment, `findPython`,
+  `makePath`, whole-file reads and atomic writes) with using-declarations;
+- child processes are `core/process.hpp` (`ChildProcess`);
+- `worker_launcher.hpp` is `class WorkerLauncher : public LocalWorker`
+  (`core/local_worker.hpp`), whose constructor only wires in the settings:
+  `worker/python`, `worker/dir`, `--allow-install` for the model hub, and the
+  hint that points at Preferences ▸ Compute;
+- `viewer/display_model.hpp` re-exports `core/display_model.hpp`, so that
+  `sirius-cli` renders exactly what the viewer draws.
+
+## The Python environment offer
+
+When the local worker cannot start — its Python lacks numpy, there is no
+Python at all, or SIRIUS's own environment no longer runs — the start-failure
+handler `main.cpp` installs (on the connecting thread, so it only posts)
+calls `offerPythonEnvironment` on the GUI thread. It shows "Set up Python for
+SIRIUS" at most once a session, never in an unattended (scripted) run, and
+only while `worker/offerEnvironment` is on; `SIRIUS_PYTHON_OFFER=always` or
+`never` overrides all of that, for screenshots and tests. The dialog works
+out a plan (`pyenv::planSetup`) on a thread of its own, runs the setup as a
+`Bridge::startTask` (so not during a run), shows the installer's lines as
+they come, and on success stops the worker and reloads the plugins. Its
+variants cover a missing package in a found Python, no Python at all, an
+interpreter the user or `$SIRIUS_PYTHON` named, and an environment that needs
+a repair or an update. Preferences ▸ Compute has the same environment's
+status line with Set up / Update / Repair / Recreate, Check, Remove and Open
+folder.
 
 ## How the layer works
 
@@ -115,3 +148,10 @@ loaded with them shown again, and written back so.
 Secrets never go there as plain text: `secrets::read / write` keeps them as
 DPAPI-encrypted blobs in that file on Windows and in `~/.sirius/secrets.json`
 (mode 0600) elsewhere.
+
+Nothing about SIRIUS's Python environment is kept in the settings: its state
+is read from the environment itself (`core/python_env.hpp`), which
+`sirius-cli` shares. The settings only hold the user's choices about it:
+`worker/offerEnvironment` (offer a setup when the worker cannot start,
+default on), `worker/environmentExtras` (the scipy / scikit-image checkbox)
+and `worker/useUv` (use uv when it is installed, default on).
