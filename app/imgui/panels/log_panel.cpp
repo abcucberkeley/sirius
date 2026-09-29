@@ -70,8 +70,8 @@ namespace sirius::app::gui {
         }
 
         // An entry may span lines (a worker's stderr, a traceback): each of its
-        // lines is a row of its own, as QPlainTextEdit made it a block of its
-        // own, so that a row is one line high and the rows under it stay clear.
+        // lines is a row of its own, so that a row is one line high and the
+        // rows under it stay clear.
         void push(const std::string& text) {
             std::size_t start = 0;
             for (;;) {

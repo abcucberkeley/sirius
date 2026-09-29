@@ -383,9 +383,9 @@ namespace sirius::app::gui::platform {
         return false;
     }
 
-    std::vector<FileFilter> filtersFromQt(const std::string& qtFilter) {
+    std::vector<FileFilter> parseFileFilters(const std::string& filter) {
         std::vector<FileFilter> out;
-        for (const std::string& entry : split(replaceAll(qtFilter, ";;", "\n"), '\n', true)) {
+        for (const std::string& entry : split(replaceAll(filter, ";;", "\n"), '\n', true)) {
             const std::size_t open = entry.find('('), close = entry.rfind(')');
             if (open == std::string::npos || close == std::string::npos || close < open) continue;
             FileFilter f;

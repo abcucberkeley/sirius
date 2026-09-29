@@ -4,7 +4,7 @@ Handoff for whoever builds the sirius side. Written 2026-09-13.
 Branch `foundation-model`, commit `233314d`, 545/545 tests passing.
 
 The model side is done and merged on that branch. The gap is in the GUI layer
-(then the Qt application; the workbench is now `app/imgui`).
+(the workbench, `app/imgui`).
 Read section 4 first if you only read one thing.
 
 ---

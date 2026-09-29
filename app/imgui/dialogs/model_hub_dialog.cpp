@@ -718,7 +718,7 @@ namespace sirius::app::gui {
                 if (smallButton("Browse…##local", ButtonKind::Secondary, 84)) {
                     app.defer(guarded([this] {
                         const std::string f = platform::openFileDialog(
-                            "Choose model", std::string(), platform::filtersFromQt("Models (*.pt *.pts *.pth *.onnx);;All files (*)"));
+                            "Choose model", std::string(), platform::parseFileFilters("Models (*.pt *.pts *.pth *.onnx);;All files (*)"));
                         if (!f.empty()) choose(f);
                     }));
                 }

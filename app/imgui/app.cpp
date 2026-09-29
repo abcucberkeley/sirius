@@ -771,11 +771,11 @@ namespace sirius::app::gui {
             fitDiagnosticsToCollapse(collapse);
     }
 
-    // The diagnostics window follows its panel's collapse (Qt's panel set its
-    // maximum height to the header): collapsed, it keeps only the header, and
-    // the viewer takes the room; expanded, it gets its height back. Docked, the
-    // dock node is sized (locked once, as a splitter drag does, so the other
-    // side of the split takes the difference); floating, the window. False
+    // The diagnostics window follows its panel's collapse: collapsed, it keeps
+    // only the header, and the viewer takes the room; expanded, it gets its
+    // height back. Docked, the dock node is sized (locked once, as a splitter
+    // drag does, so the other side of the split takes the difference);
+    // floating, the window. False
     // when there is nothing to size (yet): a window between two docks (the
     // frame a layout is rebuilt), one in a floating group, or a dock side by
     // side with another; the next frame tries again.

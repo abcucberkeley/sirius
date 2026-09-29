@@ -448,7 +448,7 @@ namespace sirius::app::gui {
                     const std::string path =
                         dir ? platform::pickFolderDialog("Choose directory", start)
                             : platform::openFileDialog("Choose file", start,
-                                                       platform::filtersFromQt(filter.empty() ? std::string("All files (*)") : filter));
+                                                       platform::parseFileFilters(filter.empty() ? std::string("All files (*)") : filter));
                     if (path.empty() || selectedId() != forStep) return;
                     a->setLastDir(dir ? path : parentPath(path));
                     bufs.erase(key);

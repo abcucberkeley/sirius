@@ -37,9 +37,10 @@ namespace sirius::app::gui::platform {
         std::string name;         // "TIFF"
         std::string extensions;   // "tif,tiff" (no dots, comma separated); "*" = all files
     };
-    // A Qt-style filter string, "SIRIUS pipeline (*.sirius.toml *.toml);;All files (*)",
-    // as filters; compound extensions keep their last part ("sirius.toml" -> "toml").
-    std::vector<FileFilter> filtersFromQt(const std::string& qtFilter);
+    // A parameter's filter string as filters: entries separated by ";;", each a
+    // name and its patterns in parentheses, "SIRIUS pipeline (*.sirius.toml *.toml);;All files (*)".
+    // Compound extensions keep their last part ("sirius.toml" -> "toml").
+    std::vector<FileFilter> parseFileFilters(const std::string& filter);
 
     // Empty when cancelled, and also when the dialog could not be opened:
     // takeDialogError() tells the two apart. `start` may be a directory or a

@@ -837,7 +837,7 @@ def run_cellpose(volume: np.ndarray, model_name: str, params: Dict[str, Any], de
         progress(0.05, f"cellpose {model_name}")
 
         class _Bar:
-            # Cellpose drives a Qt-style bar (setValue 0..100) through its stages
+            # Cellpose reports its stages by calling setValue(0..100) on the object it is given
             def setValue(self, v):  # noqa: N802 - Cellpose's expectation
                 progress(0.05 + 0.85 * min(max(float(v), 0.0), 100.0) / 100.0, f"cellpose {model_name}")
 
