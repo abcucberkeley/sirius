@@ -1771,9 +1771,10 @@ namespace sirius::app::gui {
         const bool maximized = p == Panel::Diag ? diagMaximized : pl.maximized;
         const bool floating = !maximized && pl.floating;
         const bool docked = !maximized && !floating;
-        // Drawn over the tab's own rectangle, which is left empty: bordered
-        // squares, the accent fill and a paper icon when active, the accent
-        // border when hovered.
+        // Drawn over the tab's own rectangle, which is left empty: an icon and
+        // its word, so the three read apart at a glance. Idle they are quiet
+        // text on the tab bar, hovered they get the surface colour, and the
+        // one for the panel's current state is filled with the accent.
         ImGui::PushStyleColor(ImGuiCol_TabHovered, theme::kTransparent);
         // Dear ImGui lays the trailing tabs out right after the other tabs
         // (further left only when those overflow). Each control is moved to
@@ -1782,35 +1783,80 @@ namespace sirius::app::gui {
         // the controls keep to the edge while a dock is resized, and never
         // left of where the layout put them, onto the tabs.
         ImGuiTabBar* bar = node->TabBar;
-        const float gap = ImGui::GetStyle().ItemInnerSpacing.x, buttonW = theme::snap(px(24));
+        const float gap = ImGui::GetStyle().ItemInnerSpacing.x;
         const float margin = std::max(bar->BarRect.Min.x - node->Pos.x, px(4));
         const float end = bar->BarRect.GetWidth() - margin;   // tab offsets are from the bar's left end
-        int index = 0;
-        const auto control = [&](const char* id, Icon icon, bool active, const char* tip) {
-            const float after = static_cast<float>(2 - index++);   // controls right of this one
-            if (ImGuiTabItem* tab = ImGui::TabBarFindTabByID(bar, ImGui::GetID(id)))
-                tab->Offset = std::max(tab->Offset, std::floor(end - buttonW - after * (buttonW + gap)));
-            ImGui::SetNextItemWidth(buttonW);
-            const bool pressed = ImGui::TabItemButton(id, ImGuiTabItemFlags_Trailing | ImGuiTabItemFlags_NoTooltip);
+        constexpr float kLabelPx = 12;
+        const float iconSide = theme::snap(px(14)), padX = px(8), iconGap = px(5);
+        struct Control {
+            const char* id;
+            Icon icon;
+            const char* label;
+            bool active;
+            const char* tip;
+        };
+        const char* maximize = p == Panel::Diag ? "Maximise over the viewer" : "Maximise over the main window";
+        const Control controls[3] = {
+            {"##dock", Icon::Dock, "Dock", docked, docked ? "Docked in the main window" : "Dock in the main window"},
+            {"##float", Icon::Float, "Float", floating, floating ? "Floating outside the main window" : "Float in a window of its own"},
+            {"##maximize", Icon::Maximize, maximized ? "Restore" : "Maximize", maximized, maximized ? "Restore" : maximize},
+        };
+        // Labelled while the dock's own tabs keep their full width beside
+        // them; in a narrower dock only the current state keeps its word, and
+        // in the narrowest the three are icons (their tooltips still name them).
+        float tabsW = 0.0f;
+        for (const ImGuiTabItem& tab : bar->Tabs)
+            if (!(tab.Flags & ImGuiTabItemFlags_SectionMask_)) tabsW += tab.ContentWidth + ImGui::GetStyle().FramePadding.x * 2 + gap;
+        const auto widthsFor = [&](int mode, float* out) {   // 0: all labelled, 1: the active one, 2: none
+            float total = 0.0f;
+            for (int i = 0; i < 3; ++i) {
+                const bool label = mode == 0 || (mode == 1 && controls[i].active);
+                out[i] = theme::snap(label ? padX * 2 + iconSide + iconGap + theme::textSize(controls[i].label, kLabelPx, Weight::SemiBold).x
+                                           : px(26));
+                total += out[i] + gap;
+            }
+            return total;
+        };
+        float widths[3];
+        int mode = 0;
+        while (mode < 2 && tabsW + widthsFor(mode, widths) + margin * 2 > bar->BarRect.GetWidth()) ++mode;
+        widthsFor(mode, widths);
+        bool pressed[3] = {false, false, false};
+        for (int i = 0; i < 3; ++i) {
+            const Control& c = controls[i];
+            float right = 0.0f;   // the width of the controls right of this one
+            for (int j = i + 1; j < 3; ++j) right += widths[j] + gap;
+            if (ImGuiTabItem* tab = ImGui::TabBarFindTabByID(bar, ImGui::GetID(c.id)))
+                tab->Offset = std::max(tab->Offset, std::floor(end - widths[i] - right));
+            ImGui::SetNextItemWidth(widths[i]);
+            pressed[i] = ImGui::TabItemButton(c.id, ImGuiTabItemFlags_Trailing | ImGuiTabItemFlags_NoTooltip);
             const ImVec2 a = ImGui::GetItemRectMin(), b = ImGui::GetItemRectMax();
-            if (b.x - a.x < 1.0f) return false;   // its first frame: taken into the tab bar, not laid out yet
+            if (b.x - a.x < 1.0f) {   // its first frame: taken into the tab bar, not laid out yet
+                pressed[i] = false;
+                continue;
+            }
             const bool hovered = ImGui::IsItemHovered();
             if (hovered) ImGui::SetMouseCursor(ImGuiMouseCursor_Hand);
             const float h = theme::snap(px(22));
             const ImVec2 min(a.x, theme::snap((a.y + b.y - h) * 0.5f));
             const ImVec2 max(b.x, min.y + h);
-            if (active) dl->AddRectFilled(min, max, theme::kAccent);
-            widgets::crispRect(dl, min, max, active || hovered ? theme::kAccent : theme::kNeutral400);
-            drawIcon(dl, ImVec2((min.x + max.x) * 0.5f, (min.y + max.y) * 0.5f), theme::snap(px(15)), icon,
-                     active ? theme::kBg : theme::kNeutral600, px(1.5f));
-            widgets::tooltip(tip);
-            return pressed;
-        };
-        if (control("##dock", Icon::Dock, docked, docked ? "Docked in the main window" : "Dock in the main window")) dockPanel(p);
-        if (control("##float", Icon::Float, floating, floating ? "Floating outside the main window" : "Float in a window of its own"))
-            floatPanel(p);
-        const char* maximize = p == Panel::Diag ? "Maximise over the viewer" : "Maximise over the main window";
-        if (control("##maximize", Icon::Maximize, maximized, maximized ? "Restore" : maximize)) toggleMaximized(p);
+            if (c.active) dl->AddRectFilled(min, max, theme::kAccent);
+            else if (hovered) dl->AddRectFilled(min, max, theme::kSurface);
+            const ImU32 ink = c.active ? theme::kBg : hovered ? theme::kText
+                                                              : theme::kNeutral600;
+            const float cy = (min.y + max.y) * 0.5f;
+            if (mode == 0 || (mode == 1 && c.active)) {
+                drawIcon(dl, ImVec2(min.x + padX + iconSide * 0.5f, cy), iconSide, c.icon, ink, px(1.5f));
+                widgets::drawTextIn(dl, ImVec2(min.x + padX + iconSide + iconGap, min.y), ImVec2(max.x, max.y), c.label, kLabelPx, ink,
+                                    Weight::SemiBold, 0.0f, 0.5f);
+            } else {
+                drawIcon(dl, ImVec2((min.x + max.x) * 0.5f, cy), iconSide, c.icon, ink, px(1.5f));
+            }
+            widgets::tooltip(c.tip);
+        }
+        if (pressed[0]) dockPanel(p);
+        if (pressed[1]) floatPanel(p);
+        if (pressed[2]) toggleMaximized(p);
         ImGui::PopStyleColor();
         ImGui::DockNodeEndAmendTabBar();
     }
