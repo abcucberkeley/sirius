@@ -480,6 +480,37 @@ class TestHubMethods(ServerTestCase, _CacheCase):
             models.hub_files = original
 
 
+
+class Promptable(unittest.TestCase):
+    """Which model families can answer "the object here" rather than "every object".
+
+    micro-SAM is SAM and takes point prompts. cellpose is not promptable even though
+    cellpose-SAM borrows the architecture: it exposes whole-image segmentation only, so the
+    application must not offer it a Prompt step. These assertions are the contract the GUI
+    builds its interface from; they need neither package installed.
+    """
+
+    def test_only_microsam_is_promptable(self):
+        self.assertTrue(models.family_promptable("microsam"))
+        self.assertFalse(models.family_promptable("cellpose"))
+        self.assertFalse(models.family_promptable("hf"))
+        self.assertFalse(models.family_promptable("file"))
+
+    def test_family_info_reports_it(self):
+        self.assertTrue(models.family_info("microsam:vit_b_lm")["promptable"])
+        self.assertFalse(models.family_info("cellpose:cpsam")["promptable"])
+
+    def test_prompting_cellpose_refuses_with_a_reason(self):
+        vol = np.zeros((4, 32, 32), np.float32)
+        with self.assertRaises(models.ModelError) as cm:
+            models.run_family_prompt("cellpose:cpsam", vol, [[1, 8, 8]], None, {})
+        self.assertIn("no prompt interface", str(cm.exception))
+        self.assertIn("Segment step", str(cm.exception))
+
+    def test_a_non_family_spec_is_refused(self):
+        with self.assertRaises(models.ModelError):
+            models.run_family_prompt("/tmp/x.ltb", np.zeros((4, 8, 8), np.float32), [[1, 4, 4]], None, {})
+
 if __name__ == "__main__":
     unittest.main()
 

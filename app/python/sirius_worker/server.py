@@ -8,7 +8,8 @@ Requests (see protocol.py for the framing):
     list_plugins   {}                       -> {plugins: [spec + file (+ error)], dirs}
     reload_plugins {}                       -> the same, after re-importing every plugin file
     model_info  {path | spec}               -> format, input_shape, output_shape, dtype, size_bytes, channels_out;
-                                               cellpose: / microsam: specs -> {format, available, install_hint}
+                                               cellpose: / microsam: specs -> {format, available, install_hint,
+                                               promptable}
     hub_search  {query, limit, filter?}     -> {models: [{id, downloads, likes, tags, last_modified, pipeline_tag}]}
     hub_files   {repo}                      -> {repo, files: [{name, size, model}]}
     hub_download {repo, file}               -> "progress"* then {path, bytes, spec} (cancellable like a run)
@@ -630,6 +631,24 @@ class WorkerServer:
             volume = _tensor(tensors, "input", 3)
             spec = str(p.get("model") or p.get("model_path") or "")
             if model_hub.is_family_spec(spec):
+                if str(p.get("task", "")).lower() == "prompt":
+                    # "the object here", not "every object". Only micro-SAM among the families can
+                    # answer it; model_hub.run_family_prompt refuses the others with a reason. The
+                    # same point convention as the foundation step: [[x, y, z], ...] in voxels, the
+                    # application's axis order, so one GUI interaction serves every backend.
+                    pts = np.asarray(p.get("points") or [], np.float32).reshape(-1, 3)
+                    if not len(pts):
+                        raise ValueError("the Prompt task needs at least one point")
+                    plab = p.get("point_labels")
+                    plab = None if plab is None else np.asarray(plab, np.int64).reshape(-1)
+                    labels, scores = model_hub.run_family_prompt(
+                        spec, volume, pts[:, ::-1], plab, p, device, progress=progress, cancelled=cancelled)
+                    check()
+                    return ({"labels": int(labels.max()) if labels.size else 0, "model": spec,
+                             "format": model_hub.parse_spec(spec).family, "task": "prompt",
+                             "prompts": int(len(pts)), "mask_scores": [round(float(v), 4) for v in scores],
+                             "plane_only": True, "device": device},
+                            {"labels": np.ascontiguousarray(labels, dtype=np.uint32)})
                 # cellpose / micro-SAM produce instance labels themselves; the
                 # application skips its threshold / watershed stage for these
                 labels, prob = model_hub.run_family(spec, volume, p, device, progress=progress, cancelled=cancelled)

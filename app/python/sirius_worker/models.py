@@ -756,6 +756,7 @@ def family_info(spec: str) -> Dict[str, Any]:
                            "note": plan["note"]}
     except ModelError:
         pass
+    info["promptable"] = family_promptable(ms.family)
     if ms.family == "cellpose":
         names = cellpose_model_names() if available else list(CELLPOSE_MODELS)
         info["known_models"] = names
@@ -905,6 +906,72 @@ def run_microsam(volume: np.ndarray, model_type: str, params: Dict[str, Any], de
     return np.ascontiguousarray(labels), None
 
 
+def family_promptable(family: str) -> bool:
+    """Can this family answer a POINT PROMPT -- "the object here", rather than "every object"?
+
+    micro-SAM is SAM, so yes: its predictor takes point and box prompts directly. cellpose is not
+    promptable even when its backbone is called SAM: cellpose-SAM borrows the architecture, not the
+    prompt interface, and exposes only whole-image segmentation. So cellpose stays an automatic
+    model and the application should not offer it a Prompt step.
+    """
+    return family == "microsam"
+
+
+def run_microsam_prompt(volume: np.ndarray, model_type: str, points: np.ndarray, point_labels: np.ndarray,
+                        params: Dict[str, Any], device: str = "auto",
+                        progress: ProgressFn = None, cancelled: CancelFn = None):
+    """One mask per prompt from micro-SAM's predictor -> (labels uint32 (z, y, x), score per prompt).
+
+    micro-SAM is a 2-D model, so a prompt names an object IN ITS PLANE. The mask is written into
+    that plane of the returned volume and nowhere else; a 3-D object needs a prompt per plane, or
+    our own bundle, whose decoder is 3-D. Saying so in the result rather than silently returning a
+    one-plane object is the point of `plane_only` below.
+
+    `points` is (P, 3) in (z, y, x) VOXELS of this volume, `point_labels` (P,) 1 object / 0 background.
+    Prompts sharing a plane are answered in one predictor pass, which is where the time goes.
+    """
+    try:
+        from micro_sam.util import get_sam_model  # type: ignore
+        from segment_anything.predictor import SamPredictor  # type: ignore  # noqa: F401
+    except Exception as e:                                     # noqa: BLE001
+        raise NotAvailable(f"microsam:{model_type} needs the 'micro_sam' package "
+                           f"({INSTALL_HINTS['microsam']})") from e
+    import torch  # type: ignore
+    dev = device
+    if device in ("auto", "", None):
+        dev = "cuda" if torch.cuda.is_available() else "cpu"
+    pts = np.asarray(points, np.float32).reshape(-1, 3)
+    labs = (np.ones(len(pts), np.int64) if point_labels is None
+            else np.asarray(point_labels, np.int64).reshape(-1))
+    if len(labs) != len(pts):
+        raise ModelError(f"{len(pts)} points but {len(labs)} point labels")
+    z, y, x = volume.shape
+    if ((pts < 0) | (pts >= np.array([z, y, x], np.float32))).any():
+        raise ModelError("a point falls outside the volume")
+    predictor = get_sam_model(model_type=model_type, device=dev)
+    labels = np.zeros(volume.shape, np.uint32)
+    scores = np.zeros(len(pts), np.float32)
+    order = np.argsort(pts[:, 0].astype(int), kind="stable")
+    done = 0
+    for plane in sorted({int(v) for v in pts[:, 0]}):
+        _check(cancelled)
+        pl = volume[plane]
+        lo, hi = np.percentile(pl, (0.5, 99.8))
+        img = (np.clip((pl - lo) / max(float(hi - lo), 1e-6), 0, 1) * 255).astype(np.uint8)
+        predictor.set_image(np.stack([img] * 3, -1))
+        here = [int(i) for i in order if int(pts[i, 0]) == plane]
+        for i in here:
+            m, sc, _ = predictor.predict(point_coords=np.array([[pts[i, 2], pts[i, 1]]], np.float32),
+                                         point_labels=np.array([labs[i]], np.int64), multimask_output=False)
+            mask = np.asarray(m[0], bool)
+            labels[plane][mask] = i + 1
+            scores[i] = float(sc[0])
+            done += 1
+            if progress:
+                progress(min(1.0, done / max(len(pts), 1)), f"prompt {done}/{len(pts)}")
+    return labels, scores
+
+
 def run_family(spec: str, volume: np.ndarray, params: Dict[str, Any], device: str = "auto",
                progress: ProgressFn = None, cancelled: CancelFn = None) -> Tuple[np.ndarray, Optional[np.ndarray]]:
     """Dispatch cellpose:/microsam: specs; returns (labels uint32 (z, y, x), prob (1, z, y, x) or None)."""
@@ -921,3 +988,21 @@ def run_family(spec: str, volume: np.ndarray, params: Dict[str, Any], device: st
     if ms.family == "microsam":
         return run_microsam(volume, ms.name, params, device, progress, cancelled)
     raise ModelError(f"'{spec}' is not a model family spec")
+
+
+def run_family_prompt(spec: str, volume: np.ndarray, points, point_labels, params: Dict[str, Any],
+                      device: str = "auto", progress: ProgressFn = None, cancelled: CancelFn = None):
+    """Dispatch a POINT PROMPT to a family model -> (labels uint32 (z, y, x), score per prompt)."""
+    ms = parse_spec(spec)
+    volume = np.asarray(volume, dtype=np.float32)
+    while volume.ndim > 3 and volume.shape[0] == 1:
+        volume = volume[0]
+    if volume.ndim == 2:
+        volume = volume[np.newaxis]
+    if volume.ndim != 3:
+        raise ModelError(f"family models take a (z, y, x) volume, got shape {volume.shape}")
+    if not family_promptable(ms.family):
+        raise ModelError(f"'{spec}' cannot be prompted: {ms.family} segments a whole image and has no "
+                         "prompt interface. Use the Segment step for it, or a promptable model "
+                         "(microsam:, or a .ltb bundle with a prompt decoder).")
+    return run_microsam_prompt(volume, ms.name, points, point_labels, params, device, progress, cancelled)
