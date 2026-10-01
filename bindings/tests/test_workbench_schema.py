@@ -106,7 +106,7 @@ class TestOperationSchema(unittest.TestCase):
 
     def test_types_are_consistent_with_the_defaults(self):
         expect = {"bool": bool, "int": int, "channel": int, "double": (int, float), "string": str, "path": str,
-                  "choice": str, "axes": str, "double_list": list, "string_list": list}
+                  "choice": str, "axes": str, "double_list": list, "string_list": list, "prompts": list}
         for kind, spec in wb._SPECS.items():
             for p in self.ops[kind]["params"]:
                 d = spec.defaults[p["key"]]

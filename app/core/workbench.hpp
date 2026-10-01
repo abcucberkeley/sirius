@@ -49,7 +49,9 @@ namespace sirius::app {
                             Probe,
                             Measure,
                             Roi,
-                            Paint };
+                            Paint,
+                            // places the points of a Prompt step (params.hpp)
+                            Prompt };
     enum class PaintTool { Brush,
                            Erase,
                            Fill,
@@ -58,18 +60,27 @@ namespace sirius::app {
                            Split,
                            Delete,
                            Lasso };
+    // What a drag (or a click) with the Prompt tool places. A box is the
+    // default: one box gives the best mask of any single prompt the prompt
+    // decoder was measured on (median IoU .73, a centre click .61).
+    enum class PromptMode { Box,
+                            Click,
+                            Scribble };
 
     const char* toString(ViewMode m) noexcept;       // "ortho" "3d" "compare"
-    const char* toString(ViewerTool t) noexcept;     // "nav" "probe" "measure" "roi" "paint"
+    const char* toString(ViewerTool t) noexcept;     // "nav" "probe" "measure" "roi" "paint" "prompt"
     const char* toString(PaintTool t) noexcept;
+    const char* toString(PromptMode m) noexcept;    // "box" "click" "scribble"
     std::optional<ViewMode> viewModeFromString(const std::string& s) noexcept;
     std::optional<ViewerTool> viewerToolFromString(const std::string& s) noexcept;
     std::optional<PaintTool> paintToolFromString(const std::string& s) noexcept;
+    std::optional<PromptMode> promptModeFromString(const std::string& s) noexcept;
 
     struct ViewState {
         ViewMode mode = ViewMode::Ortho;
         ViewerTool tool = ViewerTool::Probe;
         PaintTool paintTool = PaintTool::Brush;
+        PromptMode promptMode = PromptMode::Box;
         int brushPx = 18;
         bool paint3d = true;
         Index z = 0, t = 0;

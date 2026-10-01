@@ -4,8 +4,16 @@
 // itself -- hf:<repo>[:<file>] downloaded from Hugging Face, or a model
 // family (cellpose:<model>, microsam:<model_type>) whose package returns
 // instance labels directly; those skip the threshold / watershed stage here.
+//
+// A micro-SAM model can also be prompted (Task: Prompt objects): the person
+// clicks objects and gets those objects back, one mask per object point. The
+// worker's family path takes points only (no boxes, no scribbles: those are
+// the foundation bundles'), and micro-SAM is a 2-D model, so each mask lies
+// in the plane of its point; the diagnostics say so rather than leave a
+// one-plane object to be taken for a cell.
 #include "core/ops/common.hpp"
 #include "core/ops/segment_common.hpp"
+#include "core/ops/torch_model.hpp"
 #include "core/ops/builtin.hpp"
 #include "core/rpc.hpp"
 
@@ -26,6 +34,8 @@ namespace sirius::app {
         constexpr const char* kWatershed = "Watershed on boundary channel";
         constexpr const char* kComponents = "Connected components";
         constexpr const char* kNone = "None (raw probabilities)";
+        constexpr const char* kSegmentAll = "Segment all objects";
+        constexpr const char* kPrompt = kPromptTask;
 
         std::string lowered(std::string s) {
             std::transform(s.begin(), s.end(), s.begin(), [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
@@ -46,6 +56,13 @@ namespace sirius::app {
         }
 
         bool isModelSpec(const std::string& model) { return isHubSpec(model) || isFamilySpec(model); }
+
+        // The family whose models answer a point prompt (the worker's
+        // models.family_promptable); cellpose segments whole images only.
+        bool isMicroSamSpec(const std::string& model) {
+            const std::string low = lowered(model);
+            return low.rfind("microsam:", 0) == 0 || low.rfind("micro-sam:", 0) == 0 || low.rfind("micro_sam:", 0) == 0;
+        }
 
         // "cellpose cyto3", "micro-SAM vit_b_lm", "hf model.pt", or the file name.
         std::string modelLabel(const std::string& model) {
@@ -90,6 +107,7 @@ namespace sirius::app {
                 info_.hasGpuPath = true;
                 info_.remoteCapable = true;
                 info_.producesLabels = true;
+                info_.promptPointsOnly = true;   // the worker's family prompt path takes points only
                 info_.helpPage = "seg";
                 info_.params = {
                     pathParam("model", "Model").withFilter("Models (*.pt *.pts *.pth *.onnx);;All files (*)").withHelp("A TorchScript / ONNX file taking (1, 1, Z, Y, X) float32, or a spec the worker resolves: "
@@ -99,15 +117,23 @@ namespace sirius::app {
                                                                                                                        "microsam:<model_type> (vit_b_lm, vit_l_lm, vit_t_lm, vit_b_em_organelles, ...). "
                                                                                                                        "Cellpose and micro-SAM return instance labels directly; threshold and post-processing "
                                                                                                                        "then do not apply"),
+                    choiceParam("task", "Task", {kSegmentAll, kPrompt}, kSegmentAll)
+                        .withHelp("Segment every object, or only the ones you click with the viewer's Prompt tool. "
+                                  "Prompting needs a micro-SAM model (microsam:<type>), which takes points only here and "
+                                  "whose masks are 2-D: one per point, in that point's plane"),
+                    promptsParam(kPromptsKey, "Prompts")
+                        .visibleWhen("task", {kPrompt})
+                        .withHelp("Where the objects are: points {x, y, z, t, label} in voxels of the input, label 1 "
+                                  "for an object and 0 for background. Placed with the viewer's Prompt tool"),
                     channelParam("input_channel", "Input channel", 0),
-                    doubleListParam("tile", "Tile", {32.0, 256.0, 256.0}).withUnit("px").withHelp("Tile extent (z, y, x); must fit GPU memory"),
-                    intParam("overlap", "Overlap", 32).range(0, 512).withUnit("px").withHelp("Tile halo; should exceed the model's receptive-field radius"),
-                    doubleParam("threshold", "Threshold", 0.5).range(0.0, 1.0, 0.01, 2).withHelp("Foreground probability cut"),
-                    choiceParam("post", "Post-processing", {kWatershed, kComponents, kNone}, kWatershed),
+                    doubleListParam("tile", "Tile", {32.0, 256.0, 256.0}).withUnit("px").withHelp("Tile extent (z, y, x); must fit GPU memory").hiddenWhen("task", {kPrompt}),
+                    intParam("overlap", "Overlap", 32).range(0, 512).withUnit("px").withHelp("Tile halo; should exceed the model's receptive-field radius").hiddenWhen("task", {kPrompt}),
+                    doubleParam("threshold", "Threshold", 0.5).range(0.0, 1.0, 0.01, 2).withHelp("Foreground probability cut").hiddenWhen("task", {kPrompt}),
+                    choiceParam("post", "Post-processing", {kWatershed, kComponents, kNone}, kWatershed).hiddenWhen("task", {kPrompt}),
                     intParam("min_voxels", "Min. voxels", 0).range(0, 1000000000).withHelp("Drop smaller objects (0 = keep all)"),
                     doubleParam("label_opacity", "Label opacity", 0.45).range(0.0, 1.0, 0.05, 2),
                     stringParam("class_name", "Class", "nucleus").asAdvanced(),
-                    doubleParam("seed_distance", "Seed distance", 5.0).range(1.0, 200.0, 0.5, 1).withUnit("px").withHelp("Minimum distance between watershed seeds").asAdvanced(),
+                    doubleParam("seed_distance", "Seed distance", 5.0).range(1.0, 200.0, 0.5, 1).withUnit("px").withHelp("Minimum distance between watershed seeds").asAdvanced().hiddenWhen("task", {kPrompt}),
                 };
             }
 
@@ -119,6 +145,7 @@ namespace sirius::app {
                 post = post.rfind("Watershed", 0) == 0 ? "watershed" : post == kComponents ? "components"
                                                                                            : "probabilities";
                 if (isFamilySpec(model)) post = "model labels";
+                if (isPromptStep(p)) return joinSummary({modelLabel(model), "prompt", toDisplayString(promptsValue(promptsOf(p)))});
                 return joinSummary({modelLabel(model), post});
             }
 
@@ -132,6 +159,22 @@ namespace sirius::app {
                 const std::vector<double> tile = p.getDoubleList("tile");
                 if (tile.size() != 3 || std::any_of(tile.begin(), tile.end(), [](double d) { return d < 1; }))
                     v.errors.push_back("Tile must be three positive extents (z, y, x).");
+                if (isPromptStep(p)) {
+                    // the worker can tell (family_info's promptable) and is asked
+                    // at run time too, but a spec that cannot be prompted is
+                    // known here already, and the panel should say so at once
+                    if (!model.empty() && lowered(model).rfind("cellpose:", 0) == 0)
+                        v.errors.push_back("Cellpose cannot be prompted: it segments a whole image and has no prompt interface. "
+                                           "Use Task: Segment all objects, or a micro-SAM model (microsam:vit_b_lm, ...).");
+                    else if (!model.empty() && !isMicroSamSpec(model))
+                        v.errors.push_back("Only micro-SAM models (microsam:<type>) can be prompted in this step; a .ltb bundle with a "
+                                           "prompt decoder is prompted in the Foundation model step.");
+                    const std::vector<Prompt> prompts = promptsOf(p);
+                    if (std::any_of(prompts.begin(), prompts.end(), [](const Prompt& q) { return q.kind != Prompt::Kind::Point; }))
+                        v.errors.push_back("micro-SAM takes points only here (the worker's prompt path for model families): "
+                                           "remove the boxes and scribbles, or prompt a .ltb bundle in the Foundation model step.");
+                    validatePrompts(prompts, in, v);
+                }
                 return v;
             }
 
@@ -144,12 +187,8 @@ namespace sirius::app {
             StepOutput run(const StepInput& input, const ParamSet& p, const StepContext& ctx) const override {
                 const Validation v = validate(p, input.meta);
                 if (!v.ok()) throw std::runtime_error(v.firstError());
-                if (!ctx.remote)
-                    throw std::runtime_error("Segmentation needs the Python worker, which is not available here (see the "
-                                             "worker message in the log), or the HPC backend");
-                if (!ctx.remote->supports("torch_segment"))
-                    throw std::runtime_error("The connected worker does not implement torch_segment (" +
-                                             ctx.remote->capabilities().hostname + ")");
+                if (isPromptStep(p)) return runPrompt(input, p, ctx);
+                requireWorker(ctx);
                 const DatasetMeta& meta = input.meta;
                 const Dims5& d = meta.dims;
                 const Index channel = p.getInt("input_channel", 0);
@@ -241,6 +280,135 @@ namespace sirius::app {
             }
 
         private:
+            static void requireWorker(const StepContext& ctx) {
+                if (!ctx.remote)
+                    throw std::runtime_error("Segmentation needs the Python worker, which is not available here (see the "
+                                             "worker message in the log), or the HPC backend");
+                if (!ctx.remote->supports("torch_segment"))
+                    throw std::runtime_error("The connected worker does not implement torch_segment (" +
+                                             ctx.remote->capabilities().hostname + ")");
+            }
+
+            // Prompt: the objects a person pointed at, through micro-SAM's
+            // predictor. One call per time point that has prompts; a frame
+            // nobody pointed at is left empty without asking the worker.
+            StepOutput runPrompt(const StepInput& input, const ParamSet& p, const StepContext& ctx) const {
+                const DatasetMeta& meta = input.meta;
+                const Dims5& d = meta.dims;
+                const std::string model = p.getString("model");
+                const Index channel = p.getInt("input_channel", 0);
+                const std::vector<Prompt> prompts = promptsOf(p);
+                std::vector<FramePrompt> frames;
+                std::size_t prompted = 0;
+                for (Index t = 0; t < d.t; ++t) {
+                    frames.push_back(framePrompt(prompts, t));
+                    if (!frames.back().empty()) ++prompted;
+                }
+
+                StepOutput out;
+                out.meta = meta;
+                out.array = input.materialize([&](double f, const std::string& m) { ctx.report(0.05 * f, m); });
+                auto labels = std::make_shared<LabelVolume>(d.t, d.z, d.y, d.x);
+                if (prompted > 0) {
+                    requireWorker(ctx);
+                    // The worker says which families answer a prompt
+                    // (family_info's promptable); one that says no is refused
+                    // with its reason before any frame is sent.
+                    const nlohmann::json info = torchModelInfo(*ctx.remote, model);
+                    if (info.contains("promptable") && info["promptable"].is_boolean() && !info["promptable"].get<bool>())
+                        throw std::runtime_error("The worker reports that " + modelLabel(model) +
+                                                 " cannot be prompted. Use Task: Segment all objects, or a micro-SAM model.");
+                }
+
+                nlohmann::json params = {{"model", model}, {"task", "prompt"}, {"device", workerDevice(ctx)}};
+                if (!ctx.hubToken.empty()) params["token"] = ctx.hubToken;
+                const Index volume = d.z * d.planeSize();
+                const Index minVoxels = p.getInt("min_voxels", 0);
+                double seconds = 0.0;
+                std::size_t done = 0;
+                bool planeOnly = false;
+                std::string scores;
+                for (Index t = 0; t < d.t; ++t) {
+                    ctx.throwIfCancelled();
+                    const FramePrompt& f = frames[static_cast<std::size_t>(t)];
+                    if (f.empty()) {
+                        labels->recomputeStats(t);
+                        continue;
+                    }
+                    const double base = 0.05 + 0.9 * static_cast<double>(done) / static_cast<double>(prompted);
+                    const double span = 0.9 / static_cast<double>(prompted);
+                    params["points"] = f.points;
+                    params["point_labels"] = f.pointLabels;
+                    const BufferView<const float> vol = out.array->volume(channel, t);
+                    rpc::TensorRef in;
+                    in.name = "input";
+                    in.dtype = "float32";
+                    in.shape = {d.z, d.y, d.x};
+                    in.data = vol.data();
+                    in.nbytes = vol.bytes();
+                    const auto t0 = std::chrono::steady_clock::now();
+                    WorkerResult r = ctx.remote->call(
+                        "run", {{"kind", "torch_segment"}, {"params", params}}, {in},
+                        [&](double fr, const std::string& m) { ctx.report(base + span * fr, m); }, [&] { return ctx.isCancelled(); });
+                    seconds += std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+                    ctx.throwIfCancelled();
+                    const rpc::Tensor* got = nullptr;
+                    for (const rpc::Tensor& tensor : r.tensors)
+                        if (tensor.name == "labels") got = &tensor;
+                    if (!got) throw std::runtime_error("the worker returned no 'labels' tensor for the prompt");
+                    if (got->shape.size() != 3 || got->shape[0] != d.z || got->shape[1] != d.y || got->shape[2] != d.x)
+                        throw std::runtime_error("the worker's labels do not match the volume");
+                    std::uint32_t* dst = labels->volume(t);
+                    std::copy_n(got->asUInt32(), volume, dst);
+                    applyPromptIds(dst, volume, f);
+                    // the ids stay those of the points, so the scores below name them
+                    if (minVoxels > 0) dropSmall(dst, volume, minVoxels);
+                    labels->recomputeStats(t);
+                    planeOnly = planeOnly || r.result.value("plane_only", false);
+                    const nlohmann::json ms = r.result.value("mask_scores", nlohmann::json::array());
+                    std::string line;
+                    for (std::size_t i = 0; i < f.ids.size(); ++i) {
+                        if (f.ids[i] == 0 || i >= ms.size() || !ms[i].is_number()) continue;
+                        line += (line.empty() ? "" : ", ") + std::string("#") + std::to_string(f.ids[i]) + " " +
+                                formatNumber(ms[i].get<double>(), 2);
+                    }
+                    if (!line.empty()) scores += (scores.empty() ? "" : " · ") + (d.t > 1 ? "t " + std::to_string(t) + ": " : std::string()) + line;
+                    ++done;
+                }
+                const std::string className = p.getString("class_name", "nucleus");
+                for (LabelStats& s : labels->stats()) s.cls = className;
+                std::uint32_t total = 0;
+                for (const LabelStats& s : labels->stats()) total = std::max(total, s.id);
+
+                out.labels = labels;
+                out.ranOn = ctx.backend;
+                out.seconds = seconds;
+                Diagnostics diag = labelDiagnostics(*labels, summary(p, meta));
+                diag.facts.push_back({"Task", "prompt"});
+                diag.facts.push_back({"Prompts", promptCounts(prompts) + " · on " + std::to_string(prompted) + " of " +
+                                                     std::to_string(d.t) + " time points"});
+                if (!scores.empty()) diag.facts.push_back({"Mask scores", scores});
+                if (planeOnly) {
+                    // micro-SAM is a 2-D model: the object a point names is the
+                    // one in its plane, and a cell needs a point on each plane
+                    diag.facts.push_back({"Masks", "per plane: each covers its point's z plane only"});
+                    diag.warnings.push_back(modelLabel(model) +
+                                            " is a 2-D model: each mask lies in the plane of its point. A cell in 3-D needs a "
+                                            "point on every plane, or the Foundation model step with a 3-D promptable bundle.");
+                }
+                diag.summary = summary(p, meta) + " · " + std::to_string(total) + " labels";
+                char note[240];
+                if (prompted == 0)
+                    std::snprintf(note, sizeof note, "no prompts placed · nothing to segment");
+                else
+                    std::snprintf(note, sizeof note, "%.1f s · %u labels%s · %s", seconds, total, planeOnly ? " · per plane" : "",
+                                  ctx.remote->capabilities().device.empty() ? "worker" : ctx.remote->capabilities().device.c_str());
+                out.note = note;
+                out.diagnostics = std::move(diag);
+                ctx.report(1.0, "");
+                return out;
+            }
+
             OpInfo info_;
         };
 

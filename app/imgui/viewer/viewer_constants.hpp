@@ -45,6 +45,15 @@ namespace sirius::app::gui::viewer {
     // --- brush --------------------------------------------------------------
     inline constexpr int kBrushMinPx = 2, kBrushMaxPx = 60, kBrushStepPx = 2;
 
+    // --- prompt points ------------------------------------------------------
+    // A Prompt step re-runs this long after the last point placed or
+    // removed, so a few quick clicks (an object and its corrections) make
+    // one run rather than one each.
+    inline constexpr int kPromptRunDelayMs = 600;
+    // A click this close (design pixels) to a point on the pane's plane
+    // removes that point instead of placing another.
+    inline constexpr double kPromptHitPx = 9.0;
+
     // --- 3D textures --------------------------------------------------------
     // The ray caster's volume textures are reduced to at most this many
     // texels per axis, for at most this many channels.

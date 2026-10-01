@@ -59,12 +59,48 @@ longer safe.
 | Parameter | Explanation |
 |---|---|
 | **Model** <br> `.ltb` bundle | Encoder, task head and the thresholds the model was validated with. Its manifest also supplies this step's defaults. |
-| **Task** <br> segment · detect · track | *Segment* returns objects with extents, by growing each detected centre out to where the model's confidence falls away. *Detect* returns one voxel per object, which is what the model predicts directly and is the fastest. *Track* follows objects across time and needs more than one time point. A bundle whose head predicts three classes (background, interior, boundary) has no centres to detect or link, and runs *Segment* only. |
+| **Task** <br> segment · detect · track · prompt | *Segment* returns objects with extents, by growing each detected centre out to where the model's confidence falls away. *Detect* returns one voxel per object, which is what the model predicts directly and is the fastest. *Track* follows objects across time and needs more than one time point. *Prompt objects* segments only the objects you point at (below). A bundle whose head predicts regions rather than centres (three classes, a dense or a prompt head) has no centres to detect or link, and runs *Segment* only, plus *Prompt* when it has a prompt decoder. |
+| **Prompts** <br> Prompt only | The boxes, points and scribbles placed with the viewer's Prompt tool, listed under Task with a button to remove each. |
 | **Channels** <br> one · all | The model accepts several channels together. Send all of them only when the bundle was trained with channel identities; otherwise pick the one channel the structure is in. |
 | **Threshold** <br> 0 = bundle's | Peak probability cut. Lower recovers dim objects, higher separates touching ones. |
 | **Min. separation** <br> µm, 0 = bundle's | Two peaks closer together than this are treated as one object. In **microns**, not voxels, so it means the same thing along z as in plane. On anisotropic data a voxel-based gate is a different physical distance on every axis, which splits single objects in plane while merging distinct ones in depth. |
 | **Min. voxels** <br> Segment only | Drop smaller objects. *Detect* returns one voxel per object, so there is no size to filter. A tracking run keeps every object: there the label id is a track id, and dropping an object in the one frame where it looks small would leave a hole in its track. |
 | **Tile** <br> 0 = bundle's | Inference tile (z, y, x); a zero extent uses the bundle's own crop size on that axis. The bundle's size is usually right; reduce it if the GPU runs out of memory. |
+
+## Prompt: pointing at objects
+
+With **Task: Prompt objects** the step segments the objects you point at
+instead of every object, in 3-D, one mask per prompt. It needs a bundle with a
+prompt decoder; any other is refused by name when the step runs. Choose the
+viewer's **Prompt** tool (the pointer in the tool strip; selecting a Prompt
+step picks it), then in **XY**:
+
+- **Box** (the default mode): drag a box around the object. Its z span is
+  the box's larger side in microns, centred on the plane you are on, unless
+  you first drag a z range in **XZ** or **YZ** (Esc clears it). Drag a box's
+  top or bottom edge in XZ / YZ to change its z span. A box is the strongest
+  single prompt: median IoU .73 against .61 for a click at the centre.
+- **Click**: click the object (an object point).
+- **Scribble**: draw a stroke over the object; a few points along it are sent.
+
+In every mode a plain click places an object point, **Alt + click** or a
+**right click** a background point, and a click on a prompt removes it. The
+button under the tool steps through the modes, and the Parameters panel has
+them side by side. Clicks in XZ and YZ place points on those planes too.
+
+The step re-runs on its own a moment after the last change, so a few quick
+clicks make one run: that is how a corrective click works. Edits, undo and
+the pipeline file keep the prompts like any other parameter, and agents set
+them with `set_params` (`prompts`, below). Each time point sends only its own
+prompts, one call per time point that has any; a time point without prompts
+is left empty without asking the model. The diagnostics give the model's
+score for each mask.
+
+The prompts are a list of records in voxels of the step's input, x y z order:
+`{"kind": "point", "x", "y", "z", "t", "label"}` (label 1 object, 0
+background), `{"kind": "box", "x0", "y0", "z0", "x1", "y1", "z1", "t"}` (the
+upper corner exclusive) and `{"kind": "scribble", "points": [[x, y, z], …],
+"t", "label"}`.
 
 ## Tracking
 

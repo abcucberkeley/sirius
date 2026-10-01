@@ -403,9 +403,10 @@ namespace sirius::app {
                  return json{{"selected_step", i + 1}};
              }});
         add({"set_view",
-             "Change the viewer: mode (ortho|3d|compare), tool (nav|probe|measure|roi|paint), z, t, crosshair [x, y], labels overlay, label (select one and jump to it), solo (draw only the selected label), trajectories and follow_track (tracked labels), channel visibility list, yaw/pitch, diagnostics tab is not part of this.",
+             "Change the viewer: mode (ortho|3d|compare), tool (nav|probe|measure|roi|paint|prompt), prompt_mode (what the Prompt tool places: box|click|scribble), z, t, crosshair [x, y], labels overlay, label (select one and jump to it), solo (draw only the selected label), trajectories and follow_track (tracked labels), channel visibility list, yaw/pitch, diagnostics tab is not part of this.",
              obj({{"mode", {{"type", "string"}, {"enum", {"ortho", "3d", "compare"}}}},
-                  {"tool", {{"type", "string"}, {"enum", {"nav", "probe", "measure", "roi", "paint"}}}},
+                  {"tool", {{"type", "string"}, {"enum", {"nav", "probe", "measure", "roi", "paint", "prompt"}}}},
+                  {"prompt_mode", {{"type", "string"}, {"enum", {"box", "click", "scribble"}}}},
                   {"z", {{"type", "integer"}}},
                   {"t", {{"type", "integer"}}},
                   {"crosshair", {{"type", "array"}, {"items", {{"type", "integer"}}}, {"description", "[x, y] or [x, y, z]"}}},
@@ -432,6 +433,12 @@ namespace sirius::app {
                      if (!t) throw std::invalid_argument("unknown tool");
                      s.tool = *t;
                      note(std::string("tool ") + toString(*t));
+                 }
+                 if (a.contains("prompt_mode")) {
+                     auto m = promptModeFromString(a["prompt_mode"].get<std::string>());
+                     if (!m) throw std::invalid_argument("prompt_mode must be box, click or scribble");
+                     s.promptMode = *m;
+                     note(std::string("prompt ") + toString(*m));
                  }
                  if (a.contains("z")) {
                      s.z = a["z"].get<Index>();

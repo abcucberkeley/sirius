@@ -279,6 +279,65 @@ namespace sirius::app::gui {
             }
         }
 
+        // prompts above the crosshair: they are what the clicks act on
+        if (hasContent() && !promptMarks_.empty()) {
+            const float pen = px(1.5f);
+            const ImU32 edge = theme::withAlpha(theme::kViewerGround, 0.85f);
+            const auto centre = [this](const DPoint& v) { return toScreenAbs(v + DPoint(0.5, 0.5)); };
+            // the faint projections first, so nothing on the plane is under one
+            for (const bool onPlane : {false, true})
+                for (const PromptMark& m : promptMarks_) {
+                    if ((m.inPlane || m.pending) != onPlane) continue;
+                    const ImU32 ink = m.object ? theme::kAccent : theme::kViewerText;
+                    switch (m.shape) {
+                        case PromptMark::Shape::Point: {
+                            const ImVec2 c = centre(m.a);
+                            if (!m.inPlane) {
+                                const float r = px(3.0f);
+                                dl->AddCircle(c, r, theme::withAlpha(theme::kViewerGround, 0.5f), 0, px(3.0f));
+                                dl->AddCircle(c, r, theme::withAlpha(ink, 0.6f), 0, pen);
+                                break;
+                            }
+                            const float r = px(5.5f), ring = px(1.5f);
+                            dl->AddCircleFilled(c, r + ring + px(1.0f), edge);
+                            dl->AddCircleFilled(c, r + ring, theme::kViewerText);
+                            dl->AddCircleFilled(c, r, m.object ? theme::kAccent : theme::kViewerGround);
+                            const float arm = r * 0.55f;
+                            dl->AddLine(ImVec2(c.x - arm, c.y), ImVec2(c.x + arm, c.y), theme::kViewerText, pen);
+                            if (m.object) dl->AddLine(ImVec2(c.x, c.y - arm), ImVec2(c.x, c.y + arm), theme::kViewerText, pen);
+                            break;
+                        }
+                        case PromptMark::Shape::Box: {
+                            const ImVec2 r0 = toScreenAbs(m.a), r1 = toScreenAbs(m.b);
+                            if (m.pending) {
+                                dl->AddRect(r0, r1, edge, 0.0f, ImDrawFlags_None, px(3.0f));
+                                dashedOutline(dl, r0, r1, theme::kViewerText, pen);
+                            } else if (!m.inPlane) {
+                                dashedOutline(dl, r0, r1, theme::withAlpha(theme::kAccent, 0.55f), px(1.0f));
+                            } else {
+                                dl->AddRect(r0, r1, edge, 0.0f, ImDrawFlags_None, px(4.0f));
+                                dl->AddRect(r0, r1, theme::kAccent, 0.0f, ImDrawFlags_None, px(2.0f));
+                            }
+                            break;
+                        }
+                        case PromptMark::Shape::Stroke: {
+                            if (m.stroke.empty()) break;
+                            std::vector<ImVec2> line;
+                            for (const DPoint& v : m.stroke) line.push_back(centre(v));
+                            if (line.size() == 1) line.push_back(ImVec2(line[0].x + 0.5f, line[0].y));
+                            const int n = static_cast<int>(line.size());
+                            if (!m.inPlane && !m.pending) {
+                                dl->AddPolyline(line.data(), n, theme::withAlpha(ink, 0.5f), ImDrawFlags_None, px(1.0f));
+                                break;
+                            }
+                            dl->AddPolyline(line.data(), n, edge, ImDrawFlags_None, px(4.5f));
+                            dl->AddPolyline(line.data(), n, m.pending ? theme::kViewerText : ink, ImDrawFlags_None, px(2.0f));
+                            break;
+                        }
+                    }
+                }
+        }
+
         if (brush_ && mouseIn_ && hasContent()) {
             const float r = static_cast<float>(std::max(1.0, brushRadius_ * view_.zx));
             const float ry = r * static_cast<float>(view_.zy / std::max(1e-9, view_.zx));

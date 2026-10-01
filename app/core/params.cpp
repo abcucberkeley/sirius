@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
+#include <functional>
 #include <sstream>
 #include <stdexcept>
 
@@ -53,6 +54,9 @@ namespace sirius::app {
     }
     ParamSpec doubleListParam(std::string key, std::string label, std::vector<double> def) {
         return spec(std::move(key), std::move(label), ParamType::DoubleList, std::move(def));
+    }
+    ParamSpec promptsParam(std::string key, std::string label) {
+        return spec(std::move(key), std::move(label), ParamType::Prompts, ParamJson{"[]"});
     }
 
     // --- ParamSet -------------------------------------------------------------
@@ -126,6 +130,7 @@ namespace sirius::app {
         const ParamValue* v = find(key);
         if (!v) return def;
         if (const std::string* s = std::get_if<std::string>(v)) return *s;
+        if (const ParamJson* j = std::get_if<ParamJson>(v)) return j->text;   // the JSON, not its summary
         return toDisplayString(*v);
     }
 
@@ -216,9 +221,22 @@ namespace sirius::app {
 
     // --- values -----------------------------------------------------------------
 
-    json toJson(const ParamValue& v) {
-        return std::visit([](const auto& x) -> json { return json(x); }, v);
-    }
+    namespace {
+        struct ToJson {
+            template <class T>
+            json operator()(const T& x) const {
+                return json(x);
+            }
+            json operator()(const ParamJson& x) const {
+                // canonical text, written by coerceToSpec; text that is not
+                // JSON (a hand-edited file) stays visible as the string it is
+                json out = json::parse(x.text, nullptr, false);
+                return out.is_discarded() ? json(x.text) : out;
+            }
+        };
+    } // namespace
+
+    json toJson(const ParamValue& v) { return std::visit(ToJson{}, v); }
 
     ParamValue paramValueFromJson(const json& j) {
         if (j.is_boolean()) return j.get<bool>();
@@ -229,11 +247,14 @@ namespace sirius::app {
             if (j.empty()) return std::vector<double>{};
             if (std::all_of(j.begin(), j.end(), [](const json& e) { return e.is_number(); }))
                 return j.get<std::vector<double>>();
+            // a list of records (the points of a Prompt step) stays structured
+            if (std::any_of(j.begin(), j.end(), [](const json& e) { return e.is_object(); })) return ParamJson{j.dump()};
             std::vector<std::string> out;
             for (const json& e : j) out.push_back(e.is_string() ? e.get<std::string>() : e.dump());
             return out;
         }
         if (j.is_null()) return std::string();
+        if (j.is_object()) return ParamJson{j.dump()};
         return j.dump();
     }
 
@@ -277,9 +298,139 @@ namespace sirius::app {
                 }
                 return out;
             }
+            // What a person reads in an undo entry or a tool's change list:
+            // "1 box, 2 points", not the JSON of them.
+            std::string operator()(const ParamJson& v) const {
+                const json j = json::parse(v.text, nullptr, false);
+                if (!j.is_array()) return v.text;
+                if (j.empty()) return "none";
+                std::size_t points = 0, boxes = 0, scribbles = 0, other = 0;
+                for (const json& e : j) {
+                    const std::string kind = e.is_object() && e.contains("kind") && e["kind"].is_string() ? e["kind"].get<std::string>()
+                                             : e.is_object() && e.contains("x")                           ? std::string("point")
+                                                                                                          : std::string();
+                    if (kind == "point") ++points;
+                    else if (kind == "box") ++boxes;
+                    else if (kind == "scribble") ++scribbles;
+                    else ++other;
+                }
+                std::string out;
+                const auto part = [&out](std::size_t n, const char* one, const char* many) {
+                    if (n == 0) return;
+                    out += (out.empty() ? "" : ", ") + std::to_string(n) + " " + (n == 1 ? one : many);
+                };
+                part(boxes, "box", "boxes");
+                part(points, "point", "points");
+                part(scribbles, "scribble", "scribbles");
+                part(other, "entry", "entries");
+                return out;
+            }
         };
         return std::visit(Visitor{}, v);
     }
+
+    namespace {
+        // A coordinate as it is stored: an integer when it is one, so a point
+        // clicked on voxel 12 reads 12 in the file and in get_step, not 12.0.
+        json storedNumber(double v) {
+            if (std::floor(v) == v && std::abs(v) < 1e15) return static_cast<std::int64_t>(v);
+            return v;
+        }
+
+        // A list of three coordinates, each a voxel position >= 0.
+        json storedTriple(const json& e, const std::function<std::invalid_argument(const std::string&)>& bad, const std::string& which) {
+            if (!e.is_array() || e.size() != 3) throw bad(which + " is not [x, y, z]: " + e.dump());
+            json out = json::array();
+            for (const json& v : e) {
+                if (!v.is_number() || !std::isfinite(v.get<double>()) || v.get<double>() < 0.0)
+                    throw bad(which + " has a coordinate that is not a voxel position >= 0: " + e.dump());
+                out.push_back(storedNumber(v.get<double>()));
+            }
+            return out;
+        }
+
+        // The canonical list of prompts, or invalid_argument naming the entry
+        // that is wrong and why. Accepted: the list itself, its JSON text, and
+        // the list of JSON texts an older reader of the file made of it.
+        ParamValue coercePrompts(const ParamSpec& spec, const json& given) {
+            const std::function<std::invalid_argument(const std::string&)> bad = [&](const std::string& what) {
+                return std::invalid_argument("parameter '" + spec.key + "': " + what);
+            };
+            const std::string shapes = R"(points {"x", "y", "z", "t", "label"}, boxes {"kind": "box", "x0", "y0", "z0", "x1", "y1", "z1", "t"} )"
+                                       R"(and scribbles {"kind": "scribble", "points": [[x, y, z], ...], "t", "label"})";
+            json list = given;
+            if (list.is_string()) {
+                const std::string text = list.get<std::string>();
+                list = text.empty() ? json::array() : json::parse(text, nullptr, false);
+                if (list.is_discarded()) throw bad("expected a list of " + shapes + ", got " + given.dump());
+            }
+            if (list.is_null()) list = json::array();
+            if (!list.is_array()) throw bad("expected a list of " + shapes + ", got " + given.dump());
+            json out = json::array();
+            for (std::size_t i = 0; i < list.size(); ++i) {
+                json e = list[i];
+                if (e.is_string()) e = json::parse(e.get<std::string>(), nullptr, false);
+                const std::string which = "prompt " + std::to_string(i + 1);
+                if (!e.is_object()) throw bad(which + " is not an object: " + list[i].dump() + "; prompts are " + shapes);
+                const std::string kind = !e.contains("kind") || e["kind"].is_null() ? std::string("point")
+                                         : e["kind"].is_string()                    ? e["kind"].get<std::string>()
+                                                                                    : e["kind"].dump();
+                json p = {{"kind", kind}};
+                if (kind == "point") {
+                    for (const char* axis : {"x", "y", "z"}) {
+                        if (!e.contains(axis) || !e[axis].is_number()) throw bad(which + " (a point) needs a number '" + axis + "' (voxels)");
+                        const double v = e[axis].get<double>();
+                        if (!std::isfinite(v) || v < 0.0) throw bad(which + ": '" + axis + "' must be a voxel position >= 0");
+                        p[axis] = storedNumber(v);
+                    }
+                } else if (kind == "box") {
+                    for (const char* axis : {"x", "y", "z"}) {
+                        const std::string lo = std::string(axis) + "0", hi = std::string(axis) + "1";
+                        if (!e.contains(lo) || !e[lo].is_number() || !e.contains(hi) || !e[hi].is_number())
+                            throw bad(which + " (a box) needs numbers '" + lo + "' and '" + hi + "' (voxels, " + hi + " exclusive)");
+                        const double a0 = e[lo].get<double>(), a1 = e[hi].get<double>();
+                        if (!std::isfinite(a0) || !std::isfinite(a1) || a0 < 0.0 || a1 <= a0)
+                            throw bad(which + ": a box needs 0 <= " + lo + " < " + hi);
+                        p[lo] = storedNumber(a0);
+                        p[hi] = storedNumber(a1);
+                    }
+                } else if (kind == "scribble") {
+                    if (!e.contains("points") || !e["points"].is_array() || e["points"].empty())
+                        throw bad(which + " (a scribble) needs 'points': [[x, y, z], ...]");
+                    json pts = json::array();
+                    for (std::size_t k = 0; k < e["points"].size(); ++k)
+                        pts.push_back(storedTriple(e["points"][k], bad, which + " point " + std::to_string(k + 1)));
+                    p["points"] = std::move(pts);
+                } else {
+                    throw bad(which + " is a '" + kind + "' prompt; the kinds are point, box and scribble");
+                }
+                std::int64_t t = 0;
+                if (e.contains("t") && !e["t"].is_null()) {
+                    const double tv = e["t"].is_number() ? e["t"].get<double>() : -1.0;
+                    if (!(tv >= 0.0) || std::floor(tv) != tv) throw bad(which + ": 't' must be a time point index >= 0");
+                    t = static_cast<std::int64_t>(tv);
+                }
+                p["t"] = t;
+                int label = 1;
+                if (e.contains("label") && !e["label"].is_null()) {
+                    const json& l = e["label"];
+                    if (l.is_boolean()) label = l.get<bool>() ? 1 : 0;
+                    else if (l.is_number() && (l.get<double>() == 0.0 || l.get<double>() == 1.0)) label = static_cast<int>(l.get<double>());
+                    else if (l.is_string() && (l.get<std::string>() == "object" || l.get<std::string>() == "background"))
+                        label = l.get<std::string>() == "object" ? 1 : 0;
+                    else throw bad(which + ": 'label' is 1 (object) or 0 (background), got " + l.dump());
+                }
+                if (kind == "box") {
+                    // the prompt decoder takes a box as "the object in here"
+                    if (label != 1) throw bad(which + ": a box always names an object; mark background with a point or a scribble");
+                } else {
+                    p["label"] = label;
+                }
+                out.push_back(std::move(p));
+            }
+            return ParamJson{out.dump()};
+        }
+    } // namespace
 
     ParamValue coerceToSpec(const ParamSpec& spec, const json& j) {
         auto bad = [&](const char* what) {
@@ -382,6 +533,7 @@ namespace sirius::app {
                 }
                 throw bad("a list of strings");
             }
+            case ParamType::Prompts: return coercePrompts(spec, j);
         }
         throw bad("a value");
     }
@@ -420,9 +572,116 @@ namespace sirius::app {
                 s["type"] = "array";
                 s["items"] = {{"type", "string"}};
                 break;
+            case ParamType::Prompts: {
+                const json voxel = {{"type", "number"}, {"minimum", 0}};
+                const json frame = {{"type", "integer"}, {"minimum", 0}, {"description", "time point (default 0)"}};
+                const json label = {{"type", "integer"}, {"enum", {0, 1}}, {"description", "1 object (default), 0 background"}};
+                s["type"] = "array";
+                s["items"] = {{"type", "object"},
+                              {"description", "voxels of the step's input, x y z order; one mask per prompt"},
+                              {"properties",
+                               {{"kind", {{"type", "string"}, {"enum", {"point", "box", "scribble"}}, {"description", "default point"}}},
+                                {"x", voxel},
+                                {"y", voxel},
+                                {"z", voxel},
+                                {"x0", voxel},
+                                {"y0", voxel},
+                                {"z0", voxel},
+                                {"x1", voxel},
+                                {"y1", voxel},
+                                {"z1", voxel},
+                                {"points", {{"type", "array"}, {"items", {{"type", "array"}, {"items", voxel}, {"minItems", 3}, {"maxItems", 3}}}}},
+                                {"t", frame},
+                                {"label", label}}}};
+                desc += " (a point needs x, y, z; a box x0, y0, z0, x1, y1, z1, the upper corner exclusive; a scribble points)";
+                break;
+            }
         }
         s["description"] = desc;
         return s;
     }
+
+    // --- prompts --------------------------------------------------------------
+
+    Prompt Prompt::point(double x, double y, double z, std::int64_t t, bool object) {
+        Prompt p;
+        p.kind = Kind::Point;
+        p.at = {x, y, z};
+        p.t = t;
+        p.object = object;
+        return p;
+    }
+
+    Prompt Prompt::boxOf(std::array<double, 6> corners, std::int64_t t) {
+        Prompt p;
+        p.kind = Kind::Box;
+        p.box = corners;
+        p.t = t;
+        return p;
+    }
+
+    Prompt Prompt::scribble(std::vector<std::array<double, 3>> points, std::int64_t t, bool object) {
+        Prompt p;
+        p.kind = Kind::Scribble;
+        p.stroke = std::move(points);
+        p.t = t;
+        p.object = object;
+        return p;
+    }
+
+    std::vector<Prompt> promptsOf(const ParamSet& p, const std::string& key) {
+        std::vector<Prompt> out;
+        const ParamValue* v = p.find(key);
+        if (!v) return out;
+        ParamSpec s;
+        s.key = key;
+        s.type = ParamType::Prompts;
+        ParamValue canonical;
+        try {
+            canonical = coerceToSpec(s, toJson(*v));
+        } catch (const std::exception&) {
+            return out;   // not a list of prompts: nothing to place, the step's validation says why
+        }
+        for (const json& e : json::parse(std::get<ParamJson>(canonical).text)) {
+            const std::string kind = e.at("kind").get<std::string>();
+            const std::int64_t t = e.at("t").get<std::int64_t>();
+            if (kind == "box") {
+                out.push_back(Prompt::boxOf({e.at("x0").get<double>(), e.at("y0").get<double>(), e.at("z0").get<double>(),
+                                             e.at("x1").get<double>(), e.at("y1").get<double>(), e.at("z1").get<double>()},
+                                            t));
+            } else if (kind == "scribble") {
+                std::vector<std::array<double, 3>> stroke;
+                for (const json& q : e.at("points")) stroke.push_back({q[0].get<double>(), q[1].get<double>(), q[2].get<double>()});
+                out.push_back(Prompt::scribble(std::move(stroke), t, e.at("label").get<int>() != 0));
+            } else {
+                out.push_back(Prompt::point(e.at("x").get<double>(), e.at("y").get<double>(), e.at("z").get<double>(), t,
+                                            e.at("label").get<int>() != 0));
+            }
+        }
+        return out;
+    }
+
+    ParamValue promptsValue(const std::vector<Prompt>& prompts) {
+        json list = json::array();
+        for (const Prompt& p : prompts) {
+            switch (p.kind) {
+                case Prompt::Kind::Point:
+                    list.push_back({{"kind", "point"}, {"x", p.at[0]}, {"y", p.at[1]}, {"z", p.at[2]}, {"t", p.t}, {"label", p.object ? 1 : 0}});
+                    break;
+                case Prompt::Kind::Box:
+                    list.push_back({{"kind", "box"}, {"x0", p.box[0]}, {"y0", p.box[1]}, {"z0", p.box[2]}, {"x1", p.box[3]}, {"y1", p.box[4]}, {"z1", p.box[5]}, {"t", p.t}});
+                    break;
+                case Prompt::Kind::Scribble:
+                    list.push_back({{"kind", "scribble"}, {"points", p.stroke}, {"t", p.t}, {"label", p.object ? 1 : 0}});
+                    break;
+            }
+        }
+        ParamSpec s;
+        s.key = kPromptsKey;
+        s.type = ParamType::Prompts;
+        return coerceToSpec(s, list);
+    }
+
+    bool isPromptStep(const ParamSet& p) { return p.has(kPromptsKey) && p.getString("task") == kPromptTask; }
 
 } // namespace sirius::app

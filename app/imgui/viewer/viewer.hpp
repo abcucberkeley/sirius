@@ -48,8 +48,13 @@ namespace sirius::app::gui {
         bool loading() const;
         double loadFraction() const;
         std::string loadMessage() const;
-        // True while the viewer wants frames without input (play, a load).
+        // True while the viewer wants frames without input (play, a load, a
+        // Prompt step waiting to re-run).
         bool animating() const;
+        // The points of Prompt step `stepId` changed outside the viewer (the
+        // parameters panel's list): it re-runs as after a click, once the
+        // edits pause.
+        void promptsEdited(std::uint64_t stepId);
 
         // Scripting / testing: mouse input on the XY pane, positions in
         // voxels. --stroke and --wheel on the command line use these.

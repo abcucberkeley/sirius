@@ -36,6 +36,7 @@ namespace sirius::app {
             case ViewerTool::Measure: return "measure";
             case ViewerTool::Roi: return "roi";
             case ViewerTool::Paint: return "paint";
+            case ViewerTool::Prompt: return "prompt";
         }
         return "?";
     }
@@ -49,6 +50,15 @@ namespace sirius::app {
             case PaintTool::Split: return "split";
             case PaintTool::Delete: return "delete";
             case PaintTool::Lasso: return "lasso";
+        }
+        return "?";
+    }
+
+    const char* toString(PromptMode m) noexcept {
+        switch (m) {
+            case PromptMode::Box: return "box";
+            case PromptMode::Click: return "click";
+            case PromptMode::Scribble: return "scribble";
         }
         return "?";
     }
@@ -83,6 +93,13 @@ namespace sirius::app {
         if (l == "measure") return ViewerTool::Measure;
         if (l == "roi") return ViewerTool::Roi;
         if (l == "paint") return ViewerTool::Paint;
+        if (l == "prompt") return ViewerTool::Prompt;
+        return std::nullopt;
+    }
+    std::optional<PromptMode> promptModeFromString(const std::string& s) noexcept {
+        const std::string l = lower(s);
+        for (PromptMode m : {PromptMode::Box, PromptMode::Click, PromptMode::Scribble})
+            if (l == toString(m)) return m;
         return std::nullopt;
     }
     std::optional<PaintTool> paintToolFromString(const std::string& s) noexcept {
@@ -100,6 +117,7 @@ namespace sirius::app {
         return {{"mode", toString(mode)},
                 {"tool", toString(tool)},
                 {"paint_tool", toString(paintTool)},
+                {"prompt_mode", toString(promptMode)},
                 {"brush_px", brushPx},
                 {"paint_3d", paint3d},
                 {"z", z},
@@ -134,6 +152,7 @@ namespace sirius::app {
         if (auto m = viewModeFromString(str("mode"))) s.mode = *m;
         if (auto t = viewerToolFromString(str("tool"))) s.tool = *t;
         if (auto t = paintToolFromString(str("paint_tool"))) s.paintTool = *t;
+        if (auto m = promptModeFromString(str("prompt_mode"))) s.promptMode = *m;
         auto num = [&](const char* k, auto& out) {
             if (j.contains(k) && j[k].is_number()) out = static_cast<std::decay_t<decltype(out)>>(j[k].get<double>());
         };
@@ -954,10 +973,15 @@ namespace sirius::app {
         const std::string& kind = pipeline_.at(index).kind;
         const OpInfo& info = pipeline_.at(index).op().info();
         if (kind == "volrec") view_.mode = ViewMode::Volume;
-        if (info.producesLabels || info.needsLabels) {
+        // A Prompt step is made by pointing at objects, so selecting one
+        // picks the tool that places the points; its masks are labels.
+        if (isPromptStep(pipeline_.at(index).params)) {
+            view_.labels = true;
+            view_.tool = ViewerTool::Prompt;
+        } else if (info.producesLabels || info.needsLabels) {
             view_.labels = true;
             view_.tool = ViewerTool::Paint;
-        } else if (view_.tool == ViewerTool::Paint) {
+        } else if (view_.tool == ViewerTool::Paint || view_.tool == ViewerTool::Prompt) {
             view_.tool = ViewerTool::Probe;
         }
     }
@@ -1087,7 +1111,7 @@ namespace sirius::app {
     void Workbench::setTool(ViewerTool t) {
         if (view_.tool == t) return;
         view_.tool = t;
-        if (t == ViewerTool::Paint) view_.labels = true;
+        if (t == ViewerTool::Paint || t == ViewerTool::Prompt) view_.labels = true;
         notify(&Observer::viewStateChanged);
     }
 

@@ -21,6 +21,7 @@ namespace sirius::app {
                 case ParamType::Axes: return "axes";
                 case ParamType::DoubleList: return "double_list";
                 case ParamType::StringList: return "string_list";
+                case ParamType::Prompts: return "prompts";
             }
             return "?";
         }

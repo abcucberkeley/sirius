@@ -13,6 +13,7 @@ $$
 
 | Parameter | Explanation |
 |---|---|
+| **Task** <br> segment all · prompt | *Segment all objects* runs the model over the whole volume. *Prompt objects* segments only the objects you click (below), and needs a micro-SAM model. |
 | **Model** <br> file · hub · family | A TorchScript / ONNX file taking (1, 1, Z, Y, X) float32 and returning (1, K, Z, Y, X) logits or probabilities; `hf:<repo>[:<file>]`, a file fetched from Hugging Face on first run and cached in `~/.sirius/models`; or a model family that returns labels itself: `cellpose:<model>` (`default` for the installed Cellpose's built-in model, one of its model names, or a custom file) and `microsam:<model_type>` (vit_b_lm, vit_l_lm, vit_b_em_organelles, …). *Hub…* offers the families, installs a missing package on request, fetches weights, and searches Hugging Face. The model runs in the Python worker (locally or on the HPC backend), never inside the app process. |
 | **Input channel** <br> channel | The channel fed to the model, normalised to 0 – 1 by percentiles. |
 | **Tile · Overlap** <br> GPU bound | Tile must fit GPU memory; overlap should exceed the receptive-field radius so edges are not visible in the stitched prediction. |
@@ -29,6 +30,20 @@ Match the model to the shape of the structure.
 **Filaments, vessels, networks.** Neither is the right tool, and the failure is not subtle. Both are instance segmenters trained on cells: given a dense filament network they carve the field into cell-shaped pieces whose boundaries have nothing to do with the filaments. On the bundled SIM reconstruction (`examples/sim_bundled.sirius.toml`, a filament network in a round cell) Cellpose returns about seventy polygonal tiles covering nearly a fifth of the volume, none following a filament. Use the Classical segmentation step with the *Tubes* enhancement instead: it scores how tube-like each voxel is and traces the structure. On the same data, σ 0.8 – 2.0 over three scales with an Otsu cut and connected components gives about seventy-five filament segments over three per cent of the volume, lying along the filaments.
 
 A family whose package is missing on the worker's host is installed from the hub dialog after a confirmation (`pip install cellpose`; `conda install -c conda-forge micro_sam` in a conda environment). Plain SAM checkpoints on Hugging Face are in the transformers format, expect prompts and are not run directly; SAM 3 there is also gated, so it needs an accepted licence and an access token (Hub… ▸ Token…, or Preferences).
+
+## Prompting micro-SAM
+
+With **Task: Prompt objects** and a `microsam:` model, the step segments the
+objects you click with the viewer's **Prompt** tool: a click places an object
+point, **Alt + click** or a right click a background point, a click on a point
+removes it, and the step re-runs a moment after the last click. micro-SAM
+takes **points only** here (the Box and Scribble modes are for a Foundation
+model bundle), and it is a **2-D model**: each mask lies in the plane of its
+point, so a cell in 3-D needs a point on each plane, and the diagnostics say
+so. Cellpose cannot be prompted: it segments whole images only. The points are
+the step's `prompts` parameter, saved with the pipeline and set by agents with
+`set_params` (`{"kind": "point", "x", "y", "z", "t", "label"}`, voxels of the
+input).
 
 ## Note
 

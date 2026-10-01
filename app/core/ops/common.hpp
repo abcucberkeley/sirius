@@ -5,11 +5,13 @@
 // report progress and honour cancellation, the small formatters its summary
 // is built from, and the two standard Diagnostics.
 
+#include <array>
 #include <cstdint>
 #include <functional>
 #include <initializer_list>
 #include <memory>
 #include <string>
+#include <vector>
 
 #include "core/operation.hpp"
 
@@ -41,6 +43,47 @@ namespace sirius::app {
     std::shared_ptr<Array5> allocateLike(const DatasetMeta& meta);
     // Label table + review-queue facts (the segmentation panel's data).
     Diagnostics labelDiagnostics(const LabelVolume& labels, const std::string& summary);
+
+    // One time point of a Prompt step as the worker is asked it, and what
+    // becomes of the mask the worker returns for each prompt. The worker
+    // answers one mask per prompt -- the points, then the boxes, then the
+    // scribbles -- and lets a later mask win where two overlap. So the
+    // background points are sent first: an object mask then wins over the
+    // mask a background point produced, and that mask is dropped (a point on
+    // the background names no object). Object masks are numbered 1..n in the
+    // order they are sent.
+    struct FramePrompt {
+        struct Stroke {
+            std::vector<std::array<double, 3>> points;   // a few, evenly spaced along the stroke
+            int label = 1;
+        };
+        std::vector<std::array<double, 3>> points;      // (x, y, z), background first
+        std::vector<int> pointLabels;                   // 1 object, 0 background
+        std::vector<std::array<double, 6>> boxes;       // (x0, y0, z0, x1, y1, z1)
+        std::vector<Stroke> scribbles;
+        std::vector<std::uint32_t> ids;                 // per mask, in the worker's order: the label it becomes, 0 drops it
+        std::vector<std::size_t> placed;                // per mask: the prompt's index in the step's list
+        bool empty() const noexcept { return ids.empty(); }
+        std::size_t objects() const noexcept;
+    };
+    // A scribble is sent as at most this many points, evenly spaced along the
+    // stroke and including both ends: the prompt decoder was trained on a few
+    // points per stroke (three, at random), and a stroke's every voxel would
+    // make one decoder call no better and much slower.
+    inline constexpr std::size_t kScribblePointsSent = 8;
+    std::vector<std::array<double, 3>> scribbleSample(const std::vector<std::array<double, 3>>& stroke, std::size_t at_most = kScribblePointsSent);
+    FramePrompt framePrompt(const std::vector<Prompt>& prompts, Index t);
+    // Masks numbered as the worker returned them (i + 1 for the i-th mask)
+    // renumbered to FramePrompt::ids, in place; an id beyond the list becomes 0.
+    void applyPromptIds(std::uint32_t* labels, Index n, const FramePrompt& frame);
+    // Every prompt inside the image and on one of its time points: the worker
+    // refuses one outside the volume, and one placed on other data (a dataset
+    // swapped under the step) would otherwise be a failed run rather than a
+    // line in the panel. No prompts, or only background ones, is a warning:
+    // the step runs and segments nothing.
+    void validatePrompts(const std::vector<Prompt>& prompts, const DatasetMeta& in, Validation& v);
+    // "2 boxes · 3 object points · 1 background point": what a run was given.
+    std::string promptCounts(const std::vector<Prompt>& prompts);
 
     // The "device" of a request to the Python worker: where this run was
     // asked to go, as the launcher names it when it starts a local worker.

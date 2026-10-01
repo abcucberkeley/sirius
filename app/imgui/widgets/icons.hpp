@@ -19,6 +19,7 @@ namespace sirius::app::gui {
         Measure,
         Roi,
         Brush,
+        Prompt,   // a pointer at an object: the Prompt tool
         // label cleanup tools
         Erase,
         Fill,

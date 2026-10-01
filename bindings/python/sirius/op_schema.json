@@ -1634,14 +1634,33 @@
           "choices": [
             "Segment objects",
             "Detect centroids",
-            "Track over time"
+            "Track over time",
+            "Prompt objects"
           ],
           "default": "Segment objects",
-          "help": "Segment gives objects with extents; Detect gives one voxel per object, which is faster and is what the model predicts directly; Track follows objects across time and needs more than one time point",
+          "help": "Segment gives objects with extents; Detect gives one voxel per object, which is faster and is what the model predicts directly; Track follows objects across time and needs more than one time point; Prompt segments the objects you point at with the viewer's Prompt tool (a box, a click, a scribble), and needs a bundle with a prompt decoder",
           "key": "task",
           "label": "Task",
           "read_only": false,
           "type": "choice"
+        },
+        {
+          "advanced": false,
+          "default": [],
+          "help": "Where the objects are, in voxels of the input: points, boxes and scribbles, each on one time point. Placed with the viewer's Prompt tool",
+          "key": "prompts",
+          "label": "Prompts",
+          "read_only": false,
+          "type": "prompts",
+          "visible_when": [
+            {
+              "key": "task",
+              "negate": false,
+              "values": [
+                "Prompt objects"
+              ]
+            }
+          ]
         },
         {
           "advanced": false,
@@ -1682,7 +1701,16 @@
           "max": 1.0,
           "min": 0.0,
           "read_only": false,
-          "type": "double"
+          "type": "double",
+          "visible_when": [
+            {
+              "key": "task",
+              "negate": true,
+              "values": [
+                "Prompt objects"
+              ]
+            }
+          ]
         },
         {
           "advanced": false,
@@ -1694,7 +1722,16 @@
           "min": 0.0,
           "read_only": false,
           "type": "double",
-          "unit": "um"
+          "unit": "um",
+          "visible_when": [
+            {
+              "key": "task",
+              "negate": true,
+              "values": [
+                "Prompt objects"
+              ]
+            }
+          ]
         },
         {
           "advanced": false,
@@ -1711,7 +1748,8 @@
               "key": "task",
               "negate": false,
               "values": [
-                "Segment objects"
+                "Segment objects",
+                "Prompt objects"
               ]
             }
           ]
@@ -1770,6 +1808,37 @@
         },
         {
           "advanced": false,
+          "choices": [
+            "Segment all objects",
+            "Prompt objects"
+          ],
+          "default": "Segment all objects",
+          "help": "Segment every object, or only the ones you click with the viewer's Prompt tool. Prompting needs a micro-SAM model (microsam:<type>), which takes points only here and whose masks are 2-D: one per point, in that point's plane",
+          "key": "task",
+          "label": "Task",
+          "read_only": false,
+          "type": "choice"
+        },
+        {
+          "advanced": false,
+          "default": [],
+          "help": "Where the objects are: points {x, y, z, t, label} in voxels of the input, label 1 for an object and 0 for background. Placed with the viewer's Prompt tool",
+          "key": "prompts",
+          "label": "Prompts",
+          "read_only": false,
+          "type": "prompts",
+          "visible_when": [
+            {
+              "key": "task",
+              "negate": false,
+              "values": [
+                "Prompt objects"
+              ]
+            }
+          ]
+        },
+        {
+          "advanced": false,
           "default": 0,
           "key": "input_channel",
           "label": "Input channel",
@@ -1788,7 +1857,16 @@
           "label": "Tile",
           "read_only": false,
           "type": "double_list",
-          "unit": "px"
+          "unit": "px",
+          "visible_when": [
+            {
+              "key": "task",
+              "negate": true,
+              "values": [
+                "Prompt objects"
+              ]
+            }
+          ]
         },
         {
           "advanced": false,
@@ -1800,7 +1878,16 @@
           "min": 0.0,
           "read_only": false,
           "type": "int",
-          "unit": "px"
+          "unit": "px",
+          "visible_when": [
+            {
+              "key": "task",
+              "negate": true,
+              "values": [
+                "Prompt objects"
+              ]
+            }
+          ]
         },
         {
           "advanced": false,
@@ -1811,7 +1898,16 @@
           "max": 1.0,
           "min": 0.0,
           "read_only": false,
-          "type": "double"
+          "type": "double",
+          "visible_when": [
+            {
+              "key": "task",
+              "negate": true,
+              "values": [
+                "Prompt objects"
+              ]
+            }
+          ]
         },
         {
           "advanced": false,
@@ -1824,7 +1920,16 @@
           "key": "post",
           "label": "Post-processing",
           "read_only": false,
-          "type": "choice"
+          "type": "choice",
+          "visible_when": [
+            {
+              "key": "task",
+              "negate": true,
+              "values": [
+                "Prompt objects"
+              ]
+            }
+          ]
         },
         {
           "advanced": false,
@@ -1865,7 +1970,16 @@
           "min": 1.0,
           "read_only": false,
           "type": "double",
-          "unit": "px"
+          "unit": "px",
+          "visible_when": [
+            {
+              "key": "task",
+              "negate": true,
+              "values": [
+                "Prompt objects"
+              ]
+            }
+          ]
         }
       ],
       "plugin": false,

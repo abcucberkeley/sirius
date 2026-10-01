@@ -164,6 +164,114 @@ namespace sirius::app {
 
     std::shared_ptr<Array5> allocateLike(const DatasetMeta& meta) { return std::make_shared<Array5>(meta.dims); }
 
+    std::size_t FramePrompt::objects() const noexcept {
+        return static_cast<std::size_t>(std::count_if(ids.begin(), ids.end(), [](std::uint32_t id) { return id != 0; }));
+    }
+
+    std::vector<std::array<double, 3>> scribbleSample(const std::vector<std::array<double, 3>>& stroke, std::size_t atMost) {
+        if (stroke.size() <= atMost || atMost < 2) return stroke;
+        std::vector<std::array<double, 3>> out;
+        const double step = static_cast<double>(stroke.size() - 1) / static_cast<double>(atMost - 1);
+        for (std::size_t k = 0; k < atMost; ++k)
+            out.push_back(stroke[std::min(stroke.size() - 1, static_cast<std::size_t>(std::lround(static_cast<double>(k) * step)))]);
+        return out;
+    }
+
+    FramePrompt framePrompt(const std::vector<Prompt>& prompts, Index t) {
+        FramePrompt f;
+        std::uint32_t next = 1;
+        const auto mask = [&](std::size_t i, bool object) {
+            f.ids.push_back(object ? next++ : 0u);
+            f.placed.push_back(i);
+        };
+        for (const bool object : {false, true})
+            for (std::size_t i = 0; i < prompts.size(); ++i) {
+                const Prompt& p = prompts[i];
+                if (p.t != t || p.kind != Prompt::Kind::Point || p.object != object) continue;
+                f.points.push_back(p.at);
+                f.pointLabels.push_back(object ? 1 : 0);
+                mask(i, object);
+            }
+        for (std::size_t i = 0; i < prompts.size(); ++i) {
+            const Prompt& p = prompts[i];
+            if (p.t != t || p.kind != Prompt::Kind::Box) continue;
+            f.boxes.push_back(p.box);
+            mask(i, true);
+        }
+        for (std::size_t i = 0; i < prompts.size(); ++i) {
+            const Prompt& p = prompts[i];
+            if (p.t != t || p.kind != Prompt::Kind::Scribble) continue;
+            f.scribbles.push_back({scribbleSample(p.stroke), p.object ? 1 : 0});
+            mask(i, p.object);
+        }
+        return f;
+    }
+
+    void applyPromptIds(std::uint32_t* labels, Index n, const FramePrompt& frame) {
+        const std::size_t sent = frame.ids.size();
+        for (Index i = 0; i < n; ++i) {
+            const std::uint32_t id = labels[i];
+            if (id == 0) continue;
+            labels[i] = id <= sent ? frame.ids[id - 1] : 0u;
+        }
+    }
+
+    void validatePrompts(const std::vector<Prompt>& prompts, const DatasetMeta& in, Validation& v) {
+        const Dims5& d = in.dims;
+        if (prompts.empty()) {
+            v.warnings.push_back("No prompts yet: choose the viewer's Prompt tool and drag a box around an object, or click it.");
+            return;
+        }
+        const auto inside = [&](const std::array<double, 3>& q) {
+            return q[0] < static_cast<double>(d.x) && q[1] < static_cast<double>(d.y) && q[2] < static_cast<double>(d.z);
+        };
+        for (std::size_t i = 0; i < prompts.size(); ++i) {
+            const Prompt& p = prompts[i];
+            bool ok = p.t < d.t;
+            const char* what = "point";
+            switch (p.kind) {
+                case Prompt::Kind::Point: ok = ok && inside(p.at); break;
+                case Prompt::Kind::Box:
+                    what = "box";
+                    ok = ok && p.box[3] <= static_cast<double>(d.x) && p.box[4] <= static_cast<double>(d.y) && p.box[5] <= static_cast<double>(d.z);
+                    break;
+                case Prompt::Kind::Scribble:
+                    what = "scribble";
+                    ok = ok && std::all_of(p.stroke.begin(), p.stroke.end(), inside);
+                    break;
+            }
+            if (ok) continue;
+            char text[240];
+            std::snprintf(text, sizeof text, "Prompt %zu (a %s on time point %lld) lies outside the image (%lld x %lld x %lld voxels, %lld time points).",
+                          i + 1, what, static_cast<long long>(p.t), static_cast<long long>(d.x), static_cast<long long>(d.y),
+                          static_cast<long long>(d.z), static_cast<long long>(d.t));
+            v.errors.push_back(text);
+            return;
+        }
+        if (std::none_of(prompts.begin(), prompts.end(), [](const Prompt& p) { return p.object; }))
+            v.warnings.push_back("Only background prompts: background names no object, so there is nothing to segment.");
+    }
+
+    std::string promptCounts(const std::vector<Prompt>& prompts) {
+        std::size_t boxes = 0, objects = 0, background = 0, scribbles = 0;
+        for (const Prompt& p : prompts) {
+            if (p.kind == Prompt::Kind::Box) ++boxes;
+            else if (p.kind == Prompt::Kind::Scribble) ++scribbles;
+            else if (p.object) ++objects;
+            else ++background;
+        }
+        std::string out;
+        const auto part = [&out](std::size_t n, const char* one, const char* many) {
+            if (n == 0) return;
+            out += (out.empty() ? "" : " \xC2\xB7 ") + std::to_string(n) + " " + (n == 1 ? one : many);
+        };
+        part(boxes, "box", "boxes");
+        part(objects, "object point", "object points");
+        part(background, "background point", "background points");
+        part(scribbles, "scribble", "scribbles");
+        return out.empty() ? std::string("none") : out;
+    }
+
     Diagnostics labelDiagnostics(const LabelVolume& labels, const std::string& summary) {
         Diagnostics d;
         d.kind = DiagnosticsKind::Segment;

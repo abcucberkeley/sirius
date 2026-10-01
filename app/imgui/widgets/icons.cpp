@@ -80,6 +80,10 @@ namespace sirius::app::gui {
                     p.slab(2.6f, 18.6f, 2.8f, 2.8f);
                     p.slab(18.6f, 18.6f, 2.8f, 2.8f);
                     break;
+                case Icon::Prompt:   // a pointer aimed at an object
+                    p.poly({{5, 4}, {5, 18}, {8.8f, 14.6f}, {11.6f, 20.6f}, {14, 19.5f}, {11.3f, 13.6f}, {16.2f, 13.6f}}, true);
+                    p.ring(18.5f, 5.5f, 3.2f);
+                    break;
                 case Icon::Brush:
                     p.dot(8, 16, 3.8f);
                     p.line(10.8f, 13.2f, 20, 4);

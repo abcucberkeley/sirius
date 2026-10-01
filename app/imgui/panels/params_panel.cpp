@@ -25,6 +25,7 @@
 #include "imgui/platform.hpp"
 #include "imgui/strings.hpp"
 #include "imgui/theme.hpp"
+#include "imgui/viewer/viewer.hpp"
 #include "imgui/widgets/controls.hpp"
 
 namespace sirius::app::gui {
@@ -553,6 +554,7 @@ namespace sirius::app::gui {
                     break;
                 }
                 case ParamType::Path: pathEditor(s, params, width); break;
+                case ParamType::Prompts: break;   // placed in the viewer, listed by promptList()
                 case ParamType::String:
                 case ParamType::DoubleList:
                 case ParamType::StringList:
@@ -601,6 +603,14 @@ namespace sirius::app::gui {
                 // a field the current mode ignores is not shown at all, not
                 // even folded away under "More parameters"
                 if (!s.visibleFor(params)) continue;
+                // Prompts are placed in the viewer. The list of them stands
+                // where the parameter does, under the Task that asks for them,
+                // since for a Prompt step they are the point of the form.
+                if (s.type == ParamType::Prompts) {
+                    col = -1;
+                    if (const Step* st = step(); st && isPromptStep(params)) promptList(*st, params);
+                    continue;
+                }
                 if (s.advanced && !includeAdvanced) {
                     ParamSpec c = s;
                     c.advanced = false;
@@ -938,6 +948,136 @@ namespace sirius::app::gui {
                 break;
             }
             generic(info.params, params, input, false, done);
+        }
+
+        // A Prompt step's prompts: what the viewer's Prompt tool places (Box,
+        // Click, Scribble, the viewer's own setting), how, and one row per
+        // prompt (time point, where, object or background) with a button
+        // that removes it, and Clear all. Every change is an undoable edit of
+        // the step, which then re-runs as after a click in the viewer.
+        void promptList(const Step& st, const ParamSet& params) {
+            const std::vector<Prompt> prompts = promptsOf(params);
+            const bool pointsOnly = st.op().info().promptPointsOnly;
+            gap();
+            widgets::rule(theme::kRule);
+            gap();
+            {
+                const float y = ImGui::GetCursorScreenPos().y;
+                const float h10 = captionHeight(), h12 = lineHeight(12);
+                const float headH = std::max(h10, h12);
+                place(formX, y + (headH - h10) * 0.5f);
+                widgets::caption("Prompts");
+                const std::string count = prompts.empty() ? std::string("none") : std::to_string(prompts.size());
+                place(formX + formW - theme::textSize(count, 12).x, y + (headH - h12) * 0.5f);
+                widgets::text(count, 12, theme::kNeutral700);
+                placeEnd(formX, y + headH);
+            }
+            gap();
+            {
+                static const std::vector<std::string> modes = {"Box", "Click", "Scribble"};
+                const PromptMode current = pointsOnly ? PromptMode::Click : wb().viewState().promptMode;
+                int mode = static_cast<int>(current);
+                widgets::SegmentedOpts so;
+                so.tiles = true;
+                so.width = dp(formW);
+                so.enabled = formEnabled;
+                so.optionEnabled = {!pointsOnly, true, !pointsOnly};
+                const std::string onlyPoints = "micro-SAM takes points only here; boxes and scribbles need a Foundation model step";
+                so.tooltips = {pointsOnly ? onlyPoints : std::string("Drag a box around an object: the best single prompt"),
+                               "Click an object; Alt or right click marks background",
+                               pointsOnly ? onlyPoints : std::string("Draw a stroke over an object")};
+                if (widgets::segmented("##promptMode", modes, &mode, so) && mode >= 0) {
+                    const PromptMode m = static_cast<PromptMode>(mode);
+                    later([this, m] {
+                        ViewState vs = wb().viewState();
+                        vs.promptMode = m;
+                        vs.tool = ViewerTool::Prompt;
+                        wb().setViewState(vs);
+                    });
+                }
+            }
+            widgets::vspace(6);
+            widgets::textWrapped(pointsOnly ? "In the viewer, with the Prompt tool: click an object, Alt or right click for background, click "
+                                              "a point to remove it."
+                                            : "In the viewer, with the Prompt tool: drag a box around an object (or click it, or scribble), "
+                                              "Alt or right click for background, click a prompt to remove it. A drag in XZ / YZ sets the "
+                                              "next box's z.",
+                                 11, theme::kNeutral600, Weight::Regular, formW);
+            if (prompts.empty()) return;
+            const auto edit = [this](std::vector<Prompt> keep, std::string label) {
+                onStep([this, keep = std::move(keep), label = std::move(label)](int i) {
+                    ParamSet p = wb().pipeline().at(i).params;
+                    p.set(kPromptsKey, promptsValue(keep));
+                    wb().setStepParams(i, p, label);
+                    app.viewer().promptsEdited(wb().pipeline().at(i).id);
+                });
+            };
+            widgets::vspace(6);
+            const float h12 = lineHeight(12);
+            const float rowH = std::max(theme::snap(px(22)), h12 + px(6));
+            const float btn = theme::snap(px(18));
+            ImDrawList* dl = ImGui::GetWindowDrawList();
+            float y = ImGui::GetCursorScreenPos().y;
+            for (std::size_t k = 0; k < prompts.size(); ++k) {
+                const Prompt& p = prompts[k];
+                const float textY = y + (rowH - h12) * 0.5f;
+                // what it is, drawn as the viewer draws it: an object point an
+                // accent disc, a background one a dark disc, a box a square, a
+                // scribble a stroke
+                const float r = px(4.0f);
+                const ImVec2 c(formX + r + px(1), y + rowH * 0.5f);
+                const ImU32 ink = dim(p.object ? theme::kAccent : theme::kNeutral900);
+                if (p.kind == Prompt::Kind::Point) {
+                    dl->AddCircleFilled(c, r + px(1.0f), dim(theme::kText));
+                    dl->AddCircleFilled(c, r, ink);
+                } else if (p.kind == Prompt::Kind::Box) {
+                    dl->AddRect(ImVec2(c.x - r, c.y - r), ImVec2(c.x + r, c.y + r), ink, 0.0f, ImDrawFlags_None, px(1.5f));
+                } else {
+                    dl->AddBezierCubic(ImVec2(c.x - r, c.y + r * 0.6f), ImVec2(c.x - r * 0.3f, c.y - r * 1.4f), ImVec2(c.x + r * 0.3f, c.y + r * 1.4f),
+                                       ImVec2(c.x + r, c.y - r * 0.6f), ink, px(1.5f));
+                }
+                std::string where;
+                switch (p.kind) {
+                    case Prompt::Kind::Point:
+                        where = format("t %lld \xC2\xB7 point x %g  y %g  z %g", static_cast<long long>(p.t), p.at[0], p.at[1], p.at[2]);
+                        break;
+                    case Prompt::Kind::Box:
+                        where = format("t %lld \xC2\xB7 box x %g\xE2\x80\x93%g  y %g\xE2\x80\x93%g  z %g\xE2\x80\x93%g", static_cast<long long>(p.t), p.box[0],
+                                       p.box[3] - 1, p.box[1], p.box[4] - 1, p.box[2], p.box[5] - 1);
+                        break;
+                    case Prompt::Kind::Scribble:
+                        where = format("t %lld \xC2\xB7 scribble, %zu voxels at z %g", static_cast<long long>(p.t), p.stroke.size(),
+                                       p.stroke.empty() ? 0.0 : p.stroke.front()[2]);
+                        break;
+                }
+                const float textX = formX + 2 * r + px(10);
+                const char* kind = p.object ? "object" : "background";
+                const float kindW = theme::textSize("background", 11).x;
+                place(textX, textY);
+                widgets::elided(where, formX + formW - btn - px(16) - kindW - textX, 12, dim(theme::kText));
+                place(formX + formW - btn - px(8) - theme::textSize(kind, 11).x, y + (rowH - lineHeight(11)) * 0.5f);
+                widgets::text(kind, 11, dim(theme::kNeutral600));
+                place(formX + formW - btn, y + (rowH - btn) * 0.5f);
+                ImGui::PushID(static_cast<int>(k));
+                widgets::GlyphOpts go;
+                go.borderless = true;
+                go.enabled = formEnabled;
+                go.tooltip = "Remove this prompt";
+                if (widgets::glyphButton("##removePrompt", Icon::Close, 18, go)) {
+                    std::vector<Prompt> keep = prompts;
+                    keep.erase(keep.begin() + static_cast<std::ptrdiff_t>(k));
+                    static const char* const names[] = {"point", "box", "scribble"};
+                    edit(std::move(keep), st.name + " \xC2\xB7 removed a " + names[static_cast<int>(p.kind)]);
+                }
+                ImGui::PopID();
+                y += rowH;
+                place(formX, y);
+                widgets::rule(1);
+                y = ImGui::GetCursorScreenPos().y;
+            }
+            placeEnd(formX, y);
+            gap();
+            if (widgets::linkButton("Clear all prompts##clearPrompts", formEnabled)) edit({}, st.name + " \xC2\xB7 cleared the prompts");
         }
 
         // Hugging Face, the model cache and the model families (or the

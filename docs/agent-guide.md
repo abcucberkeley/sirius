@@ -171,6 +171,14 @@ always Load), their cached outputs and an undo history. The workflow:
    `set_step_enabled`, `move_step`, `remove_step`. Every edit is one undo
    entry: `undo`, `redo`. Steps are addressed by number or by name; numbers
    shift when steps are added, moved or removed.
+   A *Prompt* step (`foundation` with a promptable bundle, or `seg` with a
+   `microsam:` model, `"task": "Prompt objects"`) segments only what its
+   `prompts` parameter points at: a list of points `{"x", "y", "z", "t",
+   "label"}` (label 0 = background), boxes `{"kind": "box", "x0", "y0", "z0",
+   "x1", "y1", "z1", "t"}` and scribbles `{"kind": "scribble", "points":
+   [[x, y, z], ...], "t"}`, in voxels of the step's input. Set it with
+   `set_params`; `get_step` shows it. A box is the strongest single prompt;
+   micro-SAM takes points only.
 5. **Validate.** `validate {}` checks every step against the data without
    running anything: errors, warnings, shapes, memory estimates, which steps
    need the worker.

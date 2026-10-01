@@ -561,6 +561,25 @@ A step, as the editing tools return it:
 GUI's view, are not served: every tool here takes explicit steps and
 coordinates instead.
 
+**Prompt steps.** A `foundation` step (a `.ltb` bundle with a prompt decoder)
+or a `seg` step with a `microsam:` model, whose `task` is `"Prompt objects"`,
+segments only what its `prompts` parameter points at. `add_step` and
+`set_params` take the list, `get_step` returns it, `describe_operation` gives
+its schema (type `prompts`): records in voxels of the step's input, x y z
+order, each on one time point `t` (default 0) --
+`{"kind": "point", "x", "y", "z", "t", "label"}` (label 1 object, 0
+background), `{"kind": "box", "x0", "y0", "z0", "x1", "y1", "z1", "t"}` (upper
+corner exclusive) and `{"kind": "scribble", "points": [[x, y, z], ...], "t",
+"label"}`; an entry without a kind is a point. One mask per prompt; a time
+point without prompts is left empty and costs no worker call. micro-SAM takes
+points only, and its masks are per plane.
+
+```
+sirius-cli --dataset raw.tif call add_step --args '{"kind": "foundation", "params": {"model": "cells.ltb",
+  "task": "Prompt objects", "prompts": [{"kind": "box", "x0": 10, "y0": 12, "z0": 60, "x1": 30, "y1": 34, "z1": 75},
+  {"x": 40, "y": 40, "z": 67}, {"x": 50, "y": 20, "z": 67, "label": 0}]}}'
+```
+
 **Inspecting a step without an output.** `render`, `statistics`, `probe` and
 the others need the step computed. `render`, `statistics` and `export_result`
 take `run: true` to run it first; otherwise, and for the others, the error is

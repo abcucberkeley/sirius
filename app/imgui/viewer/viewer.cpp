@@ -8,6 +8,7 @@
 #include <exception>
 #include <functional>
 #include <limits>
+#include <optional>
 #include <set>
 #include <tuple>
 
@@ -19,6 +20,7 @@
 #include "core/array_source.hpp"
 #include "core/labels.hpp"
 #include "core/operation.hpp"
+#include "core/ops/common.hpp"
 #include "core/ops/contrast.hpp"
 #include "core/tracks.hpp"
 #include "imgui/app.hpp"
@@ -45,6 +47,8 @@ namespace sirius::app::gui {
         using viewer::kMaxZoom;
         using viewer::kMinZoom;
         using viewer::kPlayIntervalMs;
+        using viewer::kPromptHitPx;
+        using viewer::kPromptRunDelayMs;
         using viewer::kWheelZoomBase;
 
         // The ortho splitters' saved balance: the side column's width and the
@@ -291,6 +295,76 @@ namespace sirius::app::gui {
         Index curY() const { return std::clamp<Index>(vs().cy, 0, std::max<Index>(ny() - 1, 0)); }
         bool probe() const { return vs().tool == ViewerTool::Probe; }
 
+        // The Prompt step the Prompt tool places points for: the selected
+        // step when it is one, else the viewed step. -1 when neither is, or
+        // when the data on screen is not that step's geometry (a point is a
+        // voxel of the step's input, which the panes must be showing).
+        int promptStep() const {
+            const Pipeline& p = wb.pipeline();
+            for (const int i : {wb.selectedIndex(), wb.viewedIndex()}) {
+                if (i < 0 || i >= p.size() || !isPromptStep(p.at(i).params)) continue;
+                if (!model.valid()) return -1;
+                const Dims5 d = wb.outputMetaOf(i).dims;
+                const Dims5& shown = model.dims();
+                return d.x == shown.x && d.y == shown.y && d.z == shown.z && d.t == shown.t ? i : -1;
+            }
+            return -1;
+        }
+        // Points placed or removed: the step runs again once the clicks stop
+        // for a moment (kPromptRunDelayMs), which is how a corrective click
+        // shows its effect.
+        StepId promptRunFor = 0;
+        double promptRunAt = 0.0;
+        void schedulePromptRun(StepId id) {
+            promptRunFor = id;
+            promptRunAt = ImGui::GetTime() + kPromptRunDelayMs / 1000.0;
+            app.requestRedraw();
+        }
+        void runPromptWhenDue();
+        // What a press with the Prompt tool becomes: a click (a point, or the
+        // removal of the prompt under it), a box or a scribble dragged in XY,
+        // or in XZ / YZ the z range of the next box or a box's z edge.
+        struct PromptGesture {
+            enum class Kind { None,
+                              Box,
+                              Stroke,
+                              ZRange,
+                              ZEdge };
+            Kind kind = Kind::None;
+            bool active = false;
+            bool background = false;            // Alt was held at the press
+            SlicePane::Kind pane = SlicePane::Kind::XY;
+            DPoint start, last;                 // pane coordinates
+            std::vector<DPoint> stroke;
+            int prompt = -1;                    // ZEdge: the box, its edge (0 = z0, 1 = z1),
+            int edge = 0;                       // where the edge was and where it is now
+            double from = 0.0, z = 0.0;
+        } gesture;
+        // A z range dragged in XZ / YZ in Box mode: the next box drawn in XY
+        // spans it, [z0, z1).
+        std::optional<std::array<Index, 2>> nextBoxZ;
+        // The Prompt step takes points only (micro-SAM): Box and Scribble
+        // fall back to clicks.
+        bool promptPointsOnly() const {
+            const int i = promptStep();
+            return i >= 0 && wb.pipeline().at(i).op().info().promptPointsOnly;
+        }
+        PromptMode promptMode() const { return promptPointsOnly() ? PromptMode::Click : vs().promptMode; }
+        void promptPress(const SlicePane& pane, const DPoint& v, ImGuiKeyChord m);
+        void promptMove(const SlicePane& pane, const DPoint& v);
+        void promptRelease(const SlicePane& pane);
+        // A click: removes the prompt under it, else places an object or a
+        // background point there. False when there was nothing to do.
+        bool promptClick(const SlicePane& pane, const DPoint& v, bool object);
+        // The prompt of the frame on `pane`'s plane under `v` (a point's
+        // disc, a box's outline, a scribble's stroke), by its index in the
+        // step's list; -1 when none is within kPromptHitPx.
+        int promptAt(const SlicePane& pane, const DPoint& v) const;
+        // In XZ / YZ: the box whose z edge is under `v`, and which edge.
+        int boxEdgeAt(const SlicePane& pane, const DPoint& v, int& edge) const;
+        void editPrompts(int step, const std::vector<Prompt>& prompts, const std::string& label);
+        void pushMarkers();   // the Prompt step's prompts, and the one being drawn, onto the ortho panes
+
         bool paintAvailable() const {
             if (model.hasLabels()) return true;
             for (const Step& s : wb.pipeline().steps()) {
@@ -372,7 +446,12 @@ namespace sirius::app::gui {
     void Viewer::Impl::connect() {
         // XY: the tools
         xy.onPress = [this](DPoint v, int b, ImGuiKeyChord m) { onXYPressed(v, b, m); };
-        xy.onContextMenu = [this](ImVec2, DPoint) { contextMenuPending = true; };
+        // With the Prompt tool a right click is a background point (as
+        // Alt + click is), not the annotations menu.
+        xy.onContextMenu = [this](ImVec2, DPoint v) {
+            if (vs().tool == ViewerTool::Prompt) promptClick(xy, v, false);
+            else contextMenuPending = true;
+        };
         xy.onDrag = [this](DPoint v, DPoint d, int b, ImGuiKeyChord m) { onXYDragged(v, d, b, m); };
         xy.onRelease = [this](DPoint v, int b, ImGuiKeyChord m, bool moved) { onXYReleased(v, b, m, moved); };
         xy.onDoubleClick = [this](DPoint, ImGuiKeyChord) {
@@ -381,13 +460,23 @@ namespace sirius::app::gui {
         xy.onWheel = [this](DPoint s, double steps, ImGuiKeyChord) { zoomAround(std::pow(kWheelZoomBase, steps), s); };
         xy.onHover = [this](DPoint v) { hover(SlicePane::Kind::XY, v); };
 
-        // YZ / XZ: probe moves the crosshair (and z); navigate pans along the shared axis
-        yz.onPress = [this](DPoint v, int b, ImGuiKeyChord) {
-            if (b == ImGuiMouseButton_Left && probe() && model.valid()) wb.setCrosshair(curX(), clampIndex(v.y, ny()), clampIndex(v.x, nz()));
+        // YZ / XZ: probe moves the crosshair (and z); navigate pans along the
+        // shared axis; the Prompt tool places points on their planes too
+        yz.onPress = [this](DPoint v, int b, ImGuiKeyChord m) {
+            if (b == ImGuiMouseButton_Left && vs().tool == ViewerTool::Prompt) promptPress(yz, v, m);
+            else if (b == ImGuiMouseButton_Left && probe() && model.valid()) wb.setCrosshair(curX(), clampIndex(v.y, ny()), clampIndex(v.x, nz()));
+        };
+        yz.onRelease = [this](DPoint, int b, ImGuiKeyChord, bool) {
+            if (b == ImGuiMouseButton_Left) promptRelease(yz);
+        };
+        yz.onContextMenu = [this](ImVec2, DPoint v) {
+            if (vs().tool == ViewerTool::Prompt) promptClick(yz, v, false);
         };
         yz.onDrag = [this](DPoint v, DPoint d, int b, ImGuiKeyChord) {
             if (b == ImGuiMouseButton_Middle || (b == ImGuiMouseButton_Left && vs().tool == ViewerTool::Navigate))
                 setZoomPan(vs().zoom, vs().panX, vs().panY + d.y);
+            else if (b == ImGuiMouseButton_Left && vs().tool == ViewerTool::Prompt)
+                promptMove(yz, v);
             else if (b == ImGuiMouseButton_Left && probe() && model.valid())
                 wb.setCrosshair(curX(), clampIndex(v.y, ny()), clampIndex(v.x, nz()));
         };
@@ -396,12 +485,21 @@ namespace sirius::app::gui {
         };
         yz.onHover = [this](DPoint v) { hover(SlicePane::Kind::YZ, v); };
 
-        xz.onPress = [this](DPoint v, int b, ImGuiKeyChord) {
-            if (b == ImGuiMouseButton_Left && probe() && model.valid()) wb.setCrosshair(clampIndex(v.x, nx()), curY(), clampIndex(v.y, nz()));
+        xz.onPress = [this](DPoint v, int b, ImGuiKeyChord m) {
+            if (b == ImGuiMouseButton_Left && vs().tool == ViewerTool::Prompt) promptPress(xz, v, m);
+            else if (b == ImGuiMouseButton_Left && probe() && model.valid()) wb.setCrosshair(clampIndex(v.x, nx()), curY(), clampIndex(v.y, nz()));
+        };
+        xz.onRelease = [this](DPoint, int b, ImGuiKeyChord, bool) {
+            if (b == ImGuiMouseButton_Left) promptRelease(xz);
+        };
+        xz.onContextMenu = [this](ImVec2, DPoint v) {
+            if (vs().tool == ViewerTool::Prompt) promptClick(xz, v, false);
         };
         xz.onDrag = [this](DPoint v, DPoint d, int b, ImGuiKeyChord) {
             if (b == ImGuiMouseButton_Middle || (b == ImGuiMouseButton_Left && vs().tool == ViewerTool::Navigate))
                 setZoomPan(vs().zoom, vs().panX + d.x, vs().panY);
+            else if (b == ImGuiMouseButton_Left && vs().tool == ViewerTool::Prompt)
+                promptMove(xz, v);
             else if (b == ImGuiMouseButton_Left && probe() && model.valid())
                 wb.setCrosshair(clampIndex(v.x, nx()), curY(), clampIndex(v.y, nz()));
         };
@@ -538,8 +636,16 @@ namespace sirius::app::gui {
                 scheduleUpdate();
             }
         }
+        // the Prompt step's points: placed, removed, undone, set by an agent,
+        // or another step selected or viewed
+        const bool promptsMoved = r.step != seen.step || r.pipeline != seen.pipeline || r.selection != seen.selection ||
+                                  r.viewedStep != seen.viewedStep;
         const bool viewChanged = r.viewState != seen.viewState;
         seen = r;
+        if (promptsMoved) {
+            pushMarkers();
+            refreshHints();
+        }
         if (viewChanged) applyViewStateDiff(vs());
         if (rebuild) rebuildOutput();
         if (followPending) {
@@ -808,6 +914,15 @@ namespace sirius::app::gui {
 #endif
                 break;
             case ViewerTool::Roi: hint = "drag \xC2\xB7 box   right-click \xC2\xB7 clear"; break;
+            case ViewerTool::Prompt:
+                if (!canPaint()) hint = "prompts are paused while a run is in progress";
+                else if (promptStep() < 0) hint = "select or view a step whose task is Prompt objects";
+                else if (promptMode() == PromptMode::Box)
+                    hint = "drag \xC2\xB7 box   click \xC2\xB7 point   Alt \xC2\xB7 background";
+                else if (promptMode() == PromptMode::Scribble)
+                    hint = "draw \xC2\xB7 scribble   click \xC2\xB7 point   Alt \xC2\xB7 background";
+                else hint = "click \xC2\xB7 object   Alt / right-click \xC2\xB7 background";
+                break;
             case ViewerTool::Paint: {
                 if (!canPaint()) {
                     hint = "label edits are paused while a run is in progress";
@@ -843,6 +958,16 @@ namespace sirius::app::gui {
         }
         xy.setHint(hint);
         cmpRight.setHint(hint);
+        // XZ says what a drag does there in Box mode: the z of a box (YZ is
+        // too narrow for the line, and does the same)
+        std::string side;
+        if (s.tool == ViewerTool::Prompt && canPaint() && promptStep() >= 0 && promptMode() == PromptMode::Box) {
+            side = "drag \xC2\xB7 next box's z   a box's edge \xC2\xB7 its z";
+            if (nextBoxZ)
+                side = format("next box z %lld\xE2\x80\x93%lld   Esc \xC2\xB7 clear", static_cast<long long>((*nextBoxZ)[0]),
+                              static_cast<long long>((*nextBoxZ)[1] - 1));
+        }
+        xz.setHint(side);
         const bool brush = brushLike(s);
         xy.setBrushCursor(brush, s.brushPx / 2.0);
         cmpRight.setBrushCursor(brush, s.brushPx / 2.0);
@@ -1088,6 +1213,7 @@ namespace sirius::app::gui {
         const std::string name = viewed >= 0 && viewed < wb.pipeline().size() ? num2(viewed) + " " + wb.pipeline().at(viewed).name : std::string();
         cmpRight.setTitle(name);
         pushAnnotations();
+        pushMarkers();
     }
 
     void Viewer::Impl::applyDirty() {
@@ -1503,6 +1629,7 @@ namespace sirius::app::gui {
                 roi = DRect{};
                 pushAnnotations();
                 break;
+            case ViewerTool::Prompt: promptPress(xy, v, m); break;
             case ViewerTool::Paint: {
                 if (!canPaint()) return;   // a run holds the pipeline
                 // A click beside the image edits nothing: Fill, Pick, Merge,
@@ -1594,6 +1721,7 @@ namespace sirius::app::gui {
                 roi = DRect::spanning(roiStart, v);
                 pushAnnotations();
                 break;
+            case ViewerTool::Prompt: promptMove(xy, v); break;
             case ViewerTool::Paint:
                 if (painting && canPaint()) {
                     const ScopedTrace dragTrace("drag: paint handling");
@@ -1625,8 +1753,414 @@ namespace sirius::app::gui {
             roi = DRect{};
             pushAnnotations();
         }
+        if (b == ImGuiMouseButton_Left && vs().tool == ViewerTool::Prompt) promptRelease(xy);
         if (painting) wb.endPaintStroke();
         painting = false;
+    }
+
+    // --- prompts ---------------------------------------------------------------------------
+
+    // Where a prompt lies on each ortho pane, in that pane's coordinates, and
+    // how deep: XY shows (x, y) at z, XZ (x, z) at y and YZ (z, y) at x. A
+    // point placed by a click is a voxel index; one an agent set may be
+    // fractional and lies on the plane of the voxel it is in. A box is in
+    // the plane when its range on the pane's depth axis holds the plane.
+    namespace {
+        DPoint onPane(SlicePane::Kind kind, double x, double y, double z) {
+            switch (kind) {
+                case SlicePane::Kind::XZ: return {x, z};
+                case SlicePane::Kind::YZ: return {z, y};
+                default: return {x, y};
+            }
+        }
+        DPoint onPane(SlicePane::Kind kind, const std::array<double, 3>& q) { return onPane(kind, q[0], q[1], q[2]); }
+        double depthOn(SlicePane::Kind kind, const std::array<double, 3>& q) {
+            switch (kind) {
+                case SlicePane::Kind::XZ: return q[1];
+                case SlicePane::Kind::YZ: return q[0];
+                default: return q[2];
+            }
+        }
+        // a box's corners on the pane and its range on the pane's depth axis
+        void boxOnPane(SlicePane::Kind kind, const std::array<double, 6>& b, DPoint& lo, DPoint& hi, double& d0, double& d1) {
+            lo = onPane(kind, b[0], b[1], b[2]);
+            hi = onPane(kind, b[3], b[4], b[5]);
+            const int axis = kind == SlicePane::Kind::XZ ? 1 : kind == SlicePane::Kind::YZ ? 0
+                                                                                           : 2;
+            d0 = b[static_cast<std::size_t>(axis)];
+            d1 = b[static_cast<std::size_t>(axis) + 3];
+        }
+        // the z of a position on XZ (its rows) or YZ (its columns)
+        double zOf(SlicePane::Kind kind, const DPoint& v) { return kind == SlicePane::Kind::YZ ? v.x : v.y; }
+        double distanceToSegment(ImVec2 p, ImVec2 a, ImVec2 b) {
+            const double dx = b.x - a.x, dy = b.y - a.y;
+            const double len2 = dx * dx + dy * dy;
+            double t = len2 > 0.0 ? ((p.x - a.x) * dx + (p.y - a.y) * dy) / len2 : 0.0;
+            t = std::clamp(t, 0.0, 1.0);
+            return std::hypot(p.x - (a.x + t * dx), p.y - (a.y + t * dy));
+        }
+        // distance from p to the outline of the rectangle (a, b)
+        double distanceToOutline(ImVec2 p, ImVec2 a, ImVec2 b) {
+            const ImVec2 c(b.x, a.y), d(a.x, b.y);
+            return std::min({distanceToSegment(p, a, c), distanceToSegment(p, c, b), distanceToSegment(p, b, d), distanceToSegment(p, d, a)});
+        }
+    } // namespace
+
+    void Viewer::Impl::pushMarkers() {
+        std::vector<SlicePane::PromptMark> marks[3];   // XY, XZ, YZ
+        static const SlicePane::Kind kinds[3] = {SlicePane::Kind::XY, SlicePane::Kind::XZ, SlicePane::Kind::YZ};
+        const Index planes[3] = {curZ(), curY(), curX()};
+        const int i = promptStep();
+        if (i >= 0) {
+            const std::vector<Prompt> prompts = promptsOf(wb.pipeline().at(i).params);
+            for (std::size_t k = 0; k < prompts.size(); ++k) {
+                Prompt p = prompts[k];
+                if (p.t != curT()) continue;   // other time points keep theirs
+                if (gesture.kind == PromptGesture::Kind::ZEdge && gesture.prompt == static_cast<int>(k))
+                    p.box[gesture.edge == 0 ? 2 : 5] = gesture.z;   // the edge being dragged, where it is now
+                for (int pane = 0; pane < 3; ++pane) {
+                    const SlicePane::Kind kind = kinds[pane];
+                    const auto onPlane = [&](double depth) { return static_cast<Index>(std::floor(depth)) == planes[pane]; };
+                    SlicePane::PromptMark m;
+                    m.object = p.object;
+                    switch (p.kind) {
+                        case Prompt::Kind::Point:
+                            m.a = onPane(kind, p.at);
+                            m.inPlane = onPlane(depthOn(kind, p.at));
+                            break;
+                        case Prompt::Kind::Box: {
+                            double d0 = 0.0, d1 = 0.0;
+                            m.shape = SlicePane::PromptMark::Shape::Box;
+                            boxOnPane(kind, p.box, m.a, m.b, d0, d1);
+                            m.inPlane = static_cast<double>(planes[pane]) >= std::floor(d0) && static_cast<double>(planes[pane]) < d1;
+                            break;
+                        }
+                        case Prompt::Kind::Scribble:
+                            m.shape = SlicePane::PromptMark::Shape::Stroke;
+                            m.inPlane = false;
+                            for (const std::array<double, 3>& q : p.stroke) {
+                                m.stroke.push_back(onPane(kind, q));
+                                m.inPlane = m.inPlane || onPlane(depthOn(kind, q));
+                            }
+                            break;
+                    }
+                    marks[pane].push_back(std::move(m));
+                }
+            }
+        }
+        // what is being drawn
+        if (gesture.active) {
+            SlicePane::PromptMark m;
+            m.pending = true;
+            const auto voxel = [](const DPoint& v) { return DPoint(std::floor(v.x), std::floor(v.y)); };
+            if (gesture.kind == PromptGesture::Kind::Box) {
+                m.shape = SlicePane::PromptMark::Shape::Box;
+                m.a = voxel(DPoint(std::min(gesture.start.x, gesture.last.x), std::min(gesture.start.y, gesture.last.y)));
+                m.b = voxel(DPoint(std::max(gesture.start.x, gesture.last.x), std::max(gesture.start.y, gesture.last.y))) + DPoint(1, 1);
+                marks[0].push_back(m);
+            } else if (gesture.kind == PromptGesture::Kind::Stroke) {
+                m.shape = SlicePane::PromptMark::Shape::Stroke;
+                for (const DPoint& v : gesture.stroke) m.stroke.push_back(voxel(v));
+                marks[0].push_back(m);
+            }
+        }
+        // the z range of the next box: dragged now, or set before
+        std::optional<std::array<double, 2>> band;
+        if (gesture.active && gesture.kind == PromptGesture::Kind::ZRange) {
+            const double a = std::floor(std::min(zOf(gesture.pane, gesture.start), zOf(gesture.pane, gesture.last)));
+            const double b = std::floor(std::max(zOf(gesture.pane, gesture.start), zOf(gesture.pane, gesture.last))) + 1.0;
+            band = std::array<double, 2>{std::max(a, 0.0), std::min(b, static_cast<double>(nz()))};
+        } else if (nextBoxZ) {
+            band = std::array<double, 2>{static_cast<double>((*nextBoxZ)[0]), static_cast<double>((*nextBoxZ)[1])};
+        }
+        if (band) {
+            SlicePane::PromptMark m;
+            m.shape = SlicePane::PromptMark::Shape::Box;
+            m.pending = true;
+            m.a = DPoint(0.0, (*band)[0]);
+            m.b = DPoint(static_cast<double>(nx()), (*band)[1]);
+            marks[1].push_back(m);
+            m.a = DPoint((*band)[0], 0.0);
+            m.b = DPoint((*band)[1], static_cast<double>(ny()));
+            marks[2].push_back(m);
+        }
+        xy.setPromptMarks(std::move(marks[0]));
+        xz.setPromptMarks(std::move(marks[1]));
+        yz.setPromptMarks(std::move(marks[2]));
+    }
+
+    int Viewer::Impl::promptAt(const SlicePane& pane, const DPoint& v) const {
+        const int i = promptStep();
+        if (i < 0) return -1;
+        const SlicePane::Kind kind = pane.kind();
+        const Index plane = kind == SlicePane::Kind::XZ ? curY() : kind == SlicePane::Kind::YZ ? curX()
+                                                                                               : curZ();
+        const auto onPlane = [plane](double depth) { return static_cast<Index>(std::floor(depth)) == plane; };
+        const std::vector<Prompt> prompts = promptsOf(wb.pipeline().at(i).params);
+        const ImVec2 at = pane.toScreenAbs(v);
+        const auto centre = [&pane](const DPoint& q) { return pane.toScreenAbs(q + DPoint(0.5, 0.5)); };
+        int best = -1;
+        double bestD = px(static_cast<float>(kPromptHitPx));
+        for (std::size_t k = 0; k < prompts.size(); ++k) {
+            const Prompt& p = prompts[k];
+            if (p.t != curT()) continue;
+            double d = std::numeric_limits<double>::infinity();
+            switch (p.kind) {
+                case Prompt::Kind::Point:
+                    if (onPlane(depthOn(kind, p.at))) {
+                        const ImVec2 c = centre(onPane(kind, p.at));
+                        d = std::hypot(static_cast<double>(c.x - at.x), static_cast<double>(c.y - at.y));
+                    }
+                    break;
+                case Prompt::Kind::Box: {
+                    DPoint lo, hi;
+                    double d0 = 0.0, d1 = 0.0;
+                    boxOnPane(kind, p.box, lo, hi, d0, d1);
+                    if (static_cast<double>(plane) >= std::floor(d0) && static_cast<double>(plane) < d1)
+                        d = distanceToOutline(at, pane.toScreenAbs(lo), pane.toScreenAbs(hi));
+                    break;
+                }
+                case Prompt::Kind::Scribble: {
+                    if (std::none_of(p.stroke.begin(), p.stroke.end(), [&](const std::array<double, 3>& q) { return onPlane(depthOn(kind, q)); }))
+                        break;
+                    for (std::size_t j = 0; j < p.stroke.size(); ++j) {
+                        const ImVec2 a = centre(onPane(kind, p.stroke[j]));
+                        const ImVec2 b = j + 1 < p.stroke.size() ? centre(onPane(kind, p.stroke[j + 1])) : a;
+                        d = std::min(d, distanceToSegment(at, a, b));
+                    }
+                    break;
+                }
+            }
+            if (d <= bestD) {
+                bestD = d;
+                best = static_cast<int>(k);
+            }
+        }
+        return best;
+    }
+
+    int Viewer::Impl::boxEdgeAt(const SlicePane& pane, const DPoint& v, int& edge) const {
+        const SlicePane::Kind kind = pane.kind();
+        const int i = promptStep();
+        if (i < 0 || kind == SlicePane::Kind::XY) return -1;
+        const Index plane = kind == SlicePane::Kind::XZ ? curY() : curX();
+        const std::vector<Prompt> prompts = promptsOf(wb.pipeline().at(i).params);
+        const ImVec2 at = pane.toScreenAbs(v);
+        int best = -1;
+        double bestD = px(static_cast<float>(kPromptHitPx));
+        for (std::size_t k = 0; k < prompts.size(); ++k) {
+            const Prompt& p = prompts[k];
+            if (p.t != curT() || p.kind != Prompt::Kind::Box) continue;
+            DPoint lo, hi;
+            double d0 = 0.0, d1 = 0.0;
+            boxOnPane(kind, p.box, lo, hi, d0, d1);
+            if (!(static_cast<double>(plane) >= std::floor(d0) && static_cast<double>(plane) < d1)) continue;
+            for (int e = 0; e < 2; ++e) {
+                const double z = p.box[e == 0 ? 2 : 5];
+                // XZ has z on its rows, YZ on its columns: the edge is a line across the box
+                const DPoint a = kind == SlicePane::Kind::XZ ? DPoint(lo.x, z) : DPoint(z, lo.y);
+                const DPoint b = kind == SlicePane::Kind::XZ ? DPoint(hi.x, z) : DPoint(z, hi.y);
+                const double d = distanceToSegment(at, pane.toScreenAbs(a), pane.toScreenAbs(b));
+                if (d <= bestD) {
+                    bestD = d;
+                    best = static_cast<int>(k);
+                    edge = e;
+                }
+            }
+        }
+        return best;
+    }
+
+    void Viewer::Impl::editPrompts(int step, const std::vector<Prompt>& prompts, const std::string& label) {
+        ParamSet params = wb.pipeline().at(step).params;
+        params.set(kPromptsKey, promptsValue(prompts));
+        const StepId id = wb.pipeline().at(step).id;
+        wb.setStepParams(step, params, label);
+        schedulePromptRun(id);
+    }
+
+    bool Viewer::Impl::promptClick(const SlicePane& pane, const DPoint& v, bool object) {
+        // a run holds the pipeline, and its parameters with it (Workbench::canEdit)
+        if (!model.valid() || !canPaint()) return false;
+        const int i = promptStep();
+        if (i < 0) return false;
+        const Step& st = wb.pipeline().at(i);
+        std::vector<Prompt> prompts = promptsOf(st.params);
+        const int hit = promptAt(pane, v);
+        if (hit >= 0) {
+            static const char* const names[] = {"point", "box", "scribble"};
+            const Prompt gone = prompts[static_cast<std::size_t>(hit)];
+            prompts.erase(prompts.begin() + hit);
+            const std::string what = gone.kind == Prompt::Kind::Point ? (gone.object ? "object point" : "background point")
+                                                                      : names[static_cast<int>(gone.kind)];
+            editPrompts(i, prompts, st.name + " \xC2\xB7 removed a " + what);
+            return true;
+        }
+        // A click beside the image places nothing: the worker refuses a point
+        // outside the volume, and a clamped one would be on its edge.
+        if (!pane.inside(v)) return false;
+        double x = static_cast<double>(clampIndex(v.x, nx())), y = static_cast<double>(clampIndex(v.y, ny()));
+        double z = static_cast<double>(curZ());
+        if (pane.kind() == SlicePane::Kind::XZ) {
+            y = static_cast<double>(curY());
+            z = static_cast<double>(clampIndex(v.y, nz()));
+        } else if (pane.kind() == SlicePane::Kind::YZ) {
+            x = static_cast<double>(curX());
+            y = static_cast<double>(clampIndex(v.y, ny()));
+            z = static_cast<double>(clampIndex(v.x, nz()));
+        }
+        prompts.push_back(Prompt::point(x, y, z, curT(), object));
+        editPrompts(i, prompts, format("%s \xC2\xB7 %s point at x %g, y %g, z %g", st.name.c_str(), object ? "object" : "background", x, y, z));
+        return true;
+    }
+
+    void Viewer::Impl::promptPress(const SlicePane& pane, const DPoint& v, ImGuiKeyChord m) {
+        gesture = PromptGesture{};
+        if (!model.valid() || !canPaint() || promptStep() < 0) return;
+        gesture.active = true;
+        gesture.pane = pane.kind();
+        gesture.start = gesture.last = v;
+        gesture.background = (m & ImGuiMod_Alt) != 0;
+        if (pane.kind() != SlicePane::Kind::XY && !promptPointsOnly()) {
+            int edge = 0;
+            const int k = boxEdgeAt(pane, v, edge);
+            if (k >= 0) {
+                const Prompt& box = promptsOf(wb.pipeline().at(promptStep()).params)[static_cast<std::size_t>(k)];
+                gesture.kind = PromptGesture::Kind::ZEdge;
+                gesture.prompt = k;
+                gesture.edge = edge;
+                gesture.from = gesture.z = box.box[edge == 0 ? 2 : 5];
+            }
+        }
+    }
+
+    void Viewer::Impl::promptMove(const SlicePane& pane, const DPoint& v) {
+        if (!gesture.active || gesture.pane != pane.kind()) return;
+        gesture.last = v;
+        if (gesture.kind == PromptGesture::Kind::None) {
+            // a few pixels of travel make a press a drag; less is a click
+            const ImVec2 a = pane.toScreenAbs(gesture.start), b = pane.toScreenAbs(v);
+            if (std::hypot(static_cast<double>(b.x - a.x), static_cast<double>(b.y - a.y)) < px(3.0f)) return;
+            const PromptMode mode = promptMode();
+            if (gesture.background) return;   // Alt marks background: a point, whatever the drag
+            if (pane.kind() == SlicePane::Kind::XY && mode == PromptMode::Box) gesture.kind = PromptGesture::Kind::Box;
+            else if (pane.kind() == SlicePane::Kind::XY && mode == PromptMode::Scribble) {
+                gesture.kind = PromptGesture::Kind::Stroke;
+                gesture.stroke = {gesture.start};
+            } else if (pane.kind() != SlicePane::Kind::XY && mode == PromptMode::Box) {
+                gesture.kind = PromptGesture::Kind::ZRange;
+            }
+            if (gesture.kind == PromptGesture::Kind::None) return;
+        }
+        if (gesture.kind == PromptGesture::Kind::Stroke) gesture.stroke.push_back(v);
+        if (gesture.kind == PromptGesture::Kind::ZEdge) gesture.z = std::clamp(std::round(zOf(pane.kind(), v)), 0.0, static_cast<double>(nz()));
+        pushMarkers();
+    }
+
+    void Viewer::Impl::promptRelease(const SlicePane& pane) {
+        if (!gesture.active || gesture.pane != pane.kind()) {
+            gesture = PromptGesture{};
+            return;
+        }
+        const PromptGesture g = gesture;
+        gesture = PromptGesture{};
+        const int i = promptStep();
+        if (i < 0 || !canPaint()) {
+            pushMarkers();
+            return;
+        }
+        const Step& st = wb.pipeline().at(i);
+        std::vector<Prompt> prompts = promptsOf(st.params);
+        switch (g.kind) {
+            case PromptGesture::Kind::None: promptClick(pane, g.start, !g.background); break;
+            case PromptGesture::Kind::Box: {
+                const auto span = [](double a, double b, Index n, double& lo, double& hi) {
+                    lo = static_cast<double>(clampIndex(std::min(a, b), n));
+                    hi = std::clamp(std::floor(std::max(a, b)) + 1.0, lo + 1.0, static_cast<double>(n));
+                };
+                double x0 = 0, x1 = 0, y0 = 0, y1 = 0;
+                span(g.start.x, g.last.x, nx(), x0, x1);
+                span(g.start.y, g.last.y, ny(), y0, y1);
+                if (x1 - x0 < 2.0 || y1 - y0 < 2.0) {   // a box of a voxel is a click that slipped
+                    promptClick(pane, g.start, true);
+                    break;
+                }
+                double z0 = 0.0, z1 = 0.0;
+                if (nextBoxZ) {
+                    z0 = static_cast<double>((*nextBoxZ)[0]);
+                    z1 = static_cast<double>((*nextBoxZ)[1]);
+                    nextBoxZ.reset();
+                } else {
+                    // An object is about as deep as it is wide: the box's larger
+                    // side, in microns, as planes either side of this one.
+                    const auto& um = model.meta().voxelUm;
+                    const double ux = um[0] > 0.0 ? um[0] : 1.0, uy = um[1] > 0.0 ? um[1] : ux, uz = um[2] > 0.0 ? um[2] : ux;
+                    const double half = std::max(1.0, std::ceil(std::max((x1 - x0) * ux, (y1 - y0) * uy) / uz / 2.0));
+                    z0 = std::max(0.0, static_cast<double>(curZ()) - half);
+                    z1 = std::min(static_cast<double>(nz()), static_cast<double>(curZ()) + half + 1.0);
+                }
+                prompts.push_back(Prompt::boxOf({x0, y0, z0, x1, y1, z1}, curT()));
+                editPrompts(i, prompts, format("%s \xC2\xB7 box x %g\xE2\x80\x93%g, y %g\xE2\x80\x93%g, z %g\xE2\x80\x93%g", st.name.c_str(), x0, x1 - 1, y0, y1 - 1, z0, z1 - 1));
+                break;
+            }
+            case PromptGesture::Kind::Stroke: {
+                std::vector<std::array<double, 3>> stroke;
+                for (const DPoint& v : g.stroke) {
+                    if (!xy.inside(v)) continue;
+                    const std::array<double, 3> q{static_cast<double>(clampIndex(v.x, nx())), static_cast<double>(clampIndex(v.y, ny())),
+                                                  static_cast<double>(curZ())};
+                    if (stroke.empty() || stroke.back() != q) stroke.push_back(q);
+                }
+                if (stroke.size() < 2) {
+                    promptClick(pane, g.start, true);
+                    break;
+                }
+                // every voxel the stroke passed, up to a length the pipeline file
+                // still reads well with; the run sends a few of them
+                stroke = scribbleSample(stroke, 256);
+                prompts.push_back(Prompt::scribble(stroke, curT(), true));
+                editPrompts(i, prompts, format("%s \xC2\xB7 scribble over %zu voxels at z %lld", st.name.c_str(), stroke.size(), static_cast<long long>(curZ())));
+                break;
+            }
+            case PromptGesture::Kind::ZRange: {
+                const double a = zOf(g.pane, g.start), b = zOf(g.pane, g.last);
+                const Index z0 = clampIndex(std::min(a, b), nz());
+                const Index z1 = std::clamp<Index>(static_cast<Index>(std::floor(std::max(a, b))) + 1, z0 + 1, std::max<Index>(nz(), 1));
+                nextBoxZ = std::array<Index, 2>{z0, z1};
+                refreshHints();
+                break;
+            }
+            case PromptGesture::Kind::ZEdge: {
+                if (g.z == g.from || g.prompt < 0 || static_cast<std::size_t>(g.prompt) >= prompts.size()) {
+                    promptClick(pane, g.start, true);   // not moved: a click on the box, which removes it
+                    break;
+                }
+                Prompt& box = prompts[static_cast<std::size_t>(g.prompt)];
+                box.box[g.edge == 0 ? 2 : 5] = g.z;
+                if (box.box[2] > box.box[5]) std::swap(box.box[2], box.box[5]);   // an edge dragged past the other
+                if (box.box[5] - box.box[2] < 1.0) box.box[5] = std::min(box.box[2] + 1.0, static_cast<double>(nz()));
+                if (box.box[5] - box.box[2] < 1.0) box.box[2] = box.box[5] - 1.0;
+                editPrompts(i, prompts, format("%s \xC2\xB7 box z %g\xE2\x80\x93%g", st.name.c_str(), box.box[2], box.box[5] - 1));
+                break;
+            }
+        }
+        pushMarkers();
+    }
+
+    void Viewer::Impl::runPromptWhenDue() {
+        if (promptRunFor == 0) return;
+        // A run or a task in progress takes the slot: the points wait for it,
+        // and run as soon as it is over.
+        if (ImGui::GetTime() < promptRunAt || bridge.busy()) {
+            app.requestRedraw();
+            return;
+        }
+        const int i = wb.pipeline().indexOf(promptRunFor);
+        promptRunFor = 0;
+        if (i < 0 || !isPromptStep(wb.pipeline().at(i).params)) return;
+        // the step's result, labels and all, is what the person is correcting
+        if (wb.viewedIndex() != i) wb.view(i);
+        bridge.startRun(i);
     }
 
     void Viewer::Impl::commitMeasure() {
@@ -1803,6 +2337,19 @@ namespace sirius::app::gui {
                 c = i;
                 break;
             }
+        // The Prompt tool's cursor says what a press does: a hand over a
+        // prompt a click removes, a resize arrow over a box's z edge.
+        if (vs().tool == ViewerTool::Prompt && (kind == SlicePane::Kind::XY || kind == SlicePane::Kind::XZ || kind == SlicePane::Kind::YZ)) {
+            SlicePane& pane = kind == SlicePane::Kind::XY ? xy : kind == SlicePane::Kind::XZ ? xz
+                                                                                             : yz;
+            int edge = 0;
+            ImGuiMouseCursor shape = ImGuiMouseCursor_Arrow;
+            if (!promptPointsOnly() && boxEdgeAt(pane, v, edge) >= 0)
+                shape = kind == SlicePane::Kind::XZ ? ImGuiMouseCursor_ResizeNS : ImGuiMouseCursor_ResizeEW;
+            else if (promptAt(pane, v) >= 0)
+                shape = ImGuiMouseCursor_Hand;
+            pane.setCursor(shape, shape);
+        }
         std::optional<float> val;
         if (kind == SlicePane::Kind::XY || kind == SlicePane::Kind::Compare) val = model.valueAt(c, curT(), z, y, x);
         else if (const float* vol = model.volumeIfReady(c, curT())) val = vol[(z * ny() + y) * nx() + x];
@@ -1916,12 +2463,18 @@ namespace sirius::app::gui {
         if (ImGui::IsKeyChordPressed(ImGuiKey_R)) wb.setTool(ViewerTool::Roi);
         // Escape clears the annotations in progress -- unless a run or a
         // task is active, when the window's Cancel action owns the key.
-        const bool pending = !measure.empty() || !roi.isNull();
+        const bool pending = !measure.empty() || !roi.isNull() || gesture.active || nextBoxZ.has_value();
         if (pending && !bridge.busy()) app.claimKey(ImGuiKey_Escape);
         if (ImGui::IsKeyChordPressed(ImGuiKey_Escape) && !bridge.busy()) {
             measure.clear();
             roi = DRect{};
             pushAnnotations();
+            if (gesture.active || nextBoxZ) {
+                gesture = PromptGesture{};
+                nextBoxZ.reset();
+                pushMarkers();
+                refreshHints();
+            }
         }
         if (ImGui::IsKeyChordPressed(ImGuiKey_LeftBracket)) {
             ViewState s = vs();
@@ -2142,11 +2695,16 @@ namespace sirius::app::gui {
             {Icon::Probe, "##probe", "Probe \xE2\x80\x94 click to place the crosshair and read values", ImGuiKey_P, ViewerTool::Probe},
             {Icon::Measure, "##measure", "Measure distance / angle", ImGuiKey_M, ViewerTool::Measure},
             {Icon::Roi, "##roi", "ROI \xE2\x80\x94 drag a box", ImGuiKey_R, ViewerTool::Roi},
-            {Icon::Brush, "##paint", "Paint labels \xE2\x80\x94 needs a segmentation step", ImGuiKey_B, ViewerTool::Paint}};
+            {Icon::Brush, "##paint", "Paint labels \xE2\x80\x94 needs a segmentation step", ImGuiKey_B, ViewerTool::Paint},
+            {Icon::Prompt, "##prompt",
+             "Prompt \xE2\x80\x94 point at the objects to segment: a box, a click or a scribble; Alt or right click marks background, "
+             "a click on a prompt removes it",
+             ImGuiKey_None, ViewerTool::Prompt}};
         // A run owns the pipeline: the workbench refuses label edits while it
         // lasts (Workbench::canEdit), so the brush is dimmed rather than
         // silently swallowing strokes. Navigate / Probe / Measure / ROI stay.
         const bool paintOk = paintAvailable() && canPaint();
+        const bool promptOk = promptStep() >= 0 && canPaint();
         for (const auto& t : toolDefs) {
             ImGui::SetCursorScreenPos(ImVec2(cx - b * 0.5f, y));
             widgets::GlyphOpts o;
@@ -2156,10 +2714,51 @@ namespace sirius::app::gui {
                 o.enabled = paintOk;
                 if (!canPaint()) o.tooltip = "Paint labels \xE2\x80\x94 not while a run is in progress";
             }
+            if (t.tool == ViewerTool::Prompt) {
+                o.enabled = promptOk;
+                if (!canPaint()) o.tooltip = "Prompt \xE2\x80\x94 not while a run is in progress";
+                else if (promptStep() < 0)
+                    o.tooltip = "Prompt \xE2\x80\x94 needs a Foundation model or Segmentation step whose task is Prompt objects, "
+                                "selected or viewed";
+            }
             if (widgets::glyphButton(t.id, t.icon, 28, o)) {
-                if (t.tool != ViewerTool::Paint || paintAvailable()) wb.setTool(t.tool);
+                if (t.tool == ViewerTool::Prompt) {
+                    if (promptOk) wb.setTool(t.tool);
+                } else if (t.tool != ViewerTool::Paint || paintAvailable()) {
+                    wb.setTool(t.tool);
+                }
             }
             y += b + px(2);
+            // While Prompt is the tool, what it places: one button that shows
+            // the mode and steps to the next (Box, Click, Scribble), so the
+            // strip stays short enough for the default window; the
+            // Parameters panel has the three side by side. A step that takes
+            // points only (micro-SAM) stays on Click.
+            if (t.tool == ViewerTool::Prompt && s.tool == ViewerTool::Prompt && promptStep() >= 0) {
+                static const struct {
+                    Icon icon;
+                    const char* name;
+                    const char* what;
+                } modeDefs[] = {{Icon::Roi, "Box", "drag around an object in XY; its z span follows its size, or a drag in XZ / YZ"},
+                                {Icon::Pick, "Click", "click an object; Alt or right click marks background"},
+                                {Icon::Pencil, "Scribble", "draw a stroke over an object in XY"}};
+                const int mode = static_cast<int>(promptMode());
+                const int nextMode = (mode + 1) % 3;
+                const float mb = px(24);
+                ImGui::SetCursorScreenPos(ImVec2(cx - mb * 0.5f, y));
+                widgets::GlyphOpts mo;
+                mo.enabled = promptOk && !promptPointsOnly();
+                mo.tooltip = std::string("Prompt with a ") + modeDefs[mode].name + ": " + modeDefs[mode].what + ". Click for " +
+                             modeDefs[nextMode].name + ".";
+                if (promptPointsOnly())
+                    mo.tooltip = "Prompt with clicks: micro-SAM takes points only here; boxes and scribbles need a Foundation model step.";
+                if (widgets::glyphButton("##promptMode", modeDefs[mode].icon, 24, mo)) {
+                    ViewState ns = vs();
+                    ns.promptMode = static_cast<PromptMode>(nextMode);
+                    wb.setViewState(ns);
+                }
+                y += mb + px(4);
+            }
         }
         // the rule, then + / - / fit
         y += px(8);
@@ -2264,6 +2863,7 @@ namespace sirius::app::gui {
 
         // what the input did, then render what is dirty
         applyPending();
+        runPromptWhenDue();
 
         // the canvas and the views
         dl->AddRectFilled(canvasMin, canvasMax, theme::kNeutral900);
@@ -2438,7 +3038,9 @@ namespace sirius::app::gui {
     bool Viewer::loading() const { return impl_->loadActive; }
     double Viewer::loadFraction() const { return impl_->loadFrac; }
     std::string Viewer::loadMessage() const { return impl_->loadActive ? impl_->sliceNotice : std::string(); }
-    bool Viewer::animating() const { return impl_->playing || impl_->loadActive; }
+    bool Viewer::animating() const { return impl_->playing || impl_->loadActive || impl_->promptRunFor != 0; }
+
+    void Viewer::promptsEdited(std::uint64_t stepId) { impl_->schedulePromptRun(stepId); }
 
     // Scripting: the press, moves and release a mouse would make on the XY
     // pane, through the pane's own bookkeeping and the same handlers; what

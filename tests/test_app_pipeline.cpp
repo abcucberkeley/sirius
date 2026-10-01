@@ -244,6 +244,27 @@ namespace {
         }
     };
 
+    // A step that takes prompt points as the foundation and segmentation
+    // steps do (params.hpp), without a worker behind it.
+    struct PromptOp final : Operation {
+        OpInfo info_;
+        PromptOp() {
+            info_.kind = "test_prompt";
+            info_.name = "Prompt";
+            info_.group = "Segment";
+            info_.kindLabel = "SEGMENT";
+            info_.producesLabels = true;
+            info_.params = {choiceParam("task", "Task", {"Segment", kPromptTask}, kPromptTask), promptsParam(kPromptsKey, "Points")};
+        }
+        const OpInfo& info() const noexcept override { return info_; }
+        StepOutput run(const StepInput& in, const ParamSet&, const StepContext&) const override {
+            StepOutput o;
+            o.meta = in.meta;
+            o.array = in.materialize();
+            return o;
+        }
+    };
+
     void registerTestOps() {
         static bool done = false;
         if (done) return;
@@ -257,6 +278,7 @@ namespace {
         registerOperation(std::make_unique<LabelOp>());
         registerOperation(std::make_unique<FileOp>());
         registerOperation(std::make_unique<WorkerOp>());
+        registerOperation(std::make_unique<PromptOp>());
     }
 
     std::shared_ptr<MemorySource> syntheticSource(Index c = 2, Index t = 3, Index z = 4, Index y = 8, Index x = 8) {
@@ -419,6 +441,95 @@ TEST_CASE("Pipeline round-trips through JSON and TOML with ids", "[app][pipeline
     const std::string py = p.toPythonScript("/data/x.tif");
     CHECK(py.find("run_pipeline") != std::string::npos);
     CHECK(py.find("test_maxz") != std::string::npos);
+}
+
+TEST_CASE("Prompts are saved with the pipeline as records, not as text", "[app][pipeline][prompt]") {
+    registerTestOps();
+    Pipeline p;
+    p.add("test_prompt");
+    ParamSet q = p.at(1).params;
+    q.set(kPromptsKey, promptsValue({Prompt::point(3, 4, 1), Prompt::point(5.5, 6, 2, 2, false), Prompt::boxOf({1, 2, 0, 6, 7, 3}, 1),
+                                     Prompt::scribble({{2, 2, 1}, {3, 2, 1}})}));
+    p.setParams(1, q);
+    const json j = p.toJson();
+    CHECK(j["steps"][1]["params"]["prompts"] == json::parse(R"([
+        {"kind": "point", "x": 3, "y": 4, "z": 1, "t": 0, "label": 1},
+        {"kind": "point", "x": 5.5, "y": 6, "z": 2, "t": 2, "label": 0},
+        {"kind": "box", "x0": 1, "y0": 2, "z0": 0, "x1": 6, "y1": 7, "z1": 3, "t": 1},
+        {"kind": "scribble", "points": [[2, 2, 1], [3, 2, 1]], "t": 0, "label": 1}])"));
+    const Pipeline back = Pipeline::fromJson(j);
+    CHECK(promptsOf(back.at(1).params) == promptsOf(q));
+    CHECK(back.toJson() == j);
+
+    test::TempFile file("prompts", ".sirius.toml");
+    p.save(file.str);
+    const Pipeline loaded = Pipeline::load(file.str);
+    CHECK(loaded.toJson() == j);
+    REQUIRE(promptsOf(loaded.at(1).params).size() == 4);
+    CHECK(promptsOf(loaded.at(1).params) == promptsOf(q));
+    // a table per point in the file, which a person can read and edit
+    std::ifstream in(file.path);
+    const std::string text((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+    CHECK(text.find("label = 0") != std::string::npos);
+    CHECK(text.find("\"[{") == std::string::npos);
+    // a file whose point is no point is refused with the step and the entry
+    json badJson = j;
+    badJson["steps"][1]["params"]["prompts"][0].erase("z");
+    CHECK_THROWS_WITH(Pipeline::fromJson(badJson, true), Catch::Matchers::ContainsSubstring("prompt 1 (a point) needs a number 'z'"));
+}
+
+TEST_CASE("Prompts are an undoable edit that agents set and read back", "[app][tools][prompt]") {
+    registerTestOps();
+    Scratch scratch;
+    Workbench wb(scratch.dir);
+    wb.setDataset(syntheticSource());
+    while (wb.pipeline().size() > 1) wb.removeStep(1);
+    ToolApi api(wb);
+    json r = api.call("add_step", {{"kind", "test_prompt"}, {"params", {{"prompts", json::parse(R"([{"x": 1, "y": 2, "z": 3}])")}}}});
+    REQUIRE_FALSE(r.contains("error"));
+    CHECK(r["params"]["prompts"] == json::parse(R"([{"kind": "point", "x": 1, "y": 2, "z": 3, "t": 0, "label": 1}])"));
+    // selecting a Prompt step picks the tool that places its points
+    CHECK(wb.viewState().tool == ViewerTool::Prompt);
+    CHECK(wb.viewState().labels);
+
+    r = api.call("set_params", {{"step", 2}, {"params", {{"prompts", json::parse(R"([{"x": 1, "y": 2, "z": 3}, {"x": 4, "y": 5, "z": 0, "t": 1, "label": 0}])")}}}});
+    REQUIRE_FALSE(r.contains("error"));
+    r = api.call("get_step", {{"step", 2}});
+    REQUIRE(r["params"]["prompts"].is_array());
+    CHECK(r["params"]["prompts"].size() == 2);
+    CHECK(r["params"]["prompts"][1]["t"] == 1);
+    CHECK(r["params"]["prompts"][1]["label"] == 0);
+    CHECK(api.actions().back().text.find("1 point \xE2\x86\x92 2 points") != std::string::npos);
+    // a box is set the same way; a kind there is none of is refused, the step left as it was
+    r = api.call("set_params", {{"step", 2}, {"params", {{"prompts", json::parse(R"([{"kind": "box", "x0": 1, "y0": 2, "z0": 0, "x1": 4, "y1": 5, "z1": 2}])")}}}});
+    REQUIRE_FALSE(r.contains("error"));
+    CHECK(r["params"]["prompts"][0]["kind"] == "box");
+    wb.undo();
+    r = api.call("set_params", {{"step", 2}, {"params", {{"prompts", json::parse(R"([{"kind": "lasso", "x": 1, "y": 2, "z": 3}])")}}}});
+    CHECK(r.contains("error"));
+    CHECK(promptsOf(wb.pipeline().at(1).params).size() == 2);
+
+    r = api.call("undo", json::object());
+    CHECK(r["ok"] == true);
+    REQUIRE(promptsOf(wb.pipeline().at(1).params).size() == 1);
+    CHECK(promptsOf(wb.pipeline().at(1).params)[0] == Prompt::point(1, 2, 3));
+    wb.redo();
+    CHECK(promptsOf(wb.pipeline().at(1).params).size() == 2);
+
+    // the schema an agent is given for the points
+    bool described = false;
+    for (const json& op : api.call("list_operations", json::object()))
+        if (op["kind"] == "test_prompt")
+            for (const json& prm : op["params"])
+                if (prm["key"] == "prompts") described = prm["schema"]["type"] == "array" && prm["schema"]["items"]["type"] == "object";
+    CHECK(described);
+    // the viewer's tool is a view setting like the others
+    r = api.call("set_view", {{"tool", "prompt"}, {"prompt_mode", "scribble"}});
+    CHECK(wb.viewState().tool == ViewerTool::Prompt);
+    CHECK(wb.viewState().promptMode == PromptMode::Scribble);
+    CHECK(wb.viewState().toJson()["tool"] == "prompt");
+    CHECK(ViewState::fromJson(wb.viewState().toJson()).promptMode == PromptMode::Scribble);
+    CHECK(ViewState{}.promptMode == PromptMode::Box);   // the box is the best single prompt
 }
 
 TEST_CASE("A step whose operation is not loaded keeps its place and its parameters", "[app][pipeline][plugin]") {

@@ -7,6 +7,7 @@
 // assistant's tool schema are all generated from those specs, so adding a
 // parameter to an operation is one line.
 
+#include <array>
 #include <cstdint>
 #include <limits>
 #include <optional>
@@ -19,8 +20,18 @@
 
 namespace sirius::app {
 
+    // A value that is structured JSON (the points of a Prompt step), kept as
+    // its canonical text: a ParamSet stays a flat list of values that copy and
+    // compare like strings, while the pipeline file, the undo snapshots and
+    // the tools see the JSON itself rather than a string that holds it.
+    struct ParamJson {
+        std::string text;
+        friend bool operator==(const ParamJson& a, const ParamJson& b) noexcept { return a.text == b.text; }
+        friend bool operator!=(const ParamJson& a, const ParamJson& b) noexcept { return !(a == b); }
+    };
+
     using ParamValue = std::variant<bool, std::int64_t, double, std::string, std::vector<double>,
-                                    std::vector<std::string>>;
+                                    std::vector<std::string>, ParamJson>;
 
     enum class ParamType {
         Bool,
@@ -33,6 +44,10 @@ namespace sirius::app {
         Axes,        // subset of "ctzyx" (string)
         DoubleList,  // e.g. a (z, y, x) triple
         StringList,
+        // What a person pointed at for a Prompt step (ParamJson): a list of
+        // points, boxes and scribbles (see kPromptsKey below). Placed in the
+        // viewer, not in the generic form.
+        Prompts,
     };
 
     class ParamSet;   // ParamSpec::visibleFor asks it for the controlling value
@@ -130,6 +145,7 @@ namespace sirius::app {
     ParamSpec channelParam(std::string key, std::string label, std::int64_t def = 0);
     ParamSpec axesParam(std::string key, std::string label, std::string def);
     ParamSpec doubleListParam(std::string key, std::string label, std::vector<double> def);
+    ParamSpec promptsParam(std::string key, std::string label);
 
     class ParamSet {
     public:
@@ -176,6 +192,49 @@ namespace sirius::app {
     ParamValue coerceToSpec(const ParamSpec& spec, const nlohmann::json& j);
     // JSON-schema fragment describing the spec (for the assistant tools).
     nlohmann::json schemaOf(const ParamSpec& spec);
+
+    // --- prompts --------------------------------------------------------------
+    // A Prompt step segments the objects a person points at instead of every
+    // object: its "task" is kPromptTask and its kPromptsKey parameter holds
+    // the prompts, in voxels of the step's input and the application's axis
+    // order, each on one time point t:
+    //   {"kind": "point", "x", "y", "z", "t", "label"}   label 1 object, 0 background
+    //   {"kind": "box", "x0", "y0", "z0", "x1", "y1", "z1", "t"}
+    //       corners inclusive-exclusive; a box always names an object
+    //   {"kind": "scribble", "points": [[x, y, z], ...], "t", "label"}
+    //       the stroke as drawn; one stroke names one object (or background)
+    // An entry without a kind is a point; a kind this build does not know is
+    // refused rather than read as something else.
+    inline constexpr const char* kPromptsKey = "prompts";
+    inline constexpr const char* kPromptTask = "Prompt objects";
+
+    struct Prompt {
+        enum class Kind { Point,
+                          Box,
+                          Scribble };
+        Kind kind = Kind::Point;
+        std::array<double, 3> at{};                     // a point: (x, y, z)
+        std::array<double, 6> box{};                    // a box: (x0, y0, z0, x1, y1, z1)
+        std::vector<std::array<double, 3>> stroke;      // a scribble: its points
+        std::int64_t t = 0;
+        bool object = true;                             // false: background (never for a box)
+
+        static Prompt point(double x, double y, double z, std::int64_t t = 0, bool object = true);
+        static Prompt boxOf(std::array<double, 6> corners, std::int64_t t = 0);
+        static Prompt scribble(std::vector<std::array<double, 3>> points, std::int64_t t = 0, bool object = true);
+        friend bool operator==(const Prompt& a, const Prompt& b) noexcept {
+            return a.kind == b.kind && a.at == b.at && a.box == b.box && a.stroke == b.stroke && a.t == b.t && a.object == b.object;
+        }
+    };
+
+    // The prompts stored under `key`; none when there are none or the value is
+    // not a list of prompts.
+    std::vector<Prompt> promptsOf(const ParamSet& p, const std::string& key = kPromptsKey);
+    // The parameter value that stores `prompts`, in the canonical form.
+    ParamValue promptsValue(const std::vector<Prompt>& prompts);
+    // Whether a step with these parameters is a Prompt step: its task is
+    // kPromptTask and it has a place for the prompts.
+    bool isPromptStep(const ParamSet& p);
 
 } // namespace sirius::app
 

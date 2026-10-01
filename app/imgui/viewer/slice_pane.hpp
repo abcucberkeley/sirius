@@ -124,6 +124,25 @@ namespace sirius::app::gui {
             brushRadius_ = radiusVoxels;
         }
         void setAnnotations(std::vector<Annotation> annotations) { annotations_ = std::move(annotations); }
+        // The prompts of a Prompt step, in this pane's voxel coordinates.
+        // On the pane's plane: an object point is a filled accent disc with a
+        // light ring and a plus, a background point a dark disc with a light
+        // ring and a minus; a box an accent rectangle and a scribble an accent
+        // stroke (light when it marks background), all edged in dark so they
+        // read on bright data as on dark. Off the plane, where they project:
+        // small, faint, dashed. Pending (being drawn): dashed and light.
+        struct PromptMark {
+            enum class Shape { Point,
+                               Box,
+                               Stroke };
+            Shape shape = Shape::Point;
+            DPoint a, b;                  // a point's voxel; a box's corners, b exclusive
+            std::vector<DPoint> stroke;   // a scribble's voxels
+            bool object = true;
+            bool inPlane = true;
+            bool pending = false;
+        };
+        void setPromptMarks(std::vector<PromptMark> marks) { promptMarks_ = std::move(marks); }
         // Trajectories of tracked labels (track_overlay.hpp), drawn over the
         // image and under the annotations; null draws none. The paths are
         // shared with the viewer, which rebuilds them only when the labels change.
@@ -193,6 +212,7 @@ namespace sirius::app::gui {
         bool brush_ = false;
         double brushRadius_ = 0.0;
         std::vector<Annotation> annotations_;
+        std::vector<PromptMark> promptMarks_;
         std::shared_ptr<const std::vector<TrackPath>> tracks_;
         TrackPaintOptions trackOptions_;
         bool smooth_ = false;

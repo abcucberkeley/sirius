@@ -3588,12 +3588,82 @@ def tiled_inference(volume: np.ndarray, model, tile: Sequence[int] = (32, 256, 2
     return _activation(acc, activation).astype(np.float32, copy=False)
 
 
+# The task of a step that segments only the objects a person pointed at, and
+# what the prompts are (app/core/params.hpp): in voxels, the application's axis
+# order, each on one time point t --
+#   {"kind": "point", "x", "y", "z", "t", "label"}            label 1 object, 0 background
+#   {"kind": "box", "x0", "y0", "z0", "x1", "y1", "z1", "t"}   upper corner exclusive
+#   {"kind": "scribble", "points": [[x, y, z], ...], "t", "label"}
+# An entry without a kind is a point.
+_PROMPT_TASK = "Prompt objects"
+_SCRIBBLE_POINTS_SENT = 8   # app/core/ops/common.hpp kScribblePointsSent
+
+
+def _scribble_sample(stroke, at_most: int = _SCRIBBLE_POINTS_SENT):
+    """At most `at_most` points evenly spaced along a stroke, both ends kept."""
+    if len(stroke) <= at_most or at_most < 2:
+        return [list(map(float, q)) for q in stroke]
+    step = (len(stroke) - 1) / (at_most - 1)
+    return [list(map(float, stroke[min(len(stroke) - 1, int(round(k * step)))])) for k in range(at_most)]
+
+
+def _frame_prompts(prompts: Any, t: int):
+    """The prompts of time point `t` as the worker takes them, mirroring the
+    application's framePrompt (app/core/ops/common.cpp) -> (points,
+    point_labels, boxes, scribbles, ids). The worker answers one mask per
+    prompt, points then boxes then scribbles, a later mask winning where they
+    overlap; background points go first so an object mask wins over theirs.
+    `ids` is the label each returned mask becomes: 0 drops a background
+    prompt's mask, the object masks are numbered 1..n in the order sent."""
+    here = [p for p in (prompts or []) if isinstance(p, dict) and int(p.get("t", 0) or 0) == t]
+
+    def kind(p):
+        return str(p.get("kind") or "point")
+
+    def obj(p):
+        return p.get("label", 1) in (1, True, "object")
+
+    xyz, plab, boxes, scribbles, ids = [], [], [], [], []
+    n = 0
+
+    def mask(is_object):
+        nonlocal n
+        if is_object:
+            n += 1
+        ids.append(n if is_object else 0)
+
+    for want in (False, True):
+        for p in here:
+            if kind(p) == "point" and obj(p) == want:
+                xyz.append([float(p["x"]), float(p["y"]), float(p["z"])])
+                plab.append(1 if want else 0)
+                mask(want)
+    for p in here:
+        if kind(p) == "box":
+            boxes.append([float(p[k]) for k in ("x0", "y0", "z0", "x1", "y1", "z1")])
+            mask(True)
+    for p in here:
+        if kind(p) == "scribble":
+            scribbles.append({"points": _scribble_sample(p.get("points") or []), "label": 1 if obj(p) else 0})
+            mask(obj(p))
+    return xyz, plab, boxes, scribbles, ids
+
+
+def _renumber_prompt_masks(labels: np.ndarray, ids) -> np.ndarray:
+    """Masks numbered i + 1 for the i-th prompt sent, renumbered to `ids`."""
+    lut = np.zeros(len(ids) + 1, np.uint32)
+    lut[1:] = np.asarray(ids, np.uint32)
+    lab = np.asarray(labels, np.int64)
+    return np.where(lab <= len(ids), lut[np.clip(lab, 0, len(ids))], 0).astype(np.uint32)
+
+
 _SEG = StepSpec(
     "seg",
-    {"model": "", "input_channel": 0, "tile": [32.0, 256.0, 256.0], "overlap": 32, "threshold": 0.5,
-     "post": "Watershed on boundary channel", "min_voxels": 0, "label_opacity": 0.45, "class_name": "nucleus",
-     "seed_distance": 5.0},
-    choices={"post": ("Watershed on boundary channel", "Connected components", "None (raw probabilities)")},
+    {"model": "", "task": "Segment all objects", "prompts": [], "input_channel": 0, "tile": [32.0, 256.0, 256.0],
+     "overlap": 32, "threshold": 0.5, "post": "Watershed on boundary channel", "min_voxels": 0, "label_opacity": 0.45,
+     "class_name": "nucleus", "seed_distance": 5.0},
+    choices={"task": ("Segment all objects", _PROMPT_TASK),
+             "post": ("Watershed on boundary channel", "Connected components", "None (raw probabilities)")},
     aliases={"channel": "input_channel", "model_path": "model", "torch_model": "model", "tile_size": "tile",
              "tau": "threshold", "post_processing": "post", "postprocess": "post", "minVoxels": "min_voxels"},
     # Python-only: how the model runs (the worker's torch_segment takes the
@@ -3629,6 +3699,28 @@ def step_seg(a: np.ndarray, params: Dict[str, Any], meta: Dict[str, Any], progre
     labels = np.zeros((a.shape[1],) + a.shape[2:], dtype=np.uint32)
     prob_last = None
     nt = a.shape[1]
+    if _choice(params.get("task"), _SEG.choices["task"], "Segment all objects") == _PROMPT_TASK:
+        # the objects a person pointed at, through micro-SAM's predictor; a
+        # frame without points stays empty and asks nothing of the model
+        try:
+            from sirius_worker import models as hub  # type: ignore
+        except ImportError as e:
+            raise NotAvailable(f"prompting '{path}' needs the sirius_worker package (app/python) on the Python path") from e
+        scores = []
+        for t in range(nt):
+            xyz, plab, boxes, scribbles, ids = _frame_prompts(params.get("prompts"), t)
+            if boxes or scribbles:
+                raise ValueError("segmentation: micro-SAM takes points only; prompt boxes and scribbles in the foundation step")
+            if not xyz:
+                continue
+            lab, sc = hub.run_family_prompt(path, a[c, t], np.asarray(xyz, np.float32)[:, ::-1], plab, params, device,
+                                            progress=lambda f, m, _t=t: _progress(progress, (_t + f) / nt, m),
+                                            cancelled=cancelled)
+            labels[t] = _remove_small(_renumber_prompt_masks(lab, ids), min_voxels, relabel=False)
+            scores.append([round(float(v), 4) for v, i in zip(sc, ids) if i])
+        return StepResult(a, dict(meta), labels=labels,
+                          info={"model": path, "task": "prompt", "labels": int(labels.max()), "mask_scores": scores,
+                                "plane_only": True})
     if _is_family_spec(path):
         # cellpose: / microsam: models return instance labels themselves
         try:
@@ -3662,10 +3754,10 @@ def step_seg(a: np.ndarray, params: Dict[str, Any], meta: Dict[str, Any], progre
 
 _FOUNDATION = StepSpec(
     "foundation",
-    {"model": "", "task": "Segment objects", "channels": "Selected channel", "input_channel": 0,
+    {"model": "", "task": "Segment objects", "prompts": [], "channels": "Selected channel", "input_channel": 0,
      "threshold": 0.0, "min_separation": 0.0, "min_voxels": 0, "tile": [0.0, 0.0, 0.0],
      "label_opacity": 0.45, "class_name": "object"},
-    choices={"task": ("Segment objects", "Detect centroids", "Track over time"),
+    choices={"task": ("Segment objects", "Detect centroids", "Track over time", _PROMPT_TASK),
              "channels": ("Selected channel", "All channels")},
     aliases={"bundle": "model", "model_path": "model", "channel": "input_channel",
              "min_sep": "min_separation", "minVoxels": "min_voxels", "tile_size": "tile"},
@@ -3697,7 +3789,7 @@ def step_foundation(a: np.ndarray, params: Dict[str, Any], meta: Dict[str, Any],
     if not path:
         raise ValueError("foundation: no model bundle given")
     task = _choice(params.get("task"), _FOUNDATION.choices["task"], "Segment objects")
-    key = {"Track over time": "track", "Detect centroids": "detect"}.get(task, "segment")
+    key = {"Track over time": "track", "Detect centroids": "detect", _PROMPT_TASK: "prompt"}.get(task, "segment")
     allc = _choice(params.get("channels"), _FOUNDATION.choices["channels"], "Selected channel") == "All channels"
     c = _channel_index(params, "input_channel", meta, a.shape[0])
     sub = a if allc else a[c:c + 1]
@@ -3708,6 +3800,31 @@ def step_foundation(a: np.ndarray, params: Dict[str, Any], meta: Dict[str, Any],
             "voxel_um": params.get("voxel_um") or (meta or {}).get("voxel_um")}
     if any(v > 0 for v in tile):
         call["tile"] = tile
+    if key == "prompt":
+        # one time point per call, as the prompt decoder takes it; a frame
+        # without prompts stays empty and asks nothing of the model
+        nt = a.shape[1]
+        labels = np.zeros((nt,) + a.shape[2:], np.uint32)
+        scores = []
+        for t in range(nt):
+            xyz, plab, boxes, scribbles, ids = _frame_prompts(params.get("prompts"), t)
+            if not ids:
+                continue
+            asked = dict(call, points=xyz, point_labels=plab)
+            if boxes:
+                asked["boxes"] = boxes
+            if scribbles:
+                asked["scribbles"] = scribbles
+            try:
+                lab, info, _ = fm.run(sub[:, t:t + 1], asked, device,
+                                      progress=lambda f, m, _t=t: _progress(progress, (_t + f) / nt, m),
+                                      cancelled=cancelled)
+            except fm.Cancelled as e:
+                raise Cancelled("cancelled") from e
+            labels[t] = _renumber_prompt_masks(np.asarray(lab)[0], ids)
+            scores.append([v for v, i in zip(info.get("mask_scores", []), ids) if i])
+        return StepResult(a, dict(meta), labels=labels,
+                          info={"model": path, "task": "prompt", "objects": int(labels.max()), "mask_scores": scores})
     try:
         labels, info, extras = fm.run(sub, call, device, progress=progress, cancelled=cancelled)
     except fm.Cancelled as e:
