@@ -136,10 +136,19 @@ def _manifest(path: str):
     return deploy.Manifest.from_dict(ck["manifest"])
 
 
+# Heads that decode a region per voxel rather than an object centroid: there is
+# nothing to detect and nothing to link, so they offer Segment only.
+_REGION_HEADS = ("threeclass", "seg", "conv", "skip", "pyr", "sam")
+# Heads carrying a prompt encoder and mask decoder: the person points at an
+# object and gets that object back. Offered alongside the automatic tasks.
+_PROMPT_HEADS = ("sam",)
+
+
 def _tasks(man) -> list:
-    # A three-class head predicts regions, not centroids: there is nothing to
-    # detect, and nothing to link.
-    return ["segment"] if man.head == "threeclass" else ["detect", "segment", "track"]
+    t = ["segment"] if man.head in _REGION_HEADS else ["detect", "segment", "track"]
+    if man.head in _PROMPT_HEADS:
+        t.append("prompt")
+    return t
 
 
 def model_info(path: str) -> Dict[str, Any]:
@@ -340,7 +349,11 @@ def run(volume: np.ndarray, params: Dict[str, Any], device: str = "auto",
 
     `params`:
         model            path to a .ltb bundle
-        task             detect | segment | track
+        task             detect | segment | track | prompt
+        points           Prompt only: [[x, y, z], ...] in VOXELS of this image,
+                         the application's axis order. One mask per point
+        point_labels     Prompt only: 1 for an object point, 0 for a background
+                         point; defaults to all object points
         threshold        peak probability; <= 0 means use the bundle's
         min_separation   microns between two objects; <= 0 means the bundle's
         min_voxels       Segment only: drop smaller objects. Detect marks one
@@ -371,9 +384,12 @@ def run(volume: np.ndarray, params: Dict[str, Any], device: str = "auto",
     m = load_bundle(str(params.get("model") or ""), device)
     man = m.m
     task = str(params.get("task") or man.task or "detect").lower()
-    if task not in ("detect", "segment", "track"):
-        raise ValueError(f"unknown task '{task}'; expected detect, segment or track")
+    if task not in ("detect", "segment", "track", "prompt"):
+        raise ValueError(f"unknown task '{task}'; expected detect, segment, track or prompt")
     if task not in _tasks(man):
+        if task == "prompt":
+            raise ValueError(f"this bundle's '{man.head}' head has no prompt decoder, so it cannot be pointed at "
+                             "an object; choose the Segment task, or load a promptable bundle")
         raise ValueError(f"this bundle's '{man.head}' head predicts regions, not centroids, so it cannot {task}; "
                          "choose the Segment task")
     deploy = _import_latents()
@@ -404,6 +420,41 @@ def run(volume: np.ndarray, params: Dict[str, Any], device: str = "auto",
 
     def peaks(hm: np.ndarray) -> np.ndarray:
         return peaks_from_heatmap(hm, threshold=thr, voxel_size=voxel, min_sep_um=sep)
+
+    if task == "prompt":
+        # The person points at an object and gets that object back. The one task that does not
+        # come from the heatmap, and the one path on which a model that cannot segment
+        # unattended is still useful.
+        pts = np.asarray(params.get("points") or [], np.float32).reshape(-1, 3)
+        if not len(pts):
+            raise ValueError("the Prompt task needs at least one point")
+        plab = params.get("point_labels")
+        plab = None if plab is None else np.asarray(plab, np.int64).reshape(-1)
+        if plab is not None and len(plab) != len(pts):
+            raise ValueError(f"{len(pts)} points but {len(plab)} point labels")
+        if n_t != 1:
+            raise ValueError(f"the Prompt task takes one frame, this image has {n_t}; "
+                             "prompt a single timepoint")
+        zyx = pts[:, ::-1]              # the application gives (x, y, z); latents takes (z, y, x)
+        if ((zyx < 0) | (zyx >= np.array([n_z, n_y, n_x], np.float32))).any():
+            raise ValueError("a point falls outside the image")
+        report(0.1, f"{len(pts)} prompt(s)")
+        vol = a[:, 0] if multi else a[0, 0]
+        masks, scores = m.prompt(vol, zyx, plab, channels=multi)
+        check()
+        # Later prompts win where two masks overlap, which is what a person adding a point expects.
+        for i, mk in enumerate(masks):
+            report(0.2 + 0.7 * (i + 1) / len(masks), f"mask {i + 1}/{len(masks)}")
+            if min_voxels and int(mk.sum()) < min_voxels:
+                continue
+            labels[0][mk] = i + 1
+            conf[0][mk] = float(scores[i])
+        info["prompts"] = int(len(pts))
+        info["mask_scores"] = [round(float(v), 4) for v in scores]
+        info["objects"] = int(labels.max())
+        extras["confidence"] = conf
+        report(1.0, "done")
+        return labels, info, extras
 
     if task == "track":
         # The whole clip in one call: this is the only path that uses the time

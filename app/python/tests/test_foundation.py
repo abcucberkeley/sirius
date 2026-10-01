@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import importlib.util
 import os
+import shutil
 import socket
 import sys
 import tempfile
@@ -76,10 +77,17 @@ def make_bundle(path: str, five_d: bool = False, head: str = "detection") -> Non
     if head == "threeclass":
         head_args = dict(dim=192, patch=patch)
         module = ThreeClassHead(**head_args)
+    elif head == "sam":
+        # a promptable head: ConvHead's dense branch plus the prompt encoder and mask decoder
+        from latents.downstream.sam_head import SamHead
+        head_args = dict(dim=192, patch=patch, n_classes=2, ch=16, embed=32, depth=1, heads=2,
+                         mlp_dim=64, dropout=0.0, ref=[8, 64, 64], low=[1, 2, 2])
+        module = SamHead(**head_args)
     else:
         head_args = dict(dim=192, patch=patch, flow=False)
         module = DetectionHead(**head_args)
-    man = Manifest(task="detect", name="test", encoder=cfg, head=head, head_args=head_args,
+    man = Manifest(task=("prompt" if head == "sam" else "detect"), name="test", encoder=cfg,
+                   head=head, head_args=head_args,
                    patch=patch, crop=(8, 64, 64), voxel_size=(0.5, 0.15, 0.15),
                    peak_threshold=0.5, min_separation_um=1.0)
     Bundle.save(path, man, enc, module)
@@ -588,6 +596,64 @@ class WithScriptedHeatmap(unittest.TestCase):
             wb.run_step("foundation", {"model": self.path, "task": "Detect centroids"},
                         clip(1, self.Z, self.Y, self.X), None, cancelled=lambda: True)
 
+
+
+class PromptTask(unittest.TestCase):
+    """A promptable (SamHead) bundle: the person points at an object and gets that object.
+
+    This is the path a model that cannot segment unattended is still useful on, so it is
+    tested for CONTRACT -- one mask per point, the application's (x, y, z) order, a score per
+    mask, and clear errors -- not for segmentation quality, which an untrained head has none of.
+    """
+
+    def setUp(self):
+        self.dir = tempfile.mkdtemp()
+        self.path = os.path.join(self.dir, "prompt.ltb")
+        make_bundle(self.path, five_d=True, head="sam")
+        self.v = blobs()
+
+    def tearDown(self):
+        shutil.rmtree(self.dir, ignore_errors=True)
+
+    def test_model_info_offers_prompt(self):
+        info = foundation.model_info(self.path)
+        self.assertIn("prompt", info["tasks"])
+        self.assertIn("segment", info["tasks"])
+        self.assertNotIn("track", info["tasks"])        # a region head has no centroids to link
+
+    def test_one_mask_per_point_in_application_order(self):
+        pts = [[16, 16, 4], [20, 44, 4]]                # (x, y, z), the application's order
+        labels, info, extras = foundation.run(self.v, {"model": self.path, "task": "prompt",
+                                                       "points": pts}, "cpu")
+        self.assertEqual(labels.shape, self.v.shape[1:])
+        self.assertEqual(info["prompts"], 2)
+        self.assertEqual(len(info["mask_scores"]), 2)
+        self.assertLessEqual(int(labels.max()), 2)
+        self.assertIn("confidence", extras)
+
+    def test_point_labels_may_mark_background(self):
+        labels, info, _ = foundation.run(self.v, {"model": self.path, "task": "prompt",
+                                                  "points": [[16, 16, 4]], "point_labels": [0]}, "cpu")
+        self.assertEqual(info["prompts"], 1)
+
+    def test_errors_are_specific(self):
+        with self.assertRaisesRegex(ValueError, "at least one point"):
+            foundation.run(self.v, {"model": self.path, "task": "prompt", "points": []}, "cpu")
+        with self.assertRaisesRegex(ValueError, "outside the image"):
+            foundation.run(self.v, {"model": self.path, "task": "prompt", "points": [[999, 1, 1]]}, "cpu")
+        with self.assertRaisesRegex(ValueError, "point labels"):
+            foundation.run(self.v, {"model": self.path, "task": "prompt",
+                                    "points": [[16, 16, 4]], "point_labels": [1, 1]}, "cpu")
+        with self.assertRaisesRegex(ValueError, "one frame"):
+            foundation.run(blobs(t=2), {"model": self.path, "task": "prompt",
+                                        "points": [[16, 16, 4]]}, "cpu")
+
+    def test_a_non_promptable_bundle_says_so(self):
+        other = os.path.join(self.dir, "plain.ltb")
+        make_bundle(other, five_d=True, head="threeclass")
+        self.assertNotIn("prompt", foundation.model_info(other)["tasks"])
+        with self.assertRaisesRegex(ValueError, "no prompt decoder"):
+            foundation.run(self.v, {"model": other, "task": "prompt", "points": [[16, 16, 4]]}, "cpu")
 
 if __name__ == "__main__":
     unittest.main()
