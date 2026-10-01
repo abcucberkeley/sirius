@@ -358,6 +358,10 @@ def run(volume: np.ndarray, params: Dict[str, Any], device: str = "auto",
                          inclusive-exclusive, one mask per box. The strongest
                          prompt we measure: median IoU .73 against .61 for a
                          centre click (latents scripts/prompt_metric.py)
+        snap_z           Prompt only: move each OBJECT point along its z column to the
+                         model's own nearest wall-distance peak before prompting
+                         (default true). Recovers a click placed on a cell's end
+                         plane: .49 -> .60 median IoU, 48% -> 68% of cells past .5
         scribbles        Prompt only: [{"points": [[x, y, z], ...], "label": 1|0}]
                          -- one stroke is ONE mask, all of its points in the same
                          decoder call. Masks come back points, then boxes, then
@@ -466,8 +470,13 @@ def run(volume: np.ndarray, params: Dict[str, Any], device: str = "auto",
         n_prompt = len(zyx) + len(bz) + len(sz)
         report(0.1, f"{n_prompt} prompt(s)")
         vol = a[:, 0] if multi else a[0, 0]
+        # snap_z on by default for the interactive path: a person centres a click in plane easily and
+        # in z badly, and a click on a cell's end plane scores .49 against .66 in its middle. The model's
+        # own distance channel puts it right for one dense pass and no extra click. snap_z: false opts out.
+        snap = bool(params.get("snap_z", True))
         masks, scores = m.prompt(vol, zyx if len(zyx) else None, plab, boxes=bz if len(bz) else None,
-                                 scribbles=sz or None, channels=multi)
+                                 scribbles=sz or None, channels=multi, snap_z=snap)
+        info["snap_z"] = snap
         check()
         # Later prompts win where two masks overlap, which is what a person adding a point expects.
         for i, mk in enumerate(masks):
