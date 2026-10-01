@@ -354,6 +354,14 @@ def run(volume: np.ndarray, params: Dict[str, Any], device: str = "auto",
                          the application's axis order. One mask per point
         point_labels     Prompt only: 1 for an object point, 0 for a background
                          point; defaults to all object points
+        boxes            Prompt only: [[x0, y0, z0, x1, y1, z1], ...] in voxels,
+                         inclusive-exclusive, one mask per box. The strongest
+                         prompt we measure: median IoU .73 against .61 for a
+                         centre click (latents scripts/prompt_metric.py)
+        scribbles        Prompt only: [{"points": [[x, y, z], ...], "label": 1|0}]
+                         -- one stroke is ONE mask, all of its points in the same
+                         decoder call. Masks come back points, then boxes, then
+                         scribbles
         threshold        peak probability; <= 0 means use the bundle's
         min_separation   microns between two objects; <= 0 means the bundle's
         min_voxels       Segment only: drop smaller objects. Detect marks one
@@ -426,8 +434,10 @@ def run(volume: np.ndarray, params: Dict[str, Any], device: str = "auto",
         # come from the heatmap, and the one path on which a model that cannot segment
         # unattended is still useful.
         pts = np.asarray(params.get("points") or [], np.float32).reshape(-1, 3)
-        if not len(pts):
-            raise ValueError("the Prompt task needs at least one point")
+        bxs = np.asarray(params.get("boxes") or [], np.float32).reshape(-1, 6)
+        scr = list(params.get("scribbles") or [])
+        if not (len(pts) or len(bxs) or len(scr)):
+            raise ValueError("the Prompt task needs at least one point, box or scribble")
         plab = params.get("point_labels")
         plab = None if plab is None else np.asarray(plab, np.int64).reshape(-1)
         if plab is not None and len(plab) != len(pts):
@@ -435,12 +445,29 @@ def run(volume: np.ndarray, params: Dict[str, Any], device: str = "auto",
         if n_t != 1:
             raise ValueError(f"the Prompt task takes one frame, this image has {n_t}; "
                              "prompt a single timepoint")
-        zyx = pts[:, ::-1]              # the application gives (x, y, z); latents takes (z, y, x)
-        if ((zyx < 0) | (zyx >= np.array([n_z, n_y, n_x], np.float32))).any():
+        # the application gives (x, y, z); latents takes (z, y, x). A box is two corners, so both
+        # halves flip the same way; a scribble flips every point of its stroke.
+        lim = np.array([n_z, n_y, n_x], np.float32)
+        zyx = pts[:, ::-1] if len(pts) else pts
+        if len(zyx) and ((zyx < 0) | (zyx >= lim)).any():
             raise ValueError("a point falls outside the image")
-        report(0.1, f"{len(pts)} prompt(s)")
+        bz = np.concatenate([bxs[:, 2::-1], bxs[:, 5:2:-1]], 1) if len(bxs) else bxs
+        if len(bz) and ((bz[:, :3] < 0) | (bz[:, :3] >= lim) | (bz[:, 3:] <= 0) | (bz[:, 3:] > lim)).any():
+            raise ValueError("a box falls outside the image")
+        sz = []
+        for sc in scr:
+            q = np.asarray(sc.get("points") or [], np.float32).reshape(-1, 3)
+            if not len(q):
+                raise ValueError("a scribble has no points")
+            q = q[:, ::-1]
+            if ((q < 0) | (q >= lim)).any():
+                raise ValueError("a scribble point falls outside the image")
+            sz.append({"points": q, "label": int(sc.get("label", 1))})
+        n_prompt = len(zyx) + len(bz) + len(sz)
+        report(0.1, f"{n_prompt} prompt(s)")
         vol = a[:, 0] if multi else a[0, 0]
-        masks, scores = m.prompt(vol, zyx, plab, channels=multi)
+        masks, scores = m.prompt(vol, zyx if len(zyx) else None, plab, boxes=bz if len(bz) else None,
+                                 scribbles=sz or None, channels=multi)
         check()
         # Later prompts win where two masks overlap, which is what a person adding a point expects.
         for i, mk in enumerate(masks):
@@ -449,7 +476,8 @@ def run(volume: np.ndarray, params: Dict[str, Any], device: str = "auto",
                 continue
             labels[0][mk] = i + 1
             conf[0][mk] = float(scores[i])
-        info["prompts"] = int(len(pts))
+        info["prompts"] = int(n_prompt)
+        info["prompt_kinds"] = {"points": int(len(zyx)), "boxes": int(len(bz)), "scribbles": int(len(sz))}
         info["mask_scores"] = [round(float(v), 4) for v in scores]
         info["objects"] = int(labels.max())
         extras["confidence"] = conf

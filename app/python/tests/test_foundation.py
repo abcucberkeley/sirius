@@ -636,8 +636,34 @@ class PromptTask(unittest.TestCase):
                                                   "points": [[16, 16, 4]], "point_labels": [0]}, "cpu")
         self.assertEqual(info["prompts"], 1)
 
+    def test_a_box_and_a_scribble_are_prompts_too(self):
+        """The box is the strongest prompt we measure, and a scribble is ONE mask, not K."""
+        labels, info, _ = foundation.run(self.v, {"model": self.path, "task": "prompt",
+                                                  "boxes": [[8, 8, 2, 28, 28, 6]]}, "cpu")
+        self.assertEqual(info["prompts"], 1)
+        self.assertEqual(info["prompt_kinds"], {"points": 0, "boxes": 1, "scribbles": 0})
+        labels, info, _ = foundation.run(self.v, {"model": self.path, "task": "prompt",
+                                                  "scribbles": [{"points": [[16, 16, 4], [18, 18, 4]],
+                                                                 "label": 1}]}, "cpu")
+        self.assertEqual(info["prompts"], 1)            # one stroke, one mask
+        self.assertLessEqual(int(labels.max()), 1)
+
+    def test_prompt_kinds_combine_and_keep_their_order(self):
+        labels, info, _ = foundation.run(self.v, {"model": self.path, "task": "prompt",
+                                                  "points": [[16, 16, 4]],
+                                                  "boxes": [[8, 8, 2, 28, 28, 6]],
+                                                  "scribbles": [{"points": [[20, 44, 4]], "label": 1}]}, "cpu")
+        self.assertEqual(info["prompts"], 3)
+        self.assertEqual(info["prompt_kinds"], {"points": 1, "boxes": 1, "scribbles": 1})
+        self.assertEqual(len(info["mask_scores"]), 3)
+
+    def test_a_box_outside_the_image_is_refused(self):
+        with self.assertRaisesRegex(ValueError, "box falls outside"):
+            foundation.run(self.v, {"model": self.path, "task": "prompt",
+                                    "boxes": [[8, 8, 2, 999, 28, 6]]}, "cpu")
+
     def test_errors_are_specific(self):
-        with self.assertRaisesRegex(ValueError, "at least one point"):
+        with self.assertRaisesRegex(ValueError, "at least one point, box or scribble"):
             foundation.run(self.v, {"model": self.path, "task": "prompt", "points": []}, "cpu")
         with self.assertRaisesRegex(ValueError, "outside the image"):
             foundation.run(self.v, {"model": self.path, "task": "prompt", "points": [[999, 1, 1]]}, "cpu")
