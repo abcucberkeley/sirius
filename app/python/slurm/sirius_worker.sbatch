@@ -97,4 +97,64 @@ echo "tunnel:  ssh -N -L 7645:$(hostname):<port> <login-node>   (fiona: fiona.ab
 cd "${WORKER_DIR}"
 # --max-clients: the application keeps a connection for its status and one for
 # the dataset it shows (read here, on the node) besides each run's.
-exec python -m sirius_worker --host 0.0.0.0 --port "${SIRIUS_PORT}" --device "${SIRIUS_DEVICE}" --max-clients "${SIRIUS_MAX_CLIENTS:-8}"
+ARGS=(--host 0.0.0.0 --port "${SIRIUS_PORT}" --device "${SIRIUS_DEVICE}" --max-clients "${SIRIUS_MAX_CLIENTS:-8}")
+
+# --- a container instead of a venv -------------------------------------------
+# SIRIUS_CONTAINER=<image.sif> runs the worker inside that image. This is the
+# practical way to serve a model on a cluster: torch, scipy and scikit-image
+# are already in the image the models were trained in, so the node needs no
+# multi-gigabyte install into a home directory, and the worker runs against
+# exactly the libraries the weights were produced with.
+#
+#   SIRIUS_CONTAINER          the image (apptainer or singularity)
+#   SIRIUS_CONTAINER_BIND     host paths to mount, apptainer's --bind syntax,
+#                             e.g. "/data:/data:ro,/scratch". Nothing outside
+#                             the image and $HOME is visible without this, so
+#                             the data the app browses must be named here.
+#   SIRIUS_CONTAINER_PYTHONPATH  extra entries appended after the worker's own
+#   SIRIUS_CONTAINER_ARGS     anything else to pass to `apptainer exec`
+#
+# The image is entered with --cleanenv, so the environment is built here and
+# handed over in a private file rather than on the command line: `apptainer
+# --env SIRIUS_TOKEN=...` would put the shared secret in argv, where every
+# user of the node can read it. A token given as $SIRIUS_TOKEN is written to a
+# 0600 file first and passed by path; the worker reads that file and deletes it.
+if [[ -n "${SIRIUS_CONTAINER:-}" ]]; then
+    RUNTIME="$(command -v apptainer || command -v singularity || true)"
+    if [[ -z "${RUNTIME}" ]]; then
+        echo "SIRIUS_CONTAINER is set but neither apptainer nor singularity is on PATH" >&2; exit 1
+    fi
+    if [[ ! -r "${SIRIUS_CONTAINER}" ]]; then
+        echo "SIRIUS_CONTAINER=${SIRIUS_CONTAINER} is not readable" >&2; exit 1
+    fi
+    RUNDIR="${SIRIUS_RUNDIR:-$HOME/.sirius/run}"; mkdir -p "${RUNDIR}"
+    TOKEN_FILE="${SIRIUS_TOKEN_FILE:-}"
+    if [[ -z "${TOKEN_FILE}" ]]; then                 # only $SIRIUS_TOKEN was given
+        TOKEN_FILE="$(mktemp "${RUNDIR}/token.XXXXXX")"; chmod 600 "${TOKEN_FILE}"
+        printf '%s' "${SIRIUS_TOKEN}" > "${TOKEN_FILE}"
+    fi
+    ENV_FILE="$(mktemp "${RUNDIR}/env.XXXXXX")"; chmod 600 "${ENV_FILE}"
+    {
+        printf 'PYTHONPATH=%s\n' "${WORKER_DIR}${SIRIUS_CONTAINER_PYTHONPATH:+:${SIRIUS_CONTAINER_PYTHONPATH}}"
+        printf 'SIRIUS_TOKEN_FILE=%s\n' "${TOKEN_FILE}"
+        # The application reads the worker's port from the {"port": N} line, and a container's
+        # stdout is a pipe, so python block-buffers it and the line never arrives: the worker looks
+        # dead while it is serving. Cost one silent start on 2026-10-02.
+        printf 'PYTHONUNBUFFERED=1\n'
+        for v in SIRIUS_LATENTS_PATH SIRIUS_MODEL_DIR HF_HOME MPLCONFIGDIR TORCH_HOME \
+                 CELLPOSE_LOCAL_MODELS_PATH MICROSAM_CACHEDIR; do
+            [[ -n "${!v:-}" ]] && printf '%s=%s\n' "$v" "${!v}"
+        done
+    } > "${ENV_FILE}"
+    GPU=(); [[ "${SIRIUS_DEVICE}" == cpu ]] || GPU=(--nv)
+    BIND=(); [[ -n "${SIRIUS_CONTAINER_BIND:-}" ]] && BIND=(--bind "${SIRIUS_CONTAINER_BIND}")
+    EXTRA=(); [[ -n "${SIRIUS_CONTAINER_ARGS:-}" ]] && read -r -a EXTRA <<< "${SIRIUS_CONTAINER_ARGS}"
+    echo "container: ${SIRIUS_CONTAINER} via $(basename "${RUNTIME}")${SIRIUS_CONTAINER_BIND:+, binds ${SIRIUS_CONTAINER_BIND}}"
+    # The env file holds no secret (the token lives in its own 0600 file, which
+    # the worker deletes), so handing the process over with exec is safe.
+    exec "${RUNTIME}" exec "${GPU[@]}" --cleanenv "${BIND[@]}" "${EXTRA[@]}" \
+        --env-file "${ENV_FILE}" --pwd "${WORKER_DIR}" \
+        "${SIRIUS_CONTAINER}" python -m sirius_worker "${ARGS[@]}"
+fi
+
+exec python -m sirius_worker "${ARGS[@]}"

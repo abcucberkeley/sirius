@@ -142,3 +142,46 @@ protocol version (`hello` checks it), so update both ends together.
 Locally `sirius-app` and `sirius-cli` start one themselves, in SIRIUS's own
 Python environment unless an interpreter is named (see
 `app/python/README.md`, which also says when).
+
+## A container instead of a venv
+
+`SIRIUS_CONTAINER=<image.sif>` runs the worker inside that image (apptainer or
+singularity). This is the practical way to serve a trained model on a cluster:
+torch, scipy and scikit-image are already in the image the model was trained
+in, so the node needs no multi-gigabyte install into a home directory, and the
+worker runs against exactly the libraries the weights were produced with.
+
+    SIRIUS_CONTAINER             the image
+    SIRIUS_CONTAINER_BIND        host paths to mount, apptainer's --bind syntax.
+                                 Nothing outside the image and $HOME is visible
+                                 without this, so name the data the app browses.
+    SIRIUS_CONTAINER_PYTHONPATH  extra entries after the worker's own
+    SIRIUS_CONTAINER_ARGS        anything else for `apptainer exec`
+
+The image is entered with `--cleanenv` and the environment is handed over in a
+private file, not on the command line: `apptainer --env SIRIUS_TOKEN=...` would
+put the shared secret in argv, where every user of the node can read it. A token
+given as `$SIRIUS_TOKEN` is written to a 0600 file first and passed by path; the
+worker reads that file and deletes it. `PYTHONUNBUFFERED=1` goes in too, because
+a container's stdout is a pipe and the `{"port": N}` line the application waits
+for would otherwise sit in python's buffer while the worker is already serving.
+
+Verified end to end on fiona's dgx on 2026-10-02: the worker started in the
+latents image on an A100, answered the handshake, loaded a `.ltb` bundle, and
+returned a prompted mask in 3.6 s.
+
+    umask 077; mkdir -p ~/.sirius/run
+    TOKEN=$(openssl rand -hex 16); printf '%s' "$TOKEN" > ~/.sirius/run/token
+    SIRIUS_TOKEN_FILE=~/.sirius/run/token \
+    SIRIUS_CONTAINER=/clusterfs/nvme2/Users/velatkilic/containers/latents.sif \
+    SIRIUS_CONTAINER_BIND=/clusterfs/vast/velatkilic,/clusterfs/nvme2/Users/velatkilic \
+    SIRIUS_CONTAINER_PYTHONPATH=/clusterfs/nvme2/Users/velatkilic/pylibs/lib/python3.12/site-packages \
+    SIRIUS_LATENTS_PATH=$HOME/dev/latents \
+    sbatch --partition=dgx --account=co_abc --qos=abc_high --time=04:00:00 \
+        --output="$HOME/.sirius/run/sirius-worker-%j.log" \
+        app/python/slurm/sirius_worker.sbatch
+
+A bind is not optional on a cluster: without `SIRIUS_CONTAINER_BIND` the worker
+cannot see the data directories, and a path that does not exist (or that you
+cannot read) makes `apptainer` fail before the worker ever starts. Name only the
+trees you need, and mount read-only anything you must not write: `/data:/data:ro`.
