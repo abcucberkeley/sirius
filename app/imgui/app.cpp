@@ -1178,14 +1178,31 @@ namespace sirius::app::gui {
                     ImGui::Dummy(ImVec2(0, theme::crispPen(1) + px(4)));
                 }
                 if (a.recentMenu) {
-                    ImGui::PushStyleVar(ImGuiStyleVar_FramePadding, px(8, 6));
-                    ImGui::SetCursorPosX(ImGui::GetCursorPosX() + px(20));
-                    ImGui::PushFont(nullptr, 12);
-                    // The font and the padding are for the item's label, and are
-                    // popped only after the submenu closed: popped inside it, they
-                    // would leave the stack of the window they were pushed in.
+                    // Dear ImGui's submenu (it opens on hover and stays open while
+                    // the mouse travels into it), drawn as the other rows are: its
+                    // own label is transparent and set in a font as tall as a row,
+                    // so the item is a row high; the label and the arrow are drawn
+                    // here at the rows' inset. The font and colour are popped only
+                    // after the submenu closed: popped inside it, they would leave
+                    // the stack of the window they were pushed in.
+                    const float h = theme::snap(px(27));
+                    const ImVec2 rowMin = ImGui::GetCursorScreenPos();
+                    const ImVec2 rowMax(rowMin.x + std::max(ImGui::GetContentRegionAvail().x, px(240)), rowMin.y + h);
+                    ImDrawList* rowList = ImGui::GetWindowDrawList();
+                    const bool rowHovered = ImGui::IsMouseHoveringRect(rowMin, rowMax) && ImGui::IsWindowHovered(ImGuiHoveredFlags_ChildWindows);
+                    ImGui::PushStyleColor(ImGuiCol_Text, theme::kTransparent);
+                    ImGui::PushFont(nullptr, h / std::max(theme::scale(), 0.01f));
                     const bool sub = ImGui::BeginMenu(a.text.c_str());
+                    const ImU32 fg = sub || rowHovered ? theme::kAccentText : theme::kText;
+                    widgets::drawTextIn(rowList, ImVec2(rowMin.x + px(28), rowMin.y), rowMax, a.text, 12, fg, Weight::Regular, 0.0f, 0.5f);
+                    {
+                        const float s = px(4), cx = rowMax.x - px(14), cy = (rowMin.y + rowMax.y) * 0.5f;
+                        rowList->AddTriangleFilled(ImVec2(cx - s, cy - s), ImVec2(cx - s, cy + s), ImVec2(cx + s * 0.5f, cy), fg);
+                    }
                     if (sub) {
+                        // the submenu's own rows: the menu's font and ink again
+                        ImGui::PushFont(nullptr, 12);
+                        ImGui::PushStyleColor(ImGuiCol_Text, theme::kText);
                         const std::vector<std::string> recent = App::recentFiles();
                         if (recent.empty()) {
                             Action none;
@@ -1209,10 +1226,12 @@ namespace sirius::app::gui {
                             clear.text = "Clear list";
                             if (drawMenuItem(clear)) settings().remove("recent/datasets");
                         }
+                        ImGui::PopStyleColor();
+                        ImGui::PopFont();
                         ImGui::EndMenu();
                     }
                     ImGui::PopFont();
-                    ImGui::PopStyleVar();
+                    ImGui::PopStyleColor();
                     continue;
                 }
                 if (drawMenuItem(a) && a.run) {
