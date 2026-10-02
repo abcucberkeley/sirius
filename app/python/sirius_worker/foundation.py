@@ -172,8 +172,17 @@ def model_info(path: str) -> Dict[str, Any]:
         "min_separation_um": man.min_separation_um,
         "link_max_dist_um": man.link_max_dist_um,
         "channels": man.channels,
+        "channel_merge": getattr(man, "channel_merge", ""),
         "notes": man.notes,
         "tasks": _tasks(man),
+        # The instance decode rule of a distance bundle (the coat students). The application shows
+        # these and may override the foreground threshold per run; the seeding prominence is what
+        # the model was scored with, so changing it changes the answer.
+        "decode": {"fg_threshold": getattr(man, "fg_threshold", 0.5),
+                   "seed_hmax": getattr(man, "seed_hmax", 0.15),
+                   "seed_hrel": getattr(man, "seed_hrel", 0.0),
+                   "seed_sigma": getattr(man, "seed_sigma", 2.0),
+                   "min_voxels": getattr(man, "min_voxels", 0)},
     }
 
 
@@ -525,7 +534,33 @@ def run(volume: np.ndarray, params: Dict[str, Any], device: str = "auto",
         check()
         report(0.05 + 0.9 * t / max(n_t, 1), f"frame {t + 1}/{n_t}")
         frame = a[:, t] if multi else a[0, t]
-        if man.head == "threeclass":
+        # getattr: a Bundle from a latents older than 2026-10-01 has no such method, and the tests'
+        # scripted stub has only the surface it needs -- neither should turn into an AttributeError.
+        if bool(getattr(m, "dense_distance", None)) and m.dense_distance():
+            # The coat students (a conv/skip/sam/pyr head trained on distance): the output is
+            # (foreground, distance to the nearest wall), decoded by a watershed seeded on the
+            # h-maxima of that distance. Not a centroid map -- heatmap() would write n_classes
+            # channels into a one-channel buffer, and watershedding the foreground as if it were
+            # centroids merges every touching cell. The decode rule comes from the bundle, because
+            # it is what the model was SCORED with and is not recoverable from the weights.
+            from scipy.special import expit
+            from latents.downstream.seg import instances_from_dist
+
+            m._check_channels(n_c)
+            logits = np.asarray(m._class_logits(frame, channels=multi), np.float32)
+            fg = expit(logits[0]); dist = expit(logits[1])
+            conf[t] = fg
+            given = float(params.get("threshold", 0) or 0)
+            fg_thr = given if given > 0 else float(getattr(man, "fg_threshold", 0.5))
+            hmax = float(getattr(man, "seed_hmax", 0.15) or 0.0)
+            hrel = float(getattr(man, "seed_hrel", 0.0) or 0.0)
+            lab = _dense(instances_from_dist(fg, dist, fg_thr=fg_thr,
+                                             sigma=float(getattr(man, "seed_sigma", 2.0) or 0.0),
+                                             hmax=hmax or None, hrel=hrel or None,
+                                             min_size=min_voxels or int(getattr(man, "min_voxels", 0) or 0)))
+            info["decode"] = {"kind": "distance", "fg_threshold": fg_thr,
+                              "seed_hrel" if hrel else "seed_hmax": hrel or hmax}
+        elif man.head == "threeclass":
             # Bundle.heatmap cannot run this head (it writes three channels
             # into a one-channel buffer and raises); Bundle.segment's own
             # route for it is the class logits, and so is this one.

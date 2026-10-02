@@ -83,13 +83,20 @@ def make_bundle(path: str, five_d: bool = False, head: str = "detection") -> Non
         head_args = dict(dim=192, patch=patch, n_classes=2, ch=16, embed=32, depth=1, heads=2,
                          mlp_dim=64, dropout=0.0, ref=[8, 64, 64], low=[1, 2, 2])
         module = SamHead(**head_args)
+    elif head == "conv":
+        # what a coat student is: (foreground, distance to the wall), decoded by a seeded watershed
+        from latents.downstream.seg import ConvHead
+        head_args = dict(dim=192, patch=patch, n_classes=2, ch=16)
+        module = ConvHead(**head_args)
     else:
         head_args = dict(dim=192, patch=patch, flow=False)
         module = DetectionHead(**head_args)
-    man = Manifest(task=("prompt" if head == "sam" else "detect"), name="test", encoder=cfg,
-                   head=head, head_args=head_args,
+    extra = dict(fg_threshold=0.5, seed_hmax=0.15, seed_hrel=0.0, seed_sigma=2.0,
+                 min_voxels=50) if head in ("conv", "sam") else {}
+    man = Manifest(task=("prompt" if head == "sam" else "segment" if head == "conv" else "detect"),
+                   name="test", encoder=cfg, head=head, head_args=head_args,
                    patch=patch, crop=(8, 64, 64), voxel_size=(0.5, 0.15, 0.15),
-                   peak_threshold=0.5, min_separation_um=1.0)
+                   peak_threshold=0.5, min_separation_um=1.0, **extra)
     Bundle.save(path, man, enc, module)
 
 
@@ -596,6 +603,49 @@ class WithScriptedHeatmap(unittest.TestCase):
             wb.run_step("foundation", {"model": self.path, "task": "Detect centroids"},
                         clip(1, self.Z, self.Y, self.X), None, cancelled=lambda: True)
 
+
+
+class DistanceHead(unittest.TestCase):
+    """A coat student: the head outputs foreground and distance to the wall, and the instances come
+    from a watershed seeded on the h-maxima of that distance.
+
+    This is NOT a centroid heatmap, and until 2026-10-01 the Segment task ran one anyway: it asked
+    Bundle.heatmap for a one-channel map from a two-channel head, and watershedding a foreground
+    probability as if it were centroids merges every cell that touches another. The decode rule
+    lives in the bundle because it is what the model was scored with and cannot be recovered from
+    the weights."""
+
+    def setUp(self):
+        self.dir = tempfile.mkdtemp()
+        self.path = os.path.join(self.dir, "dist.ltb")
+        make_bundle(self.path, five_d=True, head="conv")
+        self.v = blobs()
+
+    def tearDown(self):
+        shutil.rmtree(self.dir, ignore_errors=True)
+
+    def test_it_offers_segment_only(self):
+        info = foundation.model_info(self.path)
+        self.assertEqual(info["tasks"], ["segment"])
+        self.assertEqual(info["decode"]["seed_hmax"], 0.15)
+        self.assertEqual(info["decode"]["min_voxels"], 50)
+
+    def test_segment_decodes_through_the_distance_route(self):
+        labels, info, extras = foundation.run(self.v, {"model": self.path, "task": "segment"}, "cpu")
+        self.assertEqual(labels.shape, self.v.shape[1:])
+        self.assertEqual(info["decode"]["kind"], "distance")
+        self.assertEqual(info["decode"]["fg_threshold"], 0.5)
+        self.assertIn("confidence", extras)                 # the foreground probability, not a heatmap
+
+    def test_a_caller_threshold_overrides_the_bundles_foreground(self):
+        _, info, _ = foundation.run(self.v, {"model": self.path, "task": "segment",
+                                             "threshold": 0.8}, "cpu")
+        self.assertEqual(info["decode"]["fg_threshold"], 0.8)
+
+    def test_detect_and_track_are_refused(self):
+        for task in ("detect", "track"):
+            with self.assertRaises(ValueError):
+                foundation.run(self.v, {"model": self.path, "task": task}, "cpu")
 
 
 class PromptTask(unittest.TestCase):
