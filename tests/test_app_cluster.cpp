@@ -1092,7 +1092,12 @@ TEST_CASE("cluster: the checks of a container image say what is wrong and never 
     setEnv("FAKE_CONTAINER_SITE", "");
     CHECK(checksFailed(st));
     CHECK(st.reason.find("sirius and numpy do not import") != std::string::npos);
-    CHECK(st.remoteOutput.find("not the compiled package") != std::string::npos);
+    // Where a checkout folder named sirius is importable, Python finds an empty
+    // namespace package and the check's own assertion names it; elsewhere it is
+    // plain "No module named 'sirius'". Both are the missing compiled package.
+    INFO(st.remoteOutput);
+    CHECK((st.remoteOutput.find("not the compiled package") != std::string::npos ||
+           st.remoteOutput.find("No module named 'sirius'") != std::string::npos));
 
     // neither apptainer nor singularity
     fs::remove(fc.bin / "apptainer");
