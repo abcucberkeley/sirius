@@ -9,8 +9,8 @@
 # included -- still has to be on the link line of whoever links sirius, and
 # every target named in its usage interface has to exist again in the
 # consumer's project. Almost all of those come from FetchContent
-# (cmake/Dependencies.cmake): Eigen, zlib, libtiff, FFTW, toml++,
-# nlohmann/json. They are built here, pinned to exact revisions, and are not
+# (cmake/Dependencies.cmake): Eigen, zlib, libdeflate, zstd, libjpeg-turbo,
+# libtiff, FFTW, toml++, nlohmann/json. They are built here, pinned to exact revisions, and are not
 # packages a consumer could find_package() -- requiring a downstream user to
 # install the same six projects, at the same versions, with the same options
 # would defeat the point of the fetch.
@@ -71,10 +71,25 @@ install(FILES "${eigen3_SOURCE_DIR}/COPYING.MPL2" "${eigen3_SOURCE_DIR}/README.m
 # They carry no headers into the install tree -- a consumer never includes
 # tiffio.h or fftw3.h through a SIRIUS header -- only the archives themselves,
 # because a static sirius.lib cannot resolve their symbols on its own.
-set(SIRIUS_VENDORED_LIB_TARGETS tiff zlibstatic fftw3)
+set(SIRIUS_VENDORED_LIB_TARGETS tiff zlibstatic libdeflate_static libzstd_static sirius_jpeg fftw3)
 if(TARGET fftw3_omp)
     list(APPEND SIRIUS_VENDORED_LIB_TARGETS fftw3_omp)
 endif()
+
+# Archives only: no SIRIUS header includes libdeflate.h.
+set_target_properties(libdeflate_static PROPERTIES PUBLIC_HEADER "")
+
+# libjpeg-turbo is an ExternalProject (cmake/Dependencies.cmake), so its
+# archive is not a target install(TARGETS) knows: sirius_jpeg, the INTERFACE
+# target that carries it, links the build-tree archive; install the archive of
+# the configuration being installed under one name and point the installed
+# sirius_jpeg at it.
+install(FILES "${SIRIUS_JPEG_LIB}"
+        DESTINATION "${SIRIUS_INSTALL_VENDOR_LIBDIR}"
+        RENAME "${SIRIUS_JPEG_LIB_NAME}"
+        COMPONENT sirius_Development)
+target_link_libraries(sirius_jpeg INTERFACE
+    "$<INSTALL_INTERFACE:$<INSTALL_PREFIX>/${SIRIUS_INSTALL_VENDOR_LIBDIR}/${SIRIUS_JPEG_LIB_NAME}>")
 
 # zlib's CMakeLists puts bare absolute build- and source-tree paths on
 # zlibstatic's usage interface (target_include_directories(... PUBLIC
@@ -131,7 +146,8 @@ install(EXPORT SIRIUSTargets
 # (`if(SIRIUS_WITH_CUDA)`) and so the config only re-finds what was actually used.
 # Keep the versions in step with the pins in cmake/Dependencies.cmake.
 set(SIRIUS_VENDORED_EIGEN_VERSION "3.4.0")
-set(SIRIUS_VENDORED_SUMMARY "Eigen 3.4.0 (headers), libtiff 4.7.0, zlib 1.3.1, FFTW 3.3.10")
+set(SIRIUS_VENDORED_SUMMARY
+    "Eigen 3.4.0 (headers), libtiff 4.7.0, zlib 1.3.1, libdeflate 1.26, zstd 1.5.7, libjpeg-turbo 3.1.4.1, FFTW 3.3.10")
 
 configure_package_config_file(
     "${CMAKE_CURRENT_LIST_DIR}/SIRIUSConfig.cmake.in"
@@ -150,6 +166,26 @@ install(FILES
             "${CMAKE_CURRENT_BINARY_DIR}/SIRIUSConfigVersion.cmake"
         DESTINATION "${SIRIUS_INSTALL_CMAKEDIR}"
         COMPONENT sirius_Development)
+
+# The licences of the vendored archives (each asks binary redistributions
+# to carry its notice).
+FetchContent_GetProperties(libtiff SOURCE_DIR _sirius_lic_tiff)
+FetchContent_GetProperties(zlib SOURCE_DIR _sirius_lic_zlib)
+FetchContent_GetProperties(libdeflate SOURCE_DIR _sirius_lic_deflate)
+FetchContent_GetProperties(zstd SOURCE_DIR _sirius_lic_zstd)
+FetchContent_GetProperties(fftw3 SOURCE_DIR _sirius_lic_fftw3)
+foreach(_lic IN ITEMS "libtiff|${_sirius_lic_tiff}/LICENSE.md"
+                      "zlib|${_sirius_lic_zlib}/LICENSE"
+                      "libdeflate|${_sirius_lic_deflate}/COPYING"
+                      "zstd|${_sirius_lic_zstd}/LICENSE"
+                      "libjpeg-turbo|${SIRIUS_JPEG_SOURCE_DIR}/LICENSE.md"
+                      "libjpeg-turbo|${SIRIUS_JPEG_SOURCE_DIR}/README.ijg"
+                      "fftw3|${_sirius_lic_fftw3}/COPYING")
+    string(REPLACE "|" ";" _lic "${_lic}")
+    list(GET _lic 0 _name)
+    list(GET _lic 1 _file)
+    install(FILES "${_file}" DESTINATION "${CMAKE_INSTALL_DOCDIR}/vendor/${_name}" COMPONENT sirius_Development)
+endforeach()
 
 install(FILES "${PROJECT_SOURCE_DIR}/LICENSE"
         DESTINATION "${CMAKE_INSTALL_DOCDIR}"

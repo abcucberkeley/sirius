@@ -173,11 +173,20 @@ namespace sirius {
             if (info.unsupported.empty() && !TIFFIsCODECConfigured(info.compression))
                 info.unsupported = std::string("compression ") + std::to_string(info.compression) + " (" +
                                    compressionName(info.compression) + ") is not built into this SIRIUS's libtiff";
-            if (info.unsupported.empty() && info.photometric == PHOTOMETRIC_YCBCR &&
-                info.compression != COMPRESSION_JPEG) {
-                uint16_t sx = 1, sy = 1;
-                TIFFGetFieldDefaulted(tif, TIFFTAG_YCBCRSUBSAMPLING, &sx, &sy);
-                if (sx != 1 || sy != 1) info.unsupported = "subsampled YCbCr samples are not supported";
+            // YCbCr: a JPEG-compressed image decodes to RGB (libjpeg-turbo
+            // upsamples the chroma and converts, see jpegToRgb), as other
+            // readers return it; any other YCbCr image is read as stored, Y / Cb / Cr,
+            // which needs full-resolution chroma.
+            if (info.unsupported.empty() && info.photometric == PHOTOMETRIC_YCBCR) {
+                if (info.compression == COMPRESSION_JPEG) {
+                    if (info.planarConfig == PLANARCONFIG_SEPARATE && info.samplesPerPixel > 1)
+                        info.unsupported = "JPEG-compressed YCbCr in separate planes is not supported";
+                } else {
+                    uint16_t sx = 1, sy = 1;
+                    TIFFGetFieldDefaulted(tif, TIFFTAG_YCBCRSUBSAMPLING, &sx, &sy);
+                    if (sx != 1 || sy != 1)
+                        info.unsupported = "subsampled YCbCr samples are only supported with JPEG compression";
+                }
             }
 
             if (TIFFIsTiled(tif)) {
@@ -211,6 +220,19 @@ namespace sirius {
             TIFFGetFieldDefaulted(tif, TIFFTAG_RESOLUTIONUNIT, &unit);
             info.resolutionUnit = unit;
             return info;
+        }
+
+        // A JPEG-compressed YCbCr directory decodes to RGB: libtiff's JPEG
+        // codec then has libjpeg-turbo upsample the chroma and convert each
+        // pixel, and strip / tile sizes are those of the RGB rows. The
+        // setting belongs to the handle's current directory, so it is made
+        // after every directory change, before any size is asked for.
+        void jpegToRgb(TIFF* tif) {
+            uint16_t compression = COMPRESSION_NONE, photometric = PHOTOMETRIC_MINISBLACK;
+            TIFFGetFieldDefaulted(tif, TIFFTAG_COMPRESSION, &compression);
+            if (compression == COMPRESSION_JPEG && TIFFGetField(tif, TIFFTAG_PHOTOMETRIC, &photometric) &&
+                photometric == PHOTOMETRIC_YCBCR)
+                TIFFSetField(tif, TIFFTAG_JPEGCOLORMODE, JPEGCOLORMODE_RGB);
         }
 
         // map types to TIFF tags
@@ -483,6 +505,7 @@ namespace sirius {
                     dir = ~std::uint64_t{0};
                     if (!TIFFSetSubDirectory(tif.get(), ifd))
                         throw IoError("Failed to seek to TIFF directory at offset " + std::to_string(ifd));
+                    jpegToRgb(tif.get());
                     dir = ifd;
                 }
                 return tif.get();
@@ -520,7 +543,7 @@ namespace sirius {
                 const std::size_t n = ix1 - ix0;
 
                 // Sparse files: a chunk never written (offset or byte count 0)
-                // reads as zeros, as tifffile and GDAL read it.
+                // reads as zeros, as GDAL reads it.
                 if (TIFFGetStrileByteCount(tif, chunkIndex) == 0 || TIFFGetStrileOffset(tif, chunkIndex) == 0) {
                     for (uint16_t s = sFirst; s < sEnd; ++s)
                         for (uint32_t y = iy0; y < iy1; ++y)
@@ -736,16 +759,6 @@ namespace sirius {
             Buffer<T> h(v.shape(), Device::cpu());
             copy(v, h);            // synchronous: pageable destination
             return h;
-        }
-
-        Shape stackShape(const TiffInfo& info) {
-            return Shape{static_cast<Index>(info.pageCount()), static_cast<Index>(info.height()),
-                         static_cast<Index>(info.width())};
-        }
-
-        Shape levelShape(const TiffLevel& level) {
-            return Shape{static_cast<Index>(level.ifds.size()), static_cast<Index>(level.height),
-                         static_cast<Index>(level.width)};
         }
 
     } // anonymous namespace

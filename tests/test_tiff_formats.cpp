@@ -16,6 +16,8 @@
 #include <cstdio>
 #include <cstring>
 #include <filesystem>
+#include <fstream>
+#include <iterator>
 #include <string>
 #include <vector>
 
@@ -322,6 +324,19 @@ TEST_CASE("Several samples per pixel read as channel planes, both planar configu
         sp.predictor = PREDICTOR_FLOATINGPOINT;
         checkAllReads<double>(sp);
     }
+    SECTION("uint16 with ZSTD and the horizontal predictor") {
+        sp.bps = 16;
+        sp.compression = COMPRESSION_ZSTD;
+        sp.predictor = PREDICTOR_HORIZONTAL;
+        checkAllReads<uint16_t>(sp);
+    }
+    SECTION("float32 with ZSTD and the floating-point predictor") {
+        sp.bps = 32;
+        sp.format = SAMPLEFORMAT_IEEEFP;
+        sp.compression = COMPRESSION_ZSTD;
+        sp.predictor = PREDICTOR_FLOATINGPOINT;
+        checkAllReads<float>(sp);
+    }
 }
 
 TEST_CASE("RGB metadata: photometric, extra samples, shapes", "[tiff][samples]") {
@@ -454,11 +469,11 @@ TEST_CASE("Big-endian files decode to host order", "[tiff][endian]") {
     }
 }
 
-TEST_CASE("PackBits and every built-in codec decode", "[tiff][codec]") {
+TEST_CASE("PackBits and every built-in lossless codec decode", "[tiff][codec]") {
     Spec sp;
     sp.bps = 16;
     sp.compression = GENERATE(as<uint16_t>{}, COMPRESSION_PACKBITS, COMPRESSION_LZW, COMPRESSION_DEFLATE,
-                              COMPRESSION_ADOBE_DEFLATE);
+                              COMPRESSION_ADOBE_DEFLATE, COMPRESSION_ZSTD);
     sp.tiled = GENERATE(false, true);
     sp.spp = GENERATE(as<uint16_t>{}, 1, 3);
     sp.photometric = sp.spp == 3 ? PHOTOMETRIC_RGB : PHOTOMETRIC_MINISBLACK;
@@ -762,6 +777,94 @@ TEST_CASE("tifffile fixtures: sample layouts, codecs and number formats", "[tiff
         TiffFile f(fixture("bilevel.tif"));
         CHECK(f.info().page(0).bitsPerSample == 1);
         requirePattern(f.readStack<uint8_t>(), sp, Region{0, 0, 37, 29}, 0, 1);
+    }
+}
+
+namespace {
+    // <name>.expected.raw: tifffile + imagecodecs' decode of a lossy fixture,
+    // (pages, samples, height, width) little-endian samples of type T.
+    template <typename T>
+    std::vector<T> expectedPixels(const char* tif) {
+        std::string name = fixture(tif);
+        name.replace(name.size() - 4, 4, ".expected.raw");
+        std::ifstream in(name, std::ios::binary);
+        REQUIRE(in);
+        const std::vector<char> bytes((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+        REQUIRE(bytes.size() % sizeof(T) == 0);
+        std::vector<T> v(bytes.size() / sizeof(T));
+        for (std::size_t i = 0; i < v.size(); ++i) {
+            uint64_t le = 0;
+            for (std::size_t b = 0; b < sizeof(T); ++b)
+                le |= uint64_t{static_cast<unsigned char>(bytes[i * sizeof(T) + b])} << (8 * b);
+            v[i] = static_cast<T>(le);
+        }
+        return v;
+    }
+
+    template <typename T>
+    void requireSame(const Buffer<T>& got, const std::vector<T>& want) {
+        REQUIRE(static_cast<std::size_t>(got.size()) == want.size());
+        for (std::size_t i = 0; i < want.size(); ++i)
+            if (got.data()[i] != want[i])
+                FAIL("element " << i << ": got " << +got.data()[i] << " expected " << +want[i]);
+    }
+} // namespace
+
+TEST_CASE("tifffile fixtures: ZSTD with predictors", "[tiff][tifffile][zstd]") {
+    Spec sp;
+    SECTION("uint16 tiles, horizontal predictor") {
+        sp.bps = 16;
+        TiffFile f(fixture("zstd_uint16_tiled_pred.tif"));
+        CHECK(f.info().page(0).compression == COMPRESSION_ZSTD);
+        CHECK(f.info().page(0).predictor == PREDICTOR_HORIZONTAL);
+        requirePattern(f.readStack<uint16_t>(), sp, Region{0, 0, 37, 29}, 0, 1);
+        requirePattern(f.readRegion<uint16_t>(Region{5, 3, 20, 20}), sp, Region{5, 3, 20, 20}, 0, 1);
+    }
+    SECTION("float32 strips, floating-point predictor") {
+        sp.format = SAMPLEFORMAT_IEEEFP;
+        sp.bps = 32;
+        TiffFile f(fixture("zstd_float32_fppred.tif"));
+        CHECK(f.info().page(0).predictor == PREDICTOR_FLOATINGPOINT);
+        requirePattern(f.readStack<float>(), sp, Region{0, 0, 37, 29}, 0, 1);
+    }
+}
+
+TEST_CASE("tifffile fixtures: JPEG decodes to what libjpeg-turbo decodes, YCbCr as RGB", "[tiff][tifffile][jpeg]") {
+    SECTION("2x2-subsampled YCbCr tiles read as RGB channel planes") {
+        TiffFile f(fixture("jpeg_ycbcr_tiled.tif"));
+        const TiffImageInfo& p = f.info().page(0);
+        CHECK(p.compression == COMPRESSION_JPEG);
+        CHECK(p.photometric == PHOTOMETRIC_YCBCR);
+        REQUIRE(p.decodable());
+        const std::vector<uint8_t> want = expectedPixels<uint8_t>("jpeg_ycbcr_tiled.tif");
+        const Buffer<uint8_t> all = f.readStack<uint8_t>();
+        REQUIRE(all.shape() == Shape{2, 3, 29, 37});
+        requireSame(all, want);
+        TiffReadOptions serial;
+        serial.maxThreads = 1;
+        requireSame(f.readStack<uint8_t>(serial), want);
+        // a region and one sample are slices of the same decode
+        TiffReadOptions green;
+        green.firstSample = 1;
+        green.sampleCount = 1;
+        const Region r{5, 3, 20, 21};
+        const Buffer<uint8_t> part = f.readRegion<uint8_t>(r, 0, green);
+        REQUIRE(part.shape() == Shape{2, 21, 20});
+        for (std::size_t pg = 0; pg < 2; ++pg)
+            for (uint32_t y = 0; y < r.height; ++y)
+                for (uint32_t x = 0; x < r.width; ++x)
+                    REQUIRE(part.data()[(pg * r.height + y) * r.width + x] ==
+                            want[((pg * 3 + 1) * 29 + r.y + y) * 37 + r.x + x]);
+    }
+    SECTION("greyscale strips") {
+        TiffFile f(fixture("jpeg_grey_strips.tif"));
+        requireSame(f.readStack<uint8_t>(), expectedPixels<uint8_t>("jpeg_grey_strips.tif"));
+    }
+    SECTION("12-bit greyscale reads as uint16") {
+        TiffFile f(fixture("jpeg12_grey.tif"));
+        CHECK(f.info().page(0).bitsPerSample == 12);
+        CHECK(f.info().pixelType() == PixelType::UInt16);
+        requireSame(f.readStack<uint16_t>(), expectedPixels<uint16_t>("jpeg12_grey.tif"));
     }
 }
 

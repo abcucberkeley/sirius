@@ -297,7 +297,11 @@ jobs:
       - name: Install python build/test deps
         run: |
           python -m pip install --upgrade pip
-          # scikit-image: without it the foundation tests' scripted model only skips
+          # scikit-image: without it the foundation tests' scripted model only skips.
+          # tifffile + imagecodecs are the TEST ORACLE only: they write the parity
+          # tests' files (every codec, JPEG / ZSTD included) and decode the reference
+          # arrays; SIRIUS itself, the workbench and the worker read TIFF with
+          # SIRIUS's own C++ reader and never import them.
           pip install numpy scipy tifffile imagecodecs scikit-image
 
       - name: Build & install sirius (editable)

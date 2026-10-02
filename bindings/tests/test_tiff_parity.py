@@ -163,10 +163,29 @@ class TestPixelTypesAndCodecs(_Parity):
                     f = self.assert_same_pages(p)
                     self.assertEqual(f.info.page(0).bits_per_sample, bits)
 
+    def test_zstd_with_predictors(self):
+        cases = [
+            (np.uint8, None), (np.uint8, True), (np.uint16, None), (np.uint16, True), (np.int16, True),
+            (np.int32, True), (np.uint32, None), (np.float32, None), (np.float32, 3), (np.float64, 3),
+            (np.float16, 3),
+        ]
+        for dtype, pred in cases:
+            for tiled in (False, True):
+                with self.subTest(dtype=np.dtype(dtype).name, predictor=pred, tiled=tiled):
+                    data = _rng_array((2, 45, 70), dtype, seed=11)
+                    if np.dtype(dtype).kind in "ui":
+                        data = (np.cumsum(data.astype(np.int64), axis=-1) % 200).astype(dtype)
+                    kw = {"compression": "zstd", "photometric": "minisblack"}
+                    if pred is not None:
+                        kw["predictor"] = pred
+                    kw.update({"tile": (16, 32)} if tiled else {"rowsperstrip": 7})
+                    f = self.assert_same_pages(self.write(f"zstd-{np.dtype(dtype).name}-{pred}-{tiled}.tif", data, **kw))
+                    self.assertEqual(f.info.page(0).compression, 50000)
+
     def test_codecs_this_build_lacks_are_reported_not_misread(self):
         data = _rng_array((1, 16, 16), np.uint8, seed=4)
         written = 0
-        for comp in ("zstd", "lzma", "webp", "jpeg", "jpeg2000", "jpegxl", "lerc"):
+        for comp in ("lzma", "webp", "jpeg2000", "jpegxl", "lerc"):
             with self.subTest(compression=comp):
                 try:
                     p = self.path(f"{comp}.tif")
@@ -185,6 +204,63 @@ class TestPixelTypesAndCodecs(_Parity):
                     self.assertIn("compression", str(cm.exception))
         if not written:
             self.skipTest("tifffile could write none of these codecs (imagecodecs missing)")
+
+
+def _smooth(shape, dtype, seed):
+    """Image-like data: JPEG's output depends on content, so give it some."""
+    rng = np.random.default_rng(seed)
+    return (np.cumsum(rng.integers(0, 9, size=shape), axis=-2) % 256).astype(dtype)
+
+
+class TestJpeg(_Parity):
+    """JPEG is lossy: the reference is what libjpeg-turbo decodes, through
+    imagecodecs for tifffile and through libtiff for SIRIUS -- the same
+    pixels, bit for bit. YCbCr comes back as RGB channels, as tifffile
+    returns it."""
+
+    def test_greyscale_strips_and_tiles(self):
+        data = _smooth((2, 45, 70), np.uint8, seed=12)
+        for tiled in (False, True):
+            with self.subTest(tiled=tiled):
+                kw = {"tile": (16, 32)} if tiled else {"rowsperstrip": 16}
+                f = self.assert_same_pages(self.write(f"jpeg-grey-{tiled}.tif", data, compression="jpeg",
+                                                      photometric="minisblack", **kw))
+                self.assertEqual(f.info.page(0).compression, 7)
+
+    def test_ycbcr_every_subsampling_as_rgb(self):
+        data = _smooth((2, 45, 70, 3), np.uint8, seed=13)
+        for ss in ((1, 1), (2, 1), (2, 2), (4, 1)):
+            for tiled in (False, True):
+                with self.subTest(subsampling=ss, tiled=tiled):
+                    kw = {"tile": (32, 32)} if tiled else {"rowsperstrip": 16}
+                    p = self.write(f"jpeg-ycbcr-{ss[0]}{ss[1]}-{tiled}.tif", data, compression="jpeg",
+                                   photometric="rgb", subsampling=ss, **kw)
+                    f = self.assert_same_pages(p)
+                    page = f.info.page(0)
+                    self.assertEqual(page.photometric, 6)   # YCbCr on disk ...
+                    self.assertEqual(f.info.shape, (2, 3, 45, 70))   # ... RGB channels read
+                    with tifffile.TiffFile(p) as t:
+                        ref = np.moveaxis(t.asarray(), -1, 1)
+                    np.testing.assert_array_equal(np.asarray(f.read_stack()), ref)
+
+    def test_rgb_stored_as_rgb(self):
+        data = _smooth((2, 33, 40, 3), np.uint8, seed=14)
+        p = self.write("jpeg-rgb.tif", data, compression="jpeg", photometric="rgb",
+                       compressionargs={"outcolorspace": "rgb"})
+        f = self.assert_same_pages(p)
+        self.assertEqual(f.info.page(0).photometric, 2)
+
+    def test_twelve_bit(self):
+        # an odd width too: libtiff 4.7 drops the last sample of such rows
+        # (cmake/patches/fix_libtiff_jpeg12_odd.cmake)
+        for width in (70, 69):
+            with self.subTest(width=width):
+                data = (_smooth((2, 45, width), np.uint16, seed=15) * 16).astype(np.uint16)
+                p = self.write(f"jpeg12-{width}.tif", data, compression="jpeg", photometric="minisblack",
+                               bitspersample=12)
+                f = self.assert_same_pages(p)
+                self.assertEqual(f.info.page(0).bits_per_sample, 12)
+                self.assertEqual(np.asarray(f.read_stack()).dtype, np.uint16)
 
 
 class TestSamples(_Parity):

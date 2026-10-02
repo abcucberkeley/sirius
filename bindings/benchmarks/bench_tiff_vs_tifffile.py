@@ -7,7 +7,8 @@ as one array in their native layout (SIRIUS: (pages, samples, y, x) for RGB,
 tifffile: (pages, y, x, samples)); every result is checked equal before it
 is timed. tifffile decodes compressed files with a thread pool (its default
 maxworkers); SIRIUS with OpenMP over pages, and over the strips / tiles of a
-page when there are fewer pages than threads.
+page when there are fewer pages than threads. The ZSTD and JPEG cases need
+imagecodecs (tifffile's codecs) to write and read the reference.
 
 Usage:
     python bindings/benchmarks/bench_tiff_vs_tifffile.py [--scale 0.25] [--repeats 3] [--dir D]
@@ -49,6 +50,11 @@ def _cases(scale: float):
         smooth((max(int(64 * s), 2), 1024, 1024), np.uint16),
         {"photometric": "minisblack", "compression": "zlib", "predictor": True},
     )
+    yield (
+        "uint16 stack, ZSTD + predictor, 64 x 1024^2",
+        smooth((max(int(64 * s), 2), 1024, 1024), np.uint16),
+        {"photometric": "minisblack", "compression": "zstd", "predictor": True},
+    )
     edge = max(int(8192 * s**0.5) // 256 * 256, 512)
     yield (
         f"uint16 single page {edge}^2, Deflate + predictor, 256^2 tiles",
@@ -59,6 +65,8 @@ def _cases(scale: float):
     rgb = np.moveaxis((rgb >> 2).astype(np.uint8), 1, -1).copy()
     yield ("RGB uint8, LZW, 16 x 2048^2", rgb, {"photometric": "rgb", "compression": "lzw"})
     yield ("RGB uint8, uncompressed, 16 x 2048^2", rgb, {"photometric": "rgb"})
+    # JPEG: tifffile stores RGB as 2x2-subsampled YCbCr; both read it back as RGB
+    yield ("RGB uint8, JPEG (YCbCr 2x2), 16 x 2048^2", rgb, {"photometric": "rgb", "compression": "jpeg"})
 
 
 def _best(fn, repeats: int):

@@ -3,7 +3,8 @@
 Both images start from the same `nvidia/cuda:<ver>-devel-ubuntu24.04` base and
 run the same `install-deps.sh`, so the local Docker environment and the
 cluster Apptainer environment are identical. All library dependencies
-(Eigen, libtiff, FFTW, nvTIFF, nvCOMP, ...) are fetched by CMake, not by the
+(Eigen, libtiff and its codecs -- zlib, libdeflate, zstd, libjpeg-turbo --, FFTW,
+nvTIFF, nvCOMP, ...) are fetched by CMake, not by the
 container, so the images stay small and the dependency pins live in one place
 (`cmake/Dependencies.cmake`, `cmake/NvidiaRedist.cmake`).
 
@@ -11,7 +12,7 @@ container, so the images stay small and the dependency pins live in one place
 | --- | --- |
 | `Dockerfile` | local development: `docker build -f containers/Dockerfile -t sirius:dev .` |
 | `sirius.def` | cluster: `apptainer build sirius.sif containers/sirius.def` |
-| `install-deps.sh` | shared provisioning (compilers, CMake, Ninja, OpenMPI, Python) |
+| `install-deps.sh` | shared provisioning (compilers, CMake, Ninja, NASM, OpenMPI, Python) |
 
 Run the C++ tests inside Docker with GPU access:
 

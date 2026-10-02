@@ -1,0 +1,5 @@
+# Test fixtures are bytes: never end-of-line converted (a raw array may hold
+# CR LF pairs and no NUL byte, which would read as text).
+*.raw binary
+*.tif binary
+*.tiff binary

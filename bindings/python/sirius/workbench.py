@@ -16,9 +16,11 @@ This module is the single implementation behind two entry points:
 Arrays are always ``(c, t, z, y, x)`` float32 (x fastest), labels are
 ``(t, z, y, x)`` uint32 with 0 = background. Only numpy is required;
 ``scipy`` (resampling, connected components, distance transforms),
-``torch`` (segmentation models), ``tifffile`` / ``zarr`` (loaders) and the
-``sirius`` extension (SIM reconstruction, GPU TIFF decode) are used when
-importable and reported as missing otherwise.
+``torch`` (segmentation models), ``zarr`` (zarr / N5 loader) and the compiled
+``sirius`` extension (TIFF reading, SIM reconstruction) are used when
+importable and reported as missing otherwise. TIFF is read only by the
+extension -- the application's own C++ reader -- so a TIFF dataset needs the
+compiled ``sirius`` package.
 
 Parameter keys are the application's: every step declares a :class:`StepSpec`
 with exactly the keys, defaults and choices of the C++ operation's parameter
@@ -455,7 +457,7 @@ def _reorder_to_ctzyx(a: np.ndarray, axes: str) -> np.ndarray:
 # The Python loader has to read a file exactly as the application does --
 # the same dimensions, page order and voxel size -- or an exported pipeline
 # runs on a different array. So this is the C++ code transcribed, not
-# tifffile's own interpretation of the metadata.
+# another reader's interpretation of the metadata.
 
 _XML_SPACE = " \t\n\v\f\r"
 _STOD = re.compile(r"[ \t\n\v\f\r]*[+-]?(?:(?:[0-9]+\.?[0-9]*|\.[0-9]+)(?:[eE][+-]?[0-9]+)?|inf(?:inity)?|nan)",
@@ -643,8 +645,11 @@ def _parse_tiff_description(description: str) -> Dict[str, Any]:
 def tiff_metadata(description: str) -> Dict[str, Any]:
     """:func:`_parse_tiff_description`'s dict, parsed by SIRIUS's C++ reader
     (``sirius.parse_tiff_metadata``, the parser the application uses) when
-    the extension has it; the Python port otherwise (an older extension)."""
-    ext = _sirius_tiff()
+    the extension has it; the Python port otherwise (no extension, or an older one)."""
+    try:
+        ext = _sirius_tiff()
+    except NotAvailable:
+        ext = None
     parse = getattr(ext, "parse_tiff_metadata", None) if ext is not None else None
     if parse is None:
         return _parse_tiff_description(description)
@@ -699,65 +704,24 @@ def _pixel_from_resolution(xres: float, yres: float, unit_tag: int, imagej_unit_
     return [v if 1e-3 < v < 100.0 else 0.0 for v in (unit / xres, unit / yres)]
 
 
-def _resolution(tags, name: str) -> float:
-    """A resolution tag as libtiff hands it over: float32 of num / den."""
-    tag = tags.get(name)
-    if tag is None:
-        return 0.0
-    value = tag.value
-    try:
-        num, den = (value[0], value[1]) if isinstance(value, (tuple, list)) else (float(value), 1)
-    except (TypeError, IndexError, ValueError):
-        return 0.0
-    return float(np.float32(num / den)) if den else 0.0
-
-
 def _tiff_probe(path: str) -> Dict[str, Any]:
     """What ``probeTiff`` reads before deciding anything: the number of
     full-resolution pages, the first page's ImageDescription and resolution
-    tags, and its pixel type. The sirius extension (the application's own
-    reader) reads all of it when it is there; an extension that does not
-    hand over the tags yet leaves them to tifffile, and without the
-    extension tifffile reads everything, skipping reduced-resolution pages."""
-    info: Dict[str, Any] = {"description": "", "xres": 0.0, "yres": 0.0, "res_unit": 2, "pages": None,
-                            "dtype": None, "reader": None, "samples": 1, "photometric": 1}
+    tags, and its pixel type -- all from the sirius extension, the
+    application's own reader."""
     ext = _sirius_tiff()
-    if ext is not None:
-        t = ext.inspect_tiff(path)
-        if not t.uniform_pages:
-            raise ValueError(f"TIFF pages differ in size or pixel type: {path}")
-        page0 = t.page(0)
-        info.update(pages=int(t.page_count), dtype=str(np.dtype(t.dtype)), reader="sirius",
-                    samples=int(getattr(page0, "samples_per_pixel", 1) or 1),
-                    photometric=int(getattr(page0, "photometric", 1)))
-        tags = tiff_tags(t.page(0))
-        if tags is not None:
-            info.update(tags)
-            return info
-    try:
-        import tifffile  # type: ignore
-    except ImportError:
-        tifffile = None
-    if tifffile is None:
-        if ext is None:
-            raise NotAvailable("loading TIFF needs the 'sirius' extension or 'tifffile'")
-        return info
-    with tifffile.TiffFile(path) as tf:
-        first = tf.pages[0]
-        info["description"] = first.description or ""
-        info["xres"] = _resolution(first.tags, "XResolution")
-        info["yres"] = _resolution(first.tags, "YResolution")
-        unit = first.tags.get("ResolutionUnit")
-        info["res_unit"] = int(unit.value) if unit is not None else 2
-        if ext is None:
-            full = [i for i, page in enumerate(tf.pages) if not int(getattr(page, "subfiletype", 0)) & 1]
-            shapes = {(tuple(tf.pages[i].shape), str(tf.pages[i].dtype)) for i in full}
-            if len(shapes) != 1:
-                raise ValueError(f"TIFF pages differ in size or pixel type: {path}")
-            info.update(pages=len(full), dtype=str(first.dtype), reader="tifffile", full_pages=full,
-                        samples=int(getattr(first, "samplesperpixel", 1) or 1),
-                        photometric=int(getattr(first, "photometric", 1)),
-                        contiguous=int(getattr(first, "planarconfig", 1)) == 1)
+    t = ext.inspect_tiff(path)
+    if not t.uniform_pages:
+        raise ValueError(f"TIFF pages differ in size or pixel type: {path}")
+    page0 = t.page(0)
+    tags = tiff_tags(page0)
+    if tags is None:
+        raise NotAvailable("this build of the 'sirius' package does not hand over the TIFF tags; "
+                           "rebuild or reinstall it from this source tree")
+    info: Dict[str, Any] = {"pages": int(t.page_count), "dtype": str(np.dtype(t.dtype)), "reader": "sirius",
+                            "samples": int(getattr(page0, "samples_per_pixel", 1) or 1),
+                            "photometric": int(getattr(page0, "photometric", 1))}
+    info.update(tags)
     return info
 
 
@@ -823,15 +787,18 @@ def tiff_voxel(md: Dict[str, Any], xres: float, yres: float, res_unit: int) -> L
 
 
 def _sirius_tiff():
-    """The sirius extension when it imports (its TIFF reader is the
-    application's), else None."""
+    """The compiled sirius extension, whose TIFF reader is the
+    application's. Raises NotAvailable when it does not import: TIFF is read
+    by SIRIUS's own C++ reader only, never by a Python package."""
     try:
         import sirius  # type: ignore
 
         sirius.inspect_tiff  # noqa: B018 - the extension, not a namespace package
         return sirius
-    except Exception:  # noqa: BLE001 - fall back to tifffile
-        return None
+    except Exception as e:  # noqa: BLE001 - ImportError, or a sirius without the extension
+        raise NotAvailable(
+            "reading TIFF needs the compiled 'sirius' package (SIRIUS's C++ TIFF reader): install the wheel "
+            "(pip install sirius) or build the Python bindings (SIRIUS_ENABLE_PYTHON_BINDINGS=ON)") from e
 
 
 def load_dataset(path: str, page_order: str = "czt", c: Optional[int] = None, t: Optional[int] = None,
@@ -934,15 +901,7 @@ def _load_tiff(path: str, page_order: str, c: Optional[int], t: Optional[int], z
     given = pc > 0 or pt > 0 or pz > 0 or order_text != "czt"
     nc, nt, nz, order, from_meta = tiff_dims(pages, tiff_page_channels(md, spp), given, order_text, pc, pt, pz)
 
-    if probe["reader"] == "sirius":
-        stack = np.asarray(_sirius_tiff().read_tiff(path, dtype=np.float32))
-    else:
-        import tifffile  # type: ignore
-
-        with tifffile.TiffFile(path) as tf:
-            stack = np.stack([tf.pages[i].asarray() for i in probe["full_pages"]]).astype(np.float32, copy=False)
-        if spp > 1 and probe.get("contiguous", True):
-            stack = np.moveaxis(stack, -1, 1)   # (pages, y, x, s) -> (pages, s, y, x), as sirius reads it
+    stack = np.asarray(_sirius_tiff().read_tiff(path, dtype=np.float32))
     stack = stack.reshape((pages, spp) + stack.shape[-2:])
     counts = {"c": nc, "t": nt, "z": nz}
     slowest_first = order[::-1]

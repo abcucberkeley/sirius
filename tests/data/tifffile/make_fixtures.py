@@ -8,9 +8,14 @@ no copy of the arrays. Run from anywhere:
 
     python tests/data/tifffile/make_fixtures.py
 
-Needs tifffile and imagecodecs (LZW, Deflate predictors). The files are
-checked in; re-running rewrites them byte for byte only with the same
-tifffile version, which does not matter: the content is what is tested.
+Needs tifffile and imagecodecs (LZW, Deflate predictors, ZSTD, JPEG). The
+files are checked in; re-running rewrites them byte for byte only with the
+same tifffile version, which does not matter: the content is what is tested.
+
+JPEG is lossy, so no pattern predicts its pixels: each JPEG fixture comes with
+<name>.expected.raw, what tifffile + imagecodecs (libjpeg-turbo) decode it
+to, as (pages, samples, height, width) little-endian samples -- the C++ test
+compares SIRIUS's decode with those bytes exactly.
 """
 
 from __future__ import annotations
@@ -37,6 +42,15 @@ def path(name: str) -> str:
     return os.path.join(HERE, name)
 
 
+def write_expected(name: str) -> None:
+    """tifffile's decode of fixture `name`, as SIRIUS lays it out, to <name>.expected.raw."""
+    with tifffile.TiffFile(path(name)) as t:
+        a = np.stack([p.asarray() for p in t.pages])
+        if a.ndim == 4:   # contiguous samples: (pages, h, w, s) -> (pages, s, h, w)
+            a = np.moveaxis(a, -1, 1)
+    a.astype(a.dtype.newbyteorder("<")).tofile(path(name.replace(".tif", ".expected.raw")))
+
+
 def main() -> None:
     h, w = 29, 37
     # RGB, contiguous samples, LZW + horizontal predictor, strips
@@ -60,6 +74,21 @@ def main() -> None:
     # bilevel (1-bit) image
     b1 = (pattern(1, 1, h, w, 1)[0, 0]).astype(bool)
     tifffile.imwrite(path("bilevel.tif"), b1)
+    # ZSTD: uint16 tiles with the horizontal predictor, float32 strips with the floating-point one
+    tifffile.imwrite(path("zstd_uint16_tiled_pred.tif"), pattern(2, 1, h, w, 16).astype(np.uint16)[:, 0],
+                     compression="zstd", predictor=True, tile=(16, 16), photometric="minisblack")
+    tifffile.imwrite(path("zstd_float32_fppred.tif"), f32, compression="zstd", predictor=3, rowsperstrip=8,
+                     photometric="minisblack")
+    # JPEG: RGB stored as 2x2-subsampled YCbCr in tiles (read back as RGB), greyscale strips, 12-bit
+    tifffile.imwrite(path("jpeg_ycbcr_tiled.tif"), np.moveaxis(rgb, 1, -1), photometric="rgb", compression="jpeg",
+                     subsampling=(2, 2), tile=(16, 16))
+    write_expected("jpeg_ycbcr_tiled.tif")
+    tifffile.imwrite(path("jpeg_grey_strips.tif"), pattern(2, 1, h, w, 8).astype(np.uint8)[:, 0],
+                     photometric="minisblack", compression="jpeg", rowsperstrip=16)
+    write_expected("jpeg_grey_strips.tif")
+    tifffile.imwrite(path("jpeg12_grey.tif"), pattern(2, 1, h, w, 12).astype(np.uint16)[:, 0],
+                     photometric="minisblack", compression="jpeg", bitspersample=12)
+    write_expected("jpeg12_grey.tif")
     # ImageJ hyperstack: 3 t, 2 z, 2 c, with spacing, unit and frame interval
     ij = pattern(12, 1, h, w, 16)[:, 0].astype(np.uint16).reshape(3, 2, 2, h, w)
     tifffile.imwrite(path("imagej_hyperstack.tif"), ij, imagej=True, resolution=(1 / 0.25, 1 / 0.25),

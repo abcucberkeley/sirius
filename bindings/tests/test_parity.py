@@ -274,7 +274,7 @@ class TestLoaderParity(unittest.TestCase):
                     with warnings.catch_warnings():
                         warnings.simplefilter("error", wb.UnknownParameterWarning)
                         got, meta = wb.run_pipeline(str(FIXTURES / case["file"]), pipeline)
-                except wb.NotAvailable as e:   # neither tifffile nor the extension
+                except wb.NotAvailable as e:   # no compiled sirius package: nothing reads the TIFF
                     self.skipTest(str(e))
                 name = case["name"]
                 self.assertEqual(list(got.shape), case["dims"], f"load[{name}]: dimensions")

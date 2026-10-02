@@ -39,7 +39,7 @@ namespace sirius {
         std::string fileName;           // <UUID FileName=...>
     };
 
-    // One OME <Image> (a "series" in Bio-Formats / tifffile terms).
+    // One OME <Image> (a "series" in Bio-Formats terms).
     struct OmeImage {
         std::string id;
         std::string name;

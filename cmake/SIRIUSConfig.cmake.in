@@ -6,7 +6,8 @@
 # What is in the install tree
 #   lib/sirius.lib (libsirius.a)         the library
 #   lib/sirius/                          the static dependencies it was built
-#                                        against (libtiff, zlib, FFTW): SIRIUS
+#                                        against (libtiff, zlib, libdeflate,
+#                                        zstd, libjpeg-turbo, FFTW): SIRIUS
 #                                        is static, so its PRIVATE dependencies
 #                                        are still needed at your link step,
 #                                        and they are built in-tree by

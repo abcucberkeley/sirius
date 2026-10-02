@@ -330,7 +330,7 @@ namespace sirius::app::pyenv {
         std::optional<std::uint64_t> approximateSize(const std::string& distribution) {
             if (distribution == "numpy") return 13'000'000ULL;
             if (distribution == "scipy") return 38'000'000ULL;
-            if (distribution == "scikit-image") return 19'000'000ULL;   // with pillow, imageio, networkx, tifffile
+            if (distribution == "scikit-image") return 19'000'000ULL;   // with pillow, imageio, networkx, ...
             return std::nullopt;
         }
 

@@ -24,9 +24,24 @@ except ImportError:
     _HAVE_SCIPY = False
 
 try:
-    import tifffile  # type: ignore
+    import tifffile  # type: ignore  # writes the test files only; the loader reads with sirius
 except ImportError:  # pragma: no cover - environment dependent
     tifffile = None
+
+
+def _tiff_reader():
+    """The compiled sirius package, which reads every TIFF the workbench
+    loads (there is no other reader), or None."""
+    try:
+        import sirius  # type: ignore
+
+        sirius.inspect_tiff  # noqa: B018 - the extension, not a namespace package
+        return sirius
+    except Exception:  # noqa: BLE001
+        return None
+
+
+_NO_TIFF_READER = "reading TIFF needs the compiled sirius package (build the Python bindings)"
 
 
 def _load_workbench():
@@ -61,6 +76,7 @@ _PLAIN_CUT = {"tophat": 0, "sigma": 0.0, "opening": 0, "fill_holes": False, "pos
 
 
 @unittest.skipIf(tifffile is None, "tifffile not installed")
+@unittest.skipIf(_tiff_reader() is None, _NO_TIFF_READER)
 class TestRunPipeline(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
@@ -217,6 +233,7 @@ def _sirius_extension():
 
 
 @unittest.skipIf(tifffile is None, "tifffile not installed")
+@unittest.skipIf(_tiff_reader() is None, _NO_TIFF_READER)
 class TestTiffLoader(unittest.TestCase):
     """Files as ImageJ and tifffile's OME writer make them, loaded as the
     application loads them. The expected values were read with the
@@ -886,6 +903,7 @@ class TestSteps(unittest.TestCase):
         np.testing.assert_allclose(r.array, 3.0)   # no overlap: all fill
 
     @unittest.skipIf(tifffile is None, "tifffile not installed")
+    @unittest.skipIf(_tiff_reader() is None, _NO_TIFF_READER)
     def test_flatfield(self):
         with tempfile.TemporaryDirectory() as d:
             flat = np.full((4, 4), 2.0, np.float32)
