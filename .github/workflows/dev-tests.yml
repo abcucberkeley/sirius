@@ -296,7 +296,7 @@ jobs:
       - name: Install python build/test deps
         run: |
           python -m pip install --upgrade pip
-          # scikit-image: without it the worker's skimage_seg tests only skip
+          # scikit-image: without it the foundation tests' scripted model only skips
           pip install numpy scipy tifffile imagecodecs scikit-image
 
       - name: Build & install sirius (editable)

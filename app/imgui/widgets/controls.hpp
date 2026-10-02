@@ -195,6 +195,17 @@ namespace sirius::app::gui::widgets {
     // A dropdown one can also type into (the assistant's model). Returns true
     // when the text changed (typed or picked).
     bool editableCombo(const char* id, std::string* value, const std::vector<std::string>& items, const FieldOpts& opts = {});
+    // The same with a line of detail under each entry, and entries drawn
+    // greyed (still pickable) when `dimmed`. `picked` (optional) is set when
+    // the change came from the list rather than the keyboard; `popupWidth`
+    // (design px, 0 = the field's) lets the list be wider than the field.
+    struct ComboItem {
+        std::string value;
+        std::string detail;
+        bool dimmed = false;
+    };
+    bool editableCombo(const char* id, std::string* value, const std::vector<ComboItem>& items, const FieldOpts& opts,
+                       bool* picked, float popupWidth = 0.0f);
 
     // --- rows -----------------------------------------------------------------
     // A row that answers a click anywhere on it and paints its own hover /

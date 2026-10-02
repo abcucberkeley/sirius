@@ -185,11 +185,23 @@ namespace sirius::app {
 
     void RemoteDatasets::setAccept(std::vector<std::string> accept) { accept_ = std::move(accept); }
 
+    void RemoteDatasets::setDevice(std::string device) {
+        const std::lock_guard<std::mutex> g(deviceMutex_);
+        device_ = std::move(device);
+    }
+
+    std::string RemoteDatasets::device() const {
+        const std::lock_guard<std::mutex> g(deviceMutex_);
+        return device_;
+    }
+
     WorkerResult RemoteDatasets::call(Lane lane, const std::string& method, const json& paramsIn, const std::function<bool()>& cancelled) {
         LaneState& l = lane == Lane::Views ? views_ : reads_;
         const std::lock_guard<std::mutex> g(l.m);
         json params = paramsIn;
         if (!params.contains("accept")) params["accept"] = accept_;
+        if (!params.contains("device"))
+            if (std::string d = device(); !d.empty()) params["device"] = std::move(d);
         for (int attempt = 0; attempt < 2; ++attempt) {
             if (!l.worker || !l.worker->isOpen()) {
                 l.worker.reset();

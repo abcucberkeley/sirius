@@ -156,7 +156,11 @@ namespace sirius::app {
         // best first ("zstd", "zlib"); empty for a worker without them.
         std::vector<std::string> encodings;
         int maxClients = 1;                    // connections the worker serves at once (--max-clients)
-        std::string tifffile;                  // its version; "" when the worker cannot read TIFF itself
+        // hello's "tiff_reader": the version of the sirius package the worker
+        // reads TIFF datasets with ("" when it has none and cannot open TIFF),
+        // and whether it decodes them on the GPU (nvTIFF)
+        std::string tiffReader;
+        bool nvtiff = false;
     };
 
     struct WorkerResult {

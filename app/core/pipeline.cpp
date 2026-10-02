@@ -19,6 +19,33 @@ namespace sirius::app {
         return buf;
     }
 
+    namespace {
+        // Operations SIRIUS used to have. A pipeline that names one is not
+        // given a "missing" stand-in (that is for a plugin that is not loaded
+        // here and may be elsewhere): these are gone everywhere.
+        struct RemovedKind {
+            const char* kind;
+            const char* advice;
+        };
+        constexpr const char* kRemovedSince = "2026-10";
+        constexpr RemovedKind kRemovedKinds[] = {
+            {"threshold", "use the classic segmentation step ('classic') instead"},
+            {"skimage_seg", "use the classic segmentation step ('classic') instead"},
+        };
+    } // namespace
+
+    const char* Pipeline::removedKindAdvice(const std::string& kind) noexcept {
+        for (const RemovedKind& r : kRemovedKinds)
+            if (kind == r.kind) return r.advice;
+        return nullptr;
+    }
+
+    std::string Pipeline::removedStepMessage(int index, const std::string& kind) {
+        const char* advice = removedKindAdvice(kind);
+        return "step " + Step::number(index) + " '" + kind + "' was removed from SIRIUS (" + kRemovedSince + ")" +
+               (advice ? std::string("; ") + advice : std::string());
+    }
+
     Pipeline::Pipeline() {
         Step load;
         load.id = nextId();
@@ -161,9 +188,17 @@ namespace sirius::app {
         Pipeline p;
         std::vector<Step> steps;
         if (!j.contains("steps") || !j["steps"].is_array()) throw std::runtime_error("pipeline: missing 'steps'");
+        int position = -1;   // in the file, Load included, removed steps too
         for (const json& sj : j["steps"]) {
+            ++position;
             Step s;
             s.kind = sj.value("kind", "");
+            if (removedKindAdvice(s.kind)) {
+                // enabled or not: the file cannot be run as it was written
+                if (strict) throw std::runtime_error("pipeline: " + removedStepMessage(position, s.kind));
+                p.warnings_.push_back(removedStepMessage(position, s.kind) + "; the step was dropped");
+                continue;
+            }
             const Operation* op = findOperation(s.kind);
             // The Load step is structural: it needs no registered operation
             // (tests and tools may run without the built-ins).

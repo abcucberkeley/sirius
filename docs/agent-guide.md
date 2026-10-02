@@ -90,11 +90,12 @@ newer one on, is described in that release's documentation.
 | `--dataset P`, `--pipeline T` | open a dataset or a pipeline before the first request |
 | `--backend auto\|cpu\|cuda\|hpc`, `--cuda-device N\|all` | where steps run; `auto` is CUDA when available |
 | `--hpc host:port` | the HPC worker, with the token from `$SIRIUS_HPC_TOKEN`. It is the only HPC endpoint the server will ever use: no tool can name another host. |
+| `--hpc-device gpu\|cpu` | where the HPC worker computes (default `gpu`); `set_backend` with `hpc_device` switches it later without a new job, and `get_state` reports it |
 | `--python <exe>` | the Python for the worker (else `$SIRIUS_PYTHON`, then SIRIUS's own environment) |
 | `--plugins auto\|on\|off` | whether user operations load when needed, at start, or never |
 
-**`--allow-worker-setup`.** Steps that need Python — segmentation models, the
-scikit-image step, btrack tracking, user operations — run in the Python
+**`--allow-worker-setup`.** Steps that need Python — segmentation models,
+btrack tracking, user operations — run in the Python
 worker, which needs at least numpy. When it cannot start, the tool reports
 `worker_unavailable` and the right thing is for the agent to ask you to run
 

@@ -60,6 +60,8 @@ namespace sirius::app::gui {
 
         cluster::Profile storedProfile() const;
         void connect(const cluster::Profile& profile);   // saves the profile
+        // The SSH login and the cluster's partitions only, no job; saves the profile.
+        void logIn(const cluster::Profile& profile);
         // Off the GUI thread (scancel takes a moment); `cancelJob` scancels.
         void disconnect(bool cancelJob);
         // Asks whether to cancel the job too (default yes), then disconnects.
@@ -70,8 +72,14 @@ namespace sirius::app::gui {
         // Once a frame: state changes, the pending prompt.
         void frame();
 
-        // "HPC: n0123 · connected", its colour; "" while there was never a session.
+        // "HPC: n0123 · GPU" (the session's HPC device), its colour; "" while
+        // there was never a session.
         std::string indicator(ImU32& color) const;
+
+        // Whether the HPC device's GPU can be chosen; else `why` says what
+        // stops it: the connected worker reports no CUDA, or the profile
+        // asks for no GPU. Without a session the stored profile decides.
+        bool hpcGpuUsable(std::string* why = nullptr) const;
 
         // The cluster's folders opened last, newest first.
         std::vector<std::string> recentFolders() const;
@@ -82,6 +90,9 @@ namespace sirius::app::gui {
         void settleBeforeQuit(std::function<void()> done);
 
     private:
+        // `profile` saved (its Slurm choice remembered for its host), and
+        // the fake ssh of tests and screenshots put in for ssh.
+        cluster::Profile prepared(const cluster::Profile& profile);
         std::optional<std::string> ask(const ssh::Prompt& p);
         void onState(const cluster::Status& st);
 

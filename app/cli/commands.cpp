@@ -614,6 +614,7 @@ namespace sirius::cli {
                                              : app::HeadlessOptions::Plugins::Auto;
             o.backend = g.backend;
             o.cudaDevice = g.cudaDevice;
+            o.hpcDevice = g.hpcDevice;
             if (!g.hpcHost.empty()) {
                 app::RemoteConfig hpc;
                 hpc.host = g.hpcHost;

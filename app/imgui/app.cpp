@@ -771,6 +771,7 @@ namespace sirius::app::gui {
             [this] { return wb().backend() == Backend::Hpc; };
         // scripting (--action): Connect with the stored profile, as the dialog's button does
         add("", "Connect to cluster (stored profile)", {}, [this] { self.cluster().connect(self.cluster().storedProfile()); });
+        add("", "Log in to cluster (stored profile)", {}, [this] { self.cluster().logIn(self.cluster().storedProfile()); });
         add("", "Wait for the cluster", {}, [this] { self.waitUntil([this] { return self.cluster().status().state != cluster::State::Connecting; }); });
         add("Process", "Connect to cluster\xE2\x80\xA6", {}, [this] { self.clusterDialog(); }, "One SSH login: the worker job, the HPC backend through it, the cluster's datasets");
 
@@ -3146,8 +3147,6 @@ namespace sirius::app::gui {
 
     int App::segmentationStep() const {
         const Pipeline& p = bridge_.wb().pipeline();
-        for (int i = p.size() - 1; i >= 0; --i)
-            if (p.at(i).op().info().producesLabels && p.at(i).kind != "threshold") return i;
         for (int i = p.size() - 1; i >= 0; --i)
             if (p.at(i).op().info().producesLabels) return i;
         return -1;

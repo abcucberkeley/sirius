@@ -31,7 +31,6 @@ OPTIONAL = {
     "cellpose": "cellpose",
     "micro_sam": "micro_sam",
     "btrack": "btrack",
-    "tifffile": "tifffile",
 }
 
 __all__ = ["OPTIONAL", "REQUIRED", "__version__"]

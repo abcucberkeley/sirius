@@ -1,3 +1,4 @@
-# Optional: label clean-up in the worker, the scikit-image segmentation step, some plugins.
+# Optional: label clean-up in the worker; scikit-image for the foundation step's watershed
+# (in the latents package); some plugins.
 scipy
 scikit-image

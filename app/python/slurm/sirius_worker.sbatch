@@ -41,9 +41,14 @@ set -euo pipefail
 umask 077
 
 # --- environment (Fiona; adapt the modules to your cluster) -----------------
+# SIRIUS_CONTAINER names an Apptainer/Singularity image that holds the
+# compiled sirius package, numpy and torch: the worker then runs in it (see
+# "worker" below) and none of this environment is used.
+if [[ -z "${SIRIUS_CONTAINER:-}" ]]; then
 module load python
 module load cmake 2>/dev/null || true
 module load nvhpc 2>/dev/null || true
+fi
 # A Python with numpy (and torch for segmentation models); the sirius wheel
 # enables SIM reconstruction on the node. Install what the worker needs into
 # that environment once, before submitting (share/sirius/python/ in an
@@ -55,7 +60,7 @@ module load nvhpc 2>/dev/null || true
 # `sirius-cli worker setup` makes under ~/.local/share/sirius/python-env):
 # source "$HOME/venvs/sirius/bin/activate"
 # SIRIUS_VENV names one to activate without editing this file.
-if [[ -n "${SIRIUS_VENV:-}" ]]; then
+if [[ -n "${SIRIUS_VENV:-}" && -z "${SIRIUS_CONTAINER:-}" ]]; then
     # shellcheck disable=SC1091
     source "${SIRIUS_VENV}/bin/activate"
 fi
@@ -120,9 +125,16 @@ ARGS=(--host 0.0.0.0 --port "${SIRIUS_PORT}" --device "${SIRIUS_DEVICE}" --max-c
 # user of the node can read it. A token given as $SIRIUS_TOKEN is written to a
 # 0600 file first and passed by path; the worker reads that file and deletes it.
 if [[ -n "${SIRIUS_CONTAINER:-}" ]]; then
-    RUNTIME="$(command -v apptainer || command -v singularity || true)"
+    # SIRIUS_LAUNCHER (the application sets it from the profile): apptainer by
+    # default; a module of that name is loaded when it is not on PATH, and the
+    # other runtime is tried when it still cannot be found.
+    RUNTIME="${SIRIUS_LAUNCHER:-apptainer}"
+    if ! command -v "${RUNTIME}" >/dev/null 2>&1 && type module >/dev/null 2>&1; then
+        module load "${RUNTIME}" >/dev/null 2>&1 || module load apptainer >/dev/null 2>&1 || module load singularity >/dev/null 2>&1 || true
+    fi
+    RUNTIME="$(command -v "${RUNTIME}" || command -v apptainer || command -v singularity || true)"
     if [[ -z "${RUNTIME}" ]]; then
-        echo "SIRIUS_CONTAINER is set but neither apptainer nor singularity is on PATH" >&2; exit 1
+        echo "SIRIUS_CONTAINER is set but neither ${SIRIUS_LAUNCHER:-apptainer} nor singularity can be run here (module load was tried)" >&2; exit 1
     fi
     if [[ ! -r "${SIRIUS_CONTAINER}" ]]; then
         echo "SIRIUS_CONTAINER=${SIRIUS_CONTAINER} is not readable" >&2; exit 1
@@ -148,6 +160,13 @@ if [[ -n "${SIRIUS_CONTAINER:-}" ]]; then
     } > "${ENV_FILE}"
     GPU=(); [[ "${SIRIUS_DEVICE}" == cpu ]] || GPU=(--nv)
     BIND=(); [[ -n "${SIRIUS_CONTAINER_BIND:-}" ]] && BIND=(--bind "${SIRIUS_CONTAINER_BIND}")
+    # The image sees $HOME, where the checkout and the run folder usually are; a
+    # checkout or run folder elsewhere is bound, or the worker's code and its
+    # token file would not be there inside.
+    CHECKOUT="${WORKER_DIR%/app/python}"
+    for d in "${CHECKOUT}" "${RUNDIR}"; do
+        case "$(cd "$d" && pwd -P)/" in "$(cd "$HOME" && pwd -P)/"*) ;; *) BIND+=(--bind "$d") ;; esac
+    done
     EXTRA=(); [[ -n "${SIRIUS_CONTAINER_ARGS:-}" ]] && read -r -a EXTRA <<< "${SIRIUS_CONTAINER_ARGS}"
     echo "container: ${SIRIUS_CONTAINER} via $(basename "${RUNTIME}")${SIRIUS_CONTAINER_BIND:+, binds ${SIRIUS_CONTAINER_BIND}}"
     # The env file holds no secret (the token lives in its own 0600 file, which

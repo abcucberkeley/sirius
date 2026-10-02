@@ -7,6 +7,7 @@
 #include <sirius/tiff_io.hpp>
 
 #include <optional>
+#include <stdexcept>
 #include <sstream>
 #include <string>
 #include <vector>
@@ -108,6 +109,10 @@ void bind_tiff_io(nb::module_& m) {
 
     nb::class_<TiffImageInfo>(m, "TiffImageInfo", "Metadata of one image file directory (IFD).")
         .def_ro("ifd_offset", &TiffImageInfo::ifdOffset)
+        .def_ro("description", &TiffImageInfo::description, "ImageDescription tag (OME-XML, ImageJ metadata); \"\" when absent.")
+        .def_ro("x_resolution", &TiffImageInfo::xResolution, "XResolution tag (pixels per resolution_unit); 0 when absent.")
+        .def_ro("y_resolution", &TiffImageInfo::yResolution, "YResolution tag (pixels per resolution_unit); 0 when absent.")
+        .def_ro("resolution_unit", &TiffImageInfo::resolutionUnit, "ResolutionUnit tag: 1 none, 2 inch, 3 centimetre.")
         .def_ro("width", &TiffImageInfo::width)
         .def_ro("height", &TiffImageInfo::height)
         .def_ro("pixel_type", &TiffImageInfo::pixelType)
@@ -189,13 +194,31 @@ void bind_tiff_io(nb::module_& m) {
                  return toPython(withPixelType(t, [&](auto tag) -> AnyBuffer {
                      return f.readLevel<decltype(tag)>(level, opts, streamOrNull(stream));
                  })); }, nb::arg("level"), nb::arg("dtype") = nb::none(), nb::arg("device") = Device::cpu(), nb::arg("allow_cpu_fallback") = true, nb::arg("pinned") = false, nb::arg("stream") = nb::none(), "Every page at pyramid level `level` (0 = full resolution).")
-        .def("read_region", [](const TiffFile& f, std::uint32_t x, std::uint32_t y, std::uint32_t width, std::uint32_t height, std::size_t level, nb::handle dtype, Device device, bool allowCpuFallback, bool pinned, const Stream* stream) {
+        .def("read_region", [](const TiffFile& f, std::uint32_t x, std::uint32_t y, std::uint32_t width, std::uint32_t height, std::size_t level, nb::handle dtype, Device device, bool allowCpuFallback, bool pinned, const Stream* stream, std::size_t first, std::size_t count) {
                  const PixelType t = pixelTypeFromDtype(dtype).value_or(f.info().pixelType());
                  const auto opts = makeOptions(device, allowCpuFallback, pinned);
-                 const Region r{x, y, width, height};
+                 const auto& levels = f.info().levels;
+                 if (level >= levels.size())
+                     throw std::out_of_range("Level " + std::to_string(level) + " requested from a TIFF with " +
+                                             std::to_string(levels.size()) + " level(s)");
+                 const TiffLevel& l = levels[level];
+                 const std::size_t n = l.ifds.size();
+                 // count 0: every page from `first` on. `count > n - first`
+                 // rather than `first + count > n`: the sum can wrap.
+                 if (count == 0 && first < n) count = n - first;
+                 if (count == 0 || first >= n || count > n - first)
+                     throw std::out_of_range("Pages [" + std::to_string(first) + ", +" + std::to_string(count) +
+                                             ") requested from a TIFF level with " + std::to_string(n) + " page(s)");
+                 const Region r = Region{x, y, width, height}.resolve(l.width, l.height);
+                 const std::vector<std::uint64_t> ifds(l.ifds.begin() + static_cast<std::ptrdiff_t>(first),
+                                                       l.ifds.begin() + static_cast<std::ptrdiff_t>(first + count));
                  return toPython(withPixelType(t, [&](auto tag) -> AnyBuffer {
-                     return f.readRegion<decltype(tag)>(r, level, opts, streamOrNull(stream));
-                 })); }, nb::arg("x"), nb::arg("y"), nb::arg("width") = 0, nb::arg("height") = 0, nb::arg("level") = 0, nb::arg("dtype") = nb::none(), nb::arg("device") = Device::cpu(), nb::arg("allow_cpu_fallback") = true, nb::arg("pinned") = false, nb::arg("stream") = nb::none(), "Rectangle (x, y, width, height) of every page at `level`; width/height 0 extend to the edge.");
+                     using T = decltype(tag);
+                     Buffer<T> out(Shape{static_cast<Index>(count), static_cast<Index>(r.height), static_cast<Index>(r.width)},
+                                   opts.device, opts.hostMemory, streamOrNull(stream));
+                     f.decode<T>(ifds, r, out.view(), opts, streamOrNull(stream));
+                     return AnyBuffer{std::move(out)};
+                 })); }, nb::arg("x"), nb::arg("y"), nb::arg("width") = 0, nb::arg("height") = 0, nb::arg("level") = 0, nb::arg("dtype") = nb::none(), nb::arg("device") = Device::cpu(), nb::arg("allow_cpu_fallback") = true, nb::arg("pinned") = false, nb::arg("stream") = nb::none(), nb::arg("first") = 0, nb::arg("count") = 0, "Rectangle (x, y, width, height) of pages [first, first + count) at `level` (count 0: to the last page); width/height 0 extend to the edge.");
 
     m.def("read_tiff", [](const std::string& path, nb::handle dtype, Device device, bool allowCpuFallback) {
               TiffFile f(path);

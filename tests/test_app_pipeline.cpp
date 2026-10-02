@@ -544,6 +544,38 @@ TEST_CASE("A pipeline written before prompt objects still loads, each prompt in 
     CHECK(s[1].objectId == 2);
 }
 
+TEST_CASE("The HPC device is session state that agents set and read back", "[app][tools][hpc]") {
+    registerTestOps();
+    Scratch scratch;
+    Workbench wb(scratch.dir);
+    wb.setDataset(syntheticSource());
+    CHECK(wb.hpcDevice() == HpcDevice::Gpu);
+    const std::uint64_t revision = wb.history().revision();
+    wb.setHpcDevice(HpcDevice::Cpu);
+    CHECK(wb.hpcDevice() == HpcDevice::Cpu);
+    CHECK(wb.history().revision() == revision);   // not an edit: no undo entry
+    CHECK(wb.log().back().find("HPC device: CPU") != std::string::npos);
+
+    ToolApi api(wb);
+    json r = api.call("get_state", json::object());
+    CHECK(r.value("hpc_device", "") == "cpu");
+    r = api.call("set_backend", {{"backend", "HPC"}, {"hpc_device", "gpu"}});
+    CHECK(r.value("backend", "") == "HPC");
+    CHECK(r.value("hpc_device", "") == "gpu");
+    CHECK(wb.backend() == Backend::Hpc);
+    CHECK(wb.hpcDevice() == HpcDevice::Gpu);
+    r = api.call("set_backend", {{"backend", "HPC"}, {"hpc_device", "cpu"}});
+    CHECK(wb.hpcDevice() == HpcDevice::Cpu);
+    CHECK(api.call("get_state", json::object()).value("hpc_device", "") == "cpu");
+    // without hpc_device the choice is kept
+    r = api.call("set_backend", {{"backend", "CPU"}});
+    CHECK(r.value("hpc_device", "") == "cpu");
+    r = api.call("set_backend", {{"backend", "HPC"}, {"hpc_device", "tpu"}});
+    CHECK(r.contains("error"));
+    CHECK(wb.hpcDevice() == HpcDevice::Cpu);
+    CHECK(wb.history().revision() == revision);
+}
+
 TEST_CASE("Prompts are an undoable edit that agents set and read back", "[app][tools][prompt]") {
     registerTestOps();
     Scratch scratch;
@@ -1117,13 +1149,13 @@ TEST_CASE("Workbench runs, caches, displays and reports", "[app][workbench]") {
 
 TEST_CASE("Painting labels on a disk-cached step edits the volume the viewer shows", "[app][workbench][labels]") {
     registerBuiltinOperations();
-    if (!findOperation("threshold")) SKIP("the threshold operation is not registered");
+    if (!findOperation("classic")) SKIP("the classic operation is not registered");
     Scratch scratch;
     Workbench wb(scratch.dir);
     wb.setDataset(syntheticSource(1, 1, 4, 8, 8));
     wb.setBackend(Backend::Cpu);
     while (wb.pipeline().size() > 1) wb.removeStep(1);
-    wb.addStep("threshold");
+    wb.addStep("classic");
     wb.setStepParam(1, "method", std::string("Manual"));
     wb.setStepParam(1, "value", 1e9);   // nothing above: no labels yet
     wb.setStepCache(1, CachePolicy::Disk);
@@ -2815,24 +2847,53 @@ TEST_CASE("A pipeline file with a value its parameter cannot take is refused, na
     const auto write = [](const test::TempFile& file, const std::string& method, const std::string& minVoxels) {
         std::ofstream(file.path) << "version = 1\n"
                                     "[[steps]]\nkind = \"load\"\n"
-                                    "[[steps]]\nkind = \"threshold\"\n[steps.params]\nmethod = \""
+                                    "[[steps]]\nkind = \"classic\"\n[steps.params]\nmethod = \""
                                  << method << "\"\n"
                                  << "min_voxels = " << minVoxels << "\n";
     };
     test::TempFile file("pipeline", ".sirius.toml");
     write(file, "Triangel", "4");
     // was loaded with Otsu in place of the misspelt method, silently
-    CHECK_THROWS_WITH(Pipeline::load(file.str), Catch::Matchers::ContainsSubstring("step 02 (threshold)") &&
+    CHECK_THROWS_WITH(Pipeline::load(file.str), Catch::Matchers::ContainsSubstring("step 02 (classic)") &&
                                                     Catch::Matchers::ContainsSubstring("'Triangel' is not one of"));
     write(file, "otsu", "\"many\"");
     CHECK_THROWS_WITH(Pipeline::load(file.str), Catch::Matchers::ContainsSubstring("min_voxels"));
     write(file, "otsu", "4");   // case is still forgiven
     CHECK(Pipeline::load(file.str).at(1).params.getString("method") == "Otsu");
     // an undo snapshot is read leniently: it is always well formed
-    const json snapshot = {{"steps", json::array({{{"kind", "load"}}, {{"kind", "threshold"}, {"params", {{"method", "Triangel"}}}}})}};
+    const json snapshot = {{"steps", json::array({{{"kind", "load"}}, {{"kind", "classic"}, {"params", {{"method", "Triangel"}}}}})}};
     CHECK(Pipeline::fromJson(snapshot).at(1).params.getString("method") == "Otsu");
     // the pipeline the repository ships loads
     CHECK_NOTHROW(Pipeline::load(SIRIUS_TEST_DATA_DIR "/../../examples/sim_bundled.sirius.toml"));
+}
+
+TEST_CASE("A pipeline with a step SIRIUS removed is refused by name, or dropped from a snapshot", "[app][pipeline]") {
+    registerBuiltinOperations();
+    for (const char* kind : {"threshold", "skimage_seg"}) {
+        INFO(kind);
+        CHECK_FALSE(findOperation(kind));
+        test::TempFile file("pipeline", ".sirius.toml");
+        std::ofstream(file.path) << "version = 1\n"
+                                    "[[steps]]\nkind = \"load\"\n"
+                                    "[[steps]]\nkind = \"contrast\"\n"
+                                    "[[steps]]\nkind = \""
+                                 << kind << "\"\nenabled = false\n[steps.params]\nmethod = \"Otsu\"\n";
+        // not a stand-in that says "missing" (a plugin that is not loaded):
+        // the step is gone for good, and the message says what replaces it
+        CHECK_THROWS_WITH(Pipeline::load(file.str),
+                          Catch::Matchers::ContainsSubstring("step 03 '" + std::string(kind) + "' was removed from SIRIUS (2026-10)") &&
+                              Catch::Matchers::ContainsSubstring("use the classic segmentation step"));
+        CHECK_FALSE(findOperation(kind));   // and no stand-in was registered for it
+        // read leniently, the step is dropped with a warning and the rest kept
+        const json snapshot = {{"steps", json::array({{{"kind", "load"}}, {{"kind", kind}}, {{"kind", "contrast"}}})}};
+        const Pipeline p = Pipeline::fromJson(snapshot);
+        REQUIRE(p.size() == 2);
+        CHECK(p.at(1).kind == "contrast");
+        REQUIRE(p.warnings().size() == 1);
+        CHECK_THAT(p.warnings()[0], Catch::Matchers::ContainsSubstring("step 02 '" + std::string(kind) + "' was removed") &&
+                                        Catch::Matchers::ContainsSubstring("dropped"));
+    }
+    CHECK(Pipeline::fromJson({{"steps", json::array({{{"kind", "load"}}, {{"kind", "contrast"}}})}}).warnings().empty());
 }
 
 TEST_CASE("An edit that changes no value is not an undo entry", "[app][workbench][history][params]") {

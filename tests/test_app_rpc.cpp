@@ -570,6 +570,14 @@ TEST_CASE("the foundation step keeps the labels the worker returns and reports i
         ctx.device = Device::cpu();
         (void)op.run(StepInput{meta, array, nullptr, nullptr}, p, ctx);
         CHECK(sent().value("device", "") == "cpu");
+        // HPC: the session's GPU / CPU choice, with every step
+        ctx.backend = Backend::Hpc;
+        ctx.hpcDevice = HpcDevice::Gpu;
+        (void)op.run(StepInput{meta, array, nullptr, nullptr}, p, ctx);
+        CHECK(sent().value("device", "") == "cuda");
+        ctx.hpcDevice = HpcDevice::Cpu;
+        (void)op.run(StepInput{meta, array, nullptr, nullptr}, p, ctx);
+        CHECK(sent().value("device", "") == "cpu");
     }
     SECTION("a tile with some extents given is sent, zero meaning the bundle's on that axis") {
         p.set("tile", std::vector<double>{0, 32, 32});

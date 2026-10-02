@@ -95,7 +95,6 @@ TOLERANCES = {
     # Copies and selections: the same float32 values move, nothing is
     # computed, so these must agree bit for bit. Measured: 0.
     "croppad": (0.0, 0.0),
-    "threshold": (0.0, 0.0),   # the step returns its input; the labels are the result (compared exactly below)
     # Classical segmentation also returns its input untouched -- the labels
     # carry the result and are compared exactly below, which is what makes
     # this the strict test of the filters, the thresholds and the seeding.

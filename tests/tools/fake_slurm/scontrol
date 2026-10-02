@@ -1,0 +1,12 @@
+#!/bin/bash
+# Fake scontrol: `scontrol -o show partition`, one line per partition (the
+# fields the application reads, and a few around them). $FAKE_SCONTROL_FAIL=1
+# (or a file scontrol.fail in $FAKE_SLURM_DIR) refuses.
+set -u
+if [ "${FAKE_SCONTROL_FAIL:-0}" = 1 ] || [ -f "${FAKE_SLURM_DIR:-/nonexistent}/scontrol.fail" ]; then echo "scontrol: error: Permission denied" >&2; exit 1; fi
+cat <<'OUT'
+PartitionName=cpu AllowGroups=ALL Default=YES MaxTime=7-00:00:00 Nodes=c[01-10] OverSubscribe=NO State=UP TotalCPUs=640
+PartitionName=abc_a100 AllowGroups=abc Default=NO MaxTime=3-00:00:00 Nodes=g[01-04] OverSubscribe=NO State=UP TotalCPUs=128
+PartitionName=dgx AllowGroups=abc Default=NO MaxTime=1-00:00:00 Nodes=dgx01 OverSubscribe=EXCLUSIVE State=UP TotalCPUs=256
+PartitionName=lab_h100 AllowGroups=lab Default=NO MaxTime=2-00:00:00 Nodes=h[01-02] OverSubscribe=FORCE:4 State=UP TotalCPUs=192
+OUT

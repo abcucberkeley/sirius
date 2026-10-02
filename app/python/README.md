@@ -51,8 +51,8 @@ killed leaves no worker behind. See `SECURITY.md` next to this file.
 
 `requirements.txt` is what the worker cannot start without (numpy);
 `requirements-extra.txt` is optional (scipy for label clean-up and
-resampling, scikit-image for the scikit-image segmentation step and some
-plugins). Nothing is pinned. `sirius_worker/__init__.py` holds the same
+resampling, scikit-image for the foundation step's watershed in `latents`
+and some plugins). Nothing is pinned. `sirius_worker/__init__.py` holds the same
 knowledge as import name → distribution tables: `REQUIRED` (`numpy`) and
 `OPTIONAL` (`scipy`, `skimage` → `scikit-image`, `torch`, `huggingface_hub`,
 `onnxruntime`, `cellpose`, `micro_sam`, `btrack`). The C++ side mirrors
@@ -211,7 +211,7 @@ sent, and requests do not carry it.
 | method | params | reply |
 | --- | --- | --- |
 | `hello` | `{protocol_version, client_nonce}` | `result`: `{protocol_version, server_nonce, server_proof}`; `error` on another protocol version, and the connection is closed |
-| `auth` | `{client_proof}` | `result`: `{version, protocol_version, methods, cuda, device, hostname, python, torch, sirius, workbench, encodings, max_clients}`; `error` on a wrong proof (and the connection is closed), or `busy` when every client slot is taken |
+| `auth` | `{client_proof}` | `result`: `{version, protocol_version, methods, cuda, device, hostname, python, torch, sirius, workbench, encodings, max_clients, tiff_reader}` (`tiff_reader`: `{sirius: version or null, nvtiff}`, who reads cluster TIFF datasets: the sirius package, decoding on the GPU when `nvtiff`; null means TIFF cannot be opened); `error` on a wrong proof (and the connection is closed), or `busy` when every client slot is taken |
 | `ping` | | `result`: `{time}` |
 | `model_info` | `{spec}` (or `path`) | `result`: `{format, input_shape, output_shape, dtype, size_bytes, channels_out}` for a file; `{format: "cellpose" \| "micro-sam", available, install_hint, returns: "labels"}` for a model family; `{format: "hf", cached: false, repo, file}` for an `hf:` file not downloaded yet |
 | `hub_search` | `{query, limit?, filter?, token?}` | `result`: `{models: [{id, downloads, likes, tags, last_modified, pipeline_tag, library, gated, private}]}` (Hugging Face, sorted by downloads; `gated` is `"manual"` / `"auto"` for repositories whose terms must be accepted, else `false`) |
@@ -238,7 +238,6 @@ but `hello` is served before a successful `hello`, and `install` and
 | --- | --- | --- | --- |
 | `torch_segment` | `input` (z, y, x) float32 | `prob` (C, z, y, x) float32 -- or, for a model family, `labels` (z, y, x) uint32 and optionally `prob` (1, z, y, x) | `{channels, device}` / `{labels, format, model, device}` |
 | `sim` | `input` (sections, y, x) or (c, t, sections, y, x) float32 | `output` (same rank, zoomed) | `{meta, info: {fits, wiener, ...}}` |
-| `skimage_seg` | `input` (z, y, x) float32 | `labels` (z, y, x) uint32 | `{method, seeds?, labels, note?, device}`; one frame at a time, so the ids start again at 1 in each |
 | `btrack` | `labels` (t, z, y, x) or (t, y, x) uint32 | `labels` (same shape) renumbered by track | `{tracks, objects, divisions, mean_length, longest}` |
 | any other kind | `input` (c, t, z, y, x) float32, optional `labels` (t, z, y, x) uint32 | `output` (c', t', z', y', x') float32, optional `labels`, `prob` | `{meta, info}` |
 
@@ -273,10 +272,6 @@ snapshot of the C++ parameter tables and
 * `merge`: `blend` (`Additive` | `Screen` | `Max`), `colors` (`#rrggbb` per
   channel, empty = the channels' own colours), `weights` (per-channel gain),
   `normalize_percentile` (99.9).
-* `threshold`: `channel`, `method` (`Manual` | `Otsu` | `Percentile`),
-  `value` (the manual cut), `percentile` (90), `post`
-  (`Connected components` | `Watershed (distance)`), `min_voxels` (20),
-  `seed_distance` (5), `class_name`.
 * `classic` (classical segmentation): `channel`, `tophat` (white top-hat
   radius, 0 = off), `sigma`, `method` (`Otsu` | `Manual` | `Percentile` |
   `Local mean`), `value`, `percentile`, `window`, `local_ratio`,

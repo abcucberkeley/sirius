@@ -72,6 +72,12 @@ namespace sirius::app {
         const std::string& host() const noexcept { return host_; }
         // Encodings asked for; "" in a test turns compression off.
         void setAccept(std::vector<std::string> accept);
+        // The "device" every request carries ("cuda", "cpu"): where the
+        // worker decodes the dataset's pages (nvTIFF on the GPU). The HPC
+        // device of the session (Workbench::hpcDevice); empty sends none,
+        // and the worker uses its own. Any thread.
+        void setDevice(std::string device);
+        std::string device() const;
 
         // One request on a lane's connection, made when there is none.
         WorkerResult call(Lane lane, const std::string& method, const nlohmann::json& params,
@@ -97,6 +103,8 @@ namespace sirius::app {
         std::string host_;
         Connect connect_;
         std::vector<std::string> accept_{"zstd", "zlib"};
+        mutable std::mutex deviceMutex_;
+        std::string device_;
         LaneState views_, reads_;
         std::mutex infoMutex_;
         std::map<std::string, DatasetMeta> infos_;

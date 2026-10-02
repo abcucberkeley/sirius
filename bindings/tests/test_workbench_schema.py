@@ -71,8 +71,14 @@ class TestOperationSchema(unittest.TestCase):
 
     def test_snapshot_lists_the_built_in_kinds(self):
         for kind in ("einsum", "maxproj", "meant", "contrast", "flatfield", "bleach", "croppad", "resample", "merge",
-                     "threshold", "classic", "cleanup", "seg", "sim", "load"):
+                     "classic", "cleanup", "seg", "sim", "load"):
             self.assertIn(kind, self.ops)
+
+    def test_removed_kinds_are_gone_from_both_sides(self):
+        for kind in wb._REMOVED:
+            self.assertNotIn(kind, self.ops, f"'{kind}' is listed as removed but the application still registers it")
+            self.assertNotIn(kind, wb._STEPS)
+            self.assertNotIn(kind, wb._UNSUPPORTED)
 
     def test_every_kind_is_implemented_unsupported_or_passthrough(self):
         for kind in self.ops:

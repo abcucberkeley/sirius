@@ -2,8 +2,9 @@
 // against a local stand-in: tests/tools/fake_ssh.py plays OpenSSH's ssh
 // (prompts through SSH_ASKPASS, a SOCKS5 proxy on -D, `bash -s` as the
 // remote shell), tests/tools/fake_slurm plays sbatch / squeue / sacct /
-// scancel and starts the real worker (app/python) on 127.0.0.1. No real ssh
-// is run and no host but this one is contacted.
+// scancel / sinfo / sacctmgr / scontrol / apptainer and starts the real
+// worker (app/python) on 127.0.0.1. No real ssh is run and no host but this
+// one is contacted.
 //
 // Needs a Python ($SIRIUS_PYTHON, else host::findPython) and bash
 // ($SIRIUS_TEST_BASH, else Git's bash on Windows, bash on PATH elsewhere);
@@ -107,7 +108,7 @@ namespace {
             fs::create_directories(bin);
             fs::create_directories(slurm);
             // the tools as LF scripts, whatever the checkout's line endings
-            for (const char* tool : {"sbatch", "squeue", "sacct", "scancel"}) {
+            for (const char* tool : {"sbatch", "squeue", "sacct", "scancel", "sinfo", "sacctmgr", "scontrol", "apptainer"}) {
                 std::string text = readAll(fs::path(SIRIUS_TEST_FAKE_SLURM_DIR) / tool);
                 std::string lf;
                 for (char c : text)
@@ -126,6 +127,12 @@ namespace {
             setEnv("FAKE_SLURM_PENDING_POLLS", "2");
             setEnv("FAKE_SSH_PROMPTS", "[]");
             setEnv("FAKE_SSH_ANSWERS", "[]");
+            setEnv("FAKE_SINFO_FAIL", "0");
+            setEnv("FAKE_SACCTMGR_FAIL", "0");
+            setEnv("FAKE_SCONTROL_FAIL", "0");
+            setEnv("USER", "tester");
+            setEnv("FAKE_CONTAINER_SITE", "");
+            setEnv("FAKE_APPTAINER_DRY", "0");
             setEnv("SIRIUS_WORKBENCH_PY", std::string(SIRIUS_TEST_SOURCE_DIR) + "/bindings/python/sirius/workbench.py");
         }
         ~FakeCluster() {
@@ -624,4 +631,449 @@ TEST_CASE("cluster: a job that dies is noticed and named", "[app][cluster]") {
     CHECK(st.reason.find("CANCELLED") != std::string::npos);
     CHECK(st.sshUp);   // the login is kept: browsing goes on, Connect submits anew
     session.disconnect(false);
+}
+
+// --- the partitions -----------------------------------------------------------------------
+
+namespace {
+    // What clusterInfoScript() prints on a cluster like fiona.
+    const char* kInfoOutput = "@@user tester\n"
+                              "@@sinfo\n"
+                              "cpu*|up|7-00:00:00|6|idle|(null)|64|257000\n"
+                              "cpu*|up|7-00:00:00|4|alloc|(null)|64|257000\n"
+                              "abc_a100|up|3-00:00:00|2|idle|gpu:a100:1(S:0)|32|500000\n"
+                              "abc_a100|up|3-00:00:00|1|mix|gpu:a100:1(S:0)|32|500000\n"
+                              "abc_a100|up|3-00:00:00|1|drain*|gpu:a100:1(S:0)|32|500000\n"
+                              "dgx|up|1-00:00:00|1|mix|gpu:a100:8(S:0-1)|256|1000000\n"
+                              "lab_h100|up|2-00:00:00|2|alloc|gpu:h100:4(S:0,1),shard:h100:16|96+|750000\n"
+                              "a line sinfo would never print\n"
+                              "@@rc 0\n"
+                              "@@assoc\n"
+                              "abc_a100|velatkilic|abc_debug,abc_normal|abc_debug\n"
+                              "abc_a100|abc_lab|abc_normal|\n"
+                              "dgx|abc_lab|dgx_shared|dgx_shared\n"
+                              "cpu|velatkilic||\n"
+                              "@@rc 0\n"
+                              "@@qos\n"
+                              "normal|\n"
+                              "abc_debug|01:00:00\n"
+                              "abc_normal|2-00:00:00\n"
+                              "@@rc 0\n"
+                              "@@scontrol\n"
+                              "PartitionName=cpu Default=YES OverSubscribe=NO State=UP\n"
+                              "PartitionName=dgx Default=NO OverSubscribe=EXCLUSIVE State=UP\n"
+                              "@@rc 0\n"
+                              "@@end\n";
+} // namespace
+
+TEST_CASE("cluster: sinfo, sacctmgr and scontrol are read into partitions", "[app][cluster]") {
+    const cluster::ClusterInfo info = cluster::parseClusterInfo(kInfoOutput);
+    CHECK(info.error.empty());
+    CHECK(info.user == "tester");
+    REQUIRE(info.partitions.size() == 4);
+    const cluster::Partition* cpu = cluster::findPartition(info, "cpu");
+    REQUIRE(cpu);
+    CHECK(cpu->isDefault);
+    CHECK(cpu->nodes == 10);
+    CHECK(cpu->idle == 6);
+    CHECK(cpu->gpusPerNode == 0);
+    CHECK(cpu->cpusPerNode == 64);
+    const cluster::Partition* a100 = cluster::findPartition(info, "abc_a100");
+    REQUIRE(a100);
+    CHECK_FALSE(a100->isDefault);
+    CHECK(a100->nodes == 4);
+    CHECK(a100->idle == 2);
+    CHECK(a100->mixed == 1);   // the drained node, not responding, is neither
+    CHECK(a100->gpusPerNode == 1);
+    CHECK(a100->gpuType == "a100");
+    CHECK(a100->memPerNodeMB == 500000);
+    CHECK(a100->maxTime == "3-00:00:00");
+    CHECK(cluster::partitionSummary(*a100) == "4 nodes (2 idle, 1 partly used) \xC2\xB7 1x A100 per node \xC2\xB7 max 3-00:00:00");
+    CHECK(cluster::partitionWarning(*a100).empty());
+    const cluster::Partition* h100 = cluster::findPartition(info, "lab_h100");
+    REQUIRE(h100);
+    CHECK(h100->gpusPerNode == 4);   // the shards are not GPUs; the socket list's comma splits nothing
+    CHECK(h100->cpusPerNode == 96);
+    CHECK(cluster::partitionSummary(*h100).find("none free") != std::string::npos);
+    const cluster::Partition* dgx = cluster::findPartition(info, "dgx");
+    REQUIRE(dgx);
+    CHECK(dgx->exclusive);
+    CHECK(dgx->gpusPerNode == 8);
+    CHECK(cluster::partitionWarning(*dgx).find("all 8 A100s") != std::string::npos);
+    // a whole-node partition by scontrol alone
+    cluster::Partition whole = *a100;
+    whole.name = "big";
+    whole.exclusive = true;
+    CHECK(cluster::partitionWarning(whole).find("OverSubscribe=EXCLUSIVE") != std::string::npos);
+
+    // the associations
+    CHECK(info.associationsKnown);
+    CHECK(info.exclusiveKnown);
+    CHECK(cluster::hasAssociation(info, "abc_a100"));
+    CHECK(cluster::hasAssociation(info, "cpu"));
+    CHECK_FALSE(cluster::hasAssociation(info, "lab_h100"));
+    CHECK(cluster::accountsFor(info, "abc_a100") == std::vector<std::string>{"velatkilic", "abc_lab"});
+    CHECK(cluster::qosFor(info, "abc_a100", "velatkilic") == std::vector<std::string>{"abc_debug", "abc_normal"});
+    CHECK(cluster::qosFor(info, "cpu", "velatkilic").empty());
+    CHECK(info.qosMaxWall.at("abc_debug") == "01:00:00");
+}
+
+TEST_CASE("cluster: what cannot be asked is unknown, not empty", "[app][cluster]") {
+    // sacctmgr refused, scontrol missing: the partitions are all listed as usable
+    cluster::ClusterInfo info = cluster::parseClusterInfo("@@user u\n@@sinfo\nabc|up|infinite|1|idle|gpu:2|8|1000\n@@rc 0\n"
+                                                          "@@assoc\nsacctmgr: error: Problem talking to the database\n@@rc 1\n"
+                                                          "@@qos\nsacctmgr: error: Problem talking to the database\n@@rc 1\n"
+                                                          "@@scontrol\nbash: scontrol: command not found\n@@rc 127\n@@end\n");
+    CHECK(info.error.empty());
+    REQUIRE(info.partitions.size() == 1);
+    CHECK(info.partitions[0].gpusPerNode == 2);
+    CHECK(info.partitions[0].gpuType.empty());
+    CHECK(cluster::partitionSummary(info.partitions[0]) == "1 node (1 idle) \xC2\xB7 2x GPU per node \xC2\xB7 no time limit");
+    CHECK_FALSE(info.associationsKnown);
+    CHECK_FALSE(info.exclusiveKnown);
+    CHECK(cluster::hasAssociation(info, "abc"));
+    REQUIRE(info.notes.size() == 1);
+    CHECK(info.notes[0].find("Problem talking to the database") != std::string::npos);
+    // sinfo itself failed: why, in its own words
+    info = cluster::parseClusterInfo("@@user u\n@@sinfo\nslurm_load_partitions: Unable to contact slurm controller\n@@rc 1\n@@end\n");
+    CHECK(info.partitions.empty());
+    CHECK(info.error.find("Unable to contact slurm controller") != std::string::npos);
+    // a cut-off answer
+    info = cluster::parseClusterInfo("@@user u\n@@sinfo\nabc|up|1:00:00|1|idle|(null)|8|1000\n");
+    CHECK_FALSE(info.error.empty());
+    CHECK(cluster::parseClusterInfo("").partitions.empty());
+    // the script asks with fixed text only
+    const std::string script = cluster::clusterInfoScript();
+    CHECK(script.find("sinfo -h -o '%P|%a|%l|%D|%t|%G|%c|%m'") != std::string::npos);
+    CHECK(script.find("sacctmgr -n -P show assoc user=\"$u\" format=partition,account,qos,defaultqos") != std::string::npos);
+}
+
+TEST_CASE("cluster: Slurm's times and memory sizes", "[app][cluster]") {
+    CHECK(cluster::slurmTimeSeconds("90") == 90 * 60);
+    CHECK(cluster::slurmTimeSeconds("10:30") == 10 * 60 + 30);
+    CHECK(cluster::slurmTimeSeconds("01:00:00") == 3600);
+    CHECK(cluster::slurmTimeSeconds("2-12") == 2 * 86400 + 12 * 3600);
+    CHECK(cluster::slurmTimeSeconds("2-12:30") == 2 * 86400 + 12 * 3600 + 30 * 60);
+    CHECK(cluster::slurmTimeSeconds("3-00:00:00") == 3 * 86400);
+    CHECK(cluster::slurmTimeSeconds("infinite") == -1);
+    CHECK(cluster::slurmTimeSeconds("UNLIMITED") == -1);
+    CHECK(cluster::slurmTimeSeconds("") == -2);
+    CHECK(cluster::slurmTimeSeconds("1:x:00") == -2);
+    CHECK(cluster::slurmTimeSeconds("1:2:3:4") == -2);
+    CHECK(cluster::slurmTimeText(3600) == "01:00:00");
+    CHECK(cluster::slurmTimeText(3 * 86400 + 61) == "3-00:01:01");
+    CHECK(cluster::memoryMB("64G") == 65536);
+    CHECK(cluster::memoryMB("64GB") == 65536);
+    CHECK(cluster::memoryMB("500M") == 500);
+    CHECK(cluster::memoryMB("1T") == 1024 * 1024);
+    CHECK(cluster::memoryMB("4096") == 4096);
+    CHECK(cluster::memoryMB("lots") == -1);
+    CHECK(cluster::memoryMB("") == -1);
+}
+
+TEST_CASE("cluster: choosing a partition fills the account and QoS and keeps within its nodes", "[app][cluster]") {
+    const cluster::ClusterInfo info = cluster::parseClusterInfo(kInfoOutput);
+    cluster::Profile p;
+    p.account = "someone_else";
+    p.qos = "high";
+    p.time = "2-00:00:00";
+    p.gpus = 4;
+    p.cpus = 64;
+    p.mem = "1T";
+    std::vector<std::string> changed = cluster::choosePartition(p, info, "abc_a100");
+    CHECK(p.partition == "abc_a100");
+    CHECK(p.account == "velatkilic");   // the partition's first association
+    CHECK(p.qos == "abc_debug");        // its default QoS
+    CHECK(p.time == "01:00:00");        // abc_debug's MaxWall, below the partition's 3 days
+    CHECK(p.gpus == 1);
+    CHECK(p.cpus == 32);
+    CHECK(p.mem == "488G");             // a node's 500000 MB
+    CHECK(changed.size() == 6);
+
+    // the profile's own account and QoS stay when the association has them
+    p.account = "abc_lab";
+    p.qos = "abc_normal";
+    p.time = "12:00:00";
+    changed = cluster::choosePartition(p, info, "abc_a100");
+    CHECK(p.account == "abc_lab");
+    CHECK(p.qos == "abc_normal");
+    CHECK(p.time == "12:00:00");
+    CHECK(changed.empty());
+
+    // an account without that partition: the one that has it
+    p.account = "velatkilic";
+    changed = cluster::choosePartition(p, info, "dgx");
+    CHECK(p.account == "abc_lab");
+    CHECK(p.qos == "dgx_shared");
+    CHECK(p.time == "12:00:00");   // dgx_shared has no MaxWall here; the partition allows a day
+
+    // an association with no QoS of its own: none is asked for
+    p.qos = "abc_debug";
+    cluster::choosePartition(p, info, "cpu");
+    CHECK(p.account == "velatkilic");
+    CHECK(p.qos.empty());
+
+    // no association: the account and QoS are the user's to type; the nodes still bound the rest
+    p.account = "mine";
+    p.qos = "q";
+    p.gpus = 8;
+    cluster::choosePartition(p, info, "lab_h100");
+    CHECK(p.account == "mine");
+    CHECK(p.qos == "q");
+    CHECK(p.gpus == 4);
+
+    // a partition sinfo does not list (typed by hand): only the name changes
+    p.gpus = 8;
+    CHECK(cluster::choosePartition(p, info, "elsewhere").empty());
+    CHECK(p.partition == "elsewhere");
+    CHECK(p.gpus == 8);
+}
+
+TEST_CASE("cluster: the profile remembers the Slurm choice of each host", "[app][cluster]") {
+    cluster::Profile p;
+    p.host = "fiona";
+    p.partition = "dgx";
+    p.account = "abc_lab";
+    p.qos = "dgx_shared";
+    p.time = "02:00:00";
+    p.remember();
+    p.host = "other";
+    p.partition = "gpu";
+    p.account = "me";
+    p.qos = "";
+    p.time = "00:30:00";
+    p.remember();
+    const cluster::Profile back = cluster::Profile::fromJson(p.toJson());
+    REQUIRE(back.perHost.size() == 2);
+    cluster::Profile q = back;
+    CHECK(q.recall("fiona"));
+    CHECK(q.partition == "dgx");
+    CHECK(q.account == "abc_lab");
+    CHECK(q.qos == "dgx_shared");
+    CHECK(q.time == "02:00:00");
+    CHECK_FALSE(q.recall("nowhere"));
+    CHECK(q.partition == "dgx");
+    CHECK(q.recall("other"));
+    CHECK(q.partition == "gpu");
+    CHECK(q.qos.empty());
+    // an old profile without the map reads as before
+    const cluster::Profile old = cluster::Profile::fromJson(nlohmann::json{{"host", "fiona"}, {"partition", "abc_a100"}});
+    CHECK(old.perHost.empty());
+    CHECK(old.partition == "abc_a100");
+}
+
+TEST_CASE("cluster: log in lists the partitions and submits nothing", "[app][cluster]") {
+    FakeCluster fc;
+    if (!fc.usable()) SKIP("no Python or bash for the fake ssh");
+    cluster::Session session;
+    session.setAskpassProgram(SIRIUS_TEST_ASKPASS);
+    cluster::Profile p;
+    p.host = "fakecluster";
+    p.sshProgram = fc.python;
+    p.sshProgramArgs = {SIRIUS_TEST_FAKE_SSH};
+    CHECK_FALSE(session.clusterInfo());
+    session.logIn(p);
+    REQUIRE(waitFor([&] { return session.status().state != cluster::State::Connecting; }, std::chrono::seconds(60)));
+    cluster::Status st = session.status();
+    INFO(st.reason);
+    CHECK(st.state == cluster::State::Idle);
+    CHECK(st.sshUp);
+    CHECK(st.steps[0].status == cluster::StepStatus::Done);
+    for (int i = 1; i < cluster::kStepCount; ++i) CHECK(st.steps[static_cast<std::size_t>(i)].status == cluster::StepStatus::Pending);
+    std::optional<cluster::ClusterInfo> info = session.clusterInfo();
+    REQUIRE(info);
+    CHECK(info->host == "fakecluster");
+    CHECK(info->user == "tester");
+    CHECK(info->error.empty());
+    CHECK(info->partitions.size() == 4);
+    CHECK(info->associationsKnown);
+    CHECK(info->exclusiveKnown);
+    CHECK(cluster::findPartition(*info, "dgx")->exclusive);
+    CHECK_FALSE(cluster::hasAssociation(*info, "lab_h100"));
+    // the user's name was the cluster's own
+    CHECK(readAll(fc.slurm / "sacctmgr.args").find("user=tester ") != std::string::npos);
+    // nothing was submitted
+    CHECK_FALSE(fs::exists(fc.slurm / "next"));
+    CHECK_FALSE(session.hasJob());
+
+    // Refresh, with the accounting refused: the partitions stay, the associations are unknown
+    std::ofstream(fc.slurm / "sacctmgr.fail") << "1";   // the session is open: its environment is set
+    const cluster::ClusterInfo again = session.refreshClusterInfo();
+    CHECK(again.partitions.size() == 4);
+    CHECK_FALSE(again.associationsKnown);
+    CHECK(cluster::hasAssociation(again, "lab_h100"));
+    CHECK_FALSE(again.notes.empty());
+    CHECK_FALSE(session.queryingClusterInfo());
+    // sinfo refused: said why
+    std::ofstream(fc.slurm / "sinfo.fail") << "1";
+    CHECK(session.refreshClusterInfo().error.find("Unable to contact slurm controller") != std::string::npos);
+    session.disconnect(false);
+    // the last answer is kept after the disconnect
+    REQUIRE(session.clusterInfo());
+    CHECK_THROWS_AS(session.refreshClusterInfo(), ssh::SshError);
+}
+
+// --- the worker in a container image ------------------------------------------------------
+
+namespace {
+    // A checkout on the "cluster": the worker package and the job template.
+    void copyCheckout(const fs::path& checkout) {
+        fs::create_directories(checkout / "app" / "python");
+        for (const char* d : {"sirius_worker", "slurm"})
+            fs::copy(fs::path(SIRIUS_TEST_SOURCE_DIR) / "app" / "python" / d, checkout / "app" / "python" / d,
+                     fs::copy_options::recursive | fs::copy_options::skip_existing);
+    }
+
+    // A stand-in for the image's packages: a sirius that imports.
+    fs::path containerSite(const FakeCluster& fc) {
+        const fs::path site = fc.root / "image-site";
+        fs::create_directories(site / "sirius");
+        std::ofstream(site / "sirius" / "__init__.py") << "__version__ = '0-test'\n";
+        return site;
+    }
+
+    cluster::Profile containerProfile(const FakeCluster& fc, const std::string& image) {
+        cluster::Profile p;
+        p.host = "fakecluster";
+        p.sshProgram = fc.python;
+        p.sshProgramArgs = {SIRIUS_TEST_FAKE_SSH};
+        p.checkout = "~/sirius";
+        p.venv = "~/no-such-venv";   // ignored with a container
+        p.container = image;
+        p.port = ssh::freeLocalPort();
+        return p;
+    }
+
+    cluster::Status connectUntilSettled(cluster::Session& session, const cluster::Profile& p) {
+        session.connect(p);
+        waitFor([&] { return session.status().state != cluster::State::Connecting; }, std::chrono::seconds(180));
+        return session.status();
+    }
+} // namespace
+
+TEST_CASE("cluster: the profile keeps the container image and its launcher", "[app][cluster]") {
+    cluster::Profile p;
+    CHECK(p.container.empty());
+    CHECK(p.launcher == "apptainer");
+    p.container = "/clusterfs/nvme2/Users/u/sirius-worker.sif";
+    p.launcher = "singularity";
+    const cluster::Profile back = cluster::Profile::fromJson(p.toJson());
+    CHECK(back.container == p.container);
+    CHECK(back.launcher == "singularity");
+    CHECK(cluster::Profile::fromJson(nlohmann::json{{"launcher", ""}}).launcher == "apptainer");
+}
+
+TEST_CASE("cluster: the checks of a container image say what is wrong and never suggest pip", "[app][cluster]") {
+    FakeCluster fc;
+    if (!fc.usable()) SKIP("no Python or bash for the fake ssh");
+    copyCheckout(fc.home / "sirius");
+    std::ofstream(fc.home / "broken.sif") << "broken\n";
+    std::ofstream(fc.home / "empty.sif") << "an image without sirius\n";
+    cluster::Session session;
+    session.setPollInterval(std::chrono::milliseconds(200), std::chrono::milliseconds(500));
+    auto checksFailed = [](const cluster::Status& st) {
+        return st.state == cluster::State::Disconnected && st.steps[static_cast<int>(cluster::Step::Checks)].status == cluster::StepStatus::Failed;
+    };
+
+    // no image there
+    cluster::Status st = connectUntilSettled(session, containerProfile(fc, "~/missing.sif"));
+    INFO(st.reason);
+    CHECK(checksFailed(st));
+    CHECK(st.reason.find("no container image at ~/missing.sif") != std::string::npos);
+    CHECK(st.fix.find("Build the SIRIUS worker image") != std::string::npos);
+    CHECK(st.fix.find("pip") == std::string::npos);
+
+    // an image that does not open
+    st = connectUntilSettled(session, containerProfile(fc, "~/broken.sif"));
+    CHECK(checksFailed(st));
+    CHECK(st.reason.find("cannot run the worker") != std::string::npos);
+    CHECK(st.remoteOutput.find("squashfs") != std::string::npos);
+    CHECK(st.fix.find("pip") == std::string::npos);
+
+    // an image without the sirius package (the checkout's folder named sirius does not count)
+    st = connectUntilSettled(session, containerProfile(fc, "~/empty.sif"));
+    CHECK(checksFailed(st));
+    CHECK(st.reason.find("sirius and numpy do not import") != std::string::npos);
+    CHECK(st.remoteOutput.find("not the compiled package") != std::string::npos);
+
+    // neither apptainer nor singularity
+    fs::remove(fc.bin / "apptainer");
+    st = connectUntilSettled(session, containerProfile(fc, "~/empty.sif"));
+    CHECK(checksFailed(st));
+    CHECK(st.reason.find("Neither apptainer nor singularity") != std::string::npos);
+    CHECK_FALSE(fs::exists(fc.slurm / "next"));   // nothing was submitted
+    session.disconnect(false);
+}
+
+TEST_CASE("cluster: the job template runs the worker in the container", "[app][cluster]") {
+    FakeCluster fc;
+    if (!fc.usable()) SKIP("no Python or bash for the fake ssh");
+    copyCheckout(fc.home / "sirius");
+    std::ofstream(fc.home / "w.sif") << "image\n";
+    // only singularity on this "cluster": apptainer, the default, is not found
+    fs::rename(fc.bin / "apptainer", fc.bin / "singularity");
+    ssh::Session s;
+    s.open(fc.options(), {}, std::chrono::seconds(60));
+    // the real sirius_worker.sbatch, run by bash as Slurm would (the fake launcher runs nothing)
+    const std::string job = "cd ~/sirius && mkdir -p ~/.sirius/run && export FAKE_APPTAINER_DRY=1 SIRIUS_CONTAINER=\"$HOME/w.sif\" "
+                            "SIRIUS_TOKEN_FILE=\"$HOME/.sirius/run/token.x\" SLURM_SUBMIT_DIR=\"$PWD\" && ";
+    ssh::CommandResult r = s.run(job + "bash app/python/slurm/sirius_worker.sbatch");
+    INFO(r.out << "\n"
+               << r.err);
+    CHECK(r.ok());
+    std::string args = readAll(fc.slurm / "apptainer.args");
+    // the environment (and so the token's file name) goes in through a private --env-file, never argv
+    CHECK(args.rfind("singularity exec --nv --cleanenv ", 0) == 0);
+    CHECK(args.find("--env-file ") != std::string::npos);
+    CHECK(args.find("SIRIUS_TOKEN") == std::string::npos);
+    CHECK(args.find("w.sif python -m sirius_worker --host 0.0.0.0 --port 0 --device cuda --max-clients 8") != std::string::npos);
+    // a CPU job gets no --nv
+    fs::remove(fc.slurm / "apptainer.args");
+    r = s.run(job + "SIRIUS_DEVICE=cpu bash app/python/slurm/sirius_worker.sbatch");
+    CHECK(r.ok());
+    args = readAll(fc.slurm / "apptainer.args");
+    CHECK(args.find("--nv") == std::string::npos);
+    CHECK(args.find("--device cpu") != std::string::npos);
+    // no launcher at all: said so, nothing run
+    fs::remove(fc.bin / "singularity");
+    r = s.run(job + "bash app/python/slurm/sirius_worker.sbatch");
+    CHECK_FALSE(r.ok());
+    CHECK(r.err.find("neither apptainer nor singularity") != std::string::npos);  // the message names both
+    s.close();
+}
+
+TEST_CASE("cluster: connect runs the worker in the container image", "[app][cluster]") {
+    FakeCluster fc;
+    if (!fc.usable()) SKIP("no Python or bash for the fake ssh");
+    if (!pythonHas(fc.python, "numpy")) SKIP("no numpy in " + fc.python + " for the worker");
+    copyCheckout(fc.home / "sirius");
+    std::ofstream(fc.home / "sirius-worker.sif") << "image\n";
+    setEnv("FAKE_CONTAINER_SITE", containerSite(fc).string());
+    setEnv("FAKE_SLURM_PENDING_POLLS", "0");
+    cluster::Session session;
+    session.setPollInterval(std::chrono::milliseconds(200), std::chrono::milliseconds(500));
+    cluster::Profile p = containerProfile(fc, "~/sirius-worker.sif");
+    p.gpus = 0;
+    const cluster::Status st = connectUntilSettled(session, p);
+    INFO(st.reason << "\n"
+                   << st.remoteOutput);
+    REQUIRE(st.state == cluster::State::Connected);
+    const std::string checks = st.steps[static_cast<int>(cluster::Step::Checks)].detail;
+    CHECK(checks.find("apptainer") != std::string::npos);
+    CHECK(checks.find("sirius, numpy") != std::string::npos);
+    // the job was told the image and the launcher, not the venv
+    const std::string env = readAll(fc.slurm / "4711.env");
+    CHECK(env.find("SIRIUS_CONTAINER=") != std::string::npos);
+    CHECK(env.find("sirius-worker.sif") != std::string::npos);
+    CHECK(env.find("SIRIUS_LAUNCHER=apptainer") != std::string::npos);
+    CHECK(env.find("SIRIUS_VENV") == std::string::npos);
+    CHECK(env.find("SIRIUS_DEVICE=cpu") != std::string::npos);
+    // the worker ran through the launcher, the token file read from the bound ~/.sirius/run
+    const std::string args = readAll(fc.slurm / "apptainer.args");
+    CHECK(args.find("--bind") != std::string::npos);
+    CHECK(args.find("python -m sirius_worker") != std::string::npos);
+    CHECK(args.find("--nv") == std::string::npos);
+    for (const auto& entry : fs::directory_iterator(fc.home / ".sirius" / "run")) CHECK(entry.path().filename().string().rfind("token.", 0) != 0);
+    session.disconnect(true);
+    setEnv("FAKE_CONTAINER_SITE", "");
 }

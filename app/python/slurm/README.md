@@ -11,10 +11,29 @@ window, with one SSH login:
 
 - **Profile**: the SSH host (an alias of your `~/.ssh/config`, e.g. `fiona`,
   ProxyJump and all), the SIRIUS checkout on the cluster (default
-  `~/dev/sirius`), the Python environment to activate (default
-  `~/venvs/sirius`), and the job's partition, account, QoS, time, GPUs, CPUs
-  and memory (fiona's test GPUs by default: `abc_a100`, `velatkilic`,
-  `abc_debug`, one hour). It is remembered.
+  `~/dev/sirius`), a container image to run the worker in (see *In a
+  container* below; empty by default) or else the Python environment to
+  activate (default `~/venvs/sirius`), and the job's partition, account,
+  QoS, time, GPUs, CPUs and memory (fiona's test GPUs by default:
+  `abc_a100`, `velatkilic`, `abc_debug`, one hour). It is remembered, and so
+  are the partition, account, QoS and time last used on each host.
+- **Partitions**: once logged in (*Log in* under the Slurm fields logs in
+  and lists without submitting anything; Connect lists them too), the
+  Partition field is a list of the cluster's partitions -- those you have an
+  association for first, the others greyed with "no association" -- each
+  with its nodes (how many are idle), GPUs per node and time limit. Picking
+  one fills the account and QoS from your association (a list when there
+  are several) and keeps the time, GPUs, CPUs and memory within what its
+  nodes and the QoS allow; anything can still be typed by hand. A partition
+  whose jobs take whole nodes (`OverSubscribe=EXCLUSIVE` in `scontrol`) or
+  whose name says DGX (the GPUs of fiona's `dgx` are not isolated per job:
+  the worker takes all eight A100s from the whole group) shows a warning.
+  The commands, fixed text with the user name resolved on the cluster:
+  `sinfo -h -o '%P|%a|%l|%D|%t|%G|%c|%m'`,
+  `sacctmgr -n -P show assoc user="$USER" format=partition,account,qos,defaultqos`,
+  `sacctmgr -n -P show qos format=name,maxwall` and
+  `scontrol -o show partition` (only sinfo has to answer). *Refresh* asks
+  again.
 - **Connect** starts the system's OpenSSH once
   (`ssh -T -o NumberOfPasswordPrompts=1 -o BatchMode=no -D 127.0.0.1:<port> <host> bash -l -s`):
   a password or one-time code prompt is shown in the application and handed
@@ -29,12 +48,25 @@ window, with one SSH login:
 - The status bar keeps saying whether it is connected; a job that ends
   (TIMEOUT, CANCELLED) or a connection that drops is reported with the
   reason. *Disconnect…* (and quitting) asks whether to `scancel` the job.
+- *Cluster device: GPU | CPU*, beside the backend tiles when HPC is
+  selected (and in *Preferences ▸ Compute*; `sirius-cli --hpc-device`,
+  `set_backend`'s `hpc_device`), says where the worker computes. Every step
+  and every dataset read carries it as `"device": "cuda"` / `"cpu"`, and the
+  worker honours it per request over its own `--device`, so switching needs
+  no new job. A job without a GPU (GPUs 0, so `SIRIUS_DEVICE=cpu`, or no
+  CUDA on the node) greys out GPU; a GPU asked of it anyway fails with
+  "this worker job has no GPU; choose CPU or reconnect with GPUs >= 1".
 
 Install once, on the cluster: the checkout at the profile's path (the same
 version as the application), and in the venv
-`pip install -r app/python/requirements.txt tifffile` (tifffile lets the
-worker read TIFF datasets for *File ▸ Open from cluster…*; torch for
-segmentation models). The job runs this directory's `sirius_worker.sbatch`
+`pip install -r app/python/requirements.txt` and the `sirius` package built
+from the checkout, `pip install ~/dev/sirius` (the checkout's path: it
+compiles SIRIUS's C++ TIFF reader, which the worker reads TIFF / OME-TIFF
+datasets for *File ▸ Open from cluster…* with -- there is no other TIFF
+reader, so without it only `.npy` datasets open; on a GPU node add
+`--config-settings=cmake.define.SIRIUS_ENABLE_CUDA=ON` to decode with nvTIFF
+on the GPU; hello's `tiff_reader` says which it got), and torch for
+segmentation models. The job runs this directory's `sirius_worker.sbatch`
 with the profile's options on the `sbatch` command line and `SIRIUS_VENV`,
 `SIRIUS_PORT=0` and `SIRIUS_MAX_CLIENTS` in its environment. The token is not
 there (Slurm's accounting may store a job's environment): the application
@@ -43,6 +75,32 @@ directory, the file `0600`) and the job gets only the file's name in
 `SIRIUS_TOKEN_FILE`; the worker deletes the file as it starts. The job's log
 is `~/.sirius/run/sirius-worker-<jobid>.log`, and the worker takes a free port,
 which it announces there (`../SECURITY.md`).
+
+### In a container
+
+With a **container image** in the profile (an Apptainer/Singularity `.sif`
+holding the compiled `sirius` package with CUDA/nvTIFF, numpy and torch;
+*Browse…* picks one among the cluster's files) the venv is not used: the job
+gets `SIRIUS_CONTAINER=<image>` and `SIRIUS_LAUNCHER` (default `apptainer`),
+and `sirius_worker.sbatch` runs
+
+```
+apptainer exec --nv --bind <checkout> --bind ~/.sirius/run <image> python -m sirius_worker ...
+```
+
+`--nv` only when the job has GPUs (not for `SIRIUS_DEVICE=cpu`); the worker's
+code comes from the checkout (on `PYTHONPATH`, which the container inherits),
+and the token file is read and deleted in `~/.sirius/run` as without a
+container. When the launcher is not on `PATH`, `module load` of it (then of
+`apptainer`, `singularity`) is tried, and then the other of the two.
+`SIRIUS_CONTAINER_BIND` adds binds of your own (comma separated: a data file
+system your site does not bind into every container already). The checks
+step makes sure the image is there and runs
+`<launcher> exec <image> python -c "import sirius, numpy"` on the login node;
+when that fails, the image itself has to be rebuilt (or the current one
+asked for): nothing is installed into it from the application.
+
+By hand: `SIRIUS_CONTAINER=/path/sirius-worker.sif SIRIUS_TOKEN_FILE=... sbatch ... app/python/slurm/sirius_worker.sbatch`.
 
 The manual way follows: for `sirius-cli`, or a cluster the dialog does not fit.
 

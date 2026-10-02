@@ -190,6 +190,7 @@ namespace sirius::app {
                              {"viewed_step", wb_.viewedIndex() + 1},
                              {"view", wb_.viewState().toJson()},
                              {"backend", toString(wb_.backend())},
+                             {"hpc_device", lower(toString(wb_.hpcDevice()))},
                              {"running", wb_.running()},
                              {"can_undo", wb_.history().canUndo()},
                              {"undo_label", wb_.history().undoLabel()}};
@@ -613,14 +614,26 @@ namespace sirius::app {
                  actions_.push_back({ActionRecord::Kind::Edit, "Redid: " + label, "", {}, "redo"});
                  return json{{"ok", true}, {"redone", label}};
              }});
-        add({"set_backend", "Compute backend for runs: CUDA, CPU or HPC.",
-             obj({{"backend", {{"type", "string"}, {"enum", {"CUDA", "CPU", "HPC"}}}}}, {"backend"}),
+        add({"set_backend",
+             "Compute backend for runs: CUDA, CPU or HPC. hpc_device picks where the HPC worker computes, its job's GPU or its "
+             "CPU; it is kept until changed and switches without a new job.",
+             obj({{"backend", {{"type", "string"}, {"enum", {"CUDA", "CPU", "HPC"}}}},
+                  {"hpc_device", {{"type", "string"}, {"enum", {"gpu", "cpu"}}}}},
+                 {"backend"}),
              [this](const json& a) {
                  auto b = backendFromString(a.value("backend", ""));
                  if (!b) throw std::invalid_argument("backend must be CUDA, CPU or HPC");
+                 std::optional<HpcDevice> d;
+                 if (a.contains("hpc_device")) {
+                     d = a["hpc_device"].is_string() ? hpcDeviceFromString(a["hpc_device"].get<std::string>()) : std::nullopt;
+                     if (!d) throw std::invalid_argument("hpc_device must be gpu or cpu");
+                 }
                  wb_.setBackend(*b);
-                 actions_.push_back({ActionRecord::Kind::Param, std::string("Backend → ") + toString(*b), "", {}, "set_backend"});
-                 return json{{"backend", toString(*b)}};
+                 if (d) wb_.setHpcDevice(*d);
+                 std::string text = std::string("Backend → ") + toString(*b);
+                 if (*b == Backend::Hpc) text += std::string(" · ") + toString(wb_.hpcDevice());
+                 actions_.push_back({ActionRecord::Kind::Param, text, "", {}, "set_backend"});
+                 return json{{"backend", toString(*b)}, {"hpc_device", lower(toString(wb_.hpcDevice()))}};
              }});
         add({"load_example_pipeline", "Replace the stack with the example pipeline (SIM → einsum → contrast → merge → segment → volume).",
              obj({}), [this](const json&) {

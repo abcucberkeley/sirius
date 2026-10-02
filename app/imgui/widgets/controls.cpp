@@ -1119,7 +1119,16 @@ namespace sirius::app::gui::widgets {
     }
 
     bool editableCombo(const char* id, std::string* value, const std::vector<std::string>& items, const FieldOpts& o) {
+        std::vector<ComboItem> rows;
+        rows.reserve(items.size());
+        for (const std::string& i : items) rows.push_back(ComboItem{i, {}, false});
+        return editableCombo(id, value, rows, o, nullptr);
+    }
+
+    bool editableCombo(const char* id, std::string* value, const std::vector<ComboItem>& items, const FieldOpts& o, bool* picked,
+                       float popupWidth) {
         bool changed = false;
+        if (picked) *picked = false;
         ImGui::PushID(id);
         const float arrow = theme::snap(px(24));
         ImVec2 min, max;
@@ -1148,8 +1157,9 @@ namespace sirius::app::gui::widgets {
         layout.restore();
         {
             const PopupLook look;
+            const float w = std::max(max.x - min.x, popupWidth > 0.0f ? px(popupWidth) : 0.0f);
             ImGui::SetNextWindowPos(ImVec2(min.x, max.y));
-            ImGui::SetNextWindowSizeConstraints(ImVec2(max.x - min.x, 0), ImVec2(max.x - min.x, px(320)));
+            ImGui::SetNextWindowSizeConstraints(ImVec2(w, 0), ImVec2(w, px(360)));
             if (ImGui::BeginPopup("##items")) {
                 if (items.empty()) {
                     ImGui::Dummy(px(0, 4));
@@ -1158,12 +1168,36 @@ namespace sirius::app::gui::widgets {
                     ImGui::Dummy(px(0, 4));
                 }
                 for (std::size_t i = 0; i < items.size(); ++i) {
+                    const ComboItem& item = items[i];
                     ImGui::PushID(static_cast<int>(i));
-                    if (popupItem(items[i], items[i] == *value)) {
-                        if (*value != items[i]) {
-                            *value = items[i];
+                    const bool selected = item.value == *value;
+                    bool clicked = false;
+                    if (item.detail.empty() && !item.dimmed) {
+                        clicked = popupItem(item.value, selected);
+                    } else {
+                        // the name, and its detail on a line of its own below
+                        const ImVec2 p = ImGui::GetCursorScreenPos();
+                        const float h = theme::snap(px(item.detail.empty() ? 26.0f : 40.0f));
+                        clicked = ImGui::Selectable("##row", selected, ImGuiSelectableFlags_None, ImVec2(0, h));
+                        const float rw = ImGui::GetItemRectSize().x;
+                        ImDrawList* dl = ImGui::GetWindowDrawList();
+                        const ImU32 ink = item.dimmed ? theme::kNeutral500 : theme::kText;
+                        const float top = item.detail.empty() ? p.y : p.y + px(3);
+                        const float nameH = item.detail.empty() ? h : px(19);
+                        drawTextIn(dl, ImVec2(p.x + px(8), top), ImVec2(p.x + rw - px(8), top + nameH), item.value, 12, ink,
+                                   selected ? Weight::SemiBold : Weight::Regular, 0.0f, 0.5f);
+                        if (!item.detail.empty())
+                            drawTextIn(dl, ImVec2(p.x + px(8), top + nameH), ImVec2(p.x + rw - px(8), p.y + h - px(3)),
+                                       elideText(item.detail, rw - px(16), 11), 11, item.dimmed ? theme::kNeutral500 : theme::kNeutral600,
+                                       Weight::Regular, 0.0f, 0.5f);
+                        if (selected) ImGui::SetItemDefaultFocus();
+                    }
+                    if (clicked) {
+                        if (*value != item.value) {
+                            *value = item.value;
                             changed = true;
                         }
+                        if (picked) *picked = true;
                         ImGui::CloseCurrentPopup();
                     }
                     ImGui::PopID();

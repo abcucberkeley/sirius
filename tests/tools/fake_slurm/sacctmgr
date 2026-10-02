@@ -1,0 +1,29 @@
+#!/bin/bash
+# Fake sacctmgr: `sacctmgr -n -P show assoc user=<u> format=partition,account,qos,defaultqos`
+# and `sacctmgr -n -P show qos format=name,maxwall`. $FAKE_SACCTMGR_FAIL=1
+# (or a file sacctmgr.fail in $FAKE_SLURM_DIR) refuses both, as a site that
+# hides its accounting does.
+set -u
+[ -n "${FAKE_SLURM_DIR:-}" ] && printf '%s\n' "$*" >> "$FAKE_SLURM_DIR/sacctmgr.args"
+if [ "${FAKE_SACCTMGR_FAIL:-0}" = 1 ] || [ -f "${FAKE_SLURM_DIR:-/nonexistent}/sacctmgr.fail" ]; then
+    echo "sacctmgr: error: Problem talking to the database: Connection refused" >&2
+    exit 1
+fi
+case " $* " in
+    *" assoc "*)
+        cat <<'OUT'
+abc_a100|velatkilic|abc_debug,abc_normal|abc_debug
+abc_a100|abc_lab|abc_normal|
+dgx|abc_lab|dgx_shared|dgx_shared
+cpu|velatkilic||
+OUT
+        ;;
+    *" qos "*)
+        cat <<'OUT'
+normal|
+abc_debug|01:00:00
+abc_normal|2-00:00:00
+dgx_shared|04:00:00
+OUT
+        ;;
+esac

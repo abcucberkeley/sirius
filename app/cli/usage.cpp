@@ -493,7 +493,7 @@ namespace sirius::cli {
                "1024 px unless max_size says otherwise), statistics, probe, get_diagnostics -> export_result /\n"
                "save_pipeline. Step 1 is always Load; address steps by number (1 = Load) or name. Relative paths resolve\n"
                "against the server's working directory (get_state.cwd); prefer absolute paths. Steps that need Python\n"
-               "(segmentation models, scikit-image, btrack tracking, plugins) use the Python worker: if a tool reports\n"
+               "(segmentation models, btrack tracking, plugins) use the Python worker: if a tool reports\n"
                "worker_unavailable, ask the user to run `sirius-cli worker setup --yes` (it downloads numpy from\n"
                "pypi.org) instead of working around it.";
     }

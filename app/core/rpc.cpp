@@ -697,7 +697,11 @@ namespace sirius::app {
             for (const json& e : r["encodings"])
                 if (e.is_string()) caps_.encodings.push_back(e.get<std::string>());
         if (r.contains("max_clients") && r["max_clients"].is_number_integer()) caps_.maxClients = r["max_clients"].get<int>();
-        if (r.contains("tifffile") && r["tifffile"].is_string()) caps_.tifffile = r["tifffile"].get<std::string>();
+        if (r.contains("tiff_reader") && r["tiff_reader"].is_object()) {
+            const json& tr = r["tiff_reader"];
+            if (tr.contains("sirius") && tr["sirius"].is_string()) caps_.tiffReader = tr["sirius"].get<std::string>();
+            if (tr.contains("nvtiff") && tr["nvtiff"].is_boolean()) caps_.nvtiff = tr["nvtiff"].get<bool>();
+        }
     }
 
     RemoteWorker::~RemoteWorker() { close(); }

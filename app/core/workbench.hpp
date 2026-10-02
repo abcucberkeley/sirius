@@ -408,6 +408,12 @@ namespace sirius::app {
         static constexpr int kAllCudaDevices = -1;
         int cudaDevice() const noexcept { return cudaDevice_; }
         void setCudaDevice(int index);
+        // Backend::Hpc: the worker job's GPU or its CPU, sent with every
+        // request (StepContext::hpcDevice), so a switch needs no new job.
+        // Session state, not the pipeline's: no undo entry, and no step goes
+        // stale (a result does not depend on where it was computed).
+        HpcDevice hpcDevice() const noexcept { return hpcDevice_; }
+        void setHpcDevice(HpcDevice d);
         const RemoteConfig& remoteConfig() const noexcept { return remote_; }
         void setRemoteConfig(RemoteConfig c);
         // Steps that need the Python worker (Operation::needsWorker) get a
@@ -557,6 +563,7 @@ namespace sirius::app {
         int viewed_ = 1;
         Backend backend_ = Backend::Cuda;
         int cudaDevice_ = 0;
+        HpcDevice hpcDevice_ = HpcDevice::Gpu;
         RemoteConfig remote_;
         std::shared_ptr<RunJob> activeRun_;
         std::vector<std::string> log_;

@@ -47,6 +47,7 @@ __all__ = [
     "AXES",
     "Cancelled",
     "NotAvailable",
+    "RemovedStep",
     "StepResult",
     "StepSpec",
     "UnknownParameterWarning",
@@ -54,12 +55,16 @@ __all__ = [
     "load_model",
     "model_cache_dir",
     "model_info",
+    "removed_step_message",
     "resolve_device",
     "resolve_model_spec",
     "run_pipeline",
     "run_step",
     "step_kinds",
     "step_spec",
+    "tiff_dims",
+    "tiff_tags",
+    "tiff_voxel",
     "tiled_inference",
 ]
 
@@ -72,6 +77,11 @@ CancelFn = Optional[Callable[[], bool]]
 class NotAvailable(NotImplementedError):
     """A step cannot run here: a dependency is missing or the kind is not
     implemented in Python. The message names the step and what is missing."""
+
+
+class RemovedStep(ValueError):
+    """A pipeline names a step kind SIRIUS no longer has (``_REMOVED``); the
+    message names the step and what to use instead."""
 
 
 class Cancelled(RuntimeError):
@@ -665,13 +675,10 @@ def _resolution(tags, name: str) -> float:
 def _tiff_probe(path: str) -> Dict[str, Any]:
     """What ``probeTiff`` reads before deciding anything: the number of
     full-resolution pages, the first page's ImageDescription and resolution
-    tags, and its pixel type. tifffile reads the tags; the page count comes
-    from the sirius extension when it is there (the application's own
-    reader), else from tifffile skipping reduced-resolution pages."""
-    try:
-        import tifffile  # type: ignore
-    except ImportError:
-        tifffile = None
+    tags, and its pixel type. The sirius extension (the application's own
+    reader) reads all of it when it is there; an extension that does not
+    hand over the tags yet leaves them to tifffile, and without the
+    extension tifffile reads everything, skipping reduced-resolution pages."""
     info: Dict[str, Any] = {"description": "", "xres": 0.0, "yres": 0.0, "res_unit": 2, "pages": None,
                             "dtype": None, "reader": None}
     ext = _sirius_tiff()
@@ -680,6 +687,14 @@ def _tiff_probe(path: str) -> Dict[str, Any]:
         if not t.uniform_pages:
             raise ValueError(f"TIFF pages differ in size or pixel type: {path}")
         info.update(pages=int(t.page_count), dtype=str(np.dtype(t.dtype)), reader="sirius")
+        tags = tiff_tags(t.page(0))
+        if tags is not None:
+            info.update(tags)
+            return info
+    try:
+        import tifffile  # type: ignore
+    except ImportError:
+        tifffile = None
     if tifffile is None:
         if ext is None:
             raise NotAvailable("loading TIFF needs the 'sirius' extension or 'tifffile'")
@@ -700,6 +715,67 @@ def _tiff_probe(path: str) -> Dict[str, Any]:
                 raise ValueError(f"TIFF pages differ in size or pixel type: {path}")
             info.update(pages=len(full), dtype=str(first.dtype), reader="tifffile", full_pages=full)
     return info
+
+
+def tiff_tags(page: Any) -> Optional[Dict[str, Any]]:
+    """The tags ``probeTiff`` reads, from a ``sirius.TiffImageInfo``
+    (``inspect_tiff(path).page(0)``): {description, xres, yres, res_unit};
+    None from an extension built before it handed them over. The
+    resolutions are rounded to float32, as libtiff hands them over."""
+    if not hasattr(page, "description"):
+        return None
+    return {"description": str(page.description or ""),
+            "xres": float(np.float32(getattr(page, "x_resolution", 0.0) or 0.0)),
+            "yres": float(np.float32(getattr(page, "y_resolution", 0.0) or 0.0)),
+            "res_unit": int(getattr(page, "resolution_unit", 2) or 2)}
+
+
+def tiff_dims(pages: int, md: Dict[str, Any], given: bool, page_order: str = "czt", c: Optional[int] = None,
+              t: Optional[int] = None, z: Optional[int] = None) -> Tuple[int, int, int, str, bool]:
+    """``probeTiff``'s dimensions of `pages` full-resolution pages:
+    (c, t, z, order fastest first, from_metadata). An explicit page order
+    (`given`, with counts c / t / z, 0 or None = what the file says) beats
+    the OME / ImageJ metadata `md` (:func:`_parse_tiff_description`), which
+    beats pages as z; counts that do not multiply to the page count fall
+    back to pages as z. The cluster worker (sirius_worker.datasets) shapes
+    a TIFF with this too, so a cluster dataset has the dimensions it has
+    when the application opens it."""
+    pc, pt, pz = (max(int(v or 0), 0) for v in (c, t, z))
+    described = (md["ome"] or md["imagej"]) and (md["c"] > 0 or md["t"] > 0 or md["z"] > 0)
+    nc, nt, nz, order, from_meta = 1, 1, pages, "czt", False
+    if given:
+        po_order = str(page_order or "czt")
+        nc = pc if pc > 0 else (md["c"] if described and md["c"] > 0 else 1)
+        nt = pt if pt > 0 else (md["t"] if described and md["t"] > 0 else 1)
+        nz = pz if pz > 0 else max(pages // max(nc * nt, 1), 1)
+        order = (_normalize_order(md["dimension_order"]) if described and po_order == "czt" and md["dimension_order"]
+                 else _normalize_order(po_order))
+        from_meta = described and pc <= 0 and pt <= 0 and pz <= 0
+    elif described:
+        nc, nt = max(md["c"], 1), max(md["t"], 1)
+        nz = md["z"] if md["z"] > 0 else max(pages // (nc * nt), 1)
+        order = _normalize_order(md["dimension_order"])
+        from_meta = True
+    if nc * nt * nz != pages:
+        nc, nt, nz, order, from_meta = 1, 1, pages, "czt", False
+    return nc, nt, nz, order, bool(from_meta)
+
+
+def tiff_voxel(md: Dict[str, Any], xres: float, yres: float, res_unit: int) -> List[float]:
+    """``probeTiff``'s voxel size (µm) before defaults: OME physical sizes,
+    else the resolution tags (in the ImageJ unit when the tag says "none"),
+    ImageJ spacing for z; 0 where the file does not say."""
+    voxel = list(md["voxel_um"]) if md["ome"] else [0.0, 0.0, 0.0]
+    imagej_unit = -md["voxel_um"][0] if md["imagej"] and md["voxel_um"][0] < 0 else 0.0
+    if voxel[0] <= 0.0 or voxel[1] <= 0.0:
+        xy = _pixel_from_resolution(xres, yres, res_unit, imagej_unit)
+        if xy[0] > 0.0:
+            voxel[0] = xy[0]
+        if xy[1] > 0.0:
+            voxel[1] = xy[1]
+    if voxel[2] <= 0.0 and md["imagej"]:
+        voxel[2] = md["voxel_um"][2]
+    return [max(float(v), 0.0) for v in voxel]
 
 
 def _sirius_tiff():
@@ -807,23 +883,7 @@ def _load_tiff(path: str, page_order: str, c: Optional[int], t: Optional[int], z
     pc, pt, pz = (max(int(v or 0), 0) for v in (c, t, z))
     order_text = "czt" if page_order is None else str(page_order)
     given = pc > 0 or pt > 0 or pz > 0 or order_text != "czt"
-    described = (md["ome"] or md["imagej"]) and (md["c"] > 0 or md["t"] > 0 or md["z"] > 0)
-    nc, nt, nz, order, from_meta = 1, 1, pages, "czt", False
-    if given:
-        po_order = order_text or "czt"
-        nc = pc if pc > 0 else (md["c"] if described and md["c"] > 0 else 1)
-        nt = pt if pt > 0 else (md["t"] if described and md["t"] > 0 else 1)
-        nz = pz if pz > 0 else max(pages // max(nc * nt, 1), 1)
-        order = (_normalize_order(md["dimension_order"]) if described and po_order == "czt" and md["dimension_order"]
-                 else _normalize_order(po_order))
-        from_meta = described and pc <= 0 and pt <= 0 and pz <= 0
-    elif described:
-        nc, nt = max(md["c"], 1), max(md["t"], 1)
-        nz = md["z"] if md["z"] > 0 else max(pages // (nc * nt), 1)
-        order = _normalize_order(md["dimension_order"])
-        from_meta = True
-    if nc * nt * nz != pages:
-        nc, nt, nz, order, from_meta = 1, 1, pages, "czt", False
+    nc, nt, nz, order, from_meta = tiff_dims(pages, md, given, order_text, pc, pt, pz)
 
     if probe["reader"] == "sirius":
         stack = np.asarray(_sirius_tiff().read_tiff(path, dtype=np.float32))
@@ -845,16 +905,7 @@ def _load_tiff(path: str, page_order: str, c: Optional[int], t: Optional[int], z
     # voxel size: OME physical sizes, else the resolution tags (in the
     # ImageJ unit when the tag says "none"), ImageJ spacing for z; a missing
     # x / y is 0.1 µm and a missing z twice x
-    voxel = list(md["voxel_um"]) if md["ome"] else [0.0, 0.0, 0.0]
-    imagej_unit = -md["voxel_um"][0] if md["imagej"] and md["voxel_um"][0] < 0 else 0.0
-    if voxel[0] <= 0.0 or voxel[1] <= 0.0:
-        xy = _pixel_from_resolution(probe["xres"], probe["yres"], probe["res_unit"], imagej_unit)
-        if xy[0] > 0.0:
-            voxel[0] = xy[0]
-        if xy[1] > 0.0:
-            voxel[1] = xy[1]
-    if voxel[2] <= 0.0 and md["imagej"]:
-        voxel[2] = md["voxel_um"][2]
+    voxel = tiff_voxel(md, probe["xres"], probe["yres"], probe["res_unit"])
     known_xy = voxel[0] > 0.0 and voxel[1] > 0.0
     if not known_xy:
         voxel[0] = voxel[1] = 0.1
@@ -954,7 +1005,7 @@ def _histogram(values: np.ndarray, bins: int, lo: float, hi: float) -> np.ndarra
 
 
 def _otsu_threshold(values: np.ndarray) -> float:
-    """``sirius::app::otsuThreshold`` (threshold.cpp): Otsu's cut on a 256-bin
+    """``sirius::app::otsuThreshold`` (ops/common.cpp): Otsu's cut on a 256-bin
     histogram between the data's min and max, returned as the upper edge of
     the best bin. NaN and +-inf are left out, as there."""
     v = np.asarray(values, dtype=np.float32).reshape(-1)
@@ -1672,26 +1723,6 @@ def _label_flags(vol: np.ndarray, low_conf: float, size_outlier_factor: float,
     return flags
 
 
-def _threshold_legacy(p: Dict[str, Any], meta: Optional[Dict[str, Any]]) -> None:
-    # Python-only pipelines named the manual cut `threshold` and had no method
-    manual = _pop_first(p, ("threshold",))
-    if manual is not None:
-        p.setdefault("value", manual)
-        if p.get("method") is None:
-            p["method"] = "Manual"
-    if p.get("method") is None and p.get("percentile") is not None:
-        p["method"] = "Percentile"
-
-
-_THRESHOLD = StepSpec(
-    "threshold",
-    {"channel": 0, "method": "Otsu", "value": 0.5, "percentile": 90.0, "post": "Connected components",
-     "min_voxels": 20, "seed_distance": 5.0, "class_name": "object"},
-    choices={"method": ("Manual", "Otsu", "Percentile"), "post": ("Connected components", "Watershed (distance)")},
-    aliases={"input_channel": "channel", "minVoxels": "min_voxels", "min_size": "min_voxels"},
-    translate=_threshold_legacy)
-
-
 def _multi_otsu_upper(values: np.ndarray) -> float:
     """``multiOtsuThresholds`` (classic.cpp): the upper of two Otsu cuts over a
     128-bin histogram, which keeps only the brightest of three classes. NaN
@@ -1750,32 +1781,6 @@ def _global_cut(v: np.ndarray, method: str, params: Dict[str, Any]) -> float:
     if method == "Percentile":
         return _percentiles(v, 0.0, _float(params, "percentile", 90.0))[1]
     return _float(params, "value", 0.5)
-
-
-@_step(_THRESHOLD)
-def step_threshold(a: np.ndarray, params: Dict[str, Any], meta: Dict[str, Any]) -> StepResult:
-    """channel; method: Manual (value) | Otsu | Percentile (percentile); post:
-    Connected components | Watershed (distance) (seed_distance); min_voxels;
-    class_name."""
-    if meta.get("rgb"):
-        raise ValueError("threshold needs an intensity channel, not an RGB merge")
-    c = _channel_index(params, "channel", meta, a.shape[0])
-    method = _choice(params.get("method"), _THRESHOLD.choices["method"], "Otsu")
-    post = _choice(params.get("post"), _THRESHOLD.choices["post"], "Connected components")
-    min_voxels = _int(params, "min_voxels", 20)
-    seed_distance = _float(params, "seed_distance", 5.0)
-    labels = np.zeros((a.shape[1],) + a.shape[2:], dtype=np.uint32)
-    cuts = []
-    total = 0
-    for t in range(a.shape[1]):
-        v = a[c, t]
-        cut = _global_cut(v, method, params)
-        labels[t] = _labels_from_probabilities(v, None, cut, post, min_voxels, seed_distance)
-        total += int(labels[t].max())
-        cuts.append(cut)
-    return StepResult(a, dict(meta), labels=labels,
-                      info={"thresholds": cuts, "method": method, "channel": c, "labels": total,
-                            "class_name": _str(params, "class_name", "object")})
 
 
 def _local_box_mean(v: np.ndarray, r: int) -> np.ndarray:
@@ -3907,8 +3912,25 @@ _UNSUPPORTED = {
     "decon": "Richardson-Lucy deconvolution", "deskew": "deskew + rotate",
     "volrec": "volume reconstruction (a display-level rendering; it also resamples the grid)",
     "stitch": "tile stitching", "register": "registration",
-    "skimage_seg": "the scikit-image methods (they run in the worker, not here)",
 }
+# Kinds SIRIUS no longer has: a pipeline that names one fails with this
+# message (run_pipeline(strict=False) drops the step with a warning instead),
+# rather than the generic "not implemented in Python".
+_REMOVED = {
+    "threshold": "use the classic segmentation step ('classic') instead",
+    "skimage_seg": "use the classic segmentation step ('classic') instead",
+}
+_REMOVED_SINCE = "2026-10"
+
+
+def removed_step_message(kind: str, number: Optional[int] = None) -> Optional[str]:
+    """Why `kind` cannot run any more, or None when it is not a removed kind.
+    `number` (1-based, as the application counts steps) names the step."""
+    advice = _REMOVED.get(kind)
+    if advice is None:
+        return None
+    where = f"step {number:02d} '{kind}'" if number is not None else f"step '{kind}'"
+    return f"{where} was removed from SIRIUS ({_REMOVED_SINCE}); {advice}"
 # Steps run_pipeline skips: Load is the dataset loader itself.
 _PASSTHROUGH = {"load"}
 
@@ -3934,6 +3956,9 @@ def run_step(kind: str, params: Dict[str, Any], array: np.ndarray, meta: Optiona
     meta = dict(meta) if meta else _default_meta(a)
     meta["dims"] = _dims(a)
     k = _KIND_ALIASES.get(kind, kind)
+    removed = removed_step_message(k)
+    if removed is not None:
+        raise RemovedStep(removed)
     fn = _STEPS.get(k)
     if fn is None:
         what = _UNSUPPORTED.get(k, k)
@@ -3962,7 +3987,8 @@ def run_pipeline(dataset_path: str, pipeline: Any, progress: ProgressFn = None, 
     (c, t, z, y, x) float32 array and its metadata (with "labels" when a
     segmentation step produced them). Steps the Python side cannot run raise
     NotAvailable, or are skipped with their kinds in meta["skipped"] when
-    strict is False.
+    strict is False. A step of a kind SIRIUS no longer has (``_REMOVED``)
+    raises RemovedStep, or with strict False is skipped with a warning.
     """
     if isinstance(pipeline, str):
         pipeline = json.loads(pipeline)
@@ -3988,6 +4014,15 @@ def run_pipeline(dataset_path: str, pipeline: Any, progress: ProgressFn = None, 
     for i, s in enumerate(steps):
         kind = s.get("kind", "")
         name = s.get("name") or kind
+        removed = removed_step_message(_KIND_ALIASES.get(kind, kind), i + 1)
+        if removed is not None:
+            # before the enabled check: a disabled step of a removed kind is
+            # still a pipeline the application refuses to load
+            if strict:
+                raise RemovedStep(removed)
+            warnings.warn(removed + "; the step is skipped", stacklevel=2)
+            skipped.append(kind)
+            continue
         if kind == "load" or not s.get("enabled", True) or kind in _PASSTHROUGH:
             continue
         _progress(progress, i / n, name)

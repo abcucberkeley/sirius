@@ -137,6 +137,7 @@ warning, so a wrapper script may pass the same options to every command.
 | `--worker-dir <dir>` | the directory holding `sirius_worker/` (default: the first that holds it of an installed tree's `share/sirius/python`, the `python/` beside the executable, `$SIRIUS_WORKER_DIR`, `python/` in the working directory, the checkout's `app/python`) |
 | `--backend auto\|cpu\|cuda\|hpc` | default `auto`: CUDA when the build has it and a device is present, else CPU; `hpc` needs `--hpc` |
 | `--cuda-device <n\|all>` | default 0; `all` spreads the volumes over every GPU |
+| `--hpc-device gpu\|cpu` | default `gpu`: where the HPC worker computes, its job's GPU or its CPU; sent with each step, so `set_backend` switches it without a new job. A GPU asked of a job without one fails with "this worker job has no GPU; choose CPU or reconnect with GPUs >= 1" |
 | `--hpc <host:port>` | the HPC worker to use, and the only one the process ever uses; its token comes from `$SIRIUS_HPC_TOKEN` |
 | `--plugins auto\|on\|off` | user operations: `auto` (default) loads them only when something needs them (below), `on` at start, `off` never |
 | `--scratch <dir>` / `--keep-scratch` | where the executor's disk cache and `renders/` go; by default a new temporary directory, removed at exit unless `--keep-scratch` |
@@ -523,7 +524,7 @@ serve (`sirius-cli tools` prints it). Rules they share:
 | `load_pipeline` | `path`*, `dataset` | `{workspace, pipeline_path, steps, dataset, missing_kinds, plugins_loaded}` | | |
 | `save_pipeline` | `path`* | `{path}` | DE | yes |
 | `clear_pipeline` | | `{steps}` (Load only; one undo entry) | | |
-| `get_state` | | `{workspace, dataset, pipeline_path, steps, backend, cuda_device, hpc_configured, running, run, can_undo, undo_label, can_redo, redo_label, plugins, worker, cwd, scratch}` | RO | yes |
+| `get_state` | | `{workspace, dataset, pipeline_path, steps, backend, cuda_device, hpc_device, hpc_configured, running, run, can_undo, undo_label, can_redo, redo_label, plugins, worker, cwd, scratch}` | RO | yes |
 | `add_step` | `kind`*, `preset`, `params`, `name`, `at` (the preset is applied first, then the params) | the step (+ `clamped`) | | |
 | `remove_step` | `step`* | `{ok}` | | |
 | `move_step` | `step`*, `delta`* | the step | | |
@@ -541,7 +542,7 @@ serve (`sirius-cli tools` prints it). Rules they share:
 | `run` | `step` (the target; default the last enabled step), `wait_s` (50; 0 = return at once; -1 = to the end), `force` | RunOutcome | open-world | |
 | `run_status` | `wait_s` (0) | RunOutcome of the active or last run, or `{status:"idle"}` | RO | yes |
 | `cancel_run` | | `{cancelled, status}` | | yes |
-| `set_backend` | `backend`* (cpu, cuda, hpc), `cuda_device` (a number or "all") | `{backend, cuda_device}` | ID | yes |
+| `set_backend` | `backend`* (cpu, cuda, hpc), `cuda_device` (a number or "all"), `hpc_device` (gpu, cpu: where the HPC worker computes; kept until changed) | `{backend, cuda_device, hpc_device}` | ID | yes |
 | `list_devices` | | `{backend, cuda_available, cuda_device, devices}` | RO | yes |
 | `render` | see "Rendering" | the caption + the image | RO | |
 | `render_diagnostics` | `step`, `tab`, `index` (0), `max_size` (768) | `{step, tab, index, title, width, height}` + the image | RO | |
@@ -854,7 +855,7 @@ status "running" after wait_s; then poll run_status) -> look with render (an ima
 1024 px unless max_size says otherwise), statistics, probe, get_diagnostics -> export_result /
 save_pipeline. Step 1 is always Load; address steps by number (1 = Load) or name. Relative paths resolve
 against the server's working directory (get_state.cwd); prefer absolute paths. Steps that need Python
-(segmentation models, scikit-image, btrack tracking, plugins) use the Python worker: if a tool reports
+(segmentation models, btrack tracking, plugins) use the Python worker: if a tool reports
 worker_unavailable, ask the user to run `sirius-cli worker setup --yes` (it downloads numpy from
 pypi.org) instead of working around it.
 ```
@@ -871,8 +872,8 @@ A handshake by hand (`>` stdin, `<` stdout, shortened):
 
 ## The Python worker
 
-Steps that live in Python (segmentation models, the scikit-image step,
-btrack tracking, user operations) run in the Python worker
+Steps that live in Python (segmentation models, btrack tracking, user
+operations) run in the Python worker
 ([app/python/README.md](../python/README.md)), which `sirius-cli` starts when
 something first needs it: a step, or the user operations (see `--plugins`).
 It runs with `--exit-with-parent`, never with

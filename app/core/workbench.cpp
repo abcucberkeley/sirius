@@ -1307,6 +1307,13 @@ namespace sirius::app {
         notify(&Observer::backendChanged);
     }
 
+    void Workbench::setHpcDevice(HpcDevice d) {
+        if (hpcDevice_ == d) return;
+        hpcDevice_ = d;
+        logLine(std::string("HPC device: ") + toString(d));
+        notify(&Observer::backendChanged);
+    }
+
     void Workbench::setRemoteConfig(RemoteConfig c) {
         remote_ = std::move(c);
         notify(&Observer::backendChanged);
@@ -1411,6 +1418,7 @@ namespace sirius::app {
         } else {
             job->ctx_.device = Device::cpu();
         }
+        job->ctx_.hpcDevice = hpcDevice_;
         job->ctx_.scratchDir = executor_.scratchDir();
         job->ctx_.hubToken = hubToken_ ? hubToken_() : std::string();
         // The worker itself is obtained by execute(), on the run's thread.
@@ -1423,6 +1431,8 @@ namespace sirius::app {
         if (backend_ == Backend::Cuda && cudaDevice_ == kAllCudaDevices && cudaAvailable())
             logLine("Run to step " + Step::number(target) + " on CUDA · all " +
                     std::to_string(cudaDeviceCount()) + " GPUs");
+        else if (backend_ == Backend::Hpc)
+            logLine("Run to step " + Step::number(target) + " on HPC · " + toString(hpcDevice_));
         else
             logLine("Run to step " + Step::number(target) + " on " + toString(backend_));
         notify(&Observer::runStateChanged);

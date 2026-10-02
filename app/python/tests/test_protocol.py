@@ -496,11 +496,59 @@ class TestRequestDevice(unittest.TestCase):
 
     def test_the_request_names_the_device_and_auto_is_the_workers_own(self):
         server = WorkerServer("127.0.0.1", 0, "t", "cuda")
+        server._cuda = True   # a GPU worker, whatever this machine has
         self.assertEqual(server.request_device("cpu"), "cpu")
         self.assertEqual(server.request_device("CPU"), "cpu")
         self.assertEqual(server.request_device("auto"), "cuda")
         self.assertEqual(server.request_device(None), "cuda")
         self.assertEqual(server.request_device("cuda:1"), "cuda:1")
+
+    def test_a_gpu_asked_of_a_worker_without_one_is_refused_clearly(self):
+        # The HPC backend sends the session's GPU / CPU choice with every
+        # step; a job started without GPUs must say so, not run on the CPU.
+        from sirius_worker import server as server_module  # noqa: PLC0415
+
+        server = WorkerServer("127.0.0.1", 0, "t", "cpu")
+        server._cuda = False
+        self.assertEqual(server.request_device("cpu"), "cpu")
+        with unittest.mock.patch.dict(os.environ, {"SLURM_JOB_ID": "4242"}):
+            for asked in ("cuda", "CUDA", "cuda:0"):
+                with self.assertRaises(ValueError, msg=asked) as e:
+                    server.request_device(asked)
+                self.assertEqual(str(e.exception), "this worker job has no GPU; choose CPU or reconnect with GPUs >= 1")
+        env = {k: v for k, v in os.environ.items() if k != "SLURM_JOB_ID"}
+        with unittest.mock.patch.dict(os.environ, env, clear=True):
+            with self.assertRaises(ValueError) as e:
+                server.request_device("cuda")
+            self.assertEqual(str(e.exception), server_module.NO_GPU_HERE)
+
+    def test_each_run_is_refused_or_served_by_its_own_device(self):
+        # One connection, the device switched between requests: a GPU run is
+        # refused at once (before the cluster input is read), the next CPU run
+        # of the same connection is served -- no new job, no restart.
+        server = WorkerServer("127.0.0.1", 0, "t", "cpu")
+        server._cuda = False
+        port = server.bind()
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        try:
+            c = _Client(port, "t")
+            c.hello()
+            ref = {"path": "/nowhere/missing.tif", "options": {}, "c": 0, "t": 0, "layout": "zyx"}
+            with unittest.mock.patch.dict(os.environ, {"SLURM_JOB_ID": "4242"}):
+                _, header, _ = c.call("run", {"kind": "einsum", "input_ref": ref,
+                                              "params": {"device": "cuda", "keep": "ctyx", "reduction": "max"}})
+            self.assertEqual(header["type"], "error", header)
+            self.assertIn("this worker job has no GPU; choose CPU or reconnect with GPUs >= 1", header["message"])
+            vol = np.ones((1, 1, 2, 3, 4), dtype=np.float32)
+            _, header, _ = c.call("run", {"kind": "einsum", "params": {"device": "cpu", "keep": "ctyx", "reduction": "max"}},
+                                  {"input": vol})
+            self.assertEqual(header["type"], "result", header)
+            self.assertEqual(header["result"]["device"], "cpu")
+            c.close()
+        finally:
+            server.stop()
+            thread.join(timeout=5)
 
     def test_the_command_line_takes_the_gpu_the_application_names(self):
         # The application starts its worker with --device cuda:N once a GPU is

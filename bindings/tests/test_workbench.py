@@ -24,12 +24,6 @@ except ImportError:
     _HAVE_SCIPY = False
 
 try:
-    import skimage  # noqa: F401
-    _HAVE_SKIMAGE = True
-except ImportError:
-    _HAVE_SKIMAGE = False
-
-try:
     import tifffile  # type: ignore
 except ImportError:  # pragma: no cover - environment dependent
     tifffile = None
@@ -59,6 +53,11 @@ wb = _load_workbench()
 
 def _no_sim_meta():
     return {"present": False, "ndirs": 3, "nphases": 5, "fast_si": False}
+
+
+# The classic segmentation step reduced to one global cut and its instances:
+# no top-hat, no blur, no opening, no hole filling, connected components.
+_PLAIN_CUT = {"tophat": 0, "sigma": 0.0, "opening": 0, "fill_holes": False, "post": "Connected components"}
 
 
 @unittest.skipIf(tifffile is None, "tifffile not installed")
@@ -154,7 +153,7 @@ class TestRunPipeline(unittest.TestCase):
 
     @unittest.skipUnless(_HAVE_SCIPY, "labelling needs scipy")
     def test_labels_do_not_outlive_a_step_that_changes_the_grid(self):
-        # threshold -> resample: the labels cover the old grid, so the
+        # segment -> resample: the labels cover the old grid, so the
         # application drops them (executor.cpp, labelsFit); a crop after the
         # resample used to cut the stale 64 x 64 labels as though they fitted
         img = np.zeros((4, 64, 64), np.float32)
@@ -163,7 +162,7 @@ class TestRunPipeline(unittest.TestCase):
         path = os.path.join(self.tmp.name, "grid.tif")
         tifffile.imwrite(path, img, photometric="minisblack")   # 4 leading planes are not RGBA
         steps = [{"kind": "load", "params": {}},
-                 {"kind": "threshold", "params": {"method": "Manual", "value": 50.0, "min_voxels": 1}},
+                 {"kind": "classic", "params": dict(_PLAIN_CUT, method="Manual", value=50.0, min_voxels=1)},
                  {"kind": "contrast", "params": {}}]
         _, meta = wb.run_pipeline(path, {"steps": steps})
         self.assertEqual(meta["labels"].shape, (1, 4, 64, 64))   # the grid is unchanged: carried through
@@ -178,6 +177,29 @@ class TestRunPipeline(unittest.TestCase):
         steps[2] = {"kind": "maxproj", "params": {"axis": "z"}}
         _, meta = wb.run_pipeline(path, {"steps": steps[:3]})
         self.assertNotIn("labels", meta)
+
+    def test_a_removed_step_fails_by_name_or_is_dropped_with_a_warning(self):
+        for kind in ("threshold", "skimage_seg"):
+            steps = [{"kind": "load", "params": {}}, {"kind": "contrast", "params": {}},
+                     {"kind": kind, "params": {"method": "Otsu"}}]
+            with self.assertRaises(wb.RemovedStep) as caught:
+                wb.run_pipeline(self.path, {"steps": steps})
+            self.assertIn(f"step 03 '{kind}' was removed from SIRIUS (2026-10)", str(caught.exception))
+            self.assertIn("classic segmentation step", str(caught.exception))
+            # a disabled one too: the application refuses the file either way
+            steps[2]["enabled"] = False
+            with self.assertRaises(wb.RemovedStep):
+                wb.run_pipeline(self.path, {"steps": steps})
+            with self.assertWarns(UserWarning) as warned:
+                out, meta = wb.run_pipeline(self.path, {"steps": steps}, strict=False)
+            self.assertIn("was removed from SIRIUS", str(warned.warning))
+            self.assertEqual(meta["skipped"], [kind])
+            self.assertNotIn("labels", meta)
+            with self.assertRaises(wb.RemovedStep):
+                wb.run_step(kind, {}, np.zeros((1, 1, 1, 4, 4), np.float32))
+            with self.assertRaises(KeyError):
+                wb.step_spec(kind)
+            self.assertNotIn(kind, wb.step_kinds())
 
     def test_load_step_voxel_overrides(self):
         pipeline = [{"kind": "load", "params": {"voxel_x": 0.05, "voxel_y": 0.0, "voxel_z": 0.5}}]
@@ -426,17 +448,15 @@ class TestParameters(unittest.TestCase):
         self.assertEqual(r.array.shape, a.shape)
 
     def test_canonical_key_wins_over_an_alias(self):
-        a = np.zeros((1, 1, 1, 6, 6), np.float32)
-        a[0, 0, 0, 1:3, 1:3] = 5.0
-        p = wb._prepare_params(wb.step_spec("threshold"), {"threshold": 9.0, "value": 1.0, "method": "Manual"}, None)
-        self.assertEqual(p["value"], 1.0)
-        self.assertNotIn("threshold", p)
+        p = wb._prepare_params(wb.step_spec("classic"), {"minVoxels": 9, "min_voxels": 1, "method": "Manual"}, None)
+        self.assertEqual(p["min_voxels"], 1)
+        self.assertNotIn("minVoxels", p)
 
     def test_defaults_are_filled(self):
-        p = wb._prepare_params(wb.step_spec("threshold"), {}, None)
+        p = wb._prepare_params(wb.step_spec("classic"), {}, None)
         self.assertEqual(p["method"], "Otsu")
         self.assertEqual(p["min_voxels"], 20)
-        self.assertEqual(p["post"], "Connected components")
+        self.assertEqual(p["post"], "Watershed (distance)")
 
     def test_numbers_are_parsed_as_the_application_loads_them(self):
         # coerceToSpec: integers round half away from zero (llround, where
@@ -552,12 +572,13 @@ class TestSteps(unittest.TestCase):
         np.testing.assert_array_equal(mx, [np.inf, np.nan, 0, 5])
         np.testing.assert_array_equal(mn, [1, np.nan, -np.inf, -np.inf])
 
-    def test_otsu_threshold_step_runs_on_an_infinite_voxel(self):
+    @unittest.skipUnless(_HAVE_SCIPY, "connected components need scipy")
+    def test_otsu_cut_runs_on_an_infinite_voxel(self):
         a = np.zeros((1, 1, 1, 8, 8), np.float32)
         a[0, 0, 0, 2:5, 2:5] = 1.0
         a[0, 0, 0, 7, 7] = np.inf
         a[0, 0, 0, 0, 7] = -np.inf
-        r = wb.run_step("threshold", {"method": "Otsu", "min_voxels": 0, "post": "Connected components"}, a)
+        r = wb.run_step("classic", dict(_PLAIN_CUT, method="Otsu", min_voxels=0), a)
         self.assertEqual(int(r.labels.max()), 2)   # the square and the +inf voxel
         self.assertNotEqual(int(r.labels[0, 0, 7, 7]), 0)
         self.assertEqual(int(r.labels[0, 0, 0, 7]), 0)
@@ -622,30 +643,27 @@ class TestSteps(unittest.TestCase):
         self.assertTrue(np.isnan(r.array[:, 0, 0, 0, 1]).all())
 
     @unittest.skipUnless(_HAVE_SCIPY, "connected components need scipy")
-    def test_threshold_methods_and_min_voxels(self):
+    def test_global_cuts_and_min_voxels(self):
         a = np.zeros((1, 1, 4, 10, 10), np.float32)
         a[0, 0, :, 1:3, 1:3] = 5.0
         a[0, 0, :, 6:9, 6:9] = 7.0
-        r = wb.run_step("threshold", {"channel": 0, "method": "Manual", "value": 1.0, "min_voxels": 0}, a)
+        r = wb.run_step("classic", dict(_PLAIN_CUT, channel=0, method="Manual", value=1.0, min_voxels=0), a)
         self.assertIsNotNone(r.labels)
         self.assertEqual(r.labels.shape, (1, 4, 10, 10))
         self.assertEqual(int(r.labels.max()), 2)
         self.assertEqual(r.info["thresholds"], [1.0])
-        r2 = wb.run_step("threshold", {"channel": 0, "method": "Manual", "value": 1.0, "min_voxels": 20}, a)
+        r2 = wb.run_step("classic", dict(_PLAIN_CUT, channel=0, method="Manual", value=1.0, min_voxels=20), a)
         self.assertEqual(int(r2.labels.max()), 1)
         # the application's default cut is Otsu, which separates 0 from the objects
-        r3 = wb.run_step("threshold", {"channel": 0, "min_voxels": 0}, a)
+        r3 = wb.run_step("classic", dict(_PLAIN_CUT, channel=0, min_voxels=0), a)
         self.assertEqual(r3.info["method"], "Otsu")
         self.assertEqual(int(r3.labels.max()), 2)
         # percentiles are order statistics: the 90th of 400 voxels is 5.0, so
         # only the 7.0 block is strictly above it (the 99th would be 7.0, which
         # cuts everything away -- as it does in the application)
-        r4 = wb.run_step("threshold", {"channel": 0, "method": "Percentile", "percentile": 90.0, "min_voxels": 0}, a)
+        r4 = wb.run_step("classic", dict(_PLAIN_CUT, channel=0, method="Percentile", percentile=90.0, min_voxels=0), a)
         self.assertEqual(int(r4.labels.max()), 1)
         self.assertEqual(r4.info["thresholds"], [5.0])
-        # the older Python-only spelling: threshold = a manual value
-        r5 = wb.run_step("threshold", {"channel": 0, "threshold": 1.0, "min_voxels": 0}, a)
-        np.testing.assert_array_equal(r5.labels, r.labels)
 
     @unittest.skipUnless(_HAVE_SCIPY, "label post-processing needs scipy")
     def test_remove_small_relabels_densely(self):
@@ -671,11 +689,11 @@ class TestSteps(unittest.TestCase):
         blobs = ((y - 10) ** 2 + (x - 13) ** 2 <= 49) | ((y - 10) ** 2 + (x - 25) ** 2 <= 49)
         a = np.zeros((1, 1, 1, 20, 40), np.float32)
         a[0, 0, 0] = blobs
-        p = {"method": "Manual", "value": 0.5, "seed_distance": 5.0, "min_voxels": 0}
-        r = wb.run_step("threshold", dict(p, post="Watershed (distance)"), a)
+        p = dict(_PLAIN_CUT, method="Manual", value=0.5, seeds="Distance maxima", seed_distance=5.0, min_voxels=0)
+        r = wb.run_step("classic", dict(p, post="Watershed (distance)"), a)
         self.assertEqual(int(r.labels.max()), 2)
         # they touch, so connected components sees one object
-        r = wb.run_step("threshold", dict(p, post="Connected components"), a)
+        r = wb.run_step("classic", dict(p, post="Connected components"), a)
         self.assertEqual(int(r.labels.max()), 1)
 
     def test_watershed_floods_in_the_application_order(self):
@@ -708,9 +726,9 @@ class TestSteps(unittest.TestCase):
         a = np.zeros((1, 1, 1, 12, 20), np.float32)
         a[0, 0, 0, 2:9, 2:9] = 1.0
         a[0, 0, 0, 2:9, 11:18] = 1.0
-        p = {"method": "Manual", "value": 0.5, "post": "Watershed (distance)", "seed_distance": 10.0,
-             "min_voxels": 0}
-        r = wb.run_step("threshold", p, a)
+        p = dict(_PLAIN_CUT, method="Manual", value=0.5, post="Watershed (distance)", seeds="Distance maxima",
+                 seed_distance=10.0, min_voxels=0)
+        r = wb.run_step("classic", p, a)
         self.assertEqual(int(r.labels.max()), 2)
         self.assertEqual(int(np.count_nonzero(r.labels)), 98)
         self.assertEqual(len(np.unique(r.labels[0, 0, 2:9, 11:18])), 1)
@@ -863,7 +881,7 @@ class TestSteps(unittest.TestCase):
         a = np.zeros((2, 1, 2, 4, 4), np.float32)
         a[1] = 3.0
         meta = {"channels": [{"label": "DAPI", "wavelength_nm": 405}, {"label": "GFP", "wavelength_nm": 488}]}
-        r = wb.run_step("threshold", {"channel": "488", "method": "Manual", "value": 1.0, "min_voxels": 0}, a, meta)
+        r = wb.run_step("classic", dict(_PLAIN_CUT, channel="488", method="Manual", value=1.0, min_voxels=0), a, meta)
         self.assertEqual(r.info["channel"], 1)
         self.assertEqual(int(r.labels.max()), 1)
 

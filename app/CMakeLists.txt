@@ -259,9 +259,7 @@ op(stitch      ops/stitch.cpp      DEPENDS array_source lib/stitching lib/stitch
 op(register    ops/register.cpp    DEPENDS lib/image_ops lib/registration)
 op(seg         ops/seg.cpp         DEPENDS ops_segment_common ops_torch_model rpc remote_source cancel errors)
 op(foundation  ops/foundation.cpp  DEPENDS tracks rpc)
-op(threshold   ops/threshold.cpp   DEPENDS ops_segment_common lib/image_ops)
 op(classic     ops/classic.cpp     DEPENDS ops_segment_common lib/image_ops lib/constants)
-op(skimage_seg ops/skimage_seg.cpp DEPENDS rpc)
 op(cleanup     ops/cleanup.cpp     DEPENDS labels)
 op(track       ops/track.cpp       DEPENDS tracking tracks rpc)
 

@@ -650,6 +650,20 @@ TEST_CASE("headless: the hpc backend takes only the endpoint given at start", "[
     CHECK(withHpc.ok("set_backend", {{"backend", "hpc"}})["backend"] == "hpc");
     CHECK(withHpc.ok("get_state")["hpc_configured"] == true);
     CHECK_THROWS_AS(Fixture([](HeadlessOptions& o) { o.backend = "hpc"; }), ToolFailure);
+
+    // where the HPC worker computes: the job's GPU (the default) or its CPU, kept until changed
+    CHECK(withHpc.ok("get_state")["hpc_device"] == "gpu");
+    const json set = withHpc.ok("set_backend", {{"backend", "hpc"}, {"hpc_device", "CPU"}});
+    CHECK(set["hpc_device"] == "cpu");
+    CHECK(withHpc.ok("get_state")["hpc_device"] == "cpu");
+    CHECK(withHpc.ok("set_backend", {{"backend", "hpc"}})["hpc_device"] == "cpu");
+    CHECK(withHpc.call("set_backend", {{"backend", "hpc"}, {"hpc_device", "tpu"}}).error.code == "invalid_argument");
+    Fixture cpuJob([](HeadlessOptions& o) {
+        o.hpc = RemoteConfig{"cluster.example", 7645, "secret"};
+        o.hpcDevice = "cpu";
+    });
+    CHECK(cpuJob.ok("get_state")["hpc_device"] == "cpu");
+    CHECK_THROWS_AS(Fixture([](HeadlessOptions& o) { o.hpcDevice = "tpu"; }), ToolFailure);
 }
 
 TEST_CASE("headless: an HPC endpoint that does not answer is a failed run, not a missing Python", "[app][headless]") {
@@ -733,7 +747,9 @@ TEST_CASE("headless: a step that needs the worker fails as no_interpreter withou
         o.workerDir = SIRIUS_TEST_WORKER_DIR;
     });
     f.openRaw();
-    f.ok("add_step", {{"kind", "skimage_seg"}});
+    // a foundation model runs only in the worker; a bundle that is not on this
+    // machine is a warning, not an error, so the run gets as far as the worker
+    f.ok("add_step", {{"kind", "foundation"}, {"params", {{"model", "not-here.ltb"}}}});
     const agent::ToolResult r = f.call("run", {{"wait_s", -1}});
     INFO(r.error.message);
     REQUIRE_FALSE(r.ok);
@@ -756,7 +772,9 @@ TEST_CASE("headless: cancel_run ends a slow worker start", "[app][headless]") {
         o.workerDir = fake.path.u8string();
     });
     f.openRaw();
-    f.ok("add_step", {{"kind", "skimage_seg"}});
+    // a foundation model runs only in the worker; a bundle that is not on this
+    // machine is a warning, not an error, so the run gets as far as the worker
+    f.ok("add_step", {{"kind", "foundation"}, {"params", {{"model", "not-here.ltb"}}}});
     CHECK(f.ok("run", {{"wait_s", 0.3}})["status"] == "running");
     const auto t0 = std::chrono::steady_clock::now();
     f.ok("cancel_run");

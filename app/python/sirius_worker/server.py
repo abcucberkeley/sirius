@@ -23,6 +23,8 @@ Requests (see protocol.py for the framing):
                                                the family's package into the worker's Python
     model_prepare {spec}                    -> "progress"* then {spec, path, cached}: fetches the weights now
     run         {kind, params} + tensors    -> "progress"* then "result" (+ tensors)
+                                               params.device ("cpu", "cuda", "cuda:N", "auto") is where
+                                               this one run computes; a GPU this worker lacks is an error
     cancel      {id}                        -> {} (the cancelled run replies with an error "cancelled")
     shutdown    {}                          -> {} and the server exits
     dataset_info  {path, options?}          -> the dataset's meta: dims (c, t, z, y, x), dtype, voxel_um, channels
@@ -33,6 +35,9 @@ Requests (see protocol.py for the framing):
     dataset_stats {path, options?, c, t}    -> {lo, hi, min, max}: a display window
                                                (dataset_read / _view reply {encoding, shuffle, dtype, shape}
                                                and one tensor "data", compressed when `accept` allows)
+                  every dataset_* also takes device? ("cpu", "cuda", "cuda:N", "auto"): where TIFF
+                  pages are decoded (nvTIFF on a CUDA device when the sirius package can, else the
+                  CPU); hello's "tiff_reader" {sirius: version | null, nvtiff} says what this worker has
 
 Model specs (params.model of torch_segment, model_info): a local .pt / .pts /
 .pth / .onnx path; ``hf:<repo>[:<file>]`` (downloaded into $SIRIUS_MODEL_CACHE
@@ -109,8 +114,29 @@ from .steps import workbench
 
 log = logging.getLogger("sirius_worker")
 
+# A step asked for the GPU of a worker that has none (request_device).
+NO_GPU_IN_JOB = "this worker job has no GPU; choose CPU or reconnect with GPUs >= 1"
+NO_GPU_HERE = "this worker has no GPU (CUDA was asked for); choose the CPU backend"
+
+
+def _cuda_present() -> bool:
+    try:
+        import torch  # type: ignore  # noqa: PLC0415
+
+        if torch.cuda.is_available():
+            return True
+    except Exception:  # noqa: BLE001 - torch is optional
+        pass
+    try:
+        import sirius  # type: ignore  # noqa: PLC0415
+
+        return bool(sirius.cuda_available())
+    except Exception:  # noqa: BLE001
+        return False
+
+
 # kinds served through run_step plus the two with their own tensor contracts
-_SPECIAL_KINDS = ("torch_segment", "foundation", "sim", "btrack", "skimage_seg")
+_SPECIAL_KINDS = ("torch_segment", "foundation", "sim", "btrack")
 
 
 class _Cancelled(Exception):
@@ -274,15 +300,38 @@ class WorkerServer:
     def resolved_device(self) -> str:
         return workbench().resolve_device(self.device)
 
+    # Whether this process can compute on a GPU (cuda_available), asked once.
+    _cuda: Optional[bool] = None
+
+    def cuda_available(self) -> bool:
+        """A GPU this process can compute on: torch sees one, or the sirius
+        package finds one. Asked once; a job's GPUs do not change."""
+        if self._cuda is None:
+            self._cuda = _cuda_present()
+        return self._cuda
+
     def request_device(self, requested: Any = None) -> str:
         """Where one request runs: the device it names ("cpu", "cuda",
         "cuda:1"), or this worker's own (--device, resolved) for "auto" or
-        none. The application sends "cpu" when the step's backend is the CPU,
-        and reports the step as having run there."""
+        none. The application sends the backend's device with every step
+        (for HPC the session's GPU / CPU choice, so it switches without a
+        new job) and reports the step as having run there. A GPU asked of a
+        worker that has none is refused, rather than run on the CPU."""
         text = str(requested or "").strip().lower()
         if not text or text == "auto":
             return self.resolved_device()
-        return workbench().resolve_device(text)
+        device = workbench().resolve_device(text)
+        if device.startswith("cuda") and not self.cuda_available():
+            raise ValueError(NO_GPU_IN_JOB if os.environ.get("SLURM_JOB_ID") else NO_GPU_HERE)
+        return device
+
+    def decode_device(self, requested: Any = None) -> str:
+        """Where a cluster dataset's TIFF pages are decoded: the device a
+        request names, else this worker's --device, unresolved: "auto" means
+        the GPU whenever the sirius package can decode there, torch or not
+        (datasets.py falls back to the CPU decoder by itself)."""
+        text = str(requested or "").strip().lower()
+        return text if text and text != "auto" else str(self.device or "auto")
 
     def capabilities(self) -> Dict[str, Any]:
         wb = workbench()
@@ -329,7 +378,9 @@ class WorkerServer:
             # what the dataset_* replies can be compressed with, best first
             "encodings": datasets.available_encodings(),
             "max_clients": int(self.max_clients),
-            "tifffile": _module_version("tifffile"),
+            # who reads TIFF datasets here: the sirius package (None: it does not
+            # import, and TIFF cannot be opened) and whether nvTIFF decodes on the GPU
+            "tiff_reader": datasets.tiff_reader(self.device),
         }
 
     def _check_version(self, params: Dict[str, Any]) -> Tuple[bool, str]:
@@ -691,17 +742,20 @@ class WorkerServer:
 
     def dataset_request(self, method: str, params: Dict[str, Any]) -> Tuple[Dict[str, Any], Optional[Dict[str, np.ndarray]]]:
         ds = datasets.open_dataset(str(params.get("path", "")), params.get("options") or {})
+        # where a TIFF is decoded: the request's device, else this worker's (--device)
+        device = self.decode_device(params.get("device"))
         if method == "dataset_info":
             return {**ds.meta(), "encodings": datasets.available_encodings()}, None
         c, t = int(params.get("c", 0)), int(params.get("t", 0))
         if method == "dataset_stats":
-            return ds.stats(c, t), None
+            return ds.stats(c, t, device), None
         if method == "dataset_read":
             z = params.get("z")
-            arr = ds.plane(c, t, int(z)) if z is not None else ds.volume(c, t)
+            arr = ds.plane(c, t, int(z), device) if z is not None else ds.volume(c, t, device)
         elif method == "dataset_view":
             arr = ds.view(str(params.get("kind", "xy")), c, t, int(params.get("index", 0) or 0),
-                          int(params.get("factor", 1) or 1), params.get("region"), int(params.get("max_side", 256) or 256))
+                          int(params.get("factor", 1) or 1), params.get("region"), int(params.get("max_side", 256) or 256),
+                          device)
         else:
             raise ValueError(f"unknown method '{method}'")
         if arr.dtype.name not in DTYPES:
@@ -784,18 +838,23 @@ class WorkerServer:
         wb = workbench()
         kind = str(params.get("kind", ""))
         ref = params.get("input_ref")
+        p = params.get("params") or {}
+        asked = None
+        if kind != "plugin" and isinstance(p, dict) and "device" in p:
+            # the request's own device (seg.cpp sends "cpu" for the CPU
+            # backend, and the HPC backend the session's GPU / CPU); a
+            # plugin's parameters are its own, device included. Resolved
+            # before the input is read: a GPU this worker lacks is refused
+            # at once.
+            p = dict(p)
+            asked = p.pop("device")
+            device = self.request_device(asked)
+        else:
+            device = self.resolved_device()
         if isinstance(ref, dict) and "input" not in tensors:
             # a cluster dataset: the input is read here, on the node, instead of uploaded
             progress(0.0, "reading " + os.path.basename(str(ref.get("path", ""))))
-            tensors = {**tensors, "input": datasets.read_ref(ref)}
-        p = params.get("params") or {}
-        if kind != "plugin" and isinstance(p, dict) and "device" in p:
-            # the request's own device (seg.cpp sends "cpu" for the CPU
-            # backend); a plugin's parameters are its own, device included
-            p = dict(p)
-            device = self.request_device(p.pop("device"))
-        else:
-            device = self.resolved_device()
+            tensors = {**tensors, "input": datasets.read_ref(ref, self.decode_device(asked))}
 
         def cancelled() -> bool:
             return cancel.is_set()
@@ -895,16 +954,6 @@ class WorkerServer:
             if extras.get("lineage"):
                 result["lineage"] = {str(k): int(v) for k, v in extras["lineage"].items()}
             return result, out_t
-
-        if kind == "skimage_seg":
-            # the scikit-image methods the application does not implement
-            # natively: they take a volume and hand back instance labels
-            from . import skimage_seg
-
-            volume = _tensor(tensors, "input", 3)
-            labels, info = skimage_seg.run(volume, p, progress=progress, cancelled=cancelled)
-            check()
-            return {**_jsonable(info), "device": "cpu"}, {"labels": np.ascontiguousarray(labels, dtype=np.uint32)}
 
         if kind == "btrack":
             # Bayesian tracking: the labels go over as they are and come back

@@ -38,6 +38,16 @@ namespace sirius::app {
     const char* toString(Backend b) noexcept;   // "CUDA" "CPU" "HPC"
     std::optional<Backend> backendFromString(const std::string& s) noexcept;
 
+    // Where a step on the HPC worker computes: the worker job's GPU or its
+    // CPU. A session's choice, sent with every request to the worker (steps
+    // and cluster dataset reads), so switching needs no new job. Not part of
+    // the pipeline: a result does not depend on it.
+    enum class HpcDevice { Gpu,
+                           Cpu };
+    const char* toString(HpcDevice d) noexcept;   // "GPU" "CPU"
+    // "gpu" / "cuda" / "cpu", any case
+    std::optional<HpcDevice> hpcDeviceFromString(const std::string& s) noexcept;
+
     enum class CachePolicy { Memory,
                              Disk,
                              Recompute };
@@ -135,6 +145,7 @@ namespace sirius::app {
         // volumes are round-robined across cuda:0..N-1.
         Device device = Device::cpu();
         RemoteWorker* remote = nullptr;            // Backend::Hpc
+        HpcDevice hpcDevice = HpcDevice::Gpu;      // Backend::Hpc: the worker job's GPU or CPU
         // Hugging Face access token for a step that fetches a gated model
         // through the worker: sent with that request, never put in the
         // worker's environment (where pip and conda would inherit it).

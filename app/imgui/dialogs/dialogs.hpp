@@ -53,9 +53,11 @@ namespace sirius::app::gui {
     std::shared_ptr<Dialog> makeClusterDialog(App& app);
     // The cluster's files through the SSH session: path bar, Up, Home,
     // recent folders; `chosen` gets "cluster://<host>/<path>" of a file (or
-    // of the folder shown, with `folders`).
+    // of the folder shown, with `folders`). `extension` (".sif") lists only
+    // the files that end so, besides the folders.
     std::shared_ptr<Dialog> makeClusterBrowser(App& app, const std::string& start, bool folders,
-                                               std::function<void(const std::string& clusterPath)> chosen);
+                                               std::function<void(const std::string& clusterPath)> chosen,
+                                               const std::string& extension = {});
 
     // File ▸ Preferences…: default backend and CUDA device, the HPC worker
     // connection, the Python interpreter for the local worker and SIRIUS's

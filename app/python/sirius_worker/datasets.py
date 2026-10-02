@@ -13,9 +13,16 @@ the data, and sent at the resolution it is drawn at:
              dtype), or the whole volume reduced to a longest side (the 3-D view)
     stats    a display window: robust percentiles of a few planes, and the range
 
-Readers: TIFF, OME-TIFF and ImageJ hyperstacks through ``tifffile`` (an
-optional package of the worker: ``pip install tifffile``), and ``.npy``
-arrays. The (c, t) volumes read most recently are kept in memory, up to
+Readers: TIFF, OME-TIFF and ImageJ hyperstacks through SIRIUS's own TIFF
+reader (the ``sirius`` package built into the worker's Python: ``pip install
+<checkout>``; without it a TIFF request fails and says so), and ``.npy``
+arrays. A TIFF is shaped exactly as the application shapes it (page order,
+OME / ImageJ dimensions and voxel size: ``sirius.workbench.tiff_dims`` /
+``tiff_voxel``, the port of array_source.cpp's probeTiff). What is read is
+what is needed: a z-stack is one page range, a zoomed-in XY plane only its
+visible region, a reduced XY plane a pyramid level when the file has one;
+on a CUDA device with nvTIFF the pages are decoded on the GPU. The (c, t)
+volumes read most recently are kept in memory, up to
 ``$SIRIUS_WORKER_VIEW_CACHE_MB`` (default 4096), so re-slicing and scrubbing
 read the file once.
 
@@ -30,7 +37,6 @@ from __future__ import annotations
 
 import collections
 import os
-import re
 import socket
 import threading
 import zlib
@@ -73,71 +79,105 @@ def _plane_of(order: str, c: int, t: int, z: int, nc: int, nt: int, nz: int) -> 
 
 def _options_key(options: Optional[Dict[str, Any]]) -> Tuple:
     o = options or {}
-    return (str(o.get("page_order", "") or ""), int(o.get("c", 0) or 0), int(o.get("t", 0) or 0), int(o.get("z", 0) or 0))
+    order = o.get("page_order")
+    return (None if order is None else str(order), int(o.get("c", 0) or 0), int(o.get("t", 0) or 0),
+            int(o.get("z", 0) or 0))
 
 
-# --- metadata ----------------------------------------------------------------------------------
+# --- the TIFF reader: the sirius package ------------------------------------------------------
 
-_OME_SIZE = re.compile(r'PhysicalSize([XYZ])="([0-9.eE+-]+)"')
-_OME_CHANNEL = re.compile(r"<(?:\w+:)?Channel\b([^>]*)>")
-_ATTR = re.compile(r'(\w+)="([^"]*)"')
-
-
-def _ome_voxel_and_channels(xml: str) -> Tuple[List[float], List[Dict[str, Any]]]:
-    voxel = [0.0, 0.0, 0.0]
-    for axis, value in _OME_SIZE.findall(xml or ""):
-        try:
-            voxel["XYZ".index(axis)] = float(value)
-        except ValueError:
-            pass
-    channels = []
-    for attrs in _OME_CHANNEL.findall(xml or ""):
-        a = dict(_ATTR.findall(attrs))
-        ch: Dict[str, Any] = {"name": a.get("Name", "")}
-        try:
-            if a.get("EmissionWavelength"):
-                ch["wavelength_nm"] = float(a["EmissionWavelength"])
-        except ValueError:
-            pass
-        channels.append(ch)
-    return voxel, channels
+TIFF_NEEDS_SIRIUS = ("reading TIFF on the cluster needs the sirius package in the worker's Python "
+                     "(pip install <checkout> in the worker's venv); see app/python/slurm/README.md")
 
 
-def _imagej_voxel(tf: Any, ij: Dict[str, Any]) -> List[float]:
-    voxel = [0.0, 0.0, 0.0]
+def _sirius() -> Any:
+    """The sirius extension (SIRIUS's TIFF reader), or None when it does not
+    import. A directory named sirius on the path imports as an empty
+    namespace package, hence the attributes."""
     try:
-        page = tf.pages[0]
-        xr = page.tags.get("XResolution")
-        yr = page.tags.get("YResolution")
-        if xr is not None and xr.value[0]:
-            voxel[0] = float(xr.value[1]) / float(xr.value[0])
-        if yr is not None and yr.value[0]:
-            voxel[1] = float(yr.value[1]) / float(yr.value[0])
-    except Exception:  # noqa: BLE001 - a missing or odd tag only loses the voxel size
-        pass
+        import sirius  # type: ignore
+
+        sirius.inspect_tiff  # noqa: B018
+        sirius.TiffFile  # noqa: B018
+        sirius.Device  # noqa: B018
+        return sirius
+    except Exception:  # noqa: BLE001 - absent, or built for another Python / without its libraries
+        return None
+
+
+def _sirius_version(ext: Any) -> str:
+    v = str(getattr(ext, "__version__", "") or "")
+    if not v:
+        try:
+            from importlib import metadata
+
+            v = metadata.version("sirius")
+        except Exception:  # noqa: BLE001 - a build tree on PYTHONPATH has no distribution
+            v = "unknown"
+    return v
+
+
+def _gpu(ext: Any, device: Optional[str]) -> Any:
+    """The CUDA device a decode named `device` ("cuda", "cuda:1", "auto"
+    (the GPU when there is one), "cpu") runs on with nvTIFF, or None for the
+    CPU decoder: a CPU device, a build without nvTIFF, or no such GPU."""
+    text = str(device or "auto").strip().lower()
+    if text != "auto" and not text.startswith("cuda"):
+        return None
     try:
-        voxel[2] = float(ij.get("spacing", 0.0) or 0.0)
-    except (TypeError, ValueError):
-        pass
-    return voxel
+        if not (ext.built_with_nvtiff() and ext.cuda_available()):
+            return None
+        index = int(text.split(":", 1)[1]) if text.startswith("cuda:") else 0
+        if not 0 <= index < int(ext.cuda_device_count()):
+            return None
+        return ext.Device.cuda(index)
+    except Exception:  # noqa: BLE001 - an odd device name or a driver that will not say
+        return None
+
+
+def tiff_reader(device: Optional[str] = "auto") -> Dict[str, Any]:
+    """hello's "tiff_reader": {"sirius": the package's version, or None when
+    TIFF cannot be read here; "nvtiff": whether a decode on `device` runs on
+    the GPU}."""
+    ext = _sirius()
+    if ext is None:
+        return {"sirius": None, "nvtiff": False}
+    return {"sirius": _sirius_version(ext), "nvtiff": _gpu(ext, device) is not None}
+
+
+def _host(a: Any) -> np.ndarray:
+    """A read's pixels on the host: numpy from a CPU decode; a sirius.Buffer
+    (GPU memory) from an nvTIFF decode, copied home."""
+    if isinstance(a, np.ndarray):
+        return a
+    to_numpy = getattr(a, "numpy", None)
+    return np.asarray(to_numpy() if callable(to_numpy) else a)
+
+
+def _ceil_div(a: int, b: int) -> int:
+    return -(-a // b)
 
 
 # --- the dataset -----------------------------------------------------------------------------------
 
 class Dataset:
-    """One opened dataset; planes and volumes in the file's own dtype."""
+    """One opened dataset; planes and volumes in the file's own dtype.
+
+    The reads take the decode `device` ("cpu", "cuda", "cuda:N" or "auto"):
+    a TIFF is decoded with nvTIFF on that GPU when it is one the sirius
+    package can decode on, else on the CPU; what comes back is on the host."""
 
     def __init__(self, path: str, options: Optional[Dict[str, Any]] = None) -> None:
         self.path = os.path.expanduser(path)
         self.options = dict(options or {})
         self.key = (os.path.abspath(self.path), _options_key(options))
-        self._lock = threading.Lock()
-        self._tf = None
-        self._pages = None          # sequence of pages, or None for an in-memory / memmapped array
-        self._array = None          # (c, t, z, y, x) view (memmap or ndarray) when one exists
-        self._rgb = False
-        self._axes_map: Optional[Tuple[str, Tuple[int, ...]]] = None
-        self._plain = True
+        self._tf: Any = None        # sirius.TiffFile of a TIFF
+        self._ext: Any = None       # the sirius module that opened it
+        self._array = None          # (c, t, z, y, x) view (memmap) of a .npy
+        self._order = "czt"         # a TIFF's page order, fastest axis first
+        self._levels: List[Tuple[int, int, int]] = []   # a TIFF's pyramid: (width, height, pages) per level
+        self._gpu_ok: Dict[str, bool] = {}              # device -> nvTIFF can decode this file there
+        self._paged_regions = True  # the extension reads a region of chosen pages (read_region first / count)
         if not os.path.exists(self.path):
             raise DatasetError(f"{path}: no such file on {socket.gethostname()}")
         if os.path.isdir(self.path):
@@ -174,92 +214,51 @@ class Dataset:
         self.dims_from_metadata = a.ndim > 3
 
     def _open_tiff(self) -> None:
+        ext = _sirius()
+        if ext is None:
+            raise DatasetError(TIFF_NEEDS_SIRIUS)
+        from .steps import workbench
+
+        wb = workbench()
+        if not hasattr(wb, "tiff_dims"):
+            raise DatasetError("the sirius package in the worker's Python is older than this worker: reinstall it "
+                               "from the checkout (pip install <checkout> in the worker's venv)")
+        name = os.path.basename(self.path)
         try:
-            import tifffile  # type: ignore
-        except ImportError as e:
-            raise DatasetError("reading TIFF on the cluster needs tifffile in the worker's Python: "
-                               "pip install tifffile") from e
-        tf = tifffile.TiffFile(self.path)
-        self._tf = tf
-        series = tf.series[0]
-        axes = str(series.axes)
-        shape = tuple(int(v) for v in series.shape)
-        self.dtype = np.dtype(series.dtype)
-        self.format = "ome-tiff" if tf.is_ome else ("imagej-tiff" if tf.is_imagej else "tiff")
-        if tf.is_ome:
-            self.voxel, self.channels = _ome_voxel_and_channels(tf.ome_metadata or "")
-        elif tf.is_imagej:
-            ij = tf.imagej_metadata or {}
-            self.voxel = _imagej_voxel(tf, ij)
-            try:
-                self.frame_interval = float(ij.get("finterval", 0.0) or 0.0)
-            except (TypeError, ValueError):
-                self.frame_interval = 0.0
-        self._samples_last = True
-        if "S" in axes:
-            # samples (RGB, or planar channels): the sample axis is the channel axis
-            i = axes.index("S")
-            self._rgb = True
-            self._samples_last = i == len(axes) - 1
-            self._samples = shape[i]
-            axes, shape = axes[:i] + axes[i + 1:], shape[:i] + shape[i + 1:]
-        if not axes.endswith("YX"):
-            raise DatasetError(f"{os.path.basename(self.path)}: axes {series.axes} do not end in YX")
-        self.y, self.x = shape[-2], shape[-1]
-        outer_axes, outer_shape = axes[:-2], shape[:-2]
-        # the planes, in the order the file stores them
-        contiguous = series.dataoffset is not None and not self._rgb
-        if contiguous:
-            n = int(np.prod(outer_shape)) if outer_shape else 1
-            mm = np.memmap(self.path, dtype=series.dtype.newbyteorder(tf.byteorder), mode="r",
-                           offset=series.dataoffset, shape=(n, self.y, self.x))
-            self._pages = mm
-        else:
-            self._pages = series.pages
-        explicit = set(outer_axes) & set("CTZ")
+            tf = ext.TiffFile(self.path)
+            info = tf.info
+            uniform = bool(info.uniform_pages)
+        except Exception as e:  # noqa: BLE001 - libtiff's own words: not a TIFF, RGB, planar ...
+            raise DatasetError(f"{name}: {e}") from e
+        if not uniform:
+            raise DatasetError(f"{name}: the pages differ in size or pixel type")
+        self._ext, self._tf = ext, tf
+        pages = int(info.page_count)
+        self.y, self.x = int(info.height), int(info.width)
+        self.dtype = np.dtype(info.dtype)
+        self._levels = [(int(lv.width), int(lv.height), len(lv.ifds)) for lv in info.levels]
+        tags = wb.tiff_tags(info.page(0)) or {"description": "", "xres": 0.0, "yres": 0.0, "res_unit": 2}
+        md = wb._parse_tiff_description(tags["description"])
+        # the application sends a page order exactly when it has one
+        # (remote_source.cpp remoteOptionsJson), and then it wins over the metadata
         o = self.options
-        if self._rgb:
-            # one page per plane, its samples the channels
-            self._plain = False
-            pages = int(np.prod(outer_shape)) if outer_shape else 1
-            self.c, self.t, self.z = int(self._samples), 1, pages
-            self._axes_map = ("rgb", outer_shape)
-            self.dims_from_metadata = True
-        elif explicit and len(explicit) == len(outer_axes) and not any(o.get(k) for k in ("c", "t", "z")) \
-                and not o.get("page_order"):
-            # every outer axis is C, T or Z (OME / ImageJ hyperstacks): the file says
-            self._plain = False
-            sizes = dict(zip(outer_axes, outer_shape))
-            self.c, self.t, self.z = sizes.get("C", 1), sizes.get("T", 1), sizes.get("Z", 1)
-            self._axes_map = (outer_axes, outer_shape)
-            self.dims_from_metadata = True
-        else:
-            # plain pages, mapped by the page order the application sends
-            pages = int(np.prod(outer_shape)) if outer_shape else 1
-            order = str(o.get("page_order", "") or "czt")
-            c, t = max(int(o.get("c", 0) or 0), 1), max(int(o.get("t", 0) or 0), 1)
-            z = int(o.get("z", 0) or 0)
-            if z <= 0:
-                z = pages // (c * t) if pages % (c * t) == 0 else 0
-            if z <= 0 or c * t * z > pages:
-                c, t, z = 1, 1, pages   # a layout the pages do not divide into: read them as z
-            self.c, self.t, self.z = c, t, z
-            self._order = order
-            self._plain = True
-            self.dims_from_metadata = False
+        given = o.get("page_order") is not None
+        self.c, self.t, self.z, self._order, from_meta = wb.tiff_dims(
+            pages, md, given, str(o.get("page_order") or "czt"), o.get("c"), o.get("t"), o.get("z"))
+        self.dims_from_metadata = bool(from_meta)
+        self.format = "ome-tiff" if md["ome"] else ("imagej-tiff" if md["imagej"] else "tiff")
+        self.voxel = wb.tiff_voxel(md, tags["xres"], tags["yres"], tags["res_unit"])
+        self.frame_interval = max(float(md["frame_interval_s"] or 0.0), 0.0)
+        if md["ome"]:
+            for ch in md["channels"]:
+                entry: Dict[str, Any] = {"name": str(ch.get("label", ""))}
+                if float(ch.get("wavelength_nm", 0.0) or 0.0) > 0.0:
+                    entry["wavelength_nm"] = float(ch["wavelength_nm"])
+                self.channels.append(entry)
 
     def close(self) -> None:
-        """Lets the file go (Windows will not delete a file a memmap or a TiffFile holds)."""
-        pages, self._pages, self._array = self._pages, None, None
-        mm = getattr(pages, "_mmap", None)
-        if mm is not None:
-            try:
-                mm.close()
-            except (BufferError, ValueError):
-                pass
-        if self._tf is not None:
-            self._tf.close()
-            self._tf = None
+        """Lets the file go."""
+        self._array, self._tf = None, None
 
     # --- facts -------------------------------------------------------------------------------------
 
@@ -279,7 +278,7 @@ class Dataset:
             "voxel_um": [float(v) for v in self.voxel],
             "frame_interval_s": float(self.frame_interval),
             "channels": self.channels,
-            "rgb": bool(self._rgb),
+            "rgb": False,
             "dims_from_metadata": bool(self.dims_from_metadata),
         }
 
@@ -288,32 +287,102 @@ class Dataset:
             where = f"c {c}, t {t}" + ("" if z is None else f", z {z}")
             raise DatasetError(f"{where} is outside the dataset ({self.c} channels, {self.t} time points, {self.z} planes)")
 
+    # --- reading a TIFF (sirius.TiffFile) --------------------------------------------------------
+
+    def _page_of(self, c: int, t: int, z: int) -> int:
+        return _plane_of(self._order, c, t, z, self.c, self.t, self.z)
+
+    def _device(self, device: Optional[str]) -> Any:
+        """sirius.Device of a decode: the GPU when nvTIFF decodes this file
+        there (TiffFile.gpu_decodable), else the CPU."""
+        ext = self._ext
+        gpu = _gpu(ext, device)
+        if gpu is None:
+            return ext.Device.cpu()
+        key = str(device or "auto").strip().lower()
+        ok = self._gpu_ok.get(key)
+        if ok is None:
+            try:
+                ok = bool(self._tf.gpu_decodable(gpu)[0])
+            except Exception:  # noqa: BLE001 - say no and decode on the CPU
+                ok = False
+            self._gpu_ok[key] = ok
+        return gpu if ok else ext.Device.cpu()
+
+    def _pages(self, first: int, count: int, device: Optional[str]) -> np.ndarray:
+        """Pages [first, first + count) as (count, y, x)."""
+        out = self._tf.read_pages(int(first), int(count), device=self._device(device), allow_cpu_fallback=True)
+        return _host(out).reshape(int(count), self.y, self.x)
+
+    def _region(self, page: int, x: int, y: int, w: int, h: int, level: int,
+                device: Optional[str]) -> Optional[np.ndarray]:
+        """(h, w) at (x, y) of one page at pyramid `level`, decoding only the
+        tiles / strips it covers; None when this extension cannot read a
+        region of one page there (built before read_region took first / count)."""
+        if self._paged_regions:
+            try:
+                out = self._tf.read_region(int(x), int(y), int(w), int(h), level=int(level), device=self._device(device),
+                                           allow_cpu_fallback=True, first=int(page), count=1)
+                return _host(out).reshape(int(h), int(w))
+            except TypeError:
+                self._paged_regions = False   # an older extension: whole pages, cropped here
+        if level != 0:
+            return None
+        return self._pages(page, 1, device)[0, y:y + h, x:x + w]
+
+    def _level_for(self, factor: int) -> Optional[Tuple[int, int]]:
+        """(level, scale) of the most reduced pyramid level whose integer
+        scale divides `factor` and that holds every page, or None."""
+        best = None
+        pages = self._levels[0][2] if self._levels else 0
+        for k, (w, h, n) in enumerate(self._levels[1:], 1):
+            if w <= 0 or h <= 0 or n != pages:
+                continue
+            s = int(round(self.x / w))
+            if s < 2 or factor % s or w not in (self.x // s, _ceil_div(self.x, s)) \
+                    or h not in (self.y // s, _ceil_div(self.y, s)):
+                continue
+            if best is None or s > best[1]:
+                best = (k, s)
+        return best
+
+    def _tiff_xy(self, c: int, t: int, z: int, factor: int, box: Tuple[int, int, int, int],
+                 device: Optional[str]) -> np.ndarray:
+        """The XY view of a TIFF plane: the region `box` (x0, y0, x1, y1)
+        reduced by `factor`, from a pyramid level when one fits (the
+        writer's reduction, not this worker's block mean), else from the
+        region's own pixels at full resolution."""
+        x0, y0, x1, y1 = box
+        page = self._page_of(c, t, z)
+        lv = self._level_for(factor) if factor > 1 else None
+        if lv is not None and x0 % lv[1] == 0 and y0 % lv[1] == 0:
+            k, s = lv
+            w, h, _ = self._levels[k]
+            lx0, ly0 = x0 // s, y0 // s
+            lx1, ly1 = min(_ceil_div(x1, s), w), min(_ceil_div(y1, s), h)
+            part = self._region(page, lx0, ly0, lx1 - lx0, ly1 - ly0, k, device) if lx1 > lx0 and ly1 > ly0 else None
+            if part is not None:
+                out = reduce_blocks(part, (factor // s, factor // s))
+                if out.shape == (_ceil_div(y1 - y0, factor), _ceil_div(x1 - x0, factor)):
+                    return out
+        if (x0, y0, x1, y1) == (0, 0, self.x, self.y):
+            full = self._pages(page, 1, device)[0]
+        else:
+            full = self._region(page, x0, y0, x1 - x0, y1 - y0, 0, device)
+        return reduce_blocks(full, (factor, factor))
+
     # --- reading (the file's dtype) ------------------------------------------------------------------
 
-    def _page(self, index: int) -> np.ndarray:
-        pages = self._pages
-        if isinstance(pages, np.ndarray):
-            return np.asarray(pages[index])
-        with self._lock:   # a TiffFile handle is not safe across threads
-            return np.asarray(pages[index].asarray())
-
-    def plane(self, c: int, t: int, z: int) -> np.ndarray:
+    def plane(self, c: int, t: int, z: int, device: Optional[str] = "auto") -> np.ndarray:
         self._check(c, t, z)
         if self._array is not None:
             return np.asarray(self._array[c, t, z])
-        if self._axes_map is not None and self._axes_map[0] == "rgb":
-            page = self._page(z)
-            return np.asarray(page[..., c] if self._samples_last else page[c])
-        if not self._plain:
-            axes, shape = self._axes_map
-            index = {"C": c, "T": t, "Z": z}
-            flat = 0
-            for a, n in zip(axes, shape):
-                flat = flat * n + index.get(a, 0)
-            return self._page(flat)
-        return self._page(_plane_of(self._order, c, t, z, self.c, self.t, self.z))
+        cached = _VOLUMES.get((self.key, c, t))
+        if cached is not None:
+            return cached[z]
+        return self._pages(self._page_of(c, t, z), 1, device)[0]
 
-    def volume(self, c: int, t: int) -> np.ndarray:
+    def volume(self, c: int, t: int, device: Optional[str] = "auto") -> np.ndarray:
         self._check(c, t)
         key = (self.key, c, t)
         cached = _VOLUMES.get(key)
@@ -322,16 +391,33 @@ class Dataset:
         if self._array is not None:
             vol = np.ascontiguousarray(self._array[c, t])
         else:
-            vol = np.empty((self.z, self.y, self.x), dtype=self.dtype)
-            for z in range(self.z):
-                vol[z] = self.plane(c, t, z)
+            vol = self._tiff_volume(c, t, device)
         _VOLUMES.put(key, vol)
+        return vol
+
+    def _tiff_volume(self, c: int, t: int, device: Optional[str]) -> np.ndarray:
+        """The z planes of (c, t): one page range when z is the fastest axis
+        (or the only one); when the pages of other axes sit between them,
+        one range of at most 4x the volume (and 1 GiB) sliced every
+        stride-th page, else page by page."""
+        first = self._page_of(c, t, 0)
+        stride = self._page_of(c, t, 1) - first if self.z > 1 else 1
+        if stride == 1:
+            return np.ascontiguousarray(self._pages(first, self.z, device))
+        span = (self.z - 1) * stride + 1
+        plane_bytes = self.y * self.x * np.dtype(self.dtype).itemsize
+        if stride <= 4 and span * plane_bytes <= (1 << 30):
+            return np.ascontiguousarray(self._pages(first, span, device)[::stride])
+        vol = np.empty((self.z, self.y, self.x), dtype=self.dtype)
+        for z in range(self.z):
+            vol[z] = self._pages(first + z * stride, 1, device)[0]
         return vol
 
     # --- what a pane draws -------------------------------------------------------------------------
 
     def view(self, kind: str, c: int, t: int, index: int = 0, factor: int = 1,
-             region: Optional[Sequence[int]] = None, max_side: int = 256) -> np.ndarray:
+             region: Optional[Sequence[int]] = None, max_side: int = 256,
+             device: Optional[str] = "auto") -> np.ndarray:
         """kind xy: the (y, x) plane at z = index; xz: rows z, columns x at y = index;
         yz: rows y, columns z at x = index; mip: the z maximum projection (y, x);
         volume: the (z, y, x) volume reduced to a longest side of `max_side`.
@@ -339,39 +425,36 @@ class Dataset:
         factor = max(int(factor), 1)
         kind = kind.lower()
         if kind == "volume":
-            vol = self.volume(c, t)
+            vol = self.volume(c, t, device)
             f = tuple(max(1, -(-n // max(int(max_side), 1))) for n in vol.shape)
             return reduce_blocks(vol, f)
         if kind == "xy":
             self._check(c, t, index)
             cached = _VOLUMES.get((self.key, c, t))
-            full = cached[index] if cached is not None else self.plane(c, t, index)
+            if cached is None and self._tf is not None:
+                # a TIFF plane not in memory: read only what the pane shows
+                return self._tiff_xy(c, t, index, factor, _box(region, self.x, self.y), device)
+            full = cached[index] if cached is not None else self.plane(c, t, index, device)
         elif kind == "xz":
             self._check(c, t)
-            full = self.volume(c, t)[:, min(max(int(index), 0), self.y - 1), :]
+            full = self.volume(c, t, device)[:, min(max(int(index), 0), self.y - 1), :]
         elif kind == "yz":
             self._check(c, t)
-            full = self.volume(c, t)[:, :, min(max(int(index), 0), self.x - 1)].T
+            full = self.volume(c, t, device)[:, :, min(max(int(index), 0), self.x - 1)].T
         elif kind == "mip":
             self._check(c, t)
             key = (self.key, c, t, "mip")
             full = _VOLUMES.get(key)
             if full is None:
-                full = np.max(self.volume(c, t), axis=0)
+                full = np.max(self.volume(c, t, device), axis=0)
                 _VOLUMES.put(key, full)
         else:
             raise DatasetError(f"unknown view '{kind}': xy, xz, yz, mip or volume")
         rows, cols = full.shape
-        if region is not None and len(region) == 4:
-            x0, y0, w, h = (int(v) for v in region)
-            x0, y0 = max(x0, 0), max(y0, 0)
-            x1, y1 = min(x0 + max(w, 0), cols), min(y0 + max(h, 0), rows)
-            if x1 <= x0 or y1 <= y0:
-                raise DatasetError(f"region {list(region)} is outside the {cols} x {rows} view")
-            full = full[y0:y1, x0:x1]
-        return reduce_blocks(full, (factor, factor))
+        x0, y0, x1, y1 = _box(region, cols, rows)
+        return reduce_blocks(full[y0:y1, x0:x1], (factor, factor))
 
-    def stats(self, c: int, t: int) -> Dict[str, float]:
+    def stats(self, c: int, t: int, device: Optional[str] = "auto") -> Dict[str, float]:
         """A display window from a few planes spread over z: the 0.1 / 99.9
         percentiles (what the viewer's Auto window is) and the range."""
         self._check(c, t)
@@ -379,7 +462,7 @@ class Dataset:
         zs = [0] if n == 1 else [k * (self.z - 1) // (n - 1) for k in range(n)]
         samples = []
         for z in zs:
-            p = self.plane(c, t, z).ravel()
+            p = self.plane(c, t, z, device).ravel()
             stride = max(1, p.size // (1 << 16))
             samples.append(p[::stride].astype(np.float32))
         s = np.concatenate(samples) if samples else np.zeros(1, np.float32)
@@ -391,6 +474,19 @@ class Dataset:
         if hi <= lo:
             lo, hi = mn, (mx if mx > mn else mn + 1.0)
         return {"lo": lo, "hi": hi, "min": mn, "max": mx}
+
+
+def _box(region: Optional[Sequence[int]], cols: int, rows: int) -> Tuple[int, int, int, int]:
+    """(x0, y0, x1, y1) of `region` (x, y, w, h) clipped to a cols x rows
+    view; the whole view without one."""
+    if region is None or len(region) != 4:
+        return 0, 0, cols, rows
+    x0, y0, w, h = (int(v) for v in region)
+    x0, y0 = max(x0, 0), max(y0, 0)
+    x1, y1 = min(x0 + max(w, 0), cols), min(y0 + max(h, 0), rows)
+    if x1 <= x0 or y1 <= y0:
+        raise DatasetError(f"region {list(region)} is outside the {cols} x {rows} view")
+    return x0, y0, x1, y1
 
 
 def reduce_blocks(a: np.ndarray, factors: Sequence[int]) -> np.ndarray:
@@ -538,20 +634,21 @@ def _indices(value: Any, extent: int, axis: str) -> List[int]:
     return out
 
 
-def read_ref(ref: Dict[str, Any]) -> np.ndarray:
+def read_ref(ref: Dict[str, Any], device: Optional[str] = "auto") -> np.ndarray:
     """A step's input named by reference instead of sent (the HPC backend
     with a cluster dataset): {path, options, c, t} -> the (z, y, x) volume as
-    float32; with c / t lists (or absent: all), layout "ctzyx" -> (c, t, z, y, x)."""
+    float32; with c / t lists (or absent: all), layout "ctzyx" -> (c, t, z, y, x).
+    A TIFF is decoded on `device` (see Dataset)."""
     ds = open_dataset(str(ref.get("path", "")), ref.get("options") or {})
     layout = str(ref.get("layout", "zyx"))
     if layout == "zyx":
-        return np.ascontiguousarray(ds.volume(int(ref.get("c", 0)), int(ref.get("t", 0))), dtype=np.float32)
+        return np.ascontiguousarray(ds.volume(int(ref.get("c", 0)), int(ref.get("t", 0)), device), dtype=np.float32)
     cs = _indices(ref.get("c"), ds.c, "c")
     ts = _indices(ref.get("t"), ds.t, "t")
     out = np.empty((len(cs), len(ts), ds.z, ds.y, ds.x), dtype=np.float32)
     for i, c in enumerate(cs):
         for j, t in enumerate(ts):
-            out[i, j] = ds.volume(c, t)
+            out[i, j] = ds.volume(c, t, device)
     return out
 
 

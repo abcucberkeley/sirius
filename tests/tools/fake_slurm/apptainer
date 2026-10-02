@@ -1,0 +1,39 @@
+#!/bin/bash
+# Fake apptainer (and singularity, as a copy of it) for tests/test_app_cluster.cpp:
+# `apptainer exec [--nv] [--bind PATH]... IMAGE COMMAND...` runs COMMAND here,
+# with no container: "python" is $FAKE_PYTHON, and $FAKE_CONTAINER_SITE, a
+# folder standing in for the image's packages (a stub `sirius`), goes in front
+# of PYTHONPATH. An image file that is not there, or whose text says "broken",
+# fails as Apptainer does. Each call's arguments are appended to
+# $FAKE_SLURM_DIR/apptainer.args; with $FAKE_APPTAINER_DRY=1 nothing is run.
+set -u
+[ -n "${FAKE_SLURM_DIR:-}" ] && printf '%s %s\n' "$(basename "$0")" "$*" >> "$FAKE_SLURM_DIR/apptainer.args"
+[ "${1:-}" = exec ] || { echo "fake apptainer: only exec is played" >&2; exit 2; }
+shift
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --bind|-B|--env|--env-file|--pwd) shift 2 ;;
+        -*) shift ;;
+        *) break ;;
+    esac
+done
+img="${1:-}"
+shift
+if [ ! -f "$img" ]; then
+    echo "FATAL:   could not open image $img: failed to retrieve path for $img: lstat $img: no such file or directory" >&2
+    exit 255
+fi
+if grep -q broken "$img"; then
+    echo "FATAL:   while loading image: could not mount squashfs: invalid superblock" >&2
+    exit 255
+fi
+[ "${FAKE_APPTAINER_DRY:-0}" = 1 ] && exit 0
+if [ -n "${FAKE_CONTAINER_SITE:-}" ]; then
+    sep=':'
+    case "${FAKE_PYTHON:-}" in *.exe | *.EXE) sep=';' ;; esac
+    export PYTHONPATH="${FAKE_CONTAINER_SITE}${PYTHONPATH:+$sep$PYTHONPATH}"
+fi
+case "${1:-}" in
+    python | python3) shift; exec "${FAKE_PYTHON:?}" "$@" ;;
+esac
+exec "$@"

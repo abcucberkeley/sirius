@@ -163,12 +163,14 @@ namespace sirius::app {
     // asked to go, as the launcher names it when it starts a local worker.
     // "auto" would mean the worker's own, fixed when its process started
     // and kept for the session, so a backend or GPU chosen since never
-    // reached it. The HPC worker keeps its own device.
+    // reached it. The HPC worker is told the session's choice
+    // (StepContext::hpcDevice), its job's GPU or its CPU, with every
+    // request, so a switch needs no new job.
     inline std::string workerDevice(const StepContext& ctx) {
         if (ctx.backend == Backend::Cpu) return "cpu";
         if (ctx.backend == Backend::Cuda)
             return ctx.device.isCuda() && ctx.device.index >= 0 ? "cuda:" + std::to_string(ctx.device.index) : std::string("cuda");
-        return "auto";
+        return ctx.hpcDevice == HpcDevice::Cpu ? "cpu" : "cuda";
     }
 
 } // namespace sirius::app

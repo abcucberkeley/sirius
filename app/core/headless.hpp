@@ -41,6 +41,7 @@ namespace sirius::app {
                              Off } plugins = Plugins::Auto;
         std::string backend = "auto";                     // auto | cpu | cuda | hpc
         int cudaDevice = 0;                               // Workbench::kAllCudaDevices = all
+        std::string hpcDevice = "gpu";                    // gpu | cpu: the HPC worker's (Workbench::hpcDevice)
         std::optional<RemoteConfig> hpc;                  // --hpc; the only endpoint tools may select (D27)
         std::string hubToken;                             // $HF_TOKEN
         std::string recordPath;

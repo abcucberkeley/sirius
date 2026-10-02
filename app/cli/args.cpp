@@ -164,6 +164,8 @@ namespace sirius::cli {
                 if (lower(value) == "all") g.cudaDevice = -1;
                 else if (isDigits(value) && value.size() < 6) g.cudaDevice = std::atoi(value.c_str());
                 else throw UsageError("--cuda-device expects a device number or all, not '" + value + "'");
+            } else if (name == "hpc-device") {
+                g.hpcDevice = oneOf(name, value, {"gpu", "cpu"});
             } else if (name == "hpc") {
                 // host:port; an IPv6 address comes in brackets ([::1]:7645)
                 const std::size_t colon = value.rfind(':');
@@ -201,6 +203,7 @@ namespace sirius::cli {
             opt("backend", "auto|cpu|cuda|hpc", "enum", "auto", "the compute backend; auto = CUDA when available, else CPU; hpc needs --hpc"),
             opt("cuda-device", "n|all", "string", "0", "the CUDA device, or all to spread the volumes over every GPU"),
             opt("hpc", "host:port", "string", "", "the HPC worker this process may use, the only one (token from $SIRIUS_HPC_TOKEN)"),
+            opt("hpc-device", "gpu|cpu", "enum", "gpu", "where the HPC worker computes: its job's GPU, or its CPU (set_backend switches it later)"),
             opt("plugins", "auto|on|off", "enum", "auto", "user operations from the Python worker: loaded when a step needs them, at start, or never"),
             opt("scratch", "dir", "path", "",
                 "the scratch directory (disk cache, rendered images); default a new temporary one. It is removed at exit when "

@@ -101,7 +101,7 @@ TEST_CASE("every shipped help page parses with the fields the window shows", "[a
     // operations the app ships
     for (const char* kind : {"load", "sim", "decon", "volrec", "einsum", "maxproj", "meant", "contrast", "flatfield",
                              "bleach", "deskew", "croppad", "resample", "merge", "stitch", "register", "seg",
-                             "foundation", "threshold", "cleanup", "manual", "shortcuts", "plugin-api"})
+                             "foundation", "classic", "cleanup", "manual", "shortcuts", "plugin-api"})
         CHECK(fs::exists(dir / (std::string(kind) + ".md")));
 }
 

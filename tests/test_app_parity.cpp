@@ -169,13 +169,14 @@ namespace {
         // on one side or both (a running sum / product a few ulps past the edge)
         {"resample_edges", "resample", {{"voxel_x", 0.04}, {"voxel_y", 0.04}, {"voxel_z", 0.1}, {"interpolation", "linear"}}},
         {"resample_nearest", "resample", {{"voxel_x", 0.16}, {"voxel_y", 0.16}, {"voxel_z", 0.2}, {"interpolation", "nearest"}}},
-        {"threshold_otsu", "threshold", {{"channel", 0}, {"method", "Otsu"}, {"post", "Connected components"}, {"min_voxels", 0}}},
-        {"threshold_manual", "threshold", {{"channel", 1}, {"method", "Manual"}, {"value", 0.6}, {"post", "Connected components"}, {"min_voxels", 4}}},
-        {"threshold_percentile", "threshold", {{"channel", 0}, {"method", "Percentile"}, {"percentile", 92.0}, {"post", "Connected components"}, {"min_voxels", 0}}},
+        // the classic step reduced to a global cut: no top-hat, blur, opening or hole fill
+        {"classic_cut_otsu", "classic", {{"channel", 0}, {"method", "Otsu"}, {"tophat", 0}, {"sigma", 0.0}, {"opening", 0}, {"fill_holes", false}, {"post", "Connected components"}, {"min_voxels", 0}}},
+        {"classic_cut_manual", "classic", {{"channel", 1}, {"method", "Manual"}, {"value", 0.6}, {"tophat", 0}, {"sigma", 0.0}, {"opening", 0}, {"fill_holes", false}, {"post", "Connected components"}, {"min_voxels", 4}}},
+        {"classic_cut_percentile", "classic", {{"channel", 0}, {"method", "Percentile"}, {"percentile", 92.0}, {"tophat", 0}, {"sigma", 0.0}, {"opening", 0}, {"fill_holes", false}, {"post", "Connected components"}, {"min_voxels", 0}}},
         // +-inf voxels: the histograms span the finite values (an infinite
         // end used to write a NaN bin index out of bounds), and max / min
         // keep a real infinity instead of mistaking it for "nothing seen"
-        {"threshold_otsu_inf", "threshold", {{"channel", 0}, {"method", "Otsu"}, {"post", "Connected components"}, {"min_voxels", 0}}, nullptr, true},
+        {"classic_cut_otsu_inf", "classic", {{"channel", 0}, {"method", "Otsu"}, {"tophat", 0}, {"sigma", 0.0}, {"opening", 0}, {"fill_holes", false}, {"post", "Connected components"}, {"min_voxels", 0}}, nullptr, true},
         {"classic_multi_otsu_inf", "classic", {{"channel", 1}, {"method", "Multi-Otsu"}, {"sigma", 0.0}, {"opening", 0}, {"fill_holes", false}, {"post", "Connected components"}, {"min_voxels", 2}}, nullptr, true},
         {"contrast_auto_inf", "contrast", {{"min", 0.0}, {"max", 0.0}, {"gamma", 1.0}}, nullptr, true},
         {"einsum_max_c_inf", "einsum", {{"keep", "tzyx"}, {"reduction", "max"}}, nullptr, true},
@@ -193,7 +194,7 @@ namespace {
         {"classic_otsu_distance_maxima", "classic", {{"channel", 0}, {"method", "Otsu"}, {"sigma", 1.0}, {"opening", 1}, {"post", "Watershed (distance)"}, {"seeds", "Distance maxima"}, {"seed_distance", 3.0}, {"min_voxels", 4}}},
         // Seeds further apart than the objects: a component no seed landed in
         // is numbered after the seeds instead of being dropped.
-        {"threshold_watershed_far_seeds", "threshold", {{"channel", 0}, {"method", "Percentile"}, {"percentile", 85.0}, {"post", "Watershed (distance)"}, {"seed_distance", 12.0}, {"min_voxels", 0}}},
+        {"classic_watershed_far_seeds", "classic", {{"channel", 0}, {"method", "Percentile"}, {"percentile", 85.0}, {"tophat", 0}, {"sigma", 0.0}, {"opening", 0}, {"fill_holes", false}, {"post", "Watershed (distance)"}, {"seeds", "Distance maxima"}, {"seed_distance", 12.0}, {"min_voxels", 0}}},
         {"classic_multi_otsu", "classic", {{"channel", 1}, {"method", "Multi-Otsu"}, {"sigma", 0.0}, {"opening", 0}, {"fill_holes", false}, {"post", "Connected components"}, {"min_voxels", 2}}},
         {"classic_local_contrast", "classic", {{"channel", 0}, {"method", "Local contrast"}, {"window", 11}, {"contrast_k", 1.2}, {"sigma", 0.0}, {"opening", 0}, {"fill_holes", false}, {"post", "Connected components"}, {"min_voxels", 2}}},
         {"classic_local_mean", "classic", {{"channel", 0}, {"method", "Local mean"}, {"window", 11}, {"local_ratio", 1.15}, {"sigma", 0.0}, {"opening", 0}, {"fill_holes", false}, {"post", "Connected components"}, {"min_voxels", 2}}},
@@ -236,8 +237,8 @@ namespace {
         // ids that are left one numbering over all of them (frame 0 loses its
         // id 2, so a numbering per frame would move id 3 there). No
         // remove_border case: every object of a 4-plane volume touches z.
-        {"cleanup_relabel", "cleanup", {{"min_voxels", 3}, {"relabel", true}}, "threshold_percentile"},
-        {"cleanup_keep_ids", "cleanup", {{"min_voxels", 2}, {"relabel", false}}, "threshold_percentile"},
+        {"cleanup_relabel", "cleanup", {{"min_voxels", 3}, {"relabel", true}}, "classic_cut_percentile"},
+        {"cleanup_keep_ids", "cleanup", {{"min_voxels", 2}, {"relabel", false}}, "classic_cut_percentile"},
         // No "Anisotropic diffusion" case: every step of it evaluates exp(),
         // and the C++ standard library and NumPy do not agree in the last bit.
         // Five iterations later a voxel can land on the other side of the

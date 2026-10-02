@@ -62,6 +62,9 @@ namespace sirius::app::gui {
             return b == Backend::Cuda && !cudaAvailable() ? Backend::Cpu : b;
         }
 
+        // The stored HPC device ("compute/hpcDevice": gpu | cpu); the GPU by default.
+        HpcDevice storedHpcDevice() { return hpcDeviceFromString(settings().getString("compute/hpcDevice", "gpu")).value_or(HpcDevice::Gpu); }
+
         // "the requirements changed." -> "the requirements changed", to go before one of ours.
         std::string withoutStop(std::string s) {
             s = trimmed(s);
@@ -98,6 +101,9 @@ namespace sirius::app::gui {
                 // does not replace it.
                 if (!cudaAvailable() && wb.backend() == Backend::Cpu && settings().getInt("compute/backend", 1) == 0)
                     backend_ = static_cast<int>(Backend::Cuda);
+                // Likewise a stored GPU the cluster's job cannot give (the session then runs on its CPU).
+                hpcDevice_ = static_cast<int>(wb.hpcDevice());
+                if (!app.cluster().hpcGpuUsable() && storedHpcDevice() == HpcDevice::Gpu) hpcDevice_ = static_cast<int>(HpcDevice::Gpu);
                 const int n = cudaDeviceCount();
                 for (int i = 0; i < n; ++i) {
                     deviceNames_.push_back(deviceLabel(i));
@@ -221,6 +227,17 @@ namespace sirius::app::gui {
                 }
                 if (backend_ == static_cast<int>(Backend::Cuda) && !cudaAvailable())
                     note("No CUDA device is available in this build / machine: runs use the CPU until there is one.");
+                if (backend_ == static_cast<int>(Backend::Hpc)) {
+                    // where the HPC worker computes, sent with each step: no new job to switch
+                    std::string why;
+                    const bool gpu = app.cluster().hpcGpuUsable(&why);
+                    const Field f("Cluster device");
+                    widgets::SegmentedOpts so;
+                    so.optionEnabled = {gpu, true};
+                    so.tooltips = {gpu ? "Run the worker's steps on the job's GPU" : why,
+                                   "Run the worker's steps on the job's CPU (the GPU stays allocated)"};
+                    widgets::segmented("##hpcDevice", {"GPU", "CPU"}, &hpcDevice_, so);
+                }
                 widgets::rule(theme::kRule);
                 widgets::caption("HPC worker");
                 {
@@ -604,6 +621,8 @@ namespace sirius::app::gui {
                 const int device = deviceValues_[static_cast<std::size_t>(std::clamp(device_, 0, static_cast<int>(deviceValues_.size()) - 1))];
                 s.set("compute/backend", backend_);
                 s.set("compute/cudaDevice", device);
+                const HpcDevice hpcDevice = hpcDevice_ == static_cast<int>(HpcDevice::Cpu) ? HpcDevice::Cpu : HpcDevice::Gpu;
+                s.set("compute/hpcDevice", std::string(hpcDevice == HpcDevice::Cpu ? "cpu" : "gpu"));
                 s.set("hpc/host", trimmed(host_));
                 s.set("hpc/port", static_cast<int>(port_));
                 // Save writes only the secrets the user changed: rewriting an
@@ -632,6 +651,8 @@ namespace sirius::app::gui {
                 if (apiKey_ != openedApiKey_ && !AssistantSettings::storeApiKey(apiKey_)) notStored.emplace_back("the assistant's API key");
                 wb.setBackend(usableBackend(backend_));
                 wb.setCudaDevice(device);
+                // a GPU the job does not have stays the stored default only
+                if (hpcDevice == HpcDevice::Cpu || app.cluster().hpcGpuUsable()) wb.setHpcDevice(hpcDevice);
                 RemoteConfig rc;
                 rc.host = trimmed(host_);
                 rc.port = static_cast<int>(port_);
@@ -652,6 +673,7 @@ namespace sirius::app::gui {
             int tab_ = 0;
             int backend_ = 0;
             int device_ = 0;
+            int hpcDevice_ = 0;                       // HpcDevice: 0 GPU, 1 CPU
             std::vector<std::string> deviceNames_;
             std::vector<int> deviceValues_;
             bool deviceEnabled_ = true;
@@ -699,6 +721,7 @@ namespace sirius::app::gui {
         const Settings& s = settings();
         wb.setBackend(usableBackend(s.getInt("compute/backend", cudaAvailable() ? 0 : 1)));
         wb.setCudaDevice(s.getInt("compute/cudaDevice", 0));
+        wb.setHpcDevice(storedHpcDevice());
         RemoteConfig rc;
         rc.host = s.getString("hpc/host", "localhost");
         rc.port = s.getInt("hpc/port", 7645);

@@ -31,6 +31,16 @@ namespace sirius::app {
         return std::nullopt;
     }
 
+    const char* toString(HpcDevice d) noexcept { return d == HpcDevice::Cpu ? "CPU" : "GPU"; }
+
+    std::optional<HpcDevice> hpcDeviceFromString(const std::string& s) noexcept {
+        std::string l;
+        for (char c : s) l += static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+        if (l == "gpu" || l == "cuda") return HpcDevice::Gpu;
+        if (l == "cpu") return HpcDevice::Cpu;
+        return std::nullopt;
+    }
+
     const char* toString(CachePolicy c) noexcept {
         switch (c) {
             case CachePolicy::Memory: return "memory";

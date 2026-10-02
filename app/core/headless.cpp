@@ -242,6 +242,7 @@ namespace sirius::app {
         std::string backendName(Backend b) { return lower(toString(b)); }
 
         json cudaDeviceJson(int device) { return device < 0 ? json("all") : json(device); }
+        std::string hpcDeviceName(HpcDevice d) { return d == HpcDevice::Cpu ? "cpu" : "gpu"; }
 
         json dimsJson(const Dims5& d) { return {{"c", d.c}, {"t", d.t}, {"z", d.z}, {"y", d.y}, {"x", d.x}}; }
 
@@ -507,6 +508,8 @@ namespace sirius::app {
         // auto: the workbench starts on CUDA when there is a GPU, else on the CPU
         if (options.hpc) wb.setRemoteConfig(*options.hpc);
         wb.setCudaDevice(options.cudaDevice);
+        if (const auto d = hpcDeviceFromString(options.hpcDevice)) wb.setHpcDevice(*d);
+        else throw ToolFailure("invalid_argument", "the HPC device must be gpu or cpu, not '" + options.hpcDevice + "'");
 
         worker.setPython(options.python);
         worker.setScriptDir(options.workerDir);
@@ -1189,6 +1192,7 @@ namespace sirius::app {
                 {"steps", steps},
                 {"backend", backendName(wb.backend())},
                 {"cuda_device", cudaDeviceJson(wb.cudaDevice())},
+                {"hpc_device", hpcDeviceName(wb.hpcDevice())},
                 {"hpc_configured", options.hpc.has_value()},
                 {"running", wb.running()},
                 {"run", runJson},
@@ -1328,6 +1332,11 @@ namespace sirius::app {
         } else {
             invalid("'backend' must be cpu, cuda or hpc");
         }
+        std::optional<HpcDevice> hpcDevice;
+        if (has(a, "hpc_device")) {
+            hpcDevice = hpcDeviceFromString(requiredString(a, "hpc_device"));
+            if (!hpcDevice) invalid("'hpc_device' must be gpu or cpu");
+        }
         if (has(a, "cuda_device")) {
             const json& v = a["cuda_device"];
             if (v.is_string() && lower(v.get<std::string>()) == "all") {
@@ -1339,11 +1348,14 @@ namespace sirius::app {
             }
         }
         wb.setBackend(backend);
+        if (hpcDevice) wb.setHpcDevice(*hpcDevice);
         syncWorkerDevice();
         // the plugins may load now where they could not before
         if (!pluginsLoaded) pluginsAttempted = false;
-        api.noteAction({ActionRecord::Kind::Param, "Backend" + std::string(kArrow) + backendName(backend), "", {}, "set_backend"});
-        return {{"backend", backendName(wb.backend())}, {"cuda_device", cudaDeviceJson(wb.cudaDevice())}};
+        std::string text = "Backend" + std::string(kArrow) + backendName(backend);
+        if (backend == Backend::Hpc) text += kMiddot + hpcDeviceName(wb.hpcDevice());
+        api.noteAction({ActionRecord::Kind::Param, text, "", {}, "set_backend"});
+        return {{"backend", backendName(wb.backend())}, {"cuda_device", cudaDeviceJson(wb.cudaDevice())}, {"hpc_device", hpcDeviceName(wb.hpcDevice())}};
     }
 
     json HeadlessWorkbench::Impl::listDevicesTool(const json&) {
@@ -1861,7 +1873,9 @@ namespace sirius::app {
         addTool("set_backend",
                 "Choose where runs compute: cpu, cuda (a GPU, or all of them) or hpc (only the endpoint the server was started with).",
                 schema({{"backend", enumProp({"cpu", "cuda", "hpc"}, "The backend")},
-                        {"cuda_device", {{"type", json::array({"integer", "string"})}, {"description", "The GPU's index, or \"all\""}}}},
+                        {"cuda_device", {{"type", json::array({"integer", "string"})}, {"description", "The GPU's index, or \"all\""}}},
+                        {"hpc_device", enumProp({"gpu", "cpu"}, "hpc: where the worker computes, its job's GPU or its CPU; kept until changed, "
+                                                                "and switched without a new job")}},
                        {"backend"}),
                 [this](const json& a) { return setBackendTool(a); });
         addTool("list_devices", "The compute devices: whether CUDA is available, the GPUs with their memory, and the backend in use.", schema(),

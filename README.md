@@ -354,7 +354,7 @@ top-hat, Gaussian, Otsu / multi-Otsu / percentile / manual / local-mean /
 local-contrast threshold, binary opening, hole filling, watershed on distance,
 h-maxima or scale-space blob-centre seeds) · Track objects (frame-to-frame optimal
 assignment on distance and overlap, gap closing; or btrack's Bayesian tracker with a
-motion model and lineages, in the worker) · Threshold · Label cleanup. Labels are painted,
+motion model and lineages, in the worker) · Label cleanup. Labels are painted,
 filled, merged, split and deleted in the viewer; every edit, parameter change and
 assistant action is one undo entry.
 
@@ -382,17 +382,6 @@ YOLO file per z. Every export appends a line to `index.jsonl` and grows `classes
 at the root, so many runs accumulate into one training set instead of overwriting each
 other. The assistant tool `export_training_data` does the same, for generating labels
 in bulk from the classical steps.
-
-**scikit-image segmentation**: a second segmentation step for the methods that
-library has and this one does not implement natively — a seeded random walker, a
-geodesic (edge-driven) active contour, SLIC and Felzenszwalb superpixels, and a
-compactness-constrained watershed. It runs in the Python worker against
-`scikit-image` and hands back instance labels, so everything downstream treats it
-like any other segmentation. Classical segmentation is still the first thing to
-reach for: it needs nothing installed, runs in-process and is mirrored voxel for
-voxel in `sirius.workbench`. This step is for when the classical recipe has
-actually failed — the random walker in particular holds a boundary too weak or
-too broken for a threshold.
 
 **Presets**: the Classical step offers a starting point per structure — Nuclei, Cells
 (touching), Puncta, Filaments, Filament network, Centrelines, Faint or noisy — since

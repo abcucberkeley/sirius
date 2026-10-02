@@ -87,6 +87,7 @@ namespace sirius::cli {
         std::string workerDir;              // --worker-dir
         std::string backend = "auto";       // auto | cpu | cuda | hpc
         int cudaDevice = 0;                 // -1 = all (Workbench::kAllCudaDevices)
+        std::string hpcDevice = "gpu";      // gpu | cpu: where the HPC worker computes
         std::string hpcHost;                // --hpc host:port, split
         int hpcPort = 0;
         std::string plugins = "auto";       // auto | on | off

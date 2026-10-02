@@ -59,9 +59,21 @@ namespace sirius::app::gui {
     }
 
     void ClusterLink::connect(const cluster::Profile& profile) {
-        settings().set("cluster/profile", profile.toJson());
         lastState_ = cluster::State::Connecting;
-        cluster::Profile p = profile;
+        session_.connect(prepared(profile));
+    }
+
+    void ClusterLink::logIn(const cluster::Profile& profile) {
+        lastState_ = cluster::State::Connecting;
+        session_.logIn(prepared(profile));
+    }
+
+    cluster::Profile ClusterLink::prepared(const cluster::Profile& profile) {
+        // saved, with its Slurm choice remembered for its host
+        cluster::Profile saved = profile;
+        saved.remember();
+        settings().set("cluster/profile", saved.toJson());
+        cluster::Profile p = saved;
         // Tests and screenshots only: $SIRIUS_TEST_SSH, a JSON list (program and
         // its first arguments), stands in for ssh -- tests/tools/fake_ssh.py.
         if (const std::string fake = host::environment("SIRIUS_TEST_SSH"); !fake.empty()) {
@@ -77,7 +89,7 @@ namespace sirius::app::gui {
             } catch (const std::exception&) {
             }
         }
-        session_.connect(p);
+        return p;
     }
 
     void ClusterLink::disconnect(bool cancelJob) {
@@ -140,6 +152,9 @@ namespace sirius::app::gui {
     }
 
     void ClusterLink::frame() {
+        // the cluster's datasets are decoded where the session computes
+        // (nvTIFF on the job's GPU), switched with the HPC device
+        if (datasets_) datasets_->setDevice(app_.wb().hpcDevice() == HpcDevice::Cpu ? "cpu" : "cuda");
         const cluster::State now = session_.status().state;
         if (now == lastState_) return;
         const cluster::State before = lastState_;
@@ -161,6 +176,9 @@ namespace sirius::app::gui {
         });
         datasets_->install();
         Workbench& wb = app_.wb();
+        // a job without a GPU computes on its CPU; with one, the session's choice stands
+        if (!st.caps.cuda) wb.setHpcDevice(HpcDevice::Cpu);
+        datasets_->setDevice(wb.hpcDevice() == HpcDevice::Cpu ? "cpu" : "cuda");
         wb.setRemoteConfig(remoteConfig());
         wb.setBackend(Backend::Hpc);
         wb.logLine("HPC: the HPC backend now runs on " + st.node + " (" + st.caps.device + "); cluster datasets open from " + st.host);
@@ -178,10 +196,27 @@ namespace sirius::app::gui {
                         step = cluster::stepTitle(static_cast<cluster::Step>(i));
                 return "HPC: connecting\xE2\x80\xA6" + (step.empty() ? std::string() : " (" + step + ")");
             }
-            case cluster::State::Connected: color = kConnected; return "HPC: " + st.node + " \xC2\xB7 connected";
+            case cluster::State::Connected:
+                color = kConnected;
+                return "HPC: " + st.node + " \xC2\xB7 " + toString(app_.wb().hpcDevice());
             case cluster::State::Disconnected: color = theme::kAccentText; return "HPC: disconnected: " + st.reason;
         }
         return {};
+    }
+
+    bool ClusterLink::hpcGpuUsable(std::string* why) const {
+        const cluster::Status st = status();
+        if (st.state == cluster::State::Connected) {
+            if (st.caps.cuda) return true;
+            if (why)
+                *why = "The worker job on " + st.node + " has no GPU (it reports " + st.caps.device +
+                       "): reconnect with GPUs \xE2\x89\xA5 1 to use one";
+            return false;
+        }
+        const cluster::Profile p = st.state == cluster::State::Idle ? storedProfile() : session_.profile();
+        if (p.gpus > 0) return true;
+        if (why) *why = "The cluster profile asks for no GPU (GPUs 0): set GPUs \xE2\x89\xA5 1 in Connect to cluster to use one";
+        return false;
     }
 
     std::vector<std::string> ClusterLink::recentFolders() const { return settings().getStringList("cluster/recentFolders"); }

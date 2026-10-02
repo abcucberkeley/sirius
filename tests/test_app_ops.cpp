@@ -126,7 +126,7 @@ namespace {
 TEST_CASE("the built-in operations are registered with complete metadata", "[app][ops]") {
     const char* kinds[] = {"load", "sim", "decon", "volrec", "einsum", "maxproj", "meant", "contrast", "flatfield",
                            "bleach", "deskew", "croppad", "resample", "merge", "stitch", "register", "seg",
-                           "foundation", "threshold", "cleanup"};
+                           "foundation", "classic", "cleanup"};
     for (const char* kind : kinds) {
         INFO(kind);
         const Operation* op = findOperation(kind);
@@ -149,7 +149,7 @@ TEST_CASE("the built-in operations are registered with complete metadata", "[app
     std::size_t builtins = 0;
     for (const Operation* op : allOperations())
         if (op->kind().rfind("test_", 0) != 0 && !op->info().plugin) ++builtins;   // nor plugins the worker tests load
-    CHECK(builtins == 23);
+    CHECK(builtins == 21);
 
     SECTION("menu groups follow the design's order and exclude Load") {
         const auto groups = operationGroups();
@@ -580,7 +580,7 @@ TEST_CASE("Contrast rescales every channel into 0..1 and reports histograms", "[
     }
 }
 
-TEST_CASE("Infinite voxels leave the contrast window and the Otsu cuts to the finite values", "[app][ops][contrast][threshold]") {
+TEST_CASE("Infinite voxels leave the contrast window and the Otsu cuts to the finite values", "[app][ops][contrast][classic]") {
     // One +-inf voxel crashed the application as a dataset opened: the
     // histograms spanned [min, inf], and (inf - lo) * (bins / inf) is a NaN
     // bin index that was written outside the counts.
@@ -605,9 +605,13 @@ TEST_CASE("Infinite voxels leave the contrast window and the Otsu cuts to the fi
         const std::vector<float> none{inf, -inf, std::numeric_limits<float>::quiet_NaN()};
         CHECK(otsuThreshold(none.data(), 3) == inf);
     }
-    SECTION("Threshold (Otsu) labels the blobs and the +inf voxel") {
-        const Operation& op = requireOperation("threshold");
+    SECTION("Classic with a plain Otsu cut labels the blobs and the +inf voxel") {
+        const Operation& op = requireOperation("classic");
         ParamSet p = op.defaults();
+        p.set("sigma", 0.0);
+        p.set("opening", std::int64_t{0});
+        p.set("fill_holes", false);
+        p.set("post", std::string("Connected components"));
         p.set("method", std::string("Otsu"));
         p.set("min_voxels", std::int64_t{0});
         const StepOutput r = op.run(inputOf(data, meta), p, prog.ctx);
@@ -661,7 +665,7 @@ TEST_CASE("Infinite voxels leave the contrast window and the Otsu cuts to the fi
     }
 }
 
-TEST_CASE("Otsu and Multi-Otsu break exact ties the way bindings/tests/test_workbench.py expects", "[app][ops][threshold]") {
+TEST_CASE("Otsu and Multi-Otsu break exact ties the way bindings/tests/test_workbench.py expects", "[app][ops][classic]") {
     // A histogram symmetric about its centre scores a split and its mirror
     // image exactly the same; which one wins is decided by the last bit of the
     // between-class variance, so the Python mirror has to evaluate it in the
@@ -696,9 +700,13 @@ TEST_CASE("Otsu and Multi-Otsu break exact ties the way bindings/tests/test_work
     };
     SECTION("Otsu: 0 + 256 * 37 / 256, not the 139 of the mirror image") {
         ParamSet p;
+        p.set("sigma", 0.0);
+        p.set("opening", std::int64_t{0});
+        p.set("fill_holes", false);
+        p.set("post", std::string("Connected components"));
         p.set("method", std::string("Otsu"));
         p.set("min_voxels", std::int64_t{0});
-        labelsAbove("threshold", p, symmetric(256.0f, 3, {{36, 6}, {117, 17}}), 37.0f);
+        labelsAbove("classic", p, symmetric(256.0f, 3, {{36, 6}, {117, 17}}), 37.0f);
     }
     SECTION("Multi-Otsu: 0 + 128 * 93 / 128, not the 71 of the mirror image") {
         ParamSet p;
@@ -1040,13 +1048,19 @@ TEST_CASE("Stitch fuses two overlapping tile files", "[app][ops][stitch]") {
 
 // --- segmentation ---------------------------------------------------------------
 
-TEST_CASE("Threshold labels blobs and Label cleanup drops the small ones", "[app][ops][threshold][cleanup]") {
+TEST_CASE("A plain classical cut labels blobs and Label cleanup drops the small ones", "[app][ops][classic][cleanup]") {
     const Dims5 dims{1, 1, 9, 40, 20};
     const DatasetMeta meta = metaFor(dims);
     auto data = blobArray(dims, 3, 3.0);
     data->at(0, 0, 4, 1, 1) = 1000.0f;   // a one-voxel speck
-    const Operation& op = requireOperation("threshold");
+    // the classic step reduced to one global cut: no blur, opening or hole
+    // fill, connected components (an opening would erase the speck)
+    const Operation& op = requireOperation("classic");
     ParamSet p = op.defaults();
+    p.set("sigma", 0.0);
+    p.set("opening", std::int64_t{0});
+    p.set("fill_holes", false);
+    p.set("post", std::string("Connected components"));
     p.set("method", std::string("Manual"));
     p.set("value", 500.0);
     p.set("min_voxels", std::int64_t{0});
@@ -1082,7 +1096,7 @@ TEST_CASE("Threshold labels blobs and Label cleanup drops the small ones", "[app
     }
 }
 
-TEST_CASE("Threshold and classical labels have an unknown confidence in every frame", "[app][ops][threshold][classic]") {
+TEST_CASE("Classical labels have an unknown confidence in every frame", "[app][ops][classic]") {
     const Dims5 dims{1, 2, 5, 40, 20};
     const DatasetMeta meta = metaFor(dims);
     auto data = blobArray(Dims5{1, 1, 5, 40, 20}, 3, 3.0);
@@ -1092,18 +1106,16 @@ TEST_CASE("Threshold and classical labels have an unknown confidence in every fr
             for (Index y = 0; y < dims.y; ++y)
                 for (Index x = 0; x < dims.x; ++x) two->at(0, t, z, y, x) = data->at(0, 0, z, y, x) * (t == 0 ? 0.5f : 1.0f);
     Progress prog;
-    for (const char* kind : {"threshold", "classic"}) {
-        INFO(kind);
-        const Operation& op = requireOperation(kind);
+    for (const double expand : {0.0, 2.0}) {
+        INFO("expand " << expand);
+        const Operation& op = requireOperation("classic");
         ParamSet p = op.defaults();
         p.set("method", std::string("Manual"));
         p.set("value", 100.0);
         p.set("min_voxels", std::int64_t{0});
-        if (std::string(kind) == "classic") {
-            p.set("sigma", 0.0);
-            p.set("opening", std::int64_t{0});
-            p.set("expand", 2.0);   // grows into voxels the mask called background
-        }
+        p.set("sigma", 0.0);
+        p.set("opening", std::int64_t{0});
+        p.set("expand", expand);   // 2 grows into voxels the mask called background
         const StepOutput r = op.run(inputOf(two, meta), p, prog.ctx);
         REQUIRE(r.labels);
         r.labels->recomputeStats(0);   // the viewer on the first frame: the intensities were never probabilities there either
@@ -1495,6 +1507,20 @@ TEST_CASE("Segmentation drives the worker protocol and labels the probabilities"
         const std::lock_guard<std::mutex> lock(fakeWorkerMutex);
         CHECK(fakeWorkerDevice == "cuda:1");
     }
+    SECTION("on HPC the request names the session's GPU / CPU choice, run by run") {
+        // the switch reaches the worker job with the next step: no new job
+        prog.ctx.backend = Backend::Hpc;
+        prog.ctx.hpcDevice = HpcDevice::Cpu;
+        (void)op.run(inputOf(data, meta), p, prog.ctx);
+        {
+            const std::lock_guard<std::mutex> lock(fakeWorkerMutex);
+            CHECK(fakeWorkerDevice == "cpu");
+        }
+        prog.ctx.hpcDevice = HpcDevice::Gpu;
+        (void)op.run(inputOf(data, meta), p, prog.ctx);
+        const std::lock_guard<std::mutex> lock(fakeWorkerMutex);
+        CHECK(fakeWorkerDevice == "cuda");
+    }
     remote->close();
     worker.join();
 }
@@ -1508,8 +1534,20 @@ TEST_CASE("A request to the Python worker names the device of the run", "[app][o
     CHECK(workerDevice(ctx) == "cuda:1");
     ctx.device = Device::cuda(-1);   // every GPU: the launcher's "cuda" too
     CHECK(workerDevice(ctx) == "cuda");
-    ctx.backend = Backend::Hpc;
-    CHECK(workerDevice(ctx) == "auto");   // the remote worker's own
+    ctx.backend = Backend::Hpc;   // the session's choice, not the job's own
+    CHECK(ctx.hpcDevice == HpcDevice::Gpu);
+    CHECK(workerDevice(ctx) == "cuda");
+    ctx.hpcDevice = HpcDevice::Cpu;
+    CHECK(workerDevice(ctx) == "cpu");
+}
+
+TEST_CASE("The HPC device is named in words", "[app][ops][hpc]") {
+    CHECK(std::string(toString(HpcDevice::Gpu)) == "GPU");
+    CHECK(std::string(toString(HpcDevice::Cpu)) == "CPU");
+    CHECK(hpcDeviceFromString("gpu") == HpcDevice::Gpu);
+    CHECK(hpcDeviceFromString("CUDA") == HpcDevice::Gpu);
+    CHECK(hpcDeviceFromString("Cpu") == HpcDevice::Cpu);
+    CHECK_FALSE(hpcDeviceFromString("tpu").has_value());
 }
 
 namespace {
@@ -2530,18 +2568,6 @@ TEST_CASE("The operations hide the fields their mode ignores", "[app][ops][param
         btrack.set("tracker", std::string("btrack (Bayesian)"));
         CHECK(shown(track, btrack).count("config") == 1);
         CHECK(shown(track, btrack).count("overlap_weight") == 0);
-    }
-
-    SECTION("the scikit-image step shows one method's settings at a time") {
-        const Operation& sk = requireOperation("skimage_seg");
-        ParamSet walker = sk.defaults();
-        CHECK(shown(sk, walker).count("beta") == 1);
-        CHECK(shown(sk, walker).count("n_segments") == 0);
-        ParamSet slic = sk.defaults();
-        slic.set("method", std::string("Superpixels (SLIC)"));
-        CHECK(shown(sk, slic).count("n_segments") == 1);
-        CHECK(shown(sk, slic).count("beta") == 0);
-        CHECK(shown(sk, slic).count("compactness") == 1);   // shared with the compact watershed
     }
 }
 

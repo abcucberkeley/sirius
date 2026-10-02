@@ -75,7 +75,18 @@ namespace sirius::app {
         // `strict`: a value that does not fit its parameter (a choice that is
         // not one of the choices, text for a number) throws, naming the step
         // and the parameter, instead of the default taking its place.
+        // A step of a kind SIRIUS has removed (removedKindAdvice) is never a
+        // stand-in: `strict` throws, naming the step and what replaces it;
+        // otherwise the step is dropped and warnings() says so.
         static Pipeline fromJson(const nlohmann::json& j, bool strict = false);
+        // What fromJson left out of the pipeline it built (removed steps), one line each.
+        const std::vector<std::string>& warnings() const noexcept { return warnings_; }
+        // What to use instead of a kind SIRIUS no longer has, or nullptr when
+        // `kind` was never removed.
+        static const char* removedKindAdvice(const std::string& kind) noexcept;
+        // "step 03 'threshold' was removed from SIRIUS (2026-10); use ... instead",
+        // for the step at `index` (0 is Load).
+        static std::string removedStepMessage(int index, const std::string& kind);
         // TOML on disk (".sirius.toml"); read strictly.
         void save(const std::string& path) const;
         static Pipeline load(const std::string& path);
@@ -88,6 +99,7 @@ namespace sirius::app {
     private:
         StepId nextId();
         std::vector<Step> steps_;
+        std::vector<std::string> warnings_;
         StepId nextId_ = 1;
     };
 

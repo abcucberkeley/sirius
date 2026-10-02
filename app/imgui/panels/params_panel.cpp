@@ -24,6 +24,7 @@
 #include "core/ops/contrast.hpp"
 #include "core/workbench.hpp"
 #include "imgui/app.hpp"
+#include "imgui/cluster_link.hpp"
 #include "imgui/dialogs/dialogs.hpp"
 #include "imgui/platform.hpp"
 #include "imgui/strings.hpp"
@@ -1624,7 +1625,10 @@ namespace sirius::app::gui {
                 "Nothing stored; recomputed from the previous step on demand. Good for cheap steps."};
             const std::string cacheNote = st ? kCacheNotes[static_cast<int>(st->cache)] : std::string();
             const float tileH = theme::snap(px(36));
-            const float backendH = px(16) + h10 + px(8) + tileH + (backendNote.empty() ? 0.0f : px(8) + wrappedHeight(backendNote, 12, width)) + px(16);
+            // HPC: the "Cluster device: GPU | CPU" row under the tiles
+            const bool hpc = w.backend() == Backend::Hpc;
+            const float deviceRowH = hpc ? px(8) + theme::snap(px(26)) : 0.0f;
+            const float backendH = px(16) + h10 + px(8) + tileH + deviceRowH + (backendNote.empty() ? 0.0f : px(8) + wrappedHeight(backendNote, 12, width)) + px(16);
             const float cacheH = px(16) + std::max(h10, h12) + px(8) + tileH + (cacheNote.empty() ? 0.0f : px(8) + wrappedHeight(cacheNote, 12, width)) + px(16);
             const float btnH = buttonHeight();
             const float footerH = rule + px(14) + btnH + px(14);
@@ -1670,6 +1674,28 @@ namespace sirius::app::gui {
                 }
             }
             y += tileH;
+            if (hpc) {
+                // Where the HPC worker computes, sent with each step: a
+                // switch needs no new job. The GPU only when the job has one.
+                const float rowH = theme::snap(px(26));
+                y += px(8);
+                place(x, y + (rowH - theme::textSize("Cluster device", 12).y) * 0.5f);
+                widgets::text("Cluster device", 12, theme::kNeutral700);
+                const std::vector<std::string> devices = {"GPU", "CPU"};
+                place(x + width - widgets::segmentedWidth(devices), y);
+                std::string why;
+                const bool gpu = app.cluster().hpcGpuUsable(&why);
+                int device = static_cast<int>(w.hpcDevice());
+                widgets::SegmentedOpts so;
+                so.optionEnabled = {gpu, true};
+                so.tooltips = {gpu ? "Run the worker's steps on the job's GPU" : why,
+                               "Run the worker's steps on the job's CPU (the GPU stays allocated)"};
+                if (widgets::segmented("##hpcDevice", devices, &device, so)) {
+                    const HpcDevice d = static_cast<HpcDevice>(device);
+                    later([this, d] { wb().setHpcDevice(d); });
+                }
+                y += rowH;
+            }
             if (!backendNote.empty()) {
                 place(x, y + px(8));
                 widgets::textWrapped(backendNote, 12, theme::kNeutral600, Weight::Regular, width);

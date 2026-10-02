@@ -58,7 +58,7 @@ TEST_CASE("operation schemas list every built-in kind with typed parameters", "[
     for (auto factory : builtinOperationFactories()) REQUIRE(kinds.count(factory()->kind()) == 1);
     // the kinds the Python mirror is written against
     for (const char* k : {"einsum", "maxproj", "meant", "contrast", "flatfield", "bleach", "croppad", "resample",
-                          "merge", "threshold", "classic", "cleanup", "seg", "sim", "load"})
+                          "merge", "classic", "cleanup", "seg", "sim", "load"})
         REQUIRE(kinds.count(k) == 1);
 
     if (const char* out = std::getenv("SIRIUS_OP_SCHEMA_OUT"); out && *out) {

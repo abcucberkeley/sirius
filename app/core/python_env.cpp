@@ -331,7 +331,6 @@ namespace sirius::app::pyenv {
             if (distribution == "numpy") return 13'000'000ULL;
             if (distribution == "scipy") return 38'000'000ULL;
             if (distribution == "scikit-image") return 19'000'000ULL;   // with pillow, imageio, networkx, tifffile
-            if (distribution == "tifffile") return 1'000'000ULL;
             return std::nullopt;
         }
 
@@ -1306,7 +1305,7 @@ namespace sirius::app::pyenv {
         // The values of sirius_worker.OPTIONAL (app/python/sirius_worker/__init__.py);
         // a test checks that each one is spelled there.
         static const std::vector<std::string> distributions{"scipy", "scikit-image", "torch", "huggingface_hub", "onnxruntime",
-                                                            "cellpose", "micro_sam", "btrack", "tifffile"};
+                                                            "cellpose", "micro_sam", "btrack"};
         return distributions;
     }
 

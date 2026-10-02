@@ -97,6 +97,24 @@ class TestReads(unittest.TestCase):
             with self.assertRaises(IndexError):
                 f.read_pages(3, 2)
 
+    def test_region_of_chosen_pages_and_the_tags(self):
+        # What the cluster worker reads a zoomed-in plane with: the region of
+        # one page, not of every page; and the tags it shapes a dataset by.
+        with tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, "s.tif")
+            sirius.write_tiff(path, self.arr)
+            f = sirius.TiffFile(path)
+            np.testing.assert_array_equal(f.read_region(5, 3, 20, 10, first=1, count=1), self.arr[1:2, 3:13, 5:25])
+            np.testing.assert_array_equal(f.read_region(5, 3, 20, 10, first=1), self.arr[1:, 3:13, 5:25])
+            for first, count in ((4, 1), (1, 4), (0, 2**63)):
+                with self.subTest(first=first, count=count), self.assertRaises(IndexError):
+                    f.read_region(0, 0, 1, 1, first=first, count=count)
+            page = f.info.page(0)
+            self.assertIsInstance(page.description, str)
+            self.assertGreaterEqual(page.x_resolution, 0.0)
+            self.assertGreaterEqual(page.y_resolution, 0.0)
+            self.assertIn(page.resolution_unit, (1, 2, 3))
+
     def test_tiled_and_compressed(self):
         for kw in ({"tile": (16, 16)}, {"compression": "lzw"}, {"tile": (16, 16), "compression": "zlib"}):
             with self.subTest(kw=kw), tempfile.TemporaryDirectory() as d:

@@ -54,8 +54,8 @@ namespace sirius::app::gui {
 
         constexpr std::size_t kDetailLines = 200;   // what "Show details" keeps of the installer's output
 
-        constexpr const char* kWhatTheWorkerDoes = "SIRIUS runs user operations (plugins), segmentation models, scikit-image "
-                                                   "steps, tracking and the model hub in a Python worker.";
+        constexpr const char* kWhatTheWorkerDoes = "SIRIUS runs user operations (plugins), segmentation models, tracking and "
+                                                   "the model hub in a Python worker.";
 
         // Where a machine without Python gets one, per system.
         const char* installPythonHint() {
@@ -623,7 +623,7 @@ namespace sirius::app::gui {
                         const std::string label = andList(planned_->extras) + " (about 57 MB)";
                         if (widgets::checkbox(label.c_str(), &extras_)) extrasTouched_ = true;
                         ImGui::Indent(px(22));
-                        note("Label clean-up in the worker, the scikit-image segmentation step and some plugins.");
+                        note("Label clean-up in the worker, the foundation step's labels and some plugins.");
                         ImGui::Unindent(px(22));
                     } else if (extras_) {
                         widgets::text("\xE2\x80\xA2  " + andList(planned_->extras), 13);
