@@ -27,7 +27,21 @@ The panels start where this list puts them; each one is moved by its tab (see *L
 
 - **CUDA** runs steps with a GPU path (SIM reconstruction, FFTs, TIFF decoding) on the selected device; the others run on the CPU.
 - **CPU** runs everything on the host with OpenMP.
-- **HPC** sends steps the Python worker implements to a worker started under Slurm (see *python/slurm*); the connection is configured in Preferences.
+- **HPC** sends steps the Python worker implements to a worker on a cluster node. *Process ▸ Connect to cluster…* starts it and connects for you (see *Cluster* below); a worker you started and tunnelled yourself is configured in *Preferences ▸ Compute*.
+
+## Cluster
+
+*Process ▸ Connect to cluster…* (also in *Preferences ▸ Compute*, and a click on the HPC indicator in the status bar) does in one window what used to take several terminals:
+
+1. **SSH login**, once per session, with your system's OpenSSH and your `~/.ssh/config` (a host alias such as `fiona` works). When the cluster asks for a password, a one-time code or a host key confirmation, SIRIUS shows the question in a box; the answer goes to ssh and is never stored or logged. A wrong answer costs one attempt and nothing is retried by itself: press *Connect again*. *Cancel* in the box stops the login without sending anything.
+2. **Checks**: `sbatch` on the host, the SIRIUS checkout (`app/python`), the Python environment and numpy in it. What is missing is named with the command that fixes it.
+3. **Submit**: the worker's job script with the profile's partition, account, QoS, time limit, GPUs, CPUs and memory. The worker's token is made here and reaches the job through the shell's environment, never a command line.
+4. **Queue**: the job's state and reason (`PENDING (Priority)`) and the time waited, every few seconds.
+5. **Start** and **Hello**: the node, then the worker's own account of itself — version, device, the steps it runs — reached through the SSH connection itself (no tunnel to type).
+
+The status bar then says *HPC: ‹node› · connected* (green), or *disconnected* and why (red: the job reached its time limit, the SSH connection dropped). The backend switches to HPC. *Disconnect…* closes the connection and asks whether to cancel the job as well (the default); quitting with a job running asks the same.
+
+**Datasets on the cluster.** As soon as the login is done, *File ▸ Open from cluster…* and the *Cluster* side of *File ▸ Open dataset…* browse the cluster's folders. A dataset opened there (`cluster://host/path`, TIFF, OME-TIFF or `.npy`; the worker's Python needs `tifffile` for TIFF) stays on the cluster: the worker reads it on the node and sends each pane what it draws at the pane's resolution — the XY plane, the XZ / YZ re-slices, the z projection, a small volume for *3D* — compressed, with the neighbouring planes fetched ahead, so a home connection is enough to look through a large stack. A Torch segmentation step on the HPC backend reads its input on the node instead of uploading it. A step that runs on this machine reads the volumes it needs over the connection.
 
 ## Parameters
 

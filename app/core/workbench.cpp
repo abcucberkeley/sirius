@@ -201,7 +201,8 @@ namespace sirius::app {
     void RunJob::connectWorker() {
         if (backend_ == Backend::Hpc) {
             progress_.set(0.0, -1, "Connecting to the HPC worker…");
-            ownedRemote_ = RemoteWorker::connect(remoteConfig_.host, remoteConfig_.port, remoteConfig_.token);
+            ownedRemote_ = RemoteWorker::connect(remoteConfig_.host, remoteConfig_.port, remoteConfig_.token, std::chrono::seconds(10), {},
+                                                 remoteConfig_.socksPort);
             workerNote_ = "HPC worker: " + ownedRemote_->capabilities().device + " on " + ownedRemote_->capabilities().hostname;
         } else if (needsWorker_) {
             if (!launcher_) throw std::runtime_error("no Python worker launcher configured");
@@ -811,7 +812,7 @@ namespace sirius::app {
             for (const ParamSpec& spec : op->info().params) {
                 if (spec.type != ParamType::Path) continue;
                 const std::string v = s.params.getString(spec.key);
-                if (v.empty() || std::filesystem::path(v).is_absolute()) continue;
+                if (v.empty() || isRemoteDatasetPath(v) || std::filesystem::path(v).is_absolute()) continue;   // a cluster path is no file here
                 std::error_code ec;
                 const std::filesystem::path beside = base / v;
                 // beside the pipeline file, unless it only exists relative to
@@ -838,7 +839,7 @@ namespace sirius::app {
         // size is opened again, the way the pipeline says.
         if (source_ && datasetMeta_.sourcePath == dataset && pipeline_.at(0).params.toJson() == loadOutputParams_.toJson()) return;
         std::filesystem::path resolved = dataset;
-        if (resolved.is_relative()) {
+        if (resolved.is_relative() && !isRemoteDatasetPath(dataset)) {
             const std::filesystem::path beside = std::filesystem::path(path).parent_path() / resolved;
             std::error_code ec;
             if (std::filesystem::exists(beside, ec)) resolved = beside;

@@ -1079,7 +1079,24 @@ namespace sirius::app {
     }
 
     namespace {
+        std::mutex& remoteOpenerMutex() {
+            static std::mutex m;
+            return m;
+        }
+        RemoteDatasetOpener& remoteOpener() {
+            static RemoteDatasetOpener opener;
+            return opener;
+        }
+        RemoteDatasetOpener currentRemoteOpener(const std::string& path) {
+            const std::lock_guard<std::mutex> g(remoteOpenerMutex());
+            if (!remoteOpener())
+                throw std::runtime_error("not connected to the cluster this dataset is on (" + path +
+                                         "): Process \xE2\x96\xB8 Connect to cluster\xE2\x80\xA6");
+            return remoteOpener();
+        }
+
         DatasetMeta probeWith(const std::string& path, const OpenOptions* options) {
+            if (isRemoteDatasetPath(path)) return currentRemoteOpener(path)(path, options ? *options : OpenOptions{}, true).meta;
             std::error_code ec;
             if (!fs::exists(path, ec)) throw std::runtime_error("no such file or directory: " + path);
             if (isManifestDataset(path)) return probeFolder(path, options).meta;
@@ -1113,7 +1130,15 @@ namespace sirius::app {
         return physical / 2;
     }
 
+    void setRemoteDatasetOpener(RemoteDatasetOpener opener) {
+        const std::lock_guard<std::mutex> g(remoteOpenerMutex());
+        remoteOpener() = std::move(opener);
+    }
+
+    bool isRemoteDatasetPath(const std::string& path) { return path.rfind("cluster://", 0) == 0; }
+
     OpenResult openDataset(const std::string& path, const OpenOptions& options) {
+        if (isRemoteDatasetPath(path)) return currentRemoteOpener(path)(path, options, false);
         std::error_code ec;
         if (!fs::exists(path, ec)) throw std::runtime_error("no such file or directory: " + path);
         OpenResult r;

@@ -10,7 +10,10 @@
 #SBATCH --output=sirius-worker-%j.log
 #
 # Runs the SIRIUS compute worker on a cluster node for the application's HPC
-# backend. Submit with a shared secret:
+# backend. sirius-app submits it for you (Process > Connect to cluster...:
+# one SSH login, then this script with the profile's partition, account, QoS,
+# time and resources on the sbatch command line). By hand, submit with a
+# shared secret:
 #
 #     SIRIUS_TOKEN=$(openssl rand -hex 16) sbatch app/python/slurm/sirius_worker.sbatch
 #
@@ -80,4 +83,6 @@ echo "tunnel:  ssh -N -L ${SIRIUS_PORT}:$(hostname):${SIRIUS_PORT} <login-node> 
 # The token is read from $SIRIUS_TOKEN (exported above), not passed as an
 # argument: the command line of a job is visible to every user of the node.
 cd "${WORKER_DIR}"
-exec python -m sirius_worker --host 0.0.0.0 --port "${SIRIUS_PORT}" --device "${SIRIUS_DEVICE}"
+# --max-clients: the application keeps a connection for its status and one for
+# the dataset it shows (read here, on the node) besides each run's.
+exec python -m sirius_worker --host 0.0.0.0 --port "${SIRIUS_PORT}" --device "${SIRIUS_DEVICE}" --max-clients "${SIRIUS_MAX_CLIENTS:-8}"

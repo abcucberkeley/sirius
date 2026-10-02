@@ -27,6 +27,7 @@
 #include "core/array_source.hpp"
 #include "core/export.hpp"
 #include "core/training_export.hpp"
+#include "imgui/cluster_link.hpp"
 #include "imgui/dialogs/dialogs.hpp"
 #include "imgui/http.hpp"
 #include "imgui/panels/assistant_panel.hpp"
@@ -419,6 +420,7 @@ namespace sirius::app::gui {
         std::unique_ptr<AssistantPanel> assistant;
         std::unique_ptr<LogPanel> log;
         std::unique_ptr<HelpWindow> help;
+        std::unique_ptr<ClusterLink> cluster;
         std::shared_ptr<PluginManager> plugins;   // created on first use
 
         std::vector<std::shared_ptr<Dialog>> dialogs;
@@ -613,6 +615,14 @@ namespace sirius::app::gui {
         // File
         add("File", "Open dataset\xE2\x80\xA6", {ImGuiMod_Ctrl | ImGuiKey_O}, [this] { self.openDatasetDialog(); });
         add("File", "Open folder as dataset\xE2\x80\xA6", {ImGuiMod_Ctrl | ImGuiMod_Shift | ImGuiKey_O}, [this] { self.openFolderDataset(); });
+        {
+            // a dataset that stays on the cluster: its folders through the SSH session
+            const auto openFromCluster = [this] {
+                auto open = [this](const std::string& path) { self.openDatasetPath(path); };
+                self.showDialog(makeClusterBrowser(self, {}, false, open));
+            };
+            add("File", "Open from cluster\xE2\x80\xA6", {}, openFromCluster, "A dataset on the cluster, read there by the worker");
+        }
         add("File", "Open recent", {}, nullptr).recentMenu = true;
         {
             Action& a = add("File", "Close dataset", {ImGuiMod_Ctrl | ImGuiKey_W}, [this] {
@@ -759,6 +769,10 @@ namespace sirius::app::gui {
         add("Process", "Backend: CPU", {}, [this] { wb().setBackend(Backend::Cpu); }).checked = [this] { return wb().backend() == Backend::Cpu; };
         add("Process", "Backend: HPC (Slurm)", {}, [this] { wb().setBackend(Backend::Hpc); }).checked =
             [this] { return wb().backend() == Backend::Hpc; };
+        // scripting (--action): Connect with the stored profile, as the dialog's button does
+        add("", "Connect to cluster (stored profile)", {}, [this] { self.cluster().connect(self.cluster().storedProfile()); });
+        add("", "Wait for the cluster", {}, [this] { self.waitUntil([this] { return self.cluster().status().state != cluster::State::Connecting; }); });
+        add("Process", "Connect to cluster\xE2\x80\xA6", {}, [this] { self.clusterDialog(); }, "One SSH login: the worker job, the HPC backend through it, the cluster's datasets");
 
         // Segment
         {
@@ -1376,7 +1390,24 @@ namespace sirius::app::gui {
             const float rightW = theme::textSize(right, 11).x;
             widgets::drawTextIn(dl, ImVec2(max.x - px(14) - rightW, top), ImVec2(max.x - px(14), max.y), right, 11, theme::kNeutral600,
                                 Weight::Regular, 0.0f, 0.5f);
-            const float limit = max.x - px(14) - rightW - px(24);
+            float limit = max.x - px(14) - rightW - px(24);
+            // The cluster session, when there is one: connected (green), connecting, or
+            // disconnected and why (red); a click opens Connect to cluster.
+            ImU32 hpcColor = theme::kNeutral600;
+            if (const std::string hpc = cluster ? cluster->indicator(hpcColor) : std::string(); !hpc.empty()) {
+                const std::string shown = widgets::elideText(hpc, px(360), 11);
+                const float wd = theme::textSize(shown, 11).x;
+                const float x0 = limit - wd;
+                ImGui::SetCursorScreenPos(ImVec2(x0, top));
+                if (ImGui::InvisibleButton("##hpcStatus", ImVec2(std::max(wd, 1.0f), max.y - top))) self.clusterDialog();
+                if (ImGui::IsItemHovered()) ImGui::SetMouseCursor(ImGuiMouseCursor_Hand);
+                widgets::tooltip(hpc + "\n\nClick for the cluster connection");
+                const float dot = theme::snap(px(6));
+                const float cy = theme::snap((top + max.y) * 0.5f);
+                dl->AddCircleFilled(ImVec2(x0 - px(8), cy), dot * 0.5f, hpcColor);
+                widgets::drawTextIn(dl, ImVec2(x0, top), ImVec2(x0 + wd, max.y), shown, 11, hpcColor, Weight::Regular, 0.0f, 0.5f);
+                limit = x0 - px(14) - px(24);
+            }
 
             float x = min.x + px(14);
             auto item = [&](const std::string& s, ImU32 color = theme::kNeutral600) {
@@ -2426,6 +2457,7 @@ namespace sirius::app::gui {
         if (d.redrawFrames > 0) --d.redrawFrames;
 
         bridge_.update();
+        if (d.cluster) d.cluster->frame();
         if (!d.deferred.empty()) {
             std::vector<std::function<void()>> actions;
             actions.swap(d.deferred);
@@ -2604,6 +2636,12 @@ namespace sirius::app::gui {
             // A task (a dataset loading, an export) counts as much as a run.
             const bool run = bridge_.running(), task = bridge_.taskRunning();
             if (!run && !task) {
+                // a worker job on a cluster is the user's to keep or cancel
+                if (d.cluster) {
+                    d.cluster->settleBeforeQuit([this] { impl_->finishClose(); });
+                    if (!impl_->closing) impl_->closeAsked = false;
+                    return;
+                }
                 d.finishClose();
                 return;
             }
@@ -2687,9 +2725,11 @@ namespace sirius::app::gui {
 
     void App::addRecentFile(const std::string& path) {
         // One entry per file, however its path was written (a drop, a dialog,
-        // the command line, a list saved by an older version).
-        const std::string key = absolutePath(path);
+        // the command line, a list saved by an older version). A cluster path
+        // is a name, not a path of this machine.
+        const std::string key = isRemoteDatasetPath(path) ? path : absolutePath(path);
         auto same = [&key](const std::string& entry) {
+            if (isRemoteDatasetPath(entry) || isRemoteDatasetPath(key)) return entry == key;
 #ifdef _WIN32
             return toLower(absolutePath(entry)) == toLower(key);   // Windows paths ignore case
 #else
@@ -2722,7 +2762,7 @@ namespace sirius::app::gui {
             return;
         }
         addRecentFile(path);
-        impl_->lastDir = parentPath(path);
+        if (!isRemoteDatasetPath(path)) impl_->lastDir = parentPath(path);
     }
 
     // A folder with a manifest opens directly; otherwise the pattern dialog
@@ -2743,6 +2783,12 @@ namespace sirius::app::gui {
     }
 
     void App::openDatasetPath(const std::string& path) {
+        if (isRemoteDatasetPath(path)) {
+            OpenOptions o;
+            o.readAll = false;   // it stays on the cluster: the viewer gets what it draws
+            openWith(path, o);
+            return;
+        }
         if (isDirectory(path) && !isFolderDataset(path)) {
             bool store = false;
             for (const char* marker : {".zarray", ".zgroup", "zarr.json", "attributes.json"})
@@ -2785,8 +2831,17 @@ namespace sirius::app::gui {
     void App::dropPaths(const std::vector<std::string>& dropped) {
         std::vector<std::string> paths;
         for (const std::string& p : dropped)
-            if (!p.empty()) paths.push_back(absolutePath(p));
+            if (!p.empty()) paths.push_back(isRemoteDatasetPath(p) ? p : absolutePath(p));
         if (paths.empty()) return;
+        // a cluster dataset (the command line, a script): opened through the cluster session
+        if (isRemoteDatasetPath(paths.front())) {
+            if (!wb().canEdit() || bridge_.taskRunning()) {
+                wb().logLine("Busy: cancel what runs (Esc) or wait before opening " + paths.front() + ".");
+                return;
+            }
+            openDatasetPath(paths.front());
+            return;
+        }
         // A drop is an edit: the workbench refuses every one of them while a
         // run holds the pipeline.
         if (!wb().canEdit()) {
@@ -3152,6 +3207,21 @@ namespace sirius::app::gui {
     // --- commands: windows ------------------------------------------------------------------
 
     void App::preferences() { showDialog(makePreferencesDialog(*this)); }
+
+    void App::clusterDialog() {
+        // one at a time: a second Connect would only show the same session twice
+        for (const auto& d : impl_->dialogs)
+            if (d && d->isOpen() && d->title() == "Connect to cluster") {
+                d->raise();
+                return;
+            }
+        showDialog(makeClusterDialog(*this));
+    }
+
+    ClusterLink& App::cluster() {
+        if (!impl_->cluster) impl_->cluster = std::make_unique<ClusterLink>(*this);
+        return *impl_->cluster;
+    }
 
     void App::pluginManager(const std::string& file) {
         Impl& d = *impl_;

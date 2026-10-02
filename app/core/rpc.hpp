@@ -85,6 +85,17 @@ namespace sirius::app::rpc {
     // connection fails.
     std::unique_ptr<Transport> connectTcp(const std::string& host, int port, std::chrono::milliseconds timeout);
 
+    // The same through a SOCKS5 proxy on this machine (the `ssh -D` of a
+    // cluster session, core/remote_host.hpp): CONNECT without
+    // authentication, the host sent as a name so that the far end resolves
+    // it -- a compute node's name means something only on the cluster.
+    // Throws ProtocolError naming what failed: the proxy, the far end
+    // refusing (the worker not listening yet), or the reply.
+    std::unique_ptr<Transport> connectSocks5(const std::string& proxyHost, int proxyPort, const std::string& host, int port,
+                                             std::chrono::milliseconds timeout);
+    // connectTcp, or connectSocks5 through 127.0.0.1:`socksPort` when it is > 0.
+    std::unique_ptr<Transport> connectEndpoint(const std::string& host, int port, int socksPort, std::chrono::milliseconds timeout);
+
     // In-memory pair for tests: what one end sends, the other receives.
     std::pair<std::unique_ptr<Transport>, std::unique_ptr<Transport>> loopbackPair();
 
@@ -100,6 +111,11 @@ namespace sirius::app {
         std::string device;                    // "cuda:0 · RTX 4000 · 20 GB"
         std::string hostname;
         std::string python;
+        // What dataset_read / dataset_view replies may be compressed with,
+        // best first ("zstd", "zlib"); empty for a worker without them.
+        std::vector<std::string> encodings;
+        int maxClients = 1;                    // connections the worker serves at once (--max-clients)
+        std::string tifffile;                  // its version; "" when the worker cannot read TIFF itself
     };
 
     struct WorkerResult {
@@ -128,9 +144,11 @@ namespace sirius::app {
         ~RemoteWorker();
 
         // `timeout` bounds the TCP connect; `cancelled` the handshake, as above.
+        // A `socksPort` > 0 connects through that local SOCKS5 proxy (a cluster
+        // session's SSH connection), which resolves `host` on the far side.
         static std::unique_ptr<RemoteWorker> connect(const std::string& host, int port, const std::string& token,
                                                      std::chrono::milliseconds timeout = std::chrono::seconds(5),
-                                                     const std::function<bool()>& cancelled = {});
+                                                     const std::function<bool()>& cancelled = {}, int socksPort = 0);
 
         const WorkerCapabilities& capabilities() const noexcept { return caps_; }
         bool supports(const std::string& kind) const noexcept;

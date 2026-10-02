@@ -50,6 +50,7 @@ namespace sirius::app::gui {
     class AssistantPanel;
     class LogPanel;
     class HelpWindow;
+    class ClusterLink;
 
     // A dialog: a titled window over the application, modal unless it says
     // otherwise. The application draws the frame, the title row and the
@@ -195,6 +196,9 @@ namespace sirius::app::gui {
 
         // --- commands: windows ---------------------------------------------------------
         void preferences();
+        // Process ▸ Connect to cluster…, and the session behind it.
+        void clusterDialog();
+        ClusterLink& cluster();
         void pluginManager(const std::string& file = {});
         void showHelpForSelected();
         void showHelp(const std::string& kind);

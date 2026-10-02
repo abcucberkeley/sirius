@@ -24,6 +24,7 @@
 
 #include "core/python_env.hpp"
 #include "core/rpc.hpp"
+#include "imgui/cluster_link.hpp"
 #include "imgui/dialogs/export_dialog_support.hpp"
 #include "imgui/panels/assistant_panel.hpp"
 #include "imgui/panels/llm_client.hpp"
@@ -223,6 +224,22 @@ namespace sirius::app::gui {
                 widgets::rule(theme::kRule);
                 widgets::caption("HPC worker");
                 {
+                    // the cluster session: one login, the job, the tunnel, all from here
+                    ClusterLink& link = app.cluster();
+                    ImU32 color = theme::kNeutral600;
+                    std::string state = link.indicator(color);
+                    if (state.empty()) state = "HPC: not connected to a cluster";
+                    widgets::text(state, 12, color);
+                    ImGui::SameLine(0.0f, px(10));
+                    widgets::ButtonOpts b;
+                    b.small = true;
+                    b.tooltip = "Log in once, submit the worker job and connect through the SSH tunnel: no terminals";
+                    if (widgets::button("Connect to cluster\xE2\x80\xA6", b)) app.defer([&app] { app.clusterDialog(); });
+                    if (link.connected())
+                        note("While the cluster session is connected the HPC backend goes through it; the fields below are for a worker "
+                             "you started and tunnelled yourself.");
+                }
+                {
                     const float w = columnWidth(2, 10);
                     widgets::FieldOpts fo;
                     fo.width = design(w);
@@ -240,8 +257,8 @@ namespace sirius::app::gui {
                     secret.password = true;
                     widgets::inputText("##token", &token_, secret);
                 }
-                note("Launch the worker on the cluster with app/python/slurm/sirius_worker.sbatch and forward its port "
-                     "(ssh -L). The same worker runs Torch models locally.");
+                note("By hand instead: launch the worker with app/python/slurm/sirius_worker.sbatch and forward its port "
+                     "(ssh -L); see app/python/slurm/README.md. The same worker runs Torch models locally.");
                 widgets::rule(theme::kRule);
                 {
                     const Field f("Python for the local worker");
@@ -612,7 +629,8 @@ namespace sirius::app::gui {
                 rc.host = trimmed(host_);
                 rc.port = static_cast<int>(port_);
                 rc.token = token_;
-                wb.setRemoteConfig(rc);
+                // a connected cluster session keeps the backend on its tunnel
+                wb.setRemoteConfig(app.cluster().connected() ? app.cluster().remoteConfig() : rc);
                 // The local worker's launcher reads "worker/python" itself each time
                 // it starts the worker, after $SIRIUS_PYTHON: handing it the field
                 // here would put the setting above the environment.

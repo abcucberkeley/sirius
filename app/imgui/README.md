@@ -28,9 +28,10 @@ command line: `--dataset`, `--pipeline`, `--run`, `--tool`, `--action`, `--ask`,
 | `theme.hpp/.cpp` | design tokens, fonts, the ImGui / ImPlot style |
 | `widgets/controls`, `widgets/icons`, `widgets/code_editor` | the design's controls, icon set and the plugin editor |
 | `settings`, `secret_store`, `platform`, `worker_launcher`, `http`, `gl` | services: persistent settings, secrets, OS dialogs, the Python worker, HTTP(S), textures and PNG |
+| `cluster_link` | the cluster session (`core/cluster.hpp`): ssh's prompts in a box, the HPC backend and cluster datasets once connected, the status-bar indicator |
 | `viewer/*` | toolbar, tool strip, ortho / 3D / compare views, dims strip, the volume loader and ray caster |
 | `panels/*` | operations, parameters, diagnostics, log, help, assistant |
-| `dialogs/*` | open, folder dataset, export, training export, preferences, model hub, plugin manager, the Python environment offer (`python_env_dialog.cpp`) |
+| `dialogs/*` | open, folder dataset, export, training export, preferences, model hub, plugin manager, the Python environment offer (`python_env_dialog.cpp`), connect to cluster and the cluster's file browser (`cluster_dialog.cpp`) |
 
 Everything is in namespace `sirius::app::gui`; includes are written from `app/`
 (`"core/workbench.hpp"`, `"imgui/theme.hpp"`). The fonts and the icons are in

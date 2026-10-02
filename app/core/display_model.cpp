@@ -143,6 +143,39 @@ namespace sirius::app::display {
 
     // --- windows -------------------------------------------------------------
 
+    ViewProvider* DisplayModel::views() const noexcept {
+        if (!out_ || out_->array || !out_->source) return nullptr;
+        return out_->source->viewProvider();
+    }
+
+    std::uint64_t DisplayModel::remoteRevision() const noexcept {
+        const ViewProvider* v = views();
+        return v ? v->revision() : 0;
+    }
+
+    bool DisplayModel::remoteBusy() const {
+        const ViewProvider* v = views();
+        return v && v->busy();
+    }
+
+    std::string DisplayModel::remoteError() const {
+        const ViewProvider* v = views();
+        return v ? v->lastError() : std::string();
+    }
+
+    std::shared_ptr<const ViewTile> DisplayModel::remoteVolume(Index c, Index t, int maxSide) {
+        ViewProvider* v = views();
+        if (!v) return nullptr;
+        ViewRequest q;
+        q.kind = ViewRequest::Kind::Volume;
+        q.c = c;
+        q.t = t;
+        q.maxSide = maxSide;
+        bool exact = false;
+        auto tile = v->view(q, exact);
+        return exact ? tile : nullptr;
+    }
+
     DisplayWindow DisplayModel::window(Index c, Index t) {
         // a live preview's window holds for every time point
         auto eit = explicit_.find(c);
@@ -152,8 +185,9 @@ namespace sirius::app::display {
         const Key key = windowMode_ == WindowMode::Full ? Key{c, t} : Key{c, -1};
         auto it = windows_.find(key);
         if (it != windows_.end()) return it->second;
+        provisional_ = false;
         const DisplayWindow w = computeWindow(c, t);
-        windows_[key] = w;
+        if (!provisional_) windows_[key] = w;
         return w;
     }
 
@@ -173,6 +207,12 @@ namespace sirius::app::display {
     DisplayWindow DisplayModel::computeWindow(Index c, Index t) {
         if (!valid()) return {0.0f, 1.0f};
         const Dims5& d = meta_.dims;
+        if (ViewProvider* v = views()) {
+            // the worker's percentiles of a few planes, once they arrive
+            if (auto w = v->window(c, t, windowMode_ == WindowMode::Full)) return {w->first, w->second > w->first ? w->second : w->first + 1.0f};
+            provisional_ = true;
+            return {0.0f, 1.0f};
+        }
         if (windowMode_ == WindowMode::Full) {
             // The exact range of the whole volume is a scan of every voxel:
             // ViewerLoader produces it beside the volume it reads, and until
@@ -212,6 +252,8 @@ namespace sirius::app::display {
         const Dims5& d = meta_.dims;
         if (c < 0 || c >= d.c || t < 0 || t >= d.t || z < 0 || z >= d.z) return nullptr;
         if (out_->array) return out_->array->plane(c, t, z);
+        // a cluster dataset is never read plane by plane on the GUI thread
+        if (views()) return nullptr;
         // a cached volume serves planes without touching the disk
         auto vit = volumes_.find(Key{c, t});
         if (vit != volumes_.end()) return vit->second->data() + z * (d.y * d.x);
@@ -266,6 +308,7 @@ namespace sirius::app::display {
         if (!valid()) return VolumeState::TooLarge;
         const Dims5& d = meta_.dims;
         if (c < 0 || c >= d.c || t < 0 || t >= d.t) return VolumeState::TooLarge;
+        if (views()) return VolumeState::Ready;   // the worker re-slices and projects
         const Key key{c, t};
         const bool haveVolume = out_->array || volumes_.count(key) != 0;
         const bool haveMip = mips_.count(key) != 0;
@@ -461,9 +504,71 @@ namespace sirius::app::display {
         }
     }
 
+    void DisplayModel::renderRemote(ViewRequest::Kind kind, Index t, Index index, const ViewState& vs, int factor, Image& img,
+                                    const RectI& r) {
+        ViewProvider* v = views();
+        factor = std::max(factor, 1);
+        const int w = std::max(1, (r.w + factor - 1) / factor), h = std::max(1, (r.h + factor - 1) / factor);
+        std::vector<ChannelPlane> chans = visibleChannels(vs, t);
+        std::vector<std::vector<float>> bufs(chans.size());
+        const Dims5& d = meta_.dims;
+        bool any = false;
+        std::size_t k = 0;
+        for (Index c = 0; c < d.c; ++c) {
+            if (!vs.channelOn(c)) continue;
+            ViewRequest q;
+            q.kind = kind;
+            q.c = c;
+            q.t = t;
+            q.index = index;
+            q.factor = factor;
+            q.x = r.x;
+            q.y = r.y;
+            q.w = r.w;
+            q.h = r.h;
+            bool exact = false;
+            const std::shared_ptr<const ViewTile> tile = v ? v->view(q, exact) : nullptr;
+            if (tile && tile->w > 0 && tile->h > 0) {
+                // the tile's pixels at the positions this render samples
+                // (the request's own factor: one to one; a stand-in: nearest)
+                std::vector<float>& buf = bufs[k];
+                buf.assign(static_cast<std::size_t>(w) * static_cast<std::size_t>(h), std::numeric_limits<float>::quiet_NaN());
+                const int tf = std::max(tile->factor, 1);
+                for (int i = 0; i < h; ++i) {
+                    const int vy = r.y + i * factor - tile->y;
+                    if (vy < 0) continue;
+                    const int ty = vy / tf;
+                    if (ty >= tile->h) break;
+                    const float* row = tile->data.data() + static_cast<std::size_t>(ty) * static_cast<std::size_t>(tile->w);
+                    float* dst = buf.data() + static_cast<std::size_t>(i) * static_cast<std::size_t>(w);
+                    for (int j = 0; j < w; ++j) {
+                        const int vx = r.x + j * factor - tile->x;
+                        if (vx < 0) continue;
+                        const int tx = vx / tf;
+                        if (tx >= tile->w) break;
+                        dst[j] = row[tx];
+                    }
+                }
+                chans[k].data = buf.data();
+                chans[k].rowStride = w;
+                chans[k].colStride = 1;
+                any = true;
+            }
+            ++k;
+        }
+        // nothing has arrived for this picture yet: the previous one stays up
+        // while it is the same size (scrubbing z), rather than a black frame
+        if (!any && img.width == w && img.height == h && !img.pixels.empty()) return;
+        blend(std::move(chans), h, w, 1, img);
+    }
+
     void DisplayModel::renderXY(Index t, Index z, const ViewState& vs, int factor, Image& img, const RectI& region) {
         const Dims5& d = meta_.dims;
         const RectI r = planeRegion(region, d.x, d.y);
+        if (views()) {
+            renderRemote(ViewRequest::Kind::XY, t, z, vs, factor, img, r);
+            return;
+        }
         std::vector<ChannelPlane> chans = visibleChannels(vs, t);
         std::size_t k = 0;
         for (Index c = 0; c < d.c; ++c) {
@@ -479,9 +584,13 @@ namespace sirius::app::display {
     void DisplayModel::renderXZ(Index t, Index y, const ViewState& vs, int factor, Image& img, const RectI& region) {
         const Dims5& d = meta_.dims;
         const RectI r = planeRegion(region, d.x, d.z);
+        y = std::clamp<Index>(y, 0, d.y - 1);
+        if (views()) {
+            renderRemote(ViewRequest::Kind::XZ, t, y, vs, factor, img, r);
+            return;
+        }
         std::vector<ChannelPlane> chans = visibleChannels(vs, t);
         std::size_t k = 0;
-        y = std::clamp<Index>(y, 0, d.y - 1);
         for (Index c = 0; c < d.c; ++c) {
             if (!vs.channelOn(c)) continue;
             const float* v = volumeIfReady(c, t);
@@ -496,8 +605,12 @@ namespace sirius::app::display {
     void DisplayModel::renderYZ(Index t, Index x, const ViewState& vs, int factor, Image& img, const RectI& region) {
         const Dims5& d = meta_.dims;
         const RectI r = planeRegion(region, d.z, d.y);
-        std::vector<ChannelPlane> chans = visibleChannels(vs, t);
         x = std::clamp<Index>(x, 0, d.x - 1);
+        if (views()) {
+            renderRemote(ViewRequest::Kind::YZ, t, x, vs, factor, img, r);
+            return;
+        }
+        std::vector<ChannelPlane> chans = visibleChannels(vs, t);
         std::size_t k = 0;
         for (Index c = 0; c < d.c; ++c) {
             if (!vs.channelOn(c)) continue;
@@ -513,6 +626,10 @@ namespace sirius::app::display {
 
     void DisplayModel::renderMIP(Index t, const ViewState& vs, int factor, Image& img) {
         const Dims5& d = meta_.dims;
+        if (views()) {
+            renderRemote(ViewRequest::Kind::MIP, t, 0, vs, factor, img, RectI{0, 0, static_cast<int>(d.x), static_cast<int>(d.y)});
+            return;
+        }
         std::vector<ChannelPlane> chans = visibleChannels(vs, t);
         std::size_t k = 0;
         for (Index c = 0; c < d.c; ++c) {

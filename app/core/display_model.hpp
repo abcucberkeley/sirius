@@ -9,6 +9,12 @@
 // volume, cached, for the re-slices; everything else reads straight out of
 // the in-memory array.
 //
+// A cluster dataset (a source with a ViewProvider, core/remote_source.hpp)
+// is drawn from what its worker computes: every renderer asks for its
+// picture at the factor it draws at and draws what has arrived; nothing is
+// read on this side, and the re-slices and the projection need no volume
+// here (volumeState() is Ready). remoteRevision() moves as views arrive.
+//
 // Drawing never reads a whole volume: volumeState() says whether one is in
 // memory, has to be produced (by ViewerLoader, off the GUI thread) or is too
 // large to hold at all, and installVolume() takes the loader's result. The
@@ -94,6 +100,14 @@ namespace sirius::app::display {
         static constexpr std::size_t kMipCacheLimit = std::size_t{1} << 30;      // 1 GiB
 
         void setOutput(std::shared_ptr<const StepOutput> out);
+        // The output is drawn through a ViewProvider (a cluster dataset).
+        bool isRemote() const noexcept { return views() != nullptr; }
+        std::uint64_t remoteRevision() const noexcept;
+        bool remoteBusy() const;
+        std::string remoteError() const;
+        // The 3-D view's volume of a remote output: (c, t) reduced on the
+        // worker to a longest side of `maxSide`; null until it has arrived.
+        std::shared_ptr<const ViewTile> remoteVolume(Index c, Index t, int maxSide = 256);
         std::shared_ptr<const StepOutput> output() const noexcept { return out_; }
         bool valid() const noexcept;
         const DatasetMeta& meta() const noexcept { return meta_; }
@@ -195,6 +209,10 @@ namespace sirius::app::display {
         };
 
         DisplayWindow computeWindow(Index c, Index t);
+        ViewProvider* views() const noexcept;
+        // A remote output's picture: `kind` at `index`, the region in the
+        // view's own pixels, blended like the local renderers.
+        void renderRemote(ViewRequest::Kind kind, Index t, Index index, const ViewState& vs, int factor, Image& img, const RectI& r);
         std::vector<ChannelPlane> visibleChannels(const ViewState& vs, Index t);
         void blend(std::vector<ChannelPlane> chans, Index rows, Index cols, int factor, Image& img);
         // `only` (non-zero) draws that label alone: the solo view.
@@ -231,6 +249,7 @@ namespace sirius::app::display {
         };
         std::map<Key, Range> ranges_;                     // exact, from the loader
         bool tooLarge_ = false;
+        bool provisional_ = false;   // computeWindow gave a stand-in: not to be kept
         // one cached plane per channel for lazy sources without a cached volume
         std::map<Index, std::pair<PlaneKey, Buffer<float>>> planes_;
         std::vector<std::uint32_t> labelScratch_;

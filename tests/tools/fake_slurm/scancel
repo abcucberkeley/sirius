@@ -1,0 +1,15 @@
+#!/bin/bash
+# Fake scancel: stops the fake job's worker (the whole process tree on Windows).
+set -u
+dir="${FAKE_SLURM_DIR:?}"
+id="$1"
+[ -f "$dir/$id.state" ] || { echo "scancel: error: Invalid job id specified" >&2; exit 1; }
+if [ -f "$dir/$id.winpid" ]; then
+    taskkill //F //T //PID "$(cat "$dir/$id.winpid")" > /dev/null 2>&1
+    rm -f "$dir/$id.winpid"
+else
+    kill "$(cat "$dir/$id.pid")" 2>/dev/null
+    rm -f "$dir/$id.ospid"
+fi
+echo CANCELLED > "$dir/$id.state"
+echo "$id" >> "$dir/cancelled"

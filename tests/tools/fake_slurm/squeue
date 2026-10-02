@@ -1,0 +1,27 @@
+#!/bin/bash
+# Fake squeue: `squeue -h -j <id> -o <format>` with %T (state), %r (reason), %N (node), %M.
+set -u
+dir="${FAKE_SLURM_DIR:?}"
+id="" fmt="%T"
+while [ $# -gt 0 ]; do
+    case "$1" in
+        -j) id="$2"; shift 2 ;;
+        -o) fmt="$2"; shift 2 ;;
+        *) shift ;;
+    esac
+done
+[ -f "$dir/$id.state" ] || exit 0
+state=$(cat "$dir/$id.state")
+if [ "$state" = RUNNING ]; then
+    pid=$(cat "$dir/$id.pid")
+    if ! kill -0 "$pid" 2>/dev/null; then echo FAILED > "$dir/$id.state"; exit 0; fi
+    left=$(cat "$dir/$id.pending" 2>/dev/null || echo 0)
+    if [ "$left" -gt 0 ]; then
+        echo $((left - 1)) > "$dir/$id.pending"
+        out="${fmt//%T/PENDING}"; out="${out//%r/Priority}"; out="${out//%N/}"; out="${out//%M/0:00}"
+        echo "$out"
+        exit 0
+    fi
+    out="${fmt//%T/RUNNING}"; out="${out//%r/None}"; out="${out//%N/${FAKE_SLURM_NODE:-fakenode}}"; out="${out//%M/0:01}"
+    echo "$out"
+fi

@@ -28,6 +28,7 @@
 #include "core/app_paths.hpp"
 #include "core/help_pages.hpp"
 #include "core/host.hpp"
+#include "core/remote_host.hpp"
 #include "core/operation.hpp"
 #include "core/ops/builtin.hpp"
 #include "core/tool_api.hpp"
@@ -172,6 +173,9 @@ namespace {
 } // namespace
 
 int main(int argc, char** argv) {
+    // Started by ssh as its askpass helper (a cluster login, core/remote_host.hpp):
+    // relay the prompt to the running application and print its answer, nothing else.
+    if (sirius::app::ssh::isAskpassInvocation()) return sirius::app::ssh::askpassMain(argc, argv);
 #ifndef _WIN32
     // Before any thread or transfer starts. http.cpp sets CURLOPT_NOSIGNAL
     // (its transfers run on threads of their own), with which libcurl leaves

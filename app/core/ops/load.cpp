@@ -55,6 +55,15 @@ namespace sirius::app {
         // Empty error when the probe succeeded. With `options`, the meta that
         // opening the dataset with them gives (probeDataset(path, options)).
         std::string cachedProbe(const std::string& path, const OpenOptions* options, DatasetMeta& meta) {
+            // a cluster dataset: no file here to stat; the session caches what its worker said
+            if (isRemoteDatasetPath(path)) {
+                try {
+                    meta = options ? probeDataset(path, *options) : probeDataset(path);
+                    return {};
+                } catch (const std::exception& ex) {
+                    return ex.what();
+                }
+            }
             std::error_code ec;
             std::filesystem::path p(path);
             if (path.empty() || !std::filesystem::exists(p, ec)) return "file not found";
@@ -245,7 +254,7 @@ namespace sirius::app {
                 const std::string path = params.getString("path");
                 if (path.empty()) throw std::runtime_error("Load: no dataset selected");
                 std::error_code ec;
-                if (axesGiven(params) && std::filesystem::is_directory(path, ec))
+                if (axesGiven(params) && !isRemoteDatasetPath(path) && std::filesystem::is_directory(path, ec))
                     throw std::runtime_error("Load: " + axesNotAppliedError(path));
                 OpenOptions options = loadOpenOptions(params);
                 options.progress = [&](double f, const std::string& m) {

@@ -65,3 +65,18 @@ target_compile_definitions(test_app_local_worker_objects PRIVATE SIRIUS_TEST_WOR
                                                                  SIRIUS_TEST_FAKE_WORKER_DIR="${PROJECT_SOURCE_DIR}/tests/data/fake_worker_missing")
 target_compile_definitions(test_app_headless_objects     PRIVATE SIRIUS_TEST_EXAMPLES_DIR="${PROJECT_SOURCE_DIR}/examples"
                                                                  SIRIUS_TEST_WORKER_DIR="${PROJECT_SOURCE_DIR}/app/python")
+
+# The cluster connection against a stand-in (tests/tools/fake_ssh.py for ssh,
+# tests/tools/fake_slurm for Slurm, the worker in the checkout on 127.0.0.1):
+# never a real ssh, never another host. sirius_test_askpass is ssh's askpass
+# helper there, as sirius-app and sirius-cli are it themselves.
+app_test(cluster test_app_cluster.cpp UNITS cluster remote_host remote_source array_source rpc process host)
+sirius_unit_closure(_sirius_askpass_units sirius_core_remote_host)
+add_executable(sirius_test_askpass tools/sirius_test_askpass.cpp)
+target_link_libraries(sirius_test_askpass PRIVATE ${_sirius_askpass_units})
+target_compile_definitions(test_app_cluster_objects PRIVATE
+    SIRIUS_TEST_ASKPASS="$<TARGET_FILE:sirius_test_askpass>"
+    SIRIUS_TEST_FAKE_SSH="${PROJECT_SOURCE_DIR}/tests/tools/fake_ssh.py"
+    SIRIUS_TEST_FAKE_SLURM_DIR="${PROJECT_SOURCE_DIR}/tests/tools/fake_slurm"
+    SIRIUS_TEST_SOURCE_DIR="${PROJECT_SOURCE_DIR}")
+add_dependencies(test_app_cluster sirius_test_askpass)

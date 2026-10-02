@@ -373,6 +373,114 @@ namespace sirius::app::rpc {
         throw ProtocolError("rpc: cannot connect to " + host + ":" + std::to_string(port) + " (" + lastErr + ")");
     }
 
+    namespace {
+        // A transport that first hands out what was read past the end of the
+        // SOCKS reply (nothing, in practice: the worker speaks only when
+        // spoken to).
+        class PrefixedTransport final : public Transport {
+        public:
+            PrefixedTransport(std::unique_ptr<Transport> inner, std::vector<std::byte> prefix)
+                : inner_(std::move(inner)), prefix_(std::move(prefix)) {}
+            void send(const std::vector<std::byte>& bytes) override { inner_->send(bytes); }
+            bool receive(std::vector<std::byte>& into, std::chrono::milliseconds timeout) override {
+                if (!prefix_.empty()) {
+                    into.insert(into.end(), prefix_.begin(), prefix_.end());
+                    prefix_.clear();
+                    return true;
+                }
+                return inner_->receive(into, timeout);
+            }
+            void close() override { inner_->close(); }
+            bool isOpen() const noexcept override { return inner_->isOpen(); }
+
+        private:
+            std::unique_ptr<Transport> inner_;
+            std::vector<std::byte> prefix_;
+        };
+
+        std::string socksReplyText(int code) {
+            switch (code) {
+                case 1: return "general failure";
+                case 2: return "not allowed by the proxy";
+                case 3: return "network unreachable";
+                case 4: return "host unreachable";
+                case 5: return "connection refused";
+                case 6: return "TTL expired";
+                case 7: return "command not supported";
+                case 8: return "address type not supported";
+                default: return "error " + std::to_string(code);
+            }
+        }
+    } // namespace
+
+    std::unique_ptr<Transport> connectSocks5(const std::string& proxyHost, int proxyPort, const std::string& host, int port,
+                                             std::chrono::milliseconds timeout) {
+        const std::string where = host + ":" + std::to_string(port);
+        if (host.empty() || host.size() > 255) throw ProtocolError("rpc: '" + host + "' is not a host name a SOCKS proxy takes");
+        std::unique_ptr<Transport> t;
+        try {
+            t = connectTcp(proxyHost, proxyPort, timeout);
+        } catch (const ProtocolError& e) {
+            throw ProtocolError("rpc: the SSH tunnel's proxy on " + proxyHost + ":" + std::to_string(proxyPort) +
+                                " does not answer (" + e.what() + "); the SSH connection has ended");
+        }
+        const auto deadline = std::chrono::steady_clock::now() + timeout;
+        std::vector<std::byte> in;
+        // Reads until `in` holds `n` bytes. The proxy closing first means the
+        // far end refused: OpenSSH closes instead of replying when it cannot
+        // open the channel.
+        auto need = [&](std::size_t n) {
+            while (in.size() < n) {
+                const auto left = std::chrono::duration_cast<std::chrono::milliseconds>(deadline - std::chrono::steady_clock::now());
+                if (left.count() <= 0) throw ProtocolError("rpc: no answer from the SSH proxy for " + where + " (timed out)");
+                try {
+                    t->receive(in, (std::min)(left, std::chrono::milliseconds(250)));
+                } catch (const ProtocolError&) {
+                    throw ProtocolError("rpc: the cluster could not open a connection to " + where +
+                                        " (nothing listens there yet, or the node refused it)");
+                }
+            }
+        };
+        auto bytes = [](std::initializer_list<int> v) {
+            std::vector<std::byte> out;
+            for (int b : v) out.push_back(static_cast<std::byte>(b));
+            return out;
+        };
+        t->send(bytes({5, 1, 0}));   // version 5, one method: no authentication
+        need(2);
+        if (std::to_integer<int>(in[0]) != 5 || std::to_integer<int>(in[1]) != 0)
+            throw ProtocolError("rpc: the proxy on port " + std::to_string(proxyPort) + " is not a SOCKS5 proxy without authentication");
+        in.erase(in.begin(), in.begin() + 2);
+        std::vector<std::byte> req = bytes({5, 1, 0, 3, static_cast<int>(host.size())});
+        for (char c : host) req.push_back(static_cast<std::byte>(c));
+        req.push_back(static_cast<std::byte>((port >> 8) & 0xff));
+        req.push_back(static_cast<std::byte>(port & 0xff));
+        t->send(req);
+        need(4);
+        const int rep = std::to_integer<int>(in[1]);
+        if (std::to_integer<int>(in[0]) != 5) throw ProtocolError("rpc: a malformed SOCKS reply for " + where);
+        if (rep != 0) throw ProtocolError("rpc: the cluster could not connect to " + where + " (" + socksReplyText(rep) + ")");
+        std::size_t addr = 0;
+        switch (std::to_integer<int>(in[3])) {
+            case 1: addr = 4; break;
+            case 4: addr = 16; break;
+            case 3:
+                need(5);
+                addr = 1 + std::to_integer<std::size_t>(in[4]);
+                break;
+            default: throw ProtocolError("rpc: a malformed SOCKS reply for " + where);
+        }
+        need(4 + addr + 2);
+        in.erase(in.begin(), in.begin() + static_cast<std::ptrdiff_t>(4 + addr + 2));
+        if (in.empty()) return t;
+        return std::make_unique<PrefixedTransport>(std::move(t), std::move(in));
+    }
+
+    std::unique_ptr<Transport> connectEndpoint(const std::string& host, int port, int socksPort, std::chrono::milliseconds timeout) {
+        if (socksPort > 0) return connectSocks5("127.0.0.1", socksPort, host, port, timeout);
+        return connectTcp(host, port, timeout);
+    }
+
     std::pair<std::unique_ptr<Transport>, std::unique_ptr<Transport>> loopbackPair() {
         auto a = std::make_shared<Pipe>(), b = std::make_shared<Pipe>();
         return {std::make_unique<LoopbackTransport>(a, b), std::make_unique<LoopbackTransport>(b, a)};
@@ -436,13 +544,21 @@ namespace sirius::app {
         caps_.python = hello.result.value("python", "");
         if (hello.result.contains("methods") && hello.result["methods"].is_array())
             for (const json& m : hello.result["methods"]) caps_.methods.push_back(m.get<std::string>());
+        if (hello.result.contains("encodings") && hello.result["encodings"].is_array())
+            for (const json& e : hello.result["encodings"])
+                if (e.is_string()) caps_.encodings.push_back(e.get<std::string>());
+        if (hello.result.contains("max_clients") && hello.result["max_clients"].is_number_integer())
+            caps_.maxClients = hello.result["max_clients"].get<int>();
+        if (hello.result.contains("tifffile") && hello.result["tifffile"].is_string())
+            caps_.tifffile = hello.result["tifffile"].get<std::string>();
     }
 
     RemoteWorker::~RemoteWorker() { close(); }
 
     std::unique_ptr<RemoteWorker> RemoteWorker::connect(const std::string& host, int port, const std::string& token,
-                                                        std::chrono::milliseconds timeout, const std::function<bool()>& cancelled) {
-        return std::make_unique<RemoteWorker>(rpc::connectTcp(host, port, timeout), token, cancelled);
+                                                        std::chrono::milliseconds timeout, const std::function<bool()>& cancelled,
+                                                        int socksPort) {
+        return std::make_unique<RemoteWorker>(rpc::connectEndpoint(host, port, socksPort, timeout), token, cancelled);
     }
 
     bool RemoteWorker::supports(const std::string& kind) const noexcept {

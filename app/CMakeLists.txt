@@ -154,6 +154,21 @@ sirius_core_unit(python_env        HEADERS python_env.hpp    SOURCES python_env.
 sirius_core_unit(local_worker      HEADERS local_worker.hpp  SOURCES local_worker.cpp
                                    DEPENDS rpc process python_env worker_error host cancel app_paths LINK Threads::Threads)
 
+# The cluster: one SSH session (its command channel, its SOCKS proxy and the
+# askpass relay of its prompts), the Slurm job of the worker it submits and
+# watches, and the datasets that stay on the cluster, read by that worker.
+sirius_core_unit(remote_host       HEADERS remote_host.hpp   SOURCES remote_host.cpp
+                                   DEPENDS process host LINK nlohmann_json::nlohmann_json Threads::Threads)
+sirius_core_unit(cluster           HEADERS cluster.hpp       SOURCES cluster.cpp
+                                   DEPENDS remote_host rpc cancel errors
+                                   PUBLIC_LINK nlohmann_json::nlohmann_json LINK Threads::Threads)
+sirius_core_unit(remote_source     HEADERS remote_source.hpp SOURCES remote_source.cpp
+                                   DEPENDS array_source dataset rpc errors
+                                   PUBLIC_LINK nlohmann_json::nlohmann_json LINK ZLIB::ZLIB Threads::Threads)
+if(WIN32)
+    target_link_libraries(sirius_core_remote_host PRIVATE ws2_32)
+endif()
+
 # --- steps and the pipeline ---------------------------------------------------------
 
 sirius_core_unit(operation
@@ -239,7 +254,7 @@ op(resample    ops/resample.cpp    DEPENDS lib/image_ops)
 op(merge       ops/merge.cpp       DEPENDS lib/image_ops)
 op(stitch      ops/stitch.cpp      DEPENDS array_source lib/stitching lib/stitching_tiff)
 op(register    ops/register.cpp    DEPENDS lib/image_ops lib/registration)
-op(seg         ops/seg.cpp         DEPENDS ops_segment_common ops_torch_model rpc)
+op(seg         ops/seg.cpp         DEPENDS ops_segment_common ops_torch_model rpc remote_source cancel errors)
 op(foundation  ops/foundation.cpp  DEPENDS tracks rpc)
 op(threshold   ops/threshold.cpp   DEPENDS ops_segment_common lib/image_ops)
 op(classic     ops/classic.cpp     DEPENDS ops_segment_common lib/image_ops lib/constants)
@@ -317,7 +332,7 @@ target_include_directories(sirius_app_core PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
 # objects need are named once more here, for them.
 target_link_libraries(sirius_app_core
     PUBLIC sirius nlohmann_json::nlohmann_json Threads::Threads
-    PRIVATE OpenMP::OpenMP_CXX TIFF::TIFF tomlplusplus::tomlplusplus)
+    PRIVATE OpenMP::OpenMP_CXX TIFF::TIFF tomlplusplus::tomlplusplus ZLIB::ZLIB)
 if(WIN32)
     target_link_libraries(sirius_app_core PRIVATE ws2_32)
 endif()

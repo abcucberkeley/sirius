@@ -7,10 +7,12 @@
 // on. Two backends: multi-page TIFF (libtiff / nvTIFF through TiffFile) and
 // zarr / N5 through TensorStore when the build has it.
 
+#include <cstdint>
 #include <functional>
 #include <memory>
 #include <optional>
 #include <string>
+#include <utility>
 #include <vector>
 
 #include "core/array.hpp"
@@ -31,6 +33,57 @@ namespace sirius::app {
         static PageOrder fromDims(const Dims5& d, const std::string& order = "czt");
     };
 
+    // --- what a pane draws, asked of a source over a slow link -----------------
+    //
+    // A dataset on a cluster (core/remote_source.hpp) is not read plane by
+    // plane at full resolution for display: the worker next to the data
+    // computes what a pane shows -- the XY plane, the XZ / YZ re-slice, the
+    // z maximum projection, a small volume for the 3-D view -- reduced by the
+    // factor the pane draws at, and sends that. The display model asks for it
+    // here and never waits: a request answers with what has arrived (or the
+    // best stand-in) and queues the rest; revision() moves when more arrives.
+
+    struct ViewRequest {
+        enum class Kind { XY,      // (y, x) at z = index
+                          XZ,      // rows z, columns x at y = index
+                          YZ,      // rows y, columns z at x = index
+                          MIP,     // the z maximum projection (y, x)
+                          Volume   // the (z, y, x) volume reduced to a longest side of maxSide
+        };
+        Kind kind = Kind::XY;
+        Index c = 0, t = 0, index = 0;
+        int factor = 1;                          // view pixels per drawn pixel
+        int x = 0, y = 0, w = 0, h = 0;          // the region in the view's columns / rows; w = 0: all of it
+        int maxSide = 256;
+    };
+
+    struct ViewTile {
+        int x = 0, y = 0;                        // the region's origin in view pixels
+        int w = 0, h = 0;                        // reduced width and height (Volume: x and y)
+        int d = 1;                               // Volume: reduced depth
+        int factor = 1;
+        std::vector<float> data;                 // h * w (Volume: d * h * w)
+    };
+
+    class ViewProvider {
+    public:
+        virtual ~ViewProvider() = default;
+        // What has arrived for `request`, never waiting: `exact` when it is the
+        // request's own factor and covers its region; otherwise the best
+        // stand-in (another factor of the same plane) or null, and a fetch of
+        // the real thing is queued.
+        virtual std::shared_ptr<const ViewTile> view(const ViewRequest& request, bool& exact) = 0;
+        // A display window for (c, t): the robust percentiles (Auto) or the
+        // range (full), once the worker has sent them; queued otherwise.
+        virtual std::optional<std::pair<float, float>> window(Index c, Index t, bool fullRange) = 0;
+        // Moves whenever a view or a window arrives.
+        virtual std::uint64_t revision() const noexcept = 0;
+        // Fetches are queued or running.
+        virtual bool busy() const = 0;
+        // The last fetch that failed, for the viewer's notice; "" when none.
+        virtual std::string lastError() const = 0;
+    };
+
     class ArraySource {
     public:
         virtual ~ArraySource() = default;
@@ -46,6 +99,9 @@ namespace sirius::app {
         virtual bool inMemory() const noexcept { return false; }
         // Whether the source can feed planes to the GPU decoder (nvTIFF).
         virtual bool gpuDecodable() const noexcept { return false; }
+        // A source that is drawn through display-sized views (a cluster
+        // dataset); null for every local one, which the viewer reads directly.
+        virtual ViewProvider* viewProvider() const noexcept { return nullptr; }
 
         // --- tiles (multi-file datasets; single-tile sources keep the defaults)
         virtual Index tileCount() const noexcept { return 1; }
@@ -95,6 +151,14 @@ namespace sirius::app {
         std::string metadataSummary;        // "OME-TIFF · 2 channels · voxel 0.032 µm"
         bool dimsFromMetadata = false;      // c/t/z came from OME/ImageJ/zarr metadata
     };
+
+    // Datasets on a cluster are named "cluster://<ssh host>/<absolute path>"
+    // and opened through the connected worker. The cluster session installs
+    // the opener (core/remote_source.hpp); openDataset and probeDataset hand
+    // such a path to it, and throw while none is installed.
+    using RemoteDatasetOpener = std::function<OpenResult(const std::string& path, const OpenOptions& options, bool probeOnly)>;
+    void setRemoteDatasetOpener(RemoteDatasetOpener opener);
+    bool isRemoteDatasetPath(const std::string& path);
 
     // Probe a path without reading pixels: dims (as far as the metadata goes),
     // dtype, size, channels. Throws std::runtime_error when unreadable.

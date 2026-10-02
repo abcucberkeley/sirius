@@ -47,6 +47,16 @@ namespace sirius::app::gui {
     std::shared_ptr<Dialog> makeTrainingExportDialog(
         App& app, std::function<void(int stepIndex, const TrainingExportOptions& options)> accepted);
 
+    // Process ▸ Connect to cluster…: the profile, Connect, the checklist of
+    // the steps (SSH login, checks, submit, queue, start, hello) and what
+    // each found or why it failed; Disconnect. Not modal. (cluster_dialog.cpp)
+    std::shared_ptr<Dialog> makeClusterDialog(App& app);
+    // The cluster's files through the SSH session: path bar, Up, Home,
+    // recent folders; `chosen` gets "cluster://<host>/<path>" of a file (or
+    // of the folder shown, with `folders`).
+    std::shared_ptr<Dialog> makeClusterBrowser(App& app, const std::string& start, bool folders,
+                                               std::function<void(const std::string& clusterPath)> chosen);
+
     // File ▸ Preferences…: default backend and CUDA device, the HPC worker
     // connection, the Python interpreter for the local worker and SIRIUS's
     // own Python environment, and the assistant provider. Values live in the

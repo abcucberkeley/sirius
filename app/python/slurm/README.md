@@ -1,9 +1,44 @@
 # Running the compute worker under Slurm (the HPC backend)
 
-The application's **HPC** backend does not submit jobs itself: it connects to
-a running `sirius_worker` and sends it steps to execute. On a cluster the
-worker is started once per session as a Slurm job, and the application
-reaches it through an SSH tunnel.
+The application's **HPC** backend sends steps to a running `sirius_worker`.
+On a cluster the worker runs once per session as a Slurm job, and the
+application reaches it through SSH.
+
+## From the application (the usual way)
+
+*Process ▸ Connect to cluster…* in `sirius-app` does all of the below in one
+window, with one SSH login:
+
+- **Profile**: the SSH host (an alias of your `~/.ssh/config`, e.g. `fiona`,
+  ProxyJump and all), the SIRIUS checkout on the cluster (default
+  `~/dev/sirius`), the Python environment to activate (default
+  `~/venvs/sirius`), and the job's partition, account, QoS, time, GPUs, CPUs
+  and memory (fiona's test GPUs by default: `abc_a100`, `velatkilic`,
+  `abc_debug`, one hour). It is remembered.
+- **Connect** starts the system's OpenSSH once
+  (`ssh -T -o NumberOfPasswordPrompts=1 -o BatchMode=no -D 127.0.0.1:<port> <host> bash -l -s`):
+  a password or one-time code prompt is shown in the application and handed
+  to ssh only (never stored); the same connection then serves as the command
+  channel (checks, `sbatch --parsable`, `squeue`, `scancel`, folder
+  listings) and as a SOCKS proxy through which the application reaches the
+  worker on the compute node -- no `ssh -L`, no node name to copy.
+- The checklist shows each step: login, checks (sbatch, the checkout, the
+  venv and numpy in it, with the command that fixes what is missing),
+  submit, the queue (state, reason, time waited), the node, and the
+  worker's hello (version, device, steps).
+- The status bar keeps saying whether it is connected; a job that ends
+  (TIMEOUT, CANCELLED) or a connection that drops is reported with the
+  reason. *Disconnect…* (and quitting) asks whether to `scancel` the job.
+
+Install once, on the cluster: the checkout at the profile's path (the same
+version as the application), and in the venv
+`pip install -r app/python/requirements.txt tifffile` (tifffile lets the
+worker read TIFF datasets for *File ▸ Open from cluster…*; torch for
+segmentation models). The job runs this directory's `sirius_worker.sbatch`
+with the profile's options on the `sbatch` command line, `SIRIUS_TOKEN`,
+`SIRIUS_VENV`, `SIRIUS_PORT` and `SIRIUS_MAX_CLIENTS` in its environment.
+
+The manual way follows: for `sirius-cli`, or a cluster the dialog does not fit.
 
 ## 1. Start the worker on a node
 
@@ -43,6 +78,10 @@ instead: `sirius-cli worker setup --yes` creates SIRIUS's own Python
 environment under `~/.local/share/sirius/python-env`, or wherever
 `SIRIUS_PYTHON_ENV` points (a project directory, when the home quota is
 small); point the script's `source .../bin/activate` line at it.
+
+The template passes `--max-clients ${SIRIUS_MAX_CLIENTS:-8}` to the worker,
+so the application can keep a connection for its status and one for the
+dataset it shows besides each run's (runs still execute one at a time).
 
 ## 2. Tunnel the port
 

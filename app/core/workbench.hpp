@@ -139,6 +139,10 @@ namespace sirius::app {
         std::string host = "localhost";
         int port = 7645;
         std::string token;
+        // > 0: reach host:port through this local SOCKS5 proxy, the SSH
+        // connection of a cluster session (core/cluster.hpp), which resolves
+        // the compute node's name on the cluster.
+        int socksPort = 0;
     };
 
     // Connects to (starting when needed) the local Python worker; installed

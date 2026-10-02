@@ -1,7 +1,7 @@
 """Command line of the SIRIUS compute worker.
 
     python -m sirius_worker [--host H] [--port P] [--token T] [--device auto|cuda|cpu]
-                            [--allow-install] [--log-level L]
+                            [--allow-install] [--max-clients N] [--log-level L]
     python -m sirius_worker --check
 
 Listens on host:port (port 0 picks a free one), prints one JSON line
@@ -148,6 +148,10 @@ def main(argv=None) -> int:
     # Not for a terminal or a batch job, where stdin is closed from the start.
     parser.add_argument("--exit-with-parent", action="store_true",
                         help="stop when stdin reaches end-of-file (the launching process went away)")
+    # The cluster job passes this: the application keeps a connection for its
+    # status and one for the dataset on screen besides each run's.
+    parser.add_argument("--max-clients", type=int, default=int(os.environ.get("SIRIUS_MAX_CLIENTS", "1") or 1),
+                        help="connections served at once (default 1, or $SIRIUS_MAX_CLIENTS); jobs still run one at a time")
     parser.add_argument("--check", action="store_true",
                         help="print what this interpreter has for the worker as one JSON line and exit")
     args = parser.parse_args(argv)
@@ -187,7 +191,7 @@ def main(argv=None) -> int:
         logging.getLogger("sirius_worker").error("%s", e)
         return 2
 
-    server = WorkerServer(args.host, args.port, args.token, args.device)
+    server = WorkerServer(args.host, args.port, args.token, args.device, max(1, args.max_clients))
     try:
         server.bind()
     except (OSError, ValueError) as e:

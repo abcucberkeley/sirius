@@ -23,6 +23,14 @@ Requests (see protocol.py for the framing):
     run         {kind, params} + tensors    -> "progress"* then "result" (+ tensors)
     cancel      {id}                        -> {} (the cancelled run replies with an error "cancelled")
     shutdown    {}                          -> {} and the server exits
+    dataset_info  {path, options?}          -> the dataset's meta: dims (c, t, z, y, x), dtype, voxel_um, channels
+    dataset_read  {path, options?, c, t, z?, accept?}
+                                            -> one plane (z given) or the (z, y, x) volume, full resolution
+    dataset_view  {path, options?, kind, c, t, index?, factor?, region?, max_side?, accept?}
+                                            -> what a pane draws, reduced on the node (datasets.py)
+    dataset_stats {path, options?, c, t}    -> {lo, hi, min, max}: a display window
+                                               (dataset_read / _view reply {encoding, shuffle, dtype, shape}
+                                               and one tensor "data", compressed when `accept` allows)
 
 Model specs (params.model of torch_segment, model_info): a local .pt / .pts /
 .pth / .onnx path; ``hf:<repo>[:<file>]`` (downloaded into $SIRIUS_MODEL_CACHE
@@ -44,7 +52,12 @@ Run kinds and their tensors:
 
 The reader loop runs on the connection's thread and the job on a worker
 thread, so a cancel request is read while a run is in progress. Every reply
-carries the request's id.
+carries the request's id. One client at a time by default; with
+--max-clients N (the cluster job) up to N connections are served at once,
+each on its own thread -- the application keeps one for its status, one
+for the dataset it shows and one per run -- while jobs still run one at a
+time (a second is refused as busy) and a connection that goes away cancels
+only its own.
 
 Trust model (app/python/SECURITY.md): whoever completes `hello` can run code
 here, so the listener refuses a non-loopback address without a token, the
@@ -71,10 +84,10 @@ from typing import Any, Dict, Optional, Tuple
 
 import numpy as np
 
-from . import __version__
+from . import __version__, datasets
 from . import models as model_hub
 from . import plugins as plugin_registry
-from .protocol import MAX_PREAUTH_FRAME, PROTOCOL_VERSION, ProtocolError, encode_frame, read_frame
+from .protocol import DTYPES, MAX_PREAUTH_FRAME, PROTOCOL_VERSION, ProtocolError, encode_frame, read_frame
 from .steps import workbench
 
 log = logging.getLogger("sirius_worker")
@@ -99,6 +112,9 @@ class WorkerServer:
         self._stop = threading.Event()
         self._job_lock = threading.Lock()
         self._job: Optional[Dict[str, Any]] = None
+        self._clients_lock = threading.Lock()
+        self._clients = 0
+        self._threads: list = []
 
     # --- lifecycle ------------------------------------------------------------
 
@@ -145,17 +161,48 @@ class WorkerServer:
                 except OSError:
                     break
                 peer = _peer(addr)
-                log.info("client %s connected", peer)
-                try:
-                    self._serve_client(conn, peer)
-                finally:
+                if self.max_clients <= 1:
+                    self._serve_and_close(conn, peer)
+                    continue
+                with self._clients_lock:
+                    full = self._clients >= self.max_clients
+                    if not full:
+                        self._clients += 1
+                if full:
+                    log.warning("client %s refused: %d clients are connected already", peer, self.max_clients)
                     try:
-                        conn.close()
+                        conn.sendall(encode_frame({"id": None, "type": "error",
+                                                   "message": f"busy: {self.max_clients} clients are connected already"}))
                     except OSError:
                         pass
-                    log.info("client %s disconnected", peer)
+                    conn.close()
+                    continue
+                th = threading.Thread(target=self._serve_counted, args=(conn, peer), name=f"sirius-client-{peer}",
+                                      daemon=True)
+                self._threads = [t for t in self._threads if t.is_alive()] + [th]
+                th.start()
         finally:
             self.close()
+            for th in self._threads:
+                th.join(timeout=5)
+
+    def _serve_and_close(self, conn: socket.socket, peer: str) -> None:
+        log.info("client %s connected", peer)
+        try:
+            self._serve_client(conn, peer)
+        finally:
+            try:
+                conn.close()
+            except OSError:
+                pass
+            log.info("client %s disconnected", peer)
+
+    def _serve_counted(self, conn: socket.socket, peer: str) -> None:
+        try:
+            self._serve_and_close(conn, peer)
+        finally:
+            with self._clients_lock:
+                self._clients -= 1
 
     def stop(self) -> None:
         self._stop.set()
@@ -187,7 +234,7 @@ class WorkerServer:
         wb = workbench()
         methods = ["hello", "ping", "model_info", "run", "cancel", "shutdown", "list_plugins", "reload_plugins",
                    "hub_search", "hub_files", "hub_download", "models_list", "models_delete", "install",
-                   "model_prepare", "list_bundles"]
+                   "model_prepare", "list_bundles", "dataset_info", "dataset_read", "dataset_view", "dataset_stats"]
         kinds = list(_SPECIAL_KINDS) + [k for k in wb.step_kinds() if k not in _SPECIAL_KINDS] + ["plugin"]
         methods += [f"run:{k}" for k in kinds]
         cuda = False
@@ -225,6 +272,10 @@ class WorkerServer:
             "torch": _module_version("torch"),
             "sirius": _module_version("sirius"),
             "workbench": getattr(wb, "__source_file__", getattr(wb, "__file__", "")),
+            # what the dataset_* replies can be compressed with, best first
+            "encodings": datasets.available_encodings(),
+            "max_clients": int(self.max_clients),
+            "tifffile": _module_version("tifffile"),
         }
 
     def _handshake(self, params: Dict[str, Any]) -> Tuple[bool, str]:
@@ -260,6 +311,7 @@ class WorkerServer:
     def _serve_client(self, conn: socket.socket, peer: str = "?") -> None:
         conn.settimeout(None)
         send_lock = threading.Lock()
+        owner = object()   # this connection's jobs: its cancel and its disconnect reach only them
         hello_deadline = time.monotonic() + self.HELLO_TIMEOUT
         # Nothing is served, with or without a token, until `hello` has agreed
         # on the protocol version -- and until then the peer's frames are held
@@ -386,7 +438,7 @@ class WorkerServer:
                     filename = str(params.get("file") or params.get("filename") or "")
                     self._start_job(rid, f"hub_download {repo}", send,
                                     lambda progress, cancel, repo=repo, filename=filename:
-                                        self._download(repo, filename, progress, cancel))
+                                        self._download(repo, filename, progress, cancel), owner)
                 elif method == "install":
                     family = str(params.get("family", ""))
                     dry_run = bool(params.get("dry_run", False))
@@ -397,13 +449,13 @@ class WorkerServer:
                                 " (dry run)" if dry_run else "", peer, model_hub.ALLOW_INSTALL)
                     self._start_job(rid, f"install {family}", send,
                                     lambda progress, cancel, family=family, dry_run=dry_run: (model_hub.install(
-                                        family, progress, cancelled=cancel.is_set, dry_run=dry_run), None))
+                                        family, progress, cancelled=cancel.is_set, dry_run=dry_run), None), owner)
                 elif method == "model_prepare":
                     model_hub.set_hub_token(str(params.get("token", "") or ""))
                     spec = str(params.get("spec", ""))
                     self._start_job(rid, f"model_prepare {spec}", send,
                                     lambda progress, cancel, spec=spec:
-                                        (model_hub.prepare(spec, progress, cancelled=cancel.is_set), None))
+                                        (model_hub.prepare(spec, progress, cancelled=cancel.is_set), None), owner)
                 elif method == "models_list":
                     reply(rid, {"cache": str(model_hub.cache_dir()), "models": model_hub.list_cached_models()})
                 elif method == "models_delete":
@@ -412,12 +464,17 @@ class WorkerServer:
                     reply(rid, self.plugin_list(reload=method == "reload_plugins", extra=params.get("dirs")))
                 elif method == "cancel":
                     target = params.get("id", header.get("target"))
-                    self._cancel(target)
+                    self._cancel(target, owner)
                     reply(rid, {"cancelled": target})
                 elif method == "run":
                     # a step fetching a gated model sends the token with the request
                     model_hub.set_hub_token(str(params.get("token", "") or ""))
-                    self._start_run(rid, params, tensors, send)
+                    self._start_run(rid, params, tensors, send, owner)
+                elif method.startswith("dataset_"):
+                    # Read on this connection's thread, not as a job: the
+                    # dataset on screen is served while a run computes.
+                    result, out = self.dataset_request(method, params)
+                    reply(rid, result, out)
                 else:
                     error(rid, f"unknown method '{method}'")
             except Exception as e:  # noqa: BLE001 - every failure is reported to the client
@@ -427,10 +484,10 @@ class WorkerServer:
                     error(rid, _message(e))
                 except OSError:
                     break
-        # the connection is gone: cancel whatever is still running
-        self._cancel(None)
+        # the connection is gone: cancel whatever it still runs
+        self._cancel(None, owner)
         job = self._current_job()
-        if job is not None:
+        if job is not None and job.get("owner") is owner:
             job["thread"].join(timeout=30)
 
     # --- jobs ----------------------------------------------------------------------
@@ -439,25 +496,27 @@ class WorkerServer:
         with self._job_lock:
             return self._job
 
-    def _cancel(self, rid) -> None:
+    def _cancel(self, rid, owner=None) -> None:
         with self._job_lock:
             job = self._job
         if job is None:
+            return
+        if owner is not None and job.get("owner") is not owner:
             return
         if rid is None or job["id"] == rid:
             job["cancel"].set()
             log.info("cancel requested for %s", job["id"])
 
-    def _start_run(self, rid, params: Dict[str, Any], tensors: Dict[str, np.ndarray], send) -> None:
+    def _start_run(self, rid, params: Dict[str, Any], tensors: Dict[str, np.ndarray], send, owner=None) -> None:
         self._start_job(rid, str(params.get("kind", "")), send,
-                        lambda progress, cancel: self._execute(rid, params, tensors, cancel, progress))
+                        lambda progress, cancel: self._execute(rid, params, tensors, cancel, progress), owner)
 
-    def _start_job(self, rid, label: str, send, work) -> None:
+    def _start_job(self, rid, label: str, send, work, owner=None) -> None:
         """Run `work(progress, cancel_event) -> (result, tensors)` on its own
         thread; `send(header, tensors)` is the connection's locked sender,
         shared by progress frames and the reply."""
         cancel = threading.Event()
-        job: Dict[str, Any] = {"id": rid, "cancel": cancel, "thread": None}
+        job: Dict[str, Any] = {"id": rid, "cancel": cancel, "thread": None, "owner": owner}
 
         def progress(fraction: float, message: str = "") -> None:
             try:
@@ -514,6 +573,28 @@ class WorkerServer:
                     raise
         if busy is not None:
             send({"id": rid, "type": "error", "message": f"busy: request {busy} is still running"})
+
+    # --- datasets on this machine (the HPC backend's cluster files) --------------------
+
+    def dataset_request(self, method: str, params: Dict[str, Any]) -> Tuple[Dict[str, Any], Optional[Dict[str, np.ndarray]]]:
+        ds = datasets.open_dataset(str(params.get("path", "")), params.get("options") or {})
+        if method == "dataset_info":
+            return {**ds.meta(), "encodings": datasets.available_encodings()}, None
+        c, t = int(params.get("c", 0)), int(params.get("t", 0))
+        if method == "dataset_stats":
+            return ds.stats(c, t), None
+        if method == "dataset_read":
+            z = params.get("z")
+            arr = ds.plane(c, t, int(z)) if z is not None else ds.volume(c, t)
+        elif method == "dataset_view":
+            arr = ds.view(str(params.get("kind", "xy")), c, t, int(params.get("index", 0) or 0),
+                          int(params.get("factor", 1) or 1), params.get("region"), int(params.get("max_side", 256) or 256))
+        else:
+            raise ValueError(f"unknown method '{method}'")
+        if arr.dtype.name not in DTYPES:
+            arr = arr.astype(np.float32)
+        desc, tensor = datasets.encode(arr, params.get("accept") or [])
+        return desc, {"data": tensor}
 
     # --- models ----------------------------------------------------------------------
 
@@ -589,6 +670,11 @@ class WorkerServer:
                  progress):
         wb = workbench()
         kind = str(params.get("kind", ""))
+        ref = params.get("input_ref")
+        if isinstance(ref, dict) and "input" not in tensors:
+            # a cluster dataset: the input is read here, on the node, instead of uploaded
+            progress(0.0, "reading " + os.path.basename(str(ref.get("path", ""))))
+            tensors = {**tensors, "input": datasets.read_ref(ref)}
         p = params.get("params") or {}
         if kind != "plugin" and isinstance(p, dict) and "device" in p:
             # the request's own device (seg.cpp sends "cpu" for the CPU

@@ -34,6 +34,8 @@
 
 #include "core/array_source.hpp"
 #include "core/manifest.hpp"
+#include "core/remote_source.hpp"
+#include "imgui/cluster_link.hpp"
 #include "imgui/dialogs/open_dataset_common.hpp"
 #include "imgui/platform.hpp"
 #include "imgui/strings.hpp"
@@ -118,6 +120,12 @@ namespace sirius::app::gui {
             r.generation = generation;
             if (p.empty()) return r;
             try {
+                if (isRemoteDatasetPath(p)) {
+                    // on the cluster: the worker there reads the header (core/remote_source.hpp)
+                    r.meta = probeDataset(p);
+                    r.kind = ProbeResult::Kind::Probed;
+                    return r;
+                }
                 std::error_code ec;
                 const fs::path path = toPath(p);
                 if (!fs::exists(path, ec)) {
@@ -181,6 +189,10 @@ namespace sirius::app::gui {
                         for (RecentRow& row : rows) {
                             if (!alive->load()) return;
                             try {
+                                if (isRemoteDatasetPath(row.path)) {
+                                    row.format = "cluster";
+                                    continue;
+                                }
                                 std::error_code ec;
                                 const fs::path p = toPath(row.path);
                                 if (!fs::exists(p, ec)) {
@@ -582,7 +594,34 @@ namespace sirius::app::gui {
 
             // --- drawing -------------------------------------------------------------------------
 
+            // This computer | Cluster: where Browse looks. A cluster path is
+            // "cluster://<host>/<path>", opened through the connected worker.
+            void drawLocationRow(App& app) {
+                if (isRemoteDatasetPath(path()) && location_ == 0 && !locationTouched_) location_ = 1;
+                if (widgets::segmented("##where", {"This computer", "Cluster"}, &location_)) locationTouched_ = true;
+                ImGui::SameLine(0.0f, px(10));
+                if (location_ == 1) {
+                    ClusterLink& link = app.cluster();
+                    ImU32 color = theme::kNeutral600;
+                    std::string state = link.indicator(color);
+                    if (!link.sshUp()) {
+                        widgets::text(state.empty() ? std::string("Not connected to a cluster") : state, 11, color);
+                        ImGui::SameLine(0.0f, px(8));
+                        if (widgets::linkButton("Connect to cluster\xE2\x80\xA6")) app.defer([&app] { app.clusterDialog(); });
+                    } else {
+                        widgets::text(link.connected() ? "Read on the cluster by the worker; only what is shown comes here"
+                                                       : "Browsing works now; opening a dataset waits for the worker",
+                                      11, theme::kNeutral600);
+                    }
+                }
+            }
+
             void drawPathRow(App& app) {
+                drawLocationRow(app);
+                if (location_ == 1) {
+                    drawClusterPathRow(app);
+                    return;
+                }
                 const float spacing = px(6);
                 const bool zarr = zarrSupported();
                 const ImVec2 browse = buttonSize("Browse", widgets::ButtonKind::Secondary, true);
@@ -635,6 +674,37 @@ namespace sirius::app::gui {
                     }
                 }
                 line.end();
+            }
+
+            void drawClusterPathRow(App& app) {
+                const float spacing = px(6);
+                const ImVec2 browse = buttonSize("Browse", widgets::ButtonKind::Secondary, true);
+                const Line line;
+                const float fieldW = std::max(px(80), line.width() - browse.x - spacing);
+                line.at(0.0f, line.height());
+                widgets::FieldOpts f;
+                f.width = fieldW / std::max(theme::scale(), 0.01f);
+                f.hint = "cluster://fiona/home/\xE2\x80\xA6/stack.tif (Browse lists the cluster's folders)";
+                if (widgets::inputText("##clusterPath", &path_, f)) pathChanged();
+                widgets::ButtonOpts b;
+                b.small = true;
+                b.enabled = app.cluster().sshUp();
+                b.tooltip = b.enabled ? std::string("The cluster's folders, through the SSH session")
+                                      : std::string("Connect to the cluster first");
+                line.at(fieldW + spacing, browse.y);
+                if (widgets::button("Browse##cluster", b)) {
+                    std::string start, host, remote;
+                    if (splitClusterPath(path(), host, remote)) start = parentPathOf(remote);
+                    app.showDialog(makeClusterBrowser(app, start, false, [this, alive = alive_](const std::string& chosen) {
+                        if (alive->load()) setPath(chosen);
+                    }));
+                }
+                line.end();
+            }
+
+            static std::string parentPathOf(const std::string& p) {
+                const std::size_t slash = p.find_last_of('/');
+                return slash == std::string::npos || slash == 0 ? std::string("/") : p.substr(0, slash);
             }
 
             // Where a file dialog starts when the path says nothing: the
@@ -869,6 +939,8 @@ namespace sirius::app::gui {
 
             std::string path_;
             bool focusPath_ = true;
+            int location_ = 0;              // 0 this computer, 1 the cluster
+            bool locationTouched_ = false;
             bool popupAtStart_ = false;
             std::string facts_;
             std::string error_;
