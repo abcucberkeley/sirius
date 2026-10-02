@@ -1087,9 +1087,11 @@ TEST_CASE("cluster: the checks of a container image say what is wrong and never 
     const fs::path numpyOnly = fc.root / "numpy-only-site";
     fs::create_directories(numpyOnly / "numpy");
     std::ofstream(numpyOnly / "numpy" / "__init__.py") << "__version__ = '0-test'\n";
-    setEnv("FAKE_CONTAINER_SITE", numpyOnly.string());
+    // through a file: the fake ssh session is already open, so a new environment
+    // variable would not reach the fake apptainer
+    std::ofstream(fc.slurm / "container_site") << numpyOnly.string();
     st = connectUntilSettled(session, containerProfile(fc, "~/empty.sif"));
-    setEnv("FAKE_CONTAINER_SITE", "");
+    fs::remove(fc.slurm / "container_site");
     CHECK(checksFailed(st));
     CHECK(st.reason.find("sirius and numpy do not import") != std::string::npos);
     // Where a checkout folder named sirius is importable, Python finds an empty

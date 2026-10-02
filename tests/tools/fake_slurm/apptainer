@@ -28,6 +28,11 @@ if grep -q broken "$img"; then
     exit 255
 fi
 [ "${FAKE_APPTAINER_DRY:-0}" = 1 ] && exit 0
+# A test whose ssh session is already open cannot change this environment:
+# $FAKE_SLURM_DIR/container_site, when present, names the site instead.
+if [ -n "${FAKE_SLURM_DIR:-}" ] && [ -f "$FAKE_SLURM_DIR/container_site" ]; then
+    FAKE_CONTAINER_SITE="$(cat "$FAKE_SLURM_DIR/container_site")"
+fi
 if [ -n "${FAKE_CONTAINER_SITE:-}" ]; then
     sep=':'
     case "${FAKE_PYTHON:-}" in *.exe | *.EXE) sep=';' ;; esac
