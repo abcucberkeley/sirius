@@ -67,9 +67,11 @@ namespace sirius::app {
         bool remoteCapable = false;       // the Python worker implements it
         bool producesLabels = false;
         bool needsLabels = false;         // consumes the labels of its input
-        // Prompted (params.hpp's isPromptStep), it takes points only: the
-        // viewer's Prompt tool offers no box and no scribble for it.
-        bool promptPointsOnly = false;
+        // Prompted (params.hpp's isPromptStep), its model is 2-D (micro-SAM):
+        // all of one object's prompts must lie on one plane, and its masks
+        // are that plane's. The viewer's Prompt tool keeps a box to its plane
+        // and corrects only the objects on the plane clicked.
+        bool promptPlanar = false;
         // The viewer can show this step on its input without running it (a
         // display-level mapping such as Contrast): while the step is not
         // run or stale, the upstream output is displayed through the step's

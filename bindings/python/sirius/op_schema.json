@@ -1647,7 +1647,7 @@
         {
           "advanced": false,
           "default": [],
-          "help": "Where the objects are, in voxels of the input: points, boxes and scribbles, each on one time point. Placed with the viewer's Prompt tool",
+          "help": "Where the objects are, in voxels of the input: points, boxes and scribbles, each on one time point and belonging to one object. An object's prompts are sent together, so a background point on it corrects its mask, labelled with the object's id. Placed with the viewer's Prompt tool",
           "key": "prompts",
           "label": "Prompts",
           "read_only": false,
@@ -1813,7 +1813,7 @@
             "Prompt objects"
           ],
           "default": "Segment all objects",
-          "help": "Segment every object, or only the ones you click with the viewer's Prompt tool. Prompting needs a micro-SAM model (microsam:<type>), which takes points only here and whose masks are 2-D: one per point, in that point's plane",
+          "help": "Segment every object, or only the ones you point at with the viewer's Prompt tool. Prompting needs a micro-SAM model (microsam:<type>), whose masks are 2-D: one per object, in the plane of its prompts",
           "key": "task",
           "label": "Task",
           "read_only": false,
@@ -1822,7 +1822,7 @@
         {
           "advanced": false,
           "default": [],
-          "help": "Where the objects are: points {x, y, z, t, label} in voxels of the input, label 1 for an object and 0 for background. Placed with the viewer's Prompt tool",
+          "help": "Where the objects are, in voxels of the input: points (label 1 object, 0 background), boxes and scribbles, each belonging to one object whose prompts all lie on one plane. A background point on an object corrects its mask. Placed with the viewer's Prompt tool",
           "key": "prompts",
           "label": "Prompts",
           "read_only": false,

@@ -448,15 +448,15 @@ TEST_CASE("Prompts are saved with the pipeline as records, not as text", "[app][
     Pipeline p;
     p.add("test_prompt");
     ParamSet q = p.at(1).params;
-    q.set(kPromptsKey, promptsValue({Prompt::point(3, 4, 1), Prompt::point(5.5, 6, 2, 2, false), Prompt::boxOf({1, 2, 0, 6, 7, 3}, 1),
-                                     Prompt::scribble({{2, 2, 1}, {3, 2, 1}})}));
+    q.set(kPromptsKey, promptsValue({Prompt::point(3, 4, 1, 0, true, 1), Prompt::point(5.5, 6, 2, 0, false, 1), Prompt::boxOf({1, 2, 0, 6, 7, 3}, 1, 2),
+                                     Prompt::scribble({{2, 2, 1}, {3, 2, 1}}, 0, true, 3)}));
     p.setParams(1, q);
     const json j = p.toJson();
     CHECK(j["steps"][1]["params"]["prompts"] == json::parse(R"([
-        {"kind": "point", "x": 3, "y": 4, "z": 1, "t": 0, "label": 1},
-        {"kind": "point", "x": 5.5, "y": 6, "z": 2, "t": 2, "label": 0},
-        {"kind": "box", "x0": 1, "y0": 2, "z0": 0, "x1": 6, "y1": 7, "z1": 3, "t": 1},
-        {"kind": "scribble", "points": [[2, 2, 1], [3, 2, 1]], "t": 0, "label": 1}])"));
+        {"kind": "point", "x": 3, "y": 4, "z": 1, "t": 0, "label": 1, "object": 1},
+        {"kind": "point", "x": 5.5, "y": 6, "z": 2, "t": 0, "label": 0, "object": 1},
+        {"kind": "box", "x0": 1, "y0": 2, "z0": 0, "x1": 6, "y1": 7, "z1": 3, "t": 1, "object": 2},
+        {"kind": "scribble", "points": [[2, 2, 1], [3, 2, 1]], "t": 0, "label": 1, "object": 3}])"));
     const Pipeline back = Pipeline::fromJson(j);
     CHECK(promptsOf(back.at(1).params) == promptsOf(q));
     CHECK(back.toJson() == j);
@@ -471,11 +471,53 @@ TEST_CASE("Prompts are saved with the pipeline as records, not as text", "[app][
     std::ifstream in(file.path);
     const std::string text((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
     CHECK(text.find("label = 0") != std::string::npos);
+    CHECK(text.find("object = 2") != std::string::npos);
     CHECK(text.find("\"[{") == std::string::npos);
     // a file whose point is no point is refused with the step and the entry
     json badJson = j;
     badJson["steps"][1]["params"]["prompts"][0].erase("z");
     CHECK_THROWS_WITH(Pipeline::fromJson(badJson, true), Catch::Matchers::ContainsSubstring("prompt 1 (a point) needs a number 'z'"));
+    badJson = j;
+    badJson["steps"][1]["params"]["prompts"][0]["object"] = 0;
+    CHECK_THROWS_WITH(Pipeline::fromJson(badJson, true), Catch::Matchers::ContainsSubstring("prompt 1: 'object' is the id"));
+}
+
+TEST_CASE("A pipeline written before prompt objects still loads, each prompt in an object", "[app][pipeline][prompt]") {
+    registerTestOps();
+    // the file format of the first Prompt steps: no "object" anywhere
+    const json old = json::parse(R"({"steps": [{"kind": "load"}, {"kind": "test_prompt", "params": {"task": "Prompt objects", "prompts": [
+        {"kind": "box", "x0": 1, "y0": 2, "z0": 0, "x1": 6, "y1": 7, "z1": 3, "t": 0},
+        {"kind": "point", "x": 30, "y": 30, "z": 1, "t": 0, "label": 1},
+        {"kind": "point", "x": 28, "y": 31, "z": 1, "t": 0, "label": 0},
+        {"kind": "point", "x": 7, "y": 3, "z": 1, "t": 0, "label": 0},
+        {"kind": "point", "x": 9, "y": 9, "z": 1, "t": 1, "label": 0},
+        {"kind": "scribble", "points": [[2, 2, 1], [3, 2, 1]], "t": 1, "label": 1}]}}]})");
+    for (const bool strict : {false, true}) {
+        const Pipeline p = Pipeline::fromJson(old, strict);
+        const std::vector<Prompt> prompts = promptsOf(p.at(1).params);
+        REQUIRE(prompts.size() == 6);
+        // every object prompt an object of its own, in list order; a
+        // background point the nearest object of its time point
+        CHECK(prompts[0].objectId == 1);
+        CHECK(prompts[1].objectId == 2);
+        CHECK(prompts[2].objectId == 2);   // beside the click
+        CHECK(prompts[3].objectId == 1);   // two voxels right of the box
+        CHECK(prompts[4].objectId == 3);   // t 1's only object: the scribble
+        CHECK(prompts[5].objectId == 3);
+        // and saved back with the ids, so they stay what they are now
+        const json back = p.toJson();
+        CHECK(back["steps"][1]["params"]["prompts"][3]["object"] == 1);
+        CHECK(promptsOf(Pipeline::fromJson(back).at(1).params) == prompts);
+    }
+    // a background point on a time point without an object is kept as an
+    // object of its own, which is never sent and which validation names
+    ParamSet stray;
+    stray.set(kPromptsKey, ParamJson{R"([{"x": 4, "y": 4, "z": 1, "label": 0}, {"x": 5, "y": 4, "z": 1, "label": 0}, {"x": 9, "y": 9, "z": 0, "t": 1}])"});
+    const std::vector<Prompt> s = promptsOf(stray);
+    REQUIRE(s.size() == 3);
+    CHECK(s[2].objectId == 1);
+    CHECK(s[0].objectId == 2);
+    CHECK(s[1].objectId == 2);
 }
 
 TEST_CASE("Prompts are an undoable edit that agents set and read back", "[app][tools][prompt]") {
@@ -487,23 +529,25 @@ TEST_CASE("Prompts are an undoable edit that agents set and read back", "[app][t
     ToolApi api(wb);
     json r = api.call("add_step", {{"kind", "test_prompt"}, {"params", {{"prompts", json::parse(R"([{"x": 1, "y": 2, "z": 3}])")}}}});
     REQUIRE_FALSE(r.contains("error"));
-    CHECK(r["params"]["prompts"] == json::parse(R"([{"kind": "point", "x": 1, "y": 2, "z": 3, "t": 0, "label": 1}])"));
+    CHECK(r["params"]["prompts"] == json::parse(R"([{"kind": "point", "x": 1, "y": 2, "z": 3, "t": 0, "label": 1, "object": 1}])"));
     // selecting a Prompt step picks the tool that places its points
     CHECK(wb.viewState().tool == ViewerTool::Prompt);
     CHECK(wb.viewState().labels);
 
-    r = api.call("set_params", {{"step", 2}, {"params", {{"prompts", json::parse(R"([{"x": 1, "y": 2, "z": 3}, {"x": 4, "y": 5, "z": 0, "t": 1, "label": 0}])")}}}});
+    // a correction of object 1, set as an agent does
+    r = api.call("set_params", {{"step", 2}, {"params", {{"prompts", json::parse(R"([{"x": 1, "y": 2, "z": 3, "object": 1}, {"x": 4, "y": 5, "z": 3, "label": 0, "object": 1}])")}}}});
     REQUIRE_FALSE(r.contains("error"));
     r = api.call("get_step", {{"step", 2}});
     REQUIRE(r["params"]["prompts"].is_array());
     CHECK(r["params"]["prompts"].size() == 2);
-    CHECK(r["params"]["prompts"][1]["t"] == 1);
+    CHECK(r["params"]["prompts"][1]["object"] == 1);
     CHECK(r["params"]["prompts"][1]["label"] == 0);
-    CHECK(api.actions().back().text.find("1 point \xE2\x86\x92 2 points") != std::string::npos);
+    CHECK(api.actions().back().text.find("1 object: 1 point \xE2\x86\x92 1 object: 2 points") != std::string::npos);
     // a box is set the same way; a kind there is none of is refused, the step left as it was
     r = api.call("set_params", {{"step", 2}, {"params", {{"prompts", json::parse(R"([{"kind": "box", "x0": 1, "y0": 2, "z0": 0, "x1": 4, "y1": 5, "z1": 2}])")}}}});
     REQUIRE_FALSE(r.contains("error"));
     CHECK(r["params"]["prompts"][0]["kind"] == "box");
+    CHECK(r["params"]["prompts"][0]["object"] == 1);
     wb.undo();
     r = api.call("set_params", {{"step", 2}, {"params", {{"prompts", json::parse(R"([{"kind": "lasso", "x": 1, "y": 2, "z": 3}])")}}}});
     CHECK(r.contains("error"));
@@ -512,16 +556,19 @@ TEST_CASE("Prompts are an undoable edit that agents set and read back", "[app][t
     r = api.call("undo", json::object());
     CHECK(r["ok"] == true);
     REQUIRE(promptsOf(wb.pipeline().at(1).params).size() == 1);
-    CHECK(promptsOf(wb.pipeline().at(1).params)[0] == Prompt::point(1, 2, 3));
+    CHECK(promptsOf(wb.pipeline().at(1).params)[0] == Prompt::point(1, 2, 3, 0, true, 1));
     wb.redo();
     CHECK(promptsOf(wb.pipeline().at(1).params).size() == 2);
+    CHECK(promptsOf(wb.pipeline().at(1).params)[1] == Prompt::point(4, 5, 3, 0, false, 1));
 
     // the schema an agent is given for the points
     bool described = false;
     for (const json& op : api.call("list_operations", json::object()))
         if (op["kind"] == "test_prompt")
             for (const json& prm : op["params"])
-                if (prm["key"] == "prompts") described = prm["schema"]["type"] == "array" && prm["schema"]["items"]["type"] == "object";
+                if (prm["key"] == "prompts")
+                    described = prm["schema"]["type"] == "array" && prm["schema"]["items"]["type"] == "object" &&
+                                prm["schema"]["items"]["properties"].contains("object");
     CHECK(described);
     // the viewer's tool is a view setting like the others
     r = api.call("set_view", {{"tool", "prompt"}, {"prompt_mode", "scribble"}});

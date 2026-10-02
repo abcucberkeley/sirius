@@ -174,11 +174,16 @@ always Load), their cached outputs and an undo history. The workflow:
    A *Prompt* step (`foundation` with a promptable bundle, or `seg` with a
    `microsam:` model, `"task": "Prompt objects"`) segments only what its
    `prompts` parameter points at: a list of points `{"x", "y", "z", "t",
-   "label"}` (label 0 = background), boxes `{"kind": "box", "x0", "y0", "z0",
-   "x1", "y1", "z1", "t"}` and scribbles `{"kind": "scribble", "points":
-   [[x, y, z], ...], "t"}`, in voxels of the step's input. Set it with
-   `set_params`; `get_step` shows it. A box is the strongest single prompt;
-   micro-SAM takes points only.
+   "label", "object"}` (label 0 = background), boxes `{"kind": "box", "x0",
+   "y0", "z0", "x1", "y1", "z1", "t", "object"}` and scribbles `{"kind":
+   "scribble", "points": [[x, y, z], ...], "t", "object"}`, in voxels of the
+   step's input. `object` groups prompts into one object, one mask, labelled
+   with that id on every run: to correct object 3, add a background point with
+   `"object": 3` (it refines that mask only); to grow it, an object point with
+   `"object": 3`. Left out, each box, object point and scribble starts its own
+   object and a background point joins the nearest one. Set it with
+   `set_params`; `get_step` shows it. A box is the strongest single prompt
+   (one per object); micro-SAM keeps each object on one plane.
 5. **Validate.** `validate {}` checks every step against the data without
    running anything: errors, warnings, shapes, memory estimates, which steps
    need the worker.

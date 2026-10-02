@@ -14,6 +14,7 @@
 // Coordinates: "local" positions are display pixels from the pane's
 // top-left corner; voxel positions are columns / rows of the pane's plane.
 
+#include <cstdint>
 #include <functional>
 #include <memory>
 #include <string>
@@ -124,13 +125,16 @@ namespace sirius::app::gui {
             brushRadius_ = radiusVoxels;
         }
         void setAnnotations(std::vector<Annotation> annotations) { annotations_ = std::move(annotations); }
-        // The prompts of a Prompt step, in this pane's voxel coordinates.
-        // On the pane's plane: an object point is a filled accent disc with a
-        // light ring and a plus, a background point a dark disc with a light
-        // ring and a minus; a box an accent rectangle and a scribble an accent
-        // stroke (light when it marks background), all edged in dark so they
-        // read on bright data as on dark. Off the plane, where they project:
-        // small, faint, dashed. Pending (being drawn): dashed and light.
+        // The prompts of a Prompt step, in this pane's voxel coordinates,
+        // each in its object's colour (the colour of the object's mask in the
+        // label overlay). On the pane's plane: an object point is a filled
+        // disc in that colour with a light ring and a plus, a background
+        // point (a correction) a dark disc ringed in the colour with a minus;
+        // a box a rectangle and a scribble a stroke in the colour (a
+        // background stroke light), all edged in dark so they read on bright
+        // data as on dark, and the object's number beside the mark that
+        // carries the tag. Off the plane, where they project: small, faint,
+        // dashed. Pending (being drawn): dashed and light.
         struct PromptMark {
             enum class Shape { Point,
                                Box,
@@ -138,9 +142,12 @@ namespace sirius::app::gui {
             Shape shape = Shape::Point;
             DPoint a, b;                  // a point's voxel; a box's corners, b exclusive
             std::vector<DPoint> stroke;   // a scribble's voxels
-            bool object = true;
+            bool positive = true;         // false: a background prompt
             bool inPlane = true;
             bool pending = false;
+            ImU32 color = IM_COL32(255, 255, 255, 255);   // the object's colour
+            std::uint32_t objectId = 0;
+            std::string tag;              // drawn beside the mark: the object's number
         };
         void setPromptMarks(std::vector<PromptMark> marks) { promptMarks_ = std::move(marks); }
         // Trajectories of tracked labels (track_overlay.hpp), drawn over the

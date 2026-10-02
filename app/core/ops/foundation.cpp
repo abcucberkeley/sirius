@@ -22,8 +22,12 @@
 // A bundle whose head has a prompt decoder also offers Prompt: the person
 // points at objects -- a box around one, a click on it, a scribble over it,
 // with the viewer's Prompt tool or as an agent sets them -- and gets those
-// objects back, in 3-D, one mask per prompt. That task sends one time point
-// per call, as the decoder takes it, and only the frames someone prompted.
+// objects back, in 3-D, one mask per object. Each object goes to the worker
+// with all of its prompts together (the joint `objects` form), so a
+// background click on an object corrects that object's mask, and its mask
+// comes back labelled with the object's id on every re-run. That task sends
+// one time point per call, as the decoder takes it, and only the frames
+// someone prompted.
 #include "core/ops/common.hpp"
 #include "core/ops/builtin.hpp"
 #include "core/rpc.hpp"
@@ -84,7 +88,9 @@ namespace sirius::app {
                     promptsParam(kPromptsKey, "Prompts")
                         .visibleWhen("task", {kPrompt})
                         .withHelp("Where the objects are, in voxels of the input: points, boxes and scribbles, each on "
-                                  "one time point. Placed with the viewer's Prompt tool"),
+                                  "one time point and belonging to one object. An object's prompts are sent together, so "
+                                  "a background point on it corrects its mask, labelled with the object's id. Placed with "
+                                  "the viewer's Prompt tool"),
                     choiceParam("channels", "Channels", {kOneChannel, kAllChannels}, kOneChannel)
                         .withHelp("The model accepts several channels at once. Send all of them only when the "
                                   "bundle was trained with channel identities, otherwise pick one"),
@@ -362,22 +368,15 @@ namespace sirius::app {
                         const BufferView<const float> vol = out.array->volume(allChannels ? c : channel, t);
                         std::copy_n(vol.data(), volume, flat.data() + static_cast<std::size_t>(c) * volume);
                     }
-                    // the worker's order is points, boxes, scribbles: framePrompt's
+                    // only `objects`: the i-th object's mask comes back as label i + 1
                     nlohmann::json params = {
                         {"model", model},
                         {"task", "prompt"},
-                        {"points", f.points},
-                        {"point_labels", f.pointLabels},
+                        {"objects", promptObjectsJson(f)},
                         {"min_voxels", p.getInt("min_voxels", 0)},
                         {"voxel_um", {meta.voxelUm[0], meta.voxelUm[1], meta.voxelUm[2]}},
                         {"device", workerDevice(ctx)},
                     };
-                    if (!f.boxes.empty()) params["boxes"] = f.boxes;
-                    if (!f.scribbles.empty()) {
-                        nlohmann::json strokes = nlohmann::json::array();
-                        for (const FramePrompt::Stroke& s : f.scribbles) strokes.push_back({{"points", s.points}, {"label", s.label}});
-                        params["scribbles"] = std::move(strokes);
-                    }
                     const std::vector<double> tile = p.getDoubleList("tile");
                     if (tile.size() == 3 && (tile[0] > 0 || tile[1] > 0 || tile[2] > 0))
                         params["tile"] = {static_cast<Index>(tile[0]), static_cast<Index>(tile[1]), static_cast<Index>(tile[2])};
@@ -409,15 +408,8 @@ namespace sirius::app {
                     std::copy_n(got->asUInt32(), volume, dst);
                     applyPromptIds(dst, volume, f);
                     labels->recomputeStats(t, oneFrame(confidence) ? confidence->asFloat32() : nullptr);
-                    // the model's own score of each object's mask, by the id it got
-                    const nlohmann::json ms = r.result.value("mask_scores", nlohmann::json::array());
-                    std::string line;
-                    for (std::size_t i = 0; i < f.ids.size(); ++i) {
-                        if (f.ids[i] == 0 || i >= ms.size() || !ms[i].is_number()) continue;
-                        line += (line.empty() ? "" : ", ") + std::string("#") + std::to_string(f.ids[i]) + " " +
-                                formatNumber(ms[i].get<double>(), 2);
-                    }
-                    if (!line.empty()) scores += (scores.empty() ? "" : " · ") + (d.t > 1 ? "t " + std::to_string(t) + ": " : std::string()) + line;
+                    // the model's own score of each object's mask, by the object's id
+                    appendPromptScores(scores, f, r.result.value("mask_scores", nlohmann::json::array()), t, d.t > 1);
                     ++done;
                 }
                 const std::string className = p.getString("class_name", "object");

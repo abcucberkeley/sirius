@@ -60,7 +60,7 @@ longer safe.
 |---|---|
 | **Model** <br> `.ltb` bundle | Encoder, task head and the thresholds the model was validated with. Its manifest also supplies this step's defaults. |
 | **Task** <br> segment · detect · track · prompt | *Segment* returns objects with extents, by growing each detected centre out to where the model's confidence falls away. *Detect* returns one voxel per object, which is what the model predicts directly and is the fastest. *Track* follows objects across time and needs more than one time point. *Prompt objects* segments only the objects you point at (below). A bundle whose head predicts regions rather than centres (three classes, a dense or a prompt head) has no centres to detect or link, and runs *Segment* only, plus *Prompt* when it has a prompt decoder. |
-| **Prompts** <br> Prompt only | The boxes, points and scribbles placed with the viewer's Prompt tool, listed under Task with a button to remove each. |
+| **Prompts** <br> Prompt only | The objects placed with the viewer's Prompt tool, each with its box, points, scribbles and corrections, listed under Task with a button to remove an object or a prompt. |
 | **Channels** <br> one · all | The model accepts several channels together. Send all of them only when the bundle was trained with channel identities; otherwise pick the one channel the structure is in. |
 | **Threshold** <br> 0 = bundle's | Peak probability cut. Lower recovers dim objects, higher separates touching ones. |
 | **Min. separation** <br> µm, 0 = bundle's | Two peaks closer together than this are treated as one object. In **microns**, not voxels, so it means the same thing along z as in plane. On anisotropic data a voxel-based gate is a different physical distance on every axis, which splits single objects in plane while merging distinct ones in depth. |
@@ -70,37 +70,61 @@ longer safe.
 ## Prompt: pointing at objects
 
 With **Task: Prompt objects** the step segments the objects you point at
-instead of every object, in 3-D, one mask per prompt. It needs a bundle with a
-prompt decoder; any other is refused by name when the step runs. Choose the
-viewer's **Prompt** tool (the pointer in the tool strip; selecting a Prompt
+instead of every object, in 3-D, one mask per **object**. It needs a bundle
+with a prompt decoder; any other is refused by name when the step runs. Choose
+the viewer's **Prompt** tool (the pointer in the tool strip; selecting a Prompt
 step picks it), then in **XY**:
 
-- **Box** (the default mode): drag a box around the object. Its z span is
-  the box's larger side in microns, centred on the plane you are on, unless
-  you first drag a z range in **XZ** or **YZ** (Esc clears it). Drag a box's
-  top or bottom edge in XZ / YZ to change its z span. A box is the strongest
-  single prompt: median IoU .73 against .61 for a click at the centre.
-- **Click**: click the object (an object point).
-- **Scribble**: draw a stroke over the object; a few points along it are sent.
+- **Box** (the default mode): drag a box around an object; it starts a new
+  object. Its z span is the box's larger side in microns, centred on the plane
+  you are on, unless you first drag a z range in **XZ** or **YZ** (Esc clears
+  it). Drag a box's top or bottom edge in XZ / YZ to change its z span. A box
+  is the strongest single prompt: median IoU .73 against .61 for a click at
+  the centre.
+- **Click**: click an object.
+- **Scribble**: draw a stroke over an object (a new one); a few points along it
+  are sent.
 
-In every mode a plain click places an object point, **Alt + click** or a
-**right click** a background point, and a click on a prompt removes it. The
-button under the tool steps through the modes, and the Parameters panel has
-them side by side. Clicks in XZ and YZ place points on those planes too.
+Every prompt belongs to one object, and an object's prompts go to the model
+together, so a click **corrects** a mask rather than asking for another one:
+
+- a plain click **outside** every mask starts a new object; **inside** an
+  object's mask it adds a point to that object, to grow it;
+- **Shift + click** always starts a new object;
+- **Alt + click** or a **right click** is a correction (a background point)
+  for the object whose mask is under it, else for the nearest object; it
+  refines that object's mask only (objects are independent of each other);
+- a click on a prompt removes it, and removing an object's last box, point or
+  scribble removes the object with its corrections.
+
+Each object is drawn in the colour its mask has in the label overlay, with its
+number beside its first prompt, and its mask's label **is** that number, on
+every re-run: correcting object 3 leaves objects 1, 2 and 4 where they were.
+The button under the tool steps through the modes, and the Parameters panel
+has them side by side, with the objects listed ("Object 3 · box + 2 points +
+1 correction · score 0.81"), a button to remove an object or one of its
+prompts, and Clear all. Clicks in XZ and YZ place points on those planes too.
 
 The step re-runs on its own a moment after the last change, so a few quick
-clicks make one run: that is how a corrective click works. Edits, undo and
-the pipeline file keep the prompts like any other parameter, and agents set
-them with `set_params` (`prompts`, below). Each time point sends only its own
-prompts, one call per time point that has any; a time point without prompts
-is left empty without asking the model. The diagnostics give the model's
-score for each mask.
+clicks make one run. Edits, undo and the pipeline file keep the prompts like
+any other parameter, and agents set them with `set_params` (`prompts`, below).
+Each time point sends only its own objects, one call per time point that has
+any; a time point without them is left empty without asking the model. An
+object with only corrections names nothing and is not sent (the panel says
+so). The diagnostics give the model's score for each object's mask. A click on
+an object's end plane is moved in z to the object's middle by the worker
+(`snap_z`); a correction never is.
 
-The prompts are a list of records in voxels of the step's input, x y z order:
-`{"kind": "point", "x", "y", "z", "t", "label"}` (label 1 object, 0
-background), `{"kind": "box", "x0", "y0", "z0", "x1", "y1", "z1", "t"}` (the
-upper corner exclusive) and `{"kind": "scribble", "points": [[x, y, z], …],
-"t", "label"}`.
+The prompts are a list of records in voxels of the step's input, x y z order,
+each with the id of its object: `{"kind": "point", "x", "y", "z", "t",
+"label", "object"}` (label 1 object, 0 background, a correction), `{"kind":
+"box", "x0", "y0", "z0", "x1", "y1", "z1", "t", "object"}` (the upper corner
+exclusive; one per object) and `{"kind": "scribble", "points": [[x, y, z], …],
+"t", "label", "object"}`. A list without `object` ids (a pipeline saved before
+objects existed, or an agent that leaves them out) still reads: each box,
+object point and scribble becomes an object of its own, and each background
+point joins the nearest object on its time point, or, when there is none,
+an object of only background points, which is kept but not sent.
 
 ## Tracking
 

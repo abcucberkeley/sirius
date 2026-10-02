@@ -6,15 +6,20 @@
 // instance labels directly; those skip the threshold / watershed stage here.
 //
 // A micro-SAM model can also be prompted (Task: Prompt objects): the person
-// clicks objects and gets those objects back, one mask per object point. The
-// worker's family path takes points only (no boxes, no scribbles: those are
-// the foundation bundles'), and micro-SAM is a 2-D model, so each mask lies
-// in the plane of its point; the diagnostics say so rather than leave a
+// points at objects (a box, clicks, a scribble) and gets those objects back,
+// one mask per object, each object's prompts in one predictor call so that a
+// background click corrects its mask. This sends the same joint `objects`
+// form as the foundation step. micro-SAM is a 2-D model: all of an object's
+// prompts must share a plane (refused here before the worker would), and
+// its mask lies in that plane; the diagnostics say so rather than leave a
 // one-plane object to be taken for a cell.
+#include "core/cancel.hpp"
+#include "core/errors.hpp"
 #include "core/ops/common.hpp"
 #include "core/ops/segment_common.hpp"
 #include "core/ops/torch_model.hpp"
 #include "core/ops/builtin.hpp"
+#include "core/remote_source.hpp"
 #include "core/rpc.hpp"
 
 #include <nlohmann/json.hpp>
@@ -107,7 +112,7 @@ namespace sirius::app {
                 info_.hasGpuPath = true;
                 info_.remoteCapable = true;
                 info_.producesLabels = true;
-                info_.promptPointsOnly = true;   // the worker's family prompt path takes points only
+                info_.promptPlanar = true;   // micro-SAM is 2-D: an object's prompts share a plane
                 info_.helpPage = "seg";
                 info_.params = {
                     pathParam("model", "Model").withFilter("Models (*.pt *.pts *.pth *.onnx);;All files (*)").withHelp("A TorchScript / ONNX file taking (1, 1, Z, Y, X) float32, or a spec the worker resolves: "
@@ -118,13 +123,14 @@ namespace sirius::app {
                                                                                                                        "Cellpose and micro-SAM return instance labels directly; threshold and post-processing "
                                                                                                                        "then do not apply"),
                     choiceParam("task", "Task", {kSegmentAll, kPrompt}, kSegmentAll)
-                        .withHelp("Segment every object, or only the ones you click with the viewer's Prompt tool. "
-                                  "Prompting needs a micro-SAM model (microsam:<type>), which takes points only here and "
-                                  "whose masks are 2-D: one per point, in that point's plane"),
+                        .withHelp("Segment every object, or only the ones you point at with the viewer's Prompt tool. "
+                                  "Prompting needs a micro-SAM model (microsam:<type>), whose masks are 2-D: one per object, "
+                                  "in the plane of its prompts"),
                     promptsParam(kPromptsKey, "Prompts")
                         .visibleWhen("task", {kPrompt})
-                        .withHelp("Where the objects are: points {x, y, z, t, label} in voxels of the input, label 1 "
-                                  "for an object and 0 for background. Placed with the viewer's Prompt tool"),
+                        .withHelp("Where the objects are, in voxels of the input: points (label 1 object, 0 background), "
+                                  "boxes and scribbles, each belonging to one object whose prompts all lie on one plane. A "
+                                  "background point on an object corrects its mask. Placed with the viewer's Prompt tool"),
                     channelParam("input_channel", "Input channel", 0),
                     doubleListParam("tile", "Tile", {32.0, 256.0, 256.0}).withUnit("px").withHelp("Tile extent (z, y, x); must fit GPU memory").hiddenWhen("task", {kPrompt}),
                     intParam("overlap", "Overlap", 32).range(0, 512).withUnit("px").withHelp("Tile halo; should exceed the model's receptive-field radius").hiddenWhen("task", {kPrompt}),
@@ -170,10 +176,21 @@ namespace sirius::app {
                         v.errors.push_back("Only micro-SAM models (microsam:<type>) can be prompted in this step; a .ltb bundle with a "
                                            "prompt decoder is prompted in the Foundation model step.");
                     const std::vector<Prompt> prompts = promptsOf(p);
-                    if (std::any_of(prompts.begin(), prompts.end(), [](const Prompt& q) { return q.kind != Prompt::Kind::Point; }))
-                        v.errors.push_back("micro-SAM takes points only here (the worker's prompt path for model families): "
-                                           "remove the boxes and scribbles, or prompt a .ltb bundle in the Foundation model step.");
                     validatePrompts(prompts, in, v);
+                    // what the worker refuses (models.run_microsam_prompt), said
+                    // while the prompts are placed rather than when they run
+                    for (Index t = 0; t < in.dims.t && v.ok(); ++t)
+                        for (const FramePrompt::Object& o : framePrompt(prompts, t).objects) {
+                            const std::vector<Index> planes = promptPlanes(o);
+                            if (planes.size() < 2) continue;
+                            std::string list;
+                            for (const Index z : planes) list += (list.empty() ? "" : ", ") + std::to_string(z);
+                            v.errors.push_back("Object " + std::to_string(o.id) + (in.dims.t > 1 ? " on time point " + std::to_string(t) : std::string()) +
+                                               " has prompts on planes z " + list + ": micro-SAM is a 2-D model and cannot correct across z. "
+                                                                                    "Keep an object's corrections on the plane it was started in (a new plane is a new object), "
+                                                                                    "or prompt a .ltb bundle in the Foundation model step, whose decoder is 3-D.");
+                            break;
+                        }
                 }
                 return v;
             }
@@ -196,7 +213,13 @@ namespace sirius::app {
 
                 StepOutput out;
                 out.meta = meta;
-                out.array = input.materialize([&](double f, const std::string& m) { ctx.report(0.05 * f, m); });
+                // A cluster dataset on the HPC backend: the worker reads each
+                // volume on the node (input_ref), and the image stays there,
+                // shown through the worker (core/remote_source.hpp).
+                const auto* remoteInput =
+                    !input.array && ctx.backend == Backend::Hpc ? dynamic_cast<const RemoteSource*>(input.source.get()) : nullptr;
+                if (remoteInput) out.source = input.source;
+                else out.array = input.materialize([&](double f, const std::string& m) { ctx.report(0.05 * f, m); });
                 auto labels = std::make_shared<LabelVolume>(d.t, d.z, d.y, d.x);
 
                 LabelPostOptions post;
@@ -221,17 +244,23 @@ namespace sirius::app {
                 for (Index t = 0; t < d.t; ++t) {
                     ctx.throwIfCancelled();
                     const double base = 0.05 + 0.9 * static_cast<double>(t) / d.t, span = 0.9 / d.t;
-                    const BufferView<const float> vol = out.array->volume(channel, t);
-                    rpc::TensorRef in;
-                    in.name = "input";
-                    in.dtype = "float32";
-                    in.shape = {d.z, d.y, d.x};
-                    in.data = vol.data();
-                    in.nbytes = vol.bytes();
+                    nlohmann::json request = {{"kind", "torch_segment"}, {"params", params}};
+                    std::vector<rpc::TensorRef> ins;
+                    if (remoteInput) {
+                        request["input_ref"] = remoteInput->inputReference(channel, t);
+                    } else {
+                        const BufferView<const float> vol = out.array->volume(channel, t);
+                        rpc::TensorRef in;
+                        in.name = "input";
+                        in.dtype = "float32";
+                        in.shape = {d.z, d.y, d.x};
+                        in.data = vol.data();
+                        in.nbytes = vol.bytes();
+                        ins.push_back(in);
+                    }
                     const auto t0 = std::chrono::steady_clock::now();
                     WorkerResult r = ctx.remote->call(
-                        "run", {{"kind", "torch_segment"}, {"params", params}}, {in},
-                        [&](double f, const std::string& m) { ctx.report(base + span * 0.8 * f, m); },
+                        "run", request, ins, [&](double f, const std::string& m) { ctx.report(base + span * 0.8 * f, m); },
                         [&] { return ctx.isCancelled(); });
                     seconds += std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
                     ctx.throwIfCancelled();
@@ -337,8 +366,8 @@ namespace sirius::app {
                     }
                     const double base = 0.05 + 0.9 * static_cast<double>(done) / static_cast<double>(prompted);
                     const double span = 0.9 / static_cast<double>(prompted);
-                    params["points"] = f.points;
-                    params["point_labels"] = f.pointLabels;
+                    // only `objects`: the i-th object's mask comes back as label i + 1
+                    params["objects"] = promptObjectsJson(f);
                     const BufferView<const float> vol = out.array->volume(channel, t);
                     rpc::TensorRef in;
                     in.name = "input";
@@ -347,9 +376,20 @@ namespace sirius::app {
                     in.data = vol.data();
                     in.nbytes = vol.bytes();
                     const auto t0 = std::chrono::steady_clock::now();
-                    WorkerResult r = ctx.remote->call(
-                        "run", {{"kind", "torch_segment"}, {"params", params}}, {in},
-                        [&](double fr, const std::string& m) { ctx.report(base + span * fr, m); }, [&] { return ctx.isCancelled(); });
+                    WorkerResult r;
+                    try {
+                        r = ctx.remote->call(
+                            "run", {{"kind", "torch_segment"}, {"params", params}}, {in},
+                            [&](double fr, const std::string& m) { ctx.report(base + span * fr, m); }, [&] { return ctx.isCancelled(); });
+                    } catch (const ProtocolError&) {
+                        throw;   // the connection, not the prompts
+                    } catch (const std::exception& e) {
+                        if (isCancellation(e)) throw;
+                        // the worker refusing the prompts (an object across
+                        // planes, a point outside the volume): say whose
+                        throw std::runtime_error(modelLabel(model) + " refused the prompts" +
+                                                 (d.t > 1 ? " of time point " + std::to_string(t) : std::string()) + ": " + e.what());
+                    }
                     seconds += std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
                     ctx.throwIfCancelled();
                     const rpc::Tensor* got = nullptr;
@@ -361,18 +401,11 @@ namespace sirius::app {
                     std::uint32_t* dst = labels->volume(t);
                     std::copy_n(got->asUInt32(), volume, dst);
                     applyPromptIds(dst, volume, f);
-                    // the ids stay those of the points, so the scores below name them
+                    // the ids stay the objects', so the scores below name them
                     if (minVoxels > 0) dropSmall(dst, volume, minVoxels);
                     labels->recomputeStats(t);
                     planeOnly = planeOnly || r.result.value("plane_only", false);
-                    const nlohmann::json ms = r.result.value("mask_scores", nlohmann::json::array());
-                    std::string line;
-                    for (std::size_t i = 0; i < f.ids.size(); ++i) {
-                        if (f.ids[i] == 0 || i >= ms.size() || !ms[i].is_number()) continue;
-                        line += (line.empty() ? "" : ", ") + std::string("#") + std::to_string(f.ids[i]) + " " +
-                                formatNumber(ms[i].get<double>(), 2);
-                    }
-                    if (!line.empty()) scores += (scores.empty() ? "" : " · ") + (d.t > 1 ? "t " + std::to_string(t) + ": " : std::string()) + line;
+                    appendPromptScores(scores, f, r.result.value("mask_scores", nlohmann::json::array()), t, d.t > 1);
                     ++done;
                 }
                 const std::string className = p.getString("class_name", "nucleus");
@@ -389,12 +422,12 @@ namespace sirius::app {
                                                      std::to_string(d.t) + " time points"});
                 if (!scores.empty()) diag.facts.push_back({"Mask scores", scores});
                 if (planeOnly) {
-                    // micro-SAM is a 2-D model: the object a point names is the
-                    // one in its plane, and a cell needs a point on each plane
-                    diag.facts.push_back({"Masks", "per plane: each covers its point's z plane only"});
+                    // micro-SAM is a 2-D model: the object its prompts name is
+                    // the one in their plane, and a cell needs an object per plane
+                    diag.facts.push_back({"Masks", "per plane: each covers its object's z plane only"});
                     diag.warnings.push_back(modelLabel(model) +
-                                            " is a 2-D model: each mask lies in the plane of its point. A cell in 3-D needs a "
-                                            "point on every plane, or the Foundation model step with a 3-D promptable bundle.");
+                                            " is a 2-D model: each mask lies in the plane of its object's prompts. A cell in 3-D needs "
+                                            "an object on every plane, or the Foundation model step with a 3-D promptable bundle.");
                 }
                 diag.summary = summary(p, meta) + " · " + std::to_string(total) + " labels";
                 char note[240];

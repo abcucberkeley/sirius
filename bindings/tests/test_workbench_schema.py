@@ -139,5 +139,41 @@ class TestOperationSchema(unittest.TestCase):
             wb.run_step("meant", {"bogus": 1}, a)
 
 
+class TestPromptObjects(unittest.TestCase):
+    """The Prompt step's request, as the application builds it
+    (tests/test_app_ops.cpp "Each time point sends its objects ...")."""
+
+    def test_each_time_point_sends_its_objects(self):
+        prompts = [{"x": 10, "y": 11, "z": 1, "object": 1},
+                   {"x": 20, "y": 21, "z": 2, "t": 1, "object": 2},
+                   {"kind": "scribble", "points": [[1, 1, 1], [2, 1, 1], [3, 2, 1]], "object": 3},
+                   {"x": 30, "y": 31, "z": 3, "label": 0, "object": 1},
+                   {"kind": "box", "x0": 0, "y0": 0, "z0": 0, "x1": 4, "y1": 4, "z1": 2, "object": 4},
+                   {"x": 2, "y": 2, "z": 1, "object": 4},
+                   {"x": 50, "y": 51, "z": 5, "t": 2, "label": 0, "object": 5}]
+        objects, ids = wb._frame_objects(prompts, 0)
+        self.assertEqual(ids, [1, 3, 4])
+        self.assertEqual(objects, [
+            {"points": [[10.0, 11.0, 1.0], [30.0, 31.0, 3.0]], "point_labels": [1, 0]},
+            {"scribbles": [{"points": [[1.0, 1.0, 1.0], [2.0, 1.0, 1.0], [3.0, 2.0, 1.0]], "label": 1}]},
+            {"box": [0.0, 0.0, 0.0, 4.0, 4.0, 2.0], "points": [[2.0, 2.0, 1.0]], "point_labels": [1]}])
+        self.assertEqual(wb._frame_objects(prompts, 1)[1], [2])
+        self.assertEqual(wb._frame_objects(prompts, 2), ([], []))   # background only: not sent
+        lab = wb._renumber_prompt_masks(np.array([0, 1, 2, 3, 4]), ids)
+        self.assertEqual(lab.tolist(), [0, 1, 3, 4, 0])
+
+    def test_a_list_without_objects_gets_them_as_the_application_gives_them(self):
+        # tests/test_app_pipeline.cpp "A pipeline written before prompt objects still loads"
+        old = [{"kind": "box", "x0": 1, "y0": 2, "z0": 0, "x1": 6, "y1": 7, "z1": 3, "t": 0},
+               {"kind": "point", "x": 30, "y": 30, "z": 1, "t": 0, "label": 1},
+               {"kind": "point", "x": 28, "y": 31, "z": 1, "t": 0, "label": 0},
+               {"kind": "point", "x": 7, "y": 3, "z": 1, "t": 0, "label": 0},
+               {"kind": "point", "x": 9, "y": 9, "z": 1, "t": 1, "label": 0},
+               {"kind": "scribble", "points": [[2, 2, 1], [3, 2, 1]], "t": 1, "label": 1}]
+        self.assertEqual([i for _, i in wb._prompt_objects(old)], [1, 2, 2, 1, 3, 3])
+        stray = [{"x": 4, "y": 4, "z": 1, "label": 0}, {"x": 5, "y": 4, "z": 1, "label": 0}, {"x": 9, "y": 9, "z": 0, "t": 1}]
+        self.assertEqual([i for _, i in wb._prompt_objects(stray)], [2, 2, 1])
+
+
 if __name__ == "__main__":
     unittest.main()

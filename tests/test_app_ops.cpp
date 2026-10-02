@@ -1675,10 +1675,11 @@ TEST_CASE("Segmentation takes instance labels from a family model", "[app][ops][
 
 // --- prompting --------------------------------------------------------------------
 
-TEST_CASE("Prompts are a parameter that keeps its structure", "[app][ops][prompt]") {
+TEST_CASE("Prompts are a parameter that keeps its structure, every prompt in an object", "[app][ops][prompt]") {
     using nlohmann::json;
     ParamSpec spec = promptsParam(kPromptsKey, "Prompts");
-    // what a person or an agent gives, in the forms it may come in
+    // what a person or an agent gives, in the forms it may come in, and
+    // without object ids, as a list written before objects existed
     const json given = json::parse(R"([
         {"x": 12, "y": 40.0, "z": 3},
         {"kind": "point", "x": 1.5, "y": 2, "z": 0, "t": 2, "label": 0},
@@ -1691,21 +1692,28 @@ TEST_CASE("Prompts are a parameter that keeps its structure", "[app][ops][prompt
     const json stored = toJson(v);
     REQUIRE(stored.is_array());
     REQUIRE(stored.size() == 5);
-    // canonical: every key present, whole voxels as integers
-    CHECK(stored[0] == json::parse(R"({"kind": "point", "x": 12, "y": 40, "z": 3, "t": 0, "label": 1})"));
+    // canonical: every key present, whole voxels as integers, and an object
+    // each: an object prompt starts one (1, 2, 3 in list order), a background
+    // prompt joins the nearest object on its time point (the scribble, 3), or,
+    // on a time point without one, an object of its own (4)
+    CHECK(stored[0] == json::parse(R"({"kind": "point", "x": 12, "y": 40, "z": 3, "t": 0, "label": 1, "object": 1})"));
     CHECK(stored[0]["y"].is_number_integer());
     CHECK(stored[1]["x"] == 1.5);
     CHECK(stored[1]["t"] == 2);
     CHECK(stored[1]["label"] == 0);
+    CHECK(stored[1]["object"] == 4);
     CHECK(stored[2]["label"] == 0);
-    CHECK(stored[3] == json::parse(R"({"kind": "box", "x0": 2, "y0": 3, "z0": 0, "x1": 10, "y1": 12, "z1": 4, "t": 1})"));
-    CHECK(stored[4] == json::parse(R"({"kind": "scribble", "points": [[4, 4, 1], [5, 4, 1], [6, 5, 1]], "t": 0, "label": 1})"));
-    CHECK(toDisplayString(v) == "1 box, 3 points, 1 scribble");
-    // its JSON text and the list of texts an older reader made of it are the same value
+    CHECK(stored[2]["object"] == 3);
+    CHECK(stored[3] == json::parse(R"({"kind": "box", "x0": 2, "y0": 3, "z0": 0, "x1": 10, "y1": 12, "z1": 4, "t": 1, "object": 2})"));
+    CHECK(stored[4] == json::parse(R"({"kind": "scribble", "points": [[4, 4, 1], [5, 4, 1], [6, 5, 1]], "t": 0, "label": 1, "object": 3})"));
+    CHECK(toDisplayString(v) == "4 objects: 1 box, 3 points, 1 scribble");
+    // its JSON text, the list of texts an older reader made of it, and the
+    // canonical list itself are the same value
     CHECK(coerceToSpec(spec, given.dump()) == v);
     json texts = json::array();
     for (const json& e : given) texts.push_back(e.dump());
     CHECK(coerceToSpec(spec, texts) == v);
+    CHECK(coerceToSpec(spec, stored) == v);
     // a value read back from JSON stays structured
     CHECK(paramValueFromJson(stored) == v);
 
@@ -1713,16 +1721,28 @@ TEST_CASE("Prompts are a parameter that keeps its structure", "[app][ops][prompt
     p.set(kPromptsKey, v);
     const std::vector<Prompt> prompts = promptsOf(p);
     REQUIRE(prompts.size() == 5);
-    CHECK(prompts[0] == Prompt::point(12, 40, 3));
-    CHECK(prompts[1] == Prompt::point(1.5, 2, 0, 2, false));
-    CHECK(prompts[3] == Prompt::boxOf({2, 3, 0, 10, 12, 4}, 1));
-    CHECK(prompts[4] == Prompt::scribble({{4, 4, 1}, {5, 4, 1}, {6, 5, 1}}));
+    CHECK(prompts[0] == Prompt::point(12, 40, 3, 0, true, 1));
+    CHECK(prompts[1] == Prompt::point(1.5, 2, 0, 2, false, 4));
+    CHECK(prompts[2] == Prompt::point(7, 8, 9, 0, false, 3));
+    CHECK(prompts[3] == Prompt::boxOf({2, 3, 0, 10, 12, 4}, 1, 2));
+    CHECK(prompts[4] == Prompt::scribble({{4, 4, 1}, {5, 4, 1}, {6, 5, 1}}, 0, true, 3));
     CHECK(promptsValue(prompts) == v);
     CHECK_FALSE(isPromptStep(p));   // no task
     p.set("task", std::string(kPromptTask));
     CHECK(isPromptStep(p));
     CHECK(promptsOf(ParamSet{}).empty());
     CHECK(toDisplayString(promptsValue({})) == "none");
+    // given ids are kept; a new object is numbered after the highest, and a
+    // background prompt joins its time point's nearest object
+    {
+        const json ids = toJson(coerceToSpec(spec, json::parse(R"([{"x": 1, "y": 1, "z": 1, "object": 7}, {"x": 30, "y": 2, "z": 1},
+                                                                        {"x": 2, "y": 2, "z": 1, "label": 0}, {"x": 29, "y": 2, "z": 1, "label": 0}])")));
+        CHECK(ids[0]["object"] == 7);
+        CHECK(ids[1]["object"] == 8);
+        CHECK(ids[2]["object"] == 7);
+        CHECK(ids[3]["object"] == 8);
+        CHECK(promptsValue({Prompt::point(1, 1, 1)}) == coerceToSpec(spec, json::parse(R"([{"x": 1, "y": 1, "z": 1, "object": 1}])")));
+    }
 
     // what cannot be a prompt says which entry and why
     const auto refused = [&](const char* text) {
@@ -1743,45 +1763,52 @@ TEST_CASE("Prompts are a parameter that keeps its structure", "[app][ops][prompt
     CHECK(refused(R"([{"kind": "scribble", "points": []}])").find("needs 'points'") != std::string::npos);
     CHECK(refused(R"([{"kind": "scribble", "points": [[1, 2]]}])").find("not [x, y, z]") != std::string::npos);
     CHECK(refused(R"([{"kind": "lasso", "x": 1, "y": 2, "z": 1}])").find("the kinds are point, box and scribble") != std::string::npos);
+    CHECK(refused(R"([{"x": 1, "y": 2, "z": 1}, {"x": 1, "y": 2, "z": 1, "object": 0}])").find("prompt 2: 'object' is the id") != std::string::npos);
+    CHECK(refused(R"([{"x": 1, "y": 2, "z": 1, "object": 1.5}])").find("'object'") != std::string::npos);
+    CHECK(refused(R"([{"x": 1, "y": 2, "z": 1, "object": "a"}])").find("'object'") != std::string::npos);
     CHECK_THROWS(coerceToSpec(spec, 3));
     // the schema an agent reads
     const json schema = schemaOf(spec);
     CHECK(schema["type"] == "array");
     CHECK(schema["items"]["properties"]["kind"]["enum"] == json::array({"point", "box", "scribble"}));
+    CHECK(schema["items"]["properties"]["object"]["type"] == "integer");
+    CHECK(schema["items"]["properties"]["object"]["minimum"] == 1);
 }
 
-TEST_CASE("Each time point sends only its own prompts, in the worker's order", "[app][ops][prompt]") {
-    const std::vector<Prompt> prompts = {Prompt::point(10, 11, 1),
-                                         Prompt::point(20, 21, 2, 1),
-                                         Prompt::scribble({{1, 1, 1}, {2, 1, 1}, {3, 2, 1}}),
-                                         Prompt::point(30, 31, 3, 0, false),
-                                         Prompt::boxOf({0, 0, 0, 4, 4, 2}),
-                                         Prompt::point(40, 41, 4),
-                                         Prompt::point(50, 51, 5, 2, false)};
+TEST_CASE("Each time point sends its objects, each with all of its prompts", "[app][ops][prompt]") {
+    using nlohmann::json;
+    const std::vector<Prompt> prompts = {Prompt::point(10, 11, 1, 0, true, 1),
+                                         Prompt::point(20, 21, 2, 1, true, 2),
+                                         Prompt::scribble({{1, 1, 1}, {2, 1, 1}, {3, 2, 1}}, 0, true, 3),
+                                         Prompt::point(30, 31, 3, 0, false, 1),   // a correction of object 1
+                                         Prompt::boxOf({0, 0, 0, 4, 4, 2}, 0, 4),
+                                         Prompt::point(2, 2, 1, 0, true, 4),        // and a click that grows object 4
+                                         Prompt::point(50, 51, 5, 2, false, 5)};   // background only: not sent
     const FramePrompt t0 = framePrompt(prompts, 0);
-    // points (the background one first, so an object mask wins over it), then boxes, then scribbles
-    REQUIRE(t0.points.size() == 3);
-    CHECK(t0.points[0] == std::array<double, 3>{30, 31, 3});
-    CHECK(t0.pointLabels == std::vector<int>{0, 1, 1});
-    REQUIRE(t0.boxes.size() == 1);
-    CHECK(t0.boxes[0] == std::array<double, 6>{0, 0, 0, 4, 4, 2});
-    REQUIRE(t0.scribbles.size() == 1);
-    CHECK(t0.scribbles[0].points.size() == 3);
-    CHECK(t0.scribbles[0].label == 1);
-    CHECK(t0.ids == std::vector<std::uint32_t>{0, 1, 2, 3, 4});
-    CHECK(t0.placed == std::vector<std::size_t>{3, 0, 5, 4, 2});
-    CHECK(t0.objects() == 4);
+    CHECK(t0.ids() == std::vector<std::uint32_t>{1, 3, 4});
+    REQUIRE(t0.objects.size() == 3);
+    CHECK(t0.objects[0].placed == std::vector<std::size_t>{0, 3});
+    CHECK(t0.objects[2].placed == std::vector<std::size_t>{4, 5});
+    CHECK(t0.backgroundOnly.empty());
+    // exactly what the worker is sent: one entry per object, in ascending id,
+    // a key only where the object has one
+    CHECK(promptObjectsJson(t0) == json::parse(R"([
+        {"points": [[10, 11, 1], [30, 31, 3]], "point_labels": [1, 0]},
+        {"scribbles": [{"points": [[1, 1, 1], [2, 1, 1], [3, 2, 1]], "label": 1}]},
+        {"box": [0, 0, 0, 4, 4, 2], "points": [[2, 2, 1]], "point_labels": [1]}])"));
     const FramePrompt t1 = framePrompt(prompts, 1);
-    REQUIRE(t1.points.size() == 1);
-    CHECK(t1.points[0] == std::array<double, 3>{20, 21, 2});
-    CHECK(t1.ids == std::vector<std::uint32_t>{1});
-    CHECK(framePrompt(prompts, 2).objects() == 0);
+    CHECK(t1.ids() == std::vector<std::uint32_t>{2});
+    CHECK(promptObjectsJson(t1) == json::parse(R"([{"points": [[20, 21, 2]], "point_labels": [1]}])"));
+    const FramePrompt t2 = framePrompt(prompts, 2);
+    CHECK(t2.empty());
+    CHECK(t2.backgroundOnly == std::vector<std::uint32_t>{5});
     CHECK(framePrompt(prompts, 3).empty());
+    CHECK(framePrompt(prompts, 3).backgroundOnly.empty());
 
-    // the worker's numbering (i + 1 for the i-th mask) becomes the objects' own
-    std::vector<std::uint32_t> masks = {0, 1, 2, 3, 4, 5, 6};
+    // the worker's numbering (i + 1 for the i-th object) becomes the objects' own ids
+    std::vector<std::uint32_t> masks = {0, 1, 2, 3, 4};
     applyPromptIds(masks.data(), static_cast<Index>(masks.size()), t0);
-    CHECK(masks == std::vector<std::uint32_t>{0, 0, 1, 2, 3, 4, 0});
+    CHECK(masks == std::vector<std::uint32_t>{0, 1, 3, 4, 0});
 
     // a long stroke is sent as a few points along it, both ends included
     std::vector<std::array<double, 3>> stroke;
@@ -1790,25 +1817,136 @@ TEST_CASE("Each time point sends only its own prompts, in the worker's order", "
     REQUIRE(sent.size() == kScribblePointsSent);
     CHECK(sent.front() == stroke.front());
     CHECK(sent.back() == stroke.back());
-    CHECK(framePrompt({Prompt::scribble(stroke)}, 0).scribbles[0].points == sent);
+    CHECK(framePrompt({Prompt::scribble(stroke, 0, true, 1)}, 0).objects[0].scribbles[0].points == sent);
 
     const DatasetMeta meta = metaFor(Dims5{1, 3, 6, 60, 60});
     Validation v;
     validatePrompts(prompts, meta, v);
     CHECK(v.ok());
-    for (const Prompt& outside : {Prompt::point(60, 1, 1), Prompt::point(1, 1, 1, 3), Prompt::boxOf({50, 50, 0, 61, 60, 6}),
-                                  Prompt::scribble({{1, 1, 1}, {1, 1, 6}})}) {
+    REQUIRE(v.warnings.size() == 1);
+    CHECK(v.warnings[0].find("Object 5 has only background prompts on time point 2") != std::string::npos);
+    for (const Prompt& outside : {Prompt::point(60, 1, 1, 0, true, 1), Prompt::point(1, 1, 1, 3, true, 1), Prompt::boxOf({50, 50, 0, 61, 60, 6}, 0, 1),
+                                  Prompt::scribble({{1, 1, 1}, {1, 1, 6}}, 0, true, 1)}) {
         Validation w;
         validatePrompts({outside}, meta, w);
         REQUIRE_FALSE(w.ok());
         CHECK(w.firstError().find("outside the image") != std::string::npos);
+        CHECK(w.firstError().find("of object 1") != std::string::npos);
+    }
+    {
+        // one object is one mask, and takes one box
+        std::vector<Prompt> twice = prompts;
+        twice.push_back(Prompt::boxOf({5, 5, 0, 9, 9, 2}, 0, 4));
+        Validation w;
+        validatePrompts(twice, meta, w);
+        REQUIRE_FALSE(w.ok());
+        CHECK(w.firstError().find("Object 4 has 2 boxes on time point 0") != std::string::npos);
     }
     Validation none;
     validatePrompts({}, meta, none);
     CHECK(none.ok());
     REQUIRE(none.warnings.size() == 1);
     CHECK(none.warnings[0].find("Prompt tool") != std::string::npos);
-    CHECK(promptCounts(prompts) == "1 box \xC2\xB7 3 object points \xC2\xB7 2 background points \xC2\xB7 1 scribble");
+    CHECK(promptCounts(prompts) == "5 objects \xC2\xB7 1 box \xC2\xB7 3 object points \xC2\xB7 2 background points \xC2\xB7 1 scribble");
+}
+
+TEST_CASE("Which object a Prompt tool click belongs to", "[app][ops][prompt]") {
+    using Action = PromptClick::Action;
+    const std::vector<Prompt> prompts = {Prompt::boxOf({10, 10, 0, 20, 20, 4}, 0, 1), Prompt::point(40, 40, 2, 0, true, 2),
+                                         Prompt::point(5, 5, 2, 1, true, 3), Prompt::point(50, 10, 2, 0, false, 4)};
+    CHECK(nextPromptObject(prompts) == 5);
+    const auto click = [&](std::array<double, 3> at, std::uint32_t under, bool positive, bool forceNew = false, Index t = 0) {
+        return promptClickTarget(prompts, t, at, under, positive, forceNew);
+    };
+    // an object click inside an object's mask grows that object ...
+    PromptClick c = click({15, 15, 2}, 1, true);
+    CHECK(c.action == Action::AddTo);
+    CHECK(c.object == 1);
+    // ... and starts a new one with Shift, outside every mask, on the mask of
+    // an object of another time point, or of one that is not sent
+    for (const PromptClick& n : {click({15, 15, 2}, 1, true, true), click({30, 30, 2}, 0, true), click({5, 5, 2}, 3, true), click({50, 10, 2}, 4, true)}) {
+        CHECK(n.action == Action::NewObject);
+        CHECK(n.object == 5);
+    }
+    // a background click corrects the object whose mask is under it ...
+    c = click({41, 41, 2}, 2, false);
+    CHECK(c.action == Action::AddTo);
+    CHECK(c.object == 2);
+    // ... else the nearest object of the time point, by distance to its prompts
+    c = click({35, 35, 2}, 0, false);
+    CHECK(c.action == Action::AddTo);
+    CHECK(c.object == 2);
+    c = click({21, 15, 2}, 0, false);   // two voxels from the box's last column
+    CHECK(c.action == Action::AddTo);
+    CHECK(c.object == 1);
+    // ... and, with no object on the time point, nothing, saying why
+    c = click({5, 5, 2}, 0, false, false, 2);
+    CHECK(c.action == Action::None);
+    CHECK(c.why.find("place one first") != std::string::npos);
+    // on a tie the lower id
+    c = promptClickTarget({Prompt::point(0, 0, 0, 0, true, 2), Prompt::point(10, 0, 0, 0, true, 1)}, 0, {5, 0, 0}, 0, false, false);
+    CHECK(c.object == 1);
+    // a 2-D model counts only the objects on the plane clicked
+    const std::vector<Prompt> planes = {Prompt::point(10, 10, 2, 0, true, 1), Prompt::point(30, 30, 5, 0, true, 2)};
+    CHECK(promptClickTarget(planes, 0, {29, 29, 2}, 0, false, false, true).object == 1);
+    CHECK(promptClickTarget(planes, 0, {29, 29, 2}, 0, false, false, false).object == 2);
+    c = promptClickTarget(planes, 0, {29, 29, 7}, 0, false, false, true);
+    CHECK(c.action == Action::None);
+    CHECK(c.why.find("this plane") != std::string::npos);
+    c = promptClickTarget(planes, 0, {30, 30, 2}, 2, true, false, true);
+    CHECK(c.action == Action::NewObject);
+    CHECK(c.object == 3);
+
+    // removing: a prompt, and with an object's last object prompt its corrections
+    const std::vector<Prompt> one = {Prompt::boxOf({10, 10, 0, 20, 20, 4}, 0, 1), Prompt::point(12, 12, 1, 0, false, 1),
+                                     Prompt::point(15, 15, 1, 0, true, 1), Prompt::point(40, 40, 2, 0, true, 2)};
+    CHECK(removePrompt(one, 2).size() == 3);
+    CHECK(removePrompt(one, 1).size() == 3);
+    const std::vector<Prompt> last = removePrompt(removePrompt(one, 2), 0);
+    REQUIRE(last.size() == 1);
+    CHECK(last[0].objectId == 2);
+    CHECK(removePromptObject(one, 1) == std::vector<Prompt>{one[3]});
+    CHECK(removePrompt(one, 9) == one);
+    const std::vector<PromptObject> objects = promptObjects(one);
+    REQUIRE(objects.size() == 2);
+    CHECK(objects[0].id == 1);
+    CHECK(objects[0].prompts == std::vector<std::size_t>{0, 1, 2});
+    CHECK(promptObjectText(objects[0]) == "box + 1 point + 1 correction");
+    CHECK(promptObjectText(objects[1]) == "1 point");
+    CHECK(objects[1].sent());
+    CHECK_FALSE(promptObjects({Prompt::point(1, 1, 1, 0, false, 1)})[0].sent());
+
+    // the planes a 2-D model answers an object in, as its worker works them out
+    FramePrompt::Object o;
+    o.box = std::array<double, 6>{0, 0, 3, 4, 4, 8};
+    CHECK(promptPlanes(o) == std::vector<Index>{5});
+    o.box = std::array<double, 6>{0, 0, 3, 4, 4, 7};
+    CHECK(promptPlanes(o) == std::vector<Index>{4});   // 4.5, rounded half to even as Python does
+    o.points = {{1, 1, 2}};
+    o.scribbles = {{{{1, 1, 3}, {2, 1, 3}}, 1}};
+    CHECK(promptPlanes(o) == std::vector<Index>{2, 3});
+
+    // the mask scores, written by the run and read back by the panel
+    const FramePrompt f = framePrompt({Prompt::point(1, 1, 1, 0, true, 3), Prompt::point(5, 5, 1, 0, true, 7)}, 0);
+    std::string fact;
+    appendPromptScores(fact, f, nlohmann::json::array({0.81, 0.7}), 0, false);
+    CHECK(fact == "#3 0.81, #7 0.70");
+    Diagnostics d;
+    d.facts.push_back({"Mask scores", fact});
+    const auto scores = promptScores(d, 0);
+    REQUIRE(scores.size() == 2);
+    CHECK(scores[0].first == 3);
+    CHECK_THAT(scores[0].second, WithinAbs(0.81, 1e-9));
+    CHECK(scores[1].first == 7);
+    std::string many;
+    appendPromptScores(many, f, nlohmann::json::array({0.81, 0.7}), 0, true);
+    appendPromptScores(many, framePrompt({Prompt::point(1, 1, 1, 2, true, 3)}, 2), nlohmann::json::array({0.5}), 2, true);
+    CHECK(many == "t 0: #3 0.81, #7 0.70 \xC2\xB7 t 2: #3 0.50");
+    d.facts.back().value = many;
+    REQUIRE(promptScores(d, 2).size() == 1);
+    CHECK_THAT(promptScores(d, 2)[0].second, WithinAbs(0.5, 1e-9));
+    CHECK(promptScores(d, 1).empty());
+    CHECK(promptScores(Diagnostics{}, 0).empty());
 }
 
 namespace {
@@ -1821,13 +1959,21 @@ namespace {
     std::mutex promptRequestsMutex;
     std::vector<PromptRequest> promptRequests;
 
-    // A worker that answers a prompt the way the real ones do: one mask per
-    // prompt, points then boxes then scribbles, numbered i + 1, later masks
-    // winning, a score per mask. A point's or a scribble's mask is a 3 x 3
-    // square on the plane of its (first) point, a box's mask the box.
-    // model_info lists the tasks a bundle offers (`promptable` false: Segment
-    // only) and, for a family spec, whether it is promptable.
-    void fakePromptWorker(std::unique_ptr<rpc::Transport> transport, bool promptable) {
+    enum class FakePrompt { Promptable,
+                            NotPromptable,
+                            Refuses };
+
+    // A worker that answers the joint `objects` form the way the real ones
+    // do: one mask per object, numbered i + 1 in the order sent, later masks
+    // winning, a score per mask (0.9, 0.8, ...). An object's mask is its box,
+    // else a 3 x 3 square on the plane of its first object point (or object
+    // scribble's first point); each of its background points then takes its
+    // own voxel out of the mask, which is how a correction shows here.
+    // model_info lists the tasks a bundle offers (NotPromptable: Segment
+    // only) and, for a family spec, whether it is promptable. Refuses answers
+    // every run with micro-SAM's refusal of an object across planes.
+    void fakePromptWorker(std::unique_ptr<rpc::Transport> transport, FakePrompt mode) {
+        const bool promptable = mode != FakePrompt::NotPromptable;
         std::vector<std::byte> inbox;
         for (;;) {
             std::optional<rpc::Message> msg;
@@ -1860,6 +2006,13 @@ namespace {
                     const std::lock_guard<std::mutex> lock(promptRequestsMutex);
                     promptRequests.push_back({kind, p, in.shape});
                 }
+                if (mode == FakePrompt::Refuses) {
+                    reply["type"] = "error";
+                    reply["message"] = "object 0 has prompts on planes [1, 3]; microsam:vit_b_lm is a 2-D model and cannot refine across z. "
+                                       "Put the object's corrective prompts in the plane it was opened in, or prompt a .ltb bundle, whose decoder is 3-D.";
+                    transport->send(rpc::encodeFrame(reply, {}));
+                    continue;
+                }
                 // (c, t, z, y, x) for the foundation model, (z, y, x) for a family model
                 const std::size_t r = in.shape.size();
                 const Index z = in.shape[r - 3], y = in.shape[r - 2], x = in.shape[r - 1];
@@ -1867,27 +2020,36 @@ namespace {
                 std::vector<float> confidence(labels.size(), 0.0f);
                 nlohmann::json scores = nlohmann::json::array();
                 std::uint32_t id = 0;
+                const auto at = [&](Index zz, Index yy, Index xx) { return static_cast<std::size_t>((zz * y + yy) * x + xx); };
                 const auto paint = [&](Index z0, Index z1, Index y0, Index y1, Index x0, Index x1) {
-                    ++id;
                     for (Index zz = std::max<Index>(z0, 0); zz < std::min(z1, z); ++zz)
                         for (Index yy = std::max<Index>(y0, 0); yy < std::min(y1, y); ++yy)
                             for (Index xx = std::max<Index>(x0, 0); xx < std::min(x1, x); ++xx) {
-                                const std::size_t at = static_cast<std::size_t>((zz * y + yy) * x + xx);
-                                labels[at] = id;
-                                confidence[at] = 0.9f;
+                                labels[at(zz, yy, xx)] = id;
+                                confidence[at(zz, yy, xx)] = 0.9f;
                             }
+                };
+                const auto voxel = [](const nlohmann::json& q, int axis) { return static_cast<Index>(q[axis].get<double>()); };
+                for (const nlohmann::json& o : p.value("objects", nlohmann::json::array())) {
+                    ++id;
+                    const nlohmann::json pts = o.value("points", nlohmann::json::array());
+                    const nlohmann::json labs = o.value("point_labels", nlohmann::json::array());
+                    if (o.contains("box")) {
+                        const nlohmann::json& b = o["box"];
+                        paint(voxel(b, 2), voxel(b, 5), voxel(b, 1), voxel(b, 4), voxel(b, 0), voxel(b, 3));
+                    } else {
+                        std::optional<nlohmann::json> first;
+                        for (std::size_t k = 0; k < pts.size() && !first; ++k)
+                            if (labs[k] == 1) first = pts[k];
+                        for (const nlohmann::json& s : o.value("scribbles", nlohmann::json::array()))
+                            if (!first && s.value("label", 1) == 1) first = s.at("points").at(0);
+                        if (first) paint(voxel(*first, 2), voxel(*first, 2) + 1, voxel(*first, 1) - 1, voxel(*first, 1) + 2, voxel(*first, 0) - 1, voxel(*first, 0) + 2);
+                    }
+                    for (std::size_t k = 0; k < pts.size(); ++k)
+                        if (labs[k] == 0 && labels[at(voxel(pts[k], 2), voxel(pts[k], 1), voxel(pts[k], 0))] == id)
+                            labels[at(voxel(pts[k], 2), voxel(pts[k], 1), voxel(pts[k], 0))] = 0;
                     scores.push_back(1.0 - 0.1 * static_cast<double>(id));
-                };
-                const auto square = [&](const nlohmann::json& q) {
-                    const Index px = static_cast<Index>(q[0].get<double>()), py = static_cast<Index>(q[1].get<double>()),
-                                pz = static_cast<Index>(q[2].get<double>());
-                    paint(pz, pz + 1, py - 1, py + 2, px - 1, px + 2);
-                };
-                for (const nlohmann::json& q : p.value("points", nlohmann::json::array())) square(q);
-                for (const nlohmann::json& b : p.value("boxes", nlohmann::json::array()))
-                    paint(static_cast<Index>(b[2].get<double>()), static_cast<Index>(b[5].get<double>()), static_cast<Index>(b[1].get<double>()),
-                          static_cast<Index>(b[4].get<double>()), static_cast<Index>(b[0].get<double>()), static_cast<Index>(b[3].get<double>()));
-                for (const nlohmann::json& s : p.value("scribbles", nlohmann::json::array())) square(s.at("points").at(0));
+                }
                 rpc::TensorRef out;
                 out.name = "labels";
                 out.dtype = "uint32";
@@ -1919,9 +2081,43 @@ namespace {
             }
         }
     }
+
+    // One run of `op` against a fresh fake worker; the error it ended with, if any.
+    StepOutput runWithFakeWorker(const Operation& op, const StepInput& input, const ParamSet& p, FakePrompt mode, std::string* error = nullptr) {
+        auto pair = rpc::loopbackPair();
+        std::thread worker(fakePromptWorker, std::move(pair.second), mode);
+        auto remote = std::make_unique<RemoteWorker>(std::move(pair.first));
+        Progress prog;
+        prog.ctx.remote = remote.get();
+        StepOutput out;
+        try {
+            out = op.run(input, p, prog.ctx);
+        } catch (const std::exception& e) {
+            if (!error) {
+                remote->close();
+                worker.join();
+                throw;
+            }
+            *error = e.what();
+        }
+        remote->close();
+        worker.join();
+        return out;
+    }
+
+    void clearPromptRequests() {
+        const std::lock_guard<std::mutex> lock(promptRequestsMutex);
+        promptRequests.clear();
+    }
+
+    std::string factOf(const Diagnostics& d, const std::string& key) {
+        for (const DiagnosticFact& f : d.facts)
+            if (f.key == key) return f.value;
+        return std::string();
+    }
 } // namespace
 
-TEST_CASE("The foundation step's Prompt task sends each frame its own prompts", "[app][ops][prompt][rpc]") {
+TEST_CASE("The foundation step's Prompt task sends each frame its objects", "[app][ops][prompt][rpc]") {
     using nlohmann::json;
     const Dims5 dims{1, 3, 4, 20, 24};
     const DatasetMeta meta = metaFor(dims);
@@ -1931,65 +2127,78 @@ TEST_CASE("The foundation step's Prompt task sends each frame its own prompts", 
     p.set("model", std::string("bundle.ltb"));
     p.set("task", std::string(kPromptTask));
     REQUIRE(isPromptStep(p));
-    // t 0: an object point, a background point, another object point and a
-    // box; t 1: nothing; t 2: an object point and a scribble
-    p.set(kPromptsKey, promptsValue({Prompt::point(5, 6, 1), Prompt::point(15, 6, 1, 0, false), Prompt::point(10, 12, 2),
-                                     Prompt::boxOf({2, 14, 0, 4, 17, 2}), Prompt::point(20, 16, 3, 2),
-                                     Prompt::scribble({{8, 8, 1}, {9, 8, 1}, {10, 8, 1}}, 2)}));
+    // t 0: object 1 a click and a correction beside it, object 2 a box,
+    // object 3 a click, object 4 only a background click; t 1: nothing;
+    // t 2: object 5 a click, object 6 a scribble
+    std::vector<Prompt> prompts = {Prompt::point(5, 6, 1, 0, true, 1), Prompt::point(6, 6, 1, 0, false, 1),
+                                   Prompt::boxOf({2, 14, 0, 4, 17, 2}, 0, 2), Prompt::point(10, 12, 2, 0, true, 3),
+                                   Prompt::point(15, 6, 1, 0, false, 4), Prompt::point(20, 16, 3, 2, true, 5),
+                                   Prompt::scribble({{8, 8, 1}, {9, 8, 1}, {10, 8, 1}}, 2, true, 6)};
+    p.set(kPromptsKey, promptsValue(prompts));
     const Validation v = op.validate(p, meta);
     CHECK(v.ok());
+    CHECK(std::any_of(v.warnings.begin(), v.warnings.end(), [](const std::string& w) { return w.find("Object 4 has only background") != std::string::npos; }));
     CHECK(op.summary(p, meta).find("prompt") != std::string::npos);
-    CHECK(op.summary(p, meta).find("1 box, 4 points, 1 scribble") != std::string::npos);
+    CHECK(op.summary(p, meta).find("6 objects: 1 box, 5 points, 1 scribble") != std::string::npos);
 
-    {
-        const std::lock_guard<std::mutex> lock(promptRequestsMutex);
-        promptRequests.clear();
-    }
-    auto pair = rpc::loopbackPair();
-    std::thread worker(fakePromptWorker, std::move(pair.second), true);
-    auto remote = std::make_unique<RemoteWorker>(std::move(pair.first));
-    Progress prog;
-    prog.ctx.remote = remote.get();
-    const StepOutput r = op.run(inputOf(data, meta), p, prog.ctx);
-    remote->close();
-    worker.join();
+    clearPromptRequests();
+    const StepOutput r = runWithFakeWorker(op, inputOf(data, meta), p, FakePrompt::Promptable);
 
-    // two calls, for t 0 and t 2; t 1 asked nothing of the worker
+    // two calls, for t 0 and t 2; t 1 asked nothing of the worker, object 4 was not sent
     REQUIRE(promptRequests.size() == 2);
     for (const PromptRequest& q : promptRequests) {
         CHECK(q.kind == "foundation");
         CHECK(q.params["task"] == "prompt");
         CHECK(q.shape == std::vector<Index>{1, 1, 4, 20, 24});   // one channel, one time point
+        for (const char* flat : {"points", "point_labels", "boxes", "scribbles"}) CHECK_FALSE(q.params.contains(flat));
     }
-    CHECK(promptRequests[0].params["points"] == json::parse("[[15, 6, 1], [5, 6, 1], [10, 12, 2]]"));
-    CHECK(promptRequests[0].params["point_labels"] == json::parse("[0, 1, 1]"));
-    CHECK(promptRequests[0].params["boxes"] == json::parse("[[2, 14, 0, 4, 17, 2]]"));
-    CHECK_FALSE(promptRequests[0].params.contains("scribbles"));
-    CHECK(promptRequests[1].params["points"] == json::parse("[[20, 16, 3]]"));
-    CHECK(promptRequests[1].params["point_labels"] == json::parse("[1]"));
-    CHECK(promptRequests[1].params["scribbles"] == json::parse(R"([{"points": [[8, 8, 1], [9, 8, 1], [10, 8, 1]], "label": 1}])"));
-    CHECK_FALSE(promptRequests[1].params.contains("boxes"));
+    CHECK(promptRequests[0].params["objects"] == json::parse(R"([
+        {"points": [[5, 6, 1], [6, 6, 1]], "point_labels": [1, 0]},
+        {"box": [2, 14, 0, 4, 17, 2]},
+        {"points": [[10, 12, 2]], "point_labels": [1]}])"));
+    CHECK(promptRequests[1].params["objects"] == json::parse(R"([
+        {"points": [[20, 16, 3]], "point_labels": [1]},
+        {"scribbles": [{"points": [[8, 8, 1], [9, 8, 1], [10, 8, 1]], "label": 1}]}])"));
 
     REQUIRE(r.labels);
-    const auto at = [&](Index t, Index z, Index y, Index x) { return r.labels->volume(t)[(z * dims.y + y) * dims.x + x]; };
-    CHECK(at(0, 1, 6, 5) == 1);    // the first object point is label 1
-    CHECK(at(0, 2, 12, 10) == 2);
-    CHECK(at(0, 1, 15, 3) == 3);   // the box
-    CHECK(at(0, 1, 6, 15) == 0);   // a background point's mask is no object
-    CHECK(at(2, 3, 16, 20) == 1);
-    CHECK(at(2, 1, 8, 8) == 2);    // the scribble
+    const auto at = [&](const StepOutput& o, Index t, Index z, Index y, Index x) { return o.labels->volume(t)[(z * dims.y + y) * dims.x + x]; };
+    // every mask carries its object's id
+    CHECK(at(r, 0, 1, 6, 5) == 1);
+    CHECK(at(r, 0, 1, 6, 6) == 0);    // the correction took its voxel out of object 1
+    CHECK(at(r, 0, 1, 15, 3) == 2);   // the box
+    CHECK(at(r, 0, 2, 12, 10) == 3);
+    CHECK(at(r, 0, 1, 6, 15) == 0);   // background names no object
+    CHECK(at(r, 2, 3, 16, 20) == 5);
+    CHECK(at(r, 2, 1, 8, 8) == 6);    // the scribble
     const std::uint32_t* t1 = r.labels->volume(1);
     CHECK(std::all_of(t1, t1 + dims.z * dims.planeSize(), [](std::uint32_t id) { return id == 0; }));
-    // the model's score of each object's mask, by the label it became
-    const auto fact = [&](const std::string& key) {
-        for (const DiagnosticFact& f : r.diagnostics.facts)
-            if (f.key == key) return f.value;
-        return std::string();
-    };
-    CHECK(fact("Mask scores") == "t 0: #1 0.80, #2 0.70, #3 0.60 \xC2\xB7 t 2: #1 0.90, #2 0.80");
-    CHECK(fact("Prompts") ==
-          "1 box \xC2\xB7 3 object points \xC2\xB7 1 background point \xC2\xB7 1 scribble \xC2\xB7 on 2 of 3 time points");
+    // the model's score of each object's mask, by the object's id
+    CHECK(factOf(r.diagnostics, "Mask scores") == "t 0: #1 0.90, #2 0.80, #3 0.70 \xC2\xB7 t 2: #5 0.90, #6 0.80");
+    CHECK(factOf(r.diagnostics, "Prompts") ==
+          "6 objects \xC2\xB7 1 box \xC2\xB7 3 object points \xC2\xB7 2 background points \xC2\xB7 1 scribble \xC2\xB7 on 2 of 3 time points");
+    REQUIRE(promptScores(r.diagnostics, 2).size() == 2);
+    CHECK(promptScores(r.diagnostics, 2)[1].first == 6);
 
+    SECTION("a correction refines its object, and every object keeps its label across re-runs") {
+        // object 1 removed, object 3 corrected beside its click: the worker now
+        // numbers the box 1 and object 3 2, and they come back as 2 and 3
+        std::vector<Prompt> next = removePromptObject(prompts, 1);
+        next.push_back(Prompt::point(11, 12, 2, 0, false, 3));
+        ParamSet q = p;
+        q.set(kPromptsKey, promptsValue(next));
+        clearPromptRequests();
+        const StepOutput again = runWithFakeWorker(op, inputOf(data, meta), q, FakePrompt::Promptable);
+        REQUIRE(promptRequests.size() == 2);
+        CHECK(promptRequests[0].params["objects"] == json::parse(R"([
+            {"box": [2, 14, 0, 4, 17, 2]},
+            {"points": [[10, 12, 2], [11, 12, 2]], "point_labels": [1, 0]}])"));
+        CHECK(at(again, 0, 1, 15, 3) == 2);
+        CHECK(at(again, 0, 2, 12, 9) == 3);
+        CHECK(at(again, 0, 2, 12, 11) == 0);   // corrected away
+        CHECK(at(again, 0, 1, 6, 5) == 0);     // object 1 is gone
+        CHECK(at(again, 2, 3, 16, 20) == 5);
+        CHECK(factOf(again.diagnostics, "Mask scores") == "t 0: #2 0.90, #3 0.80 \xC2\xB7 t 2: #5 0.90, #6 0.80");
+    }
     SECTION("without any prompt nothing is asked of the worker, and the labels are empty") {
         ParamSet none = p;
         none.set(kPromptsKey, promptsValue({}));
@@ -1999,6 +2208,15 @@ TEST_CASE("The foundation step's Prompt task sends each frame its own prompts", 
         REQUIRE(e.labels);
         CHECK(e.labels->stats().empty());
         CHECK(e.note.find("no prompts") != std::string::npos);
+    }
+    SECTION("only background prompts: nothing is sent") {
+        ParamSet bg = p;
+        bg.set(kPromptsKey, promptsValue({Prompt::point(15, 6, 1, 0, false, 4)}));
+        CHECK(op.validate(bg, meta).ok());
+        Progress noWorker;
+        const StepOutput e = op.run(inputOf(data, meta), bg, noWorker.ctx);
+        REQUIRE(e.labels);
+        CHECK(e.labels->stats().empty());
     }
     SECTION("a prompt outside the image is refused before anything runs") {
         ParamSet out = p;
@@ -2020,39 +2238,29 @@ TEST_CASE("A bundle without a prompt decoder is refused by name", "[app][ops][pr
     p.set("model", std::string("plain.ltb"));
     p.set("task", std::string(kPromptTask));
     p.set(kPromptsKey, promptsValue({Prompt::point(5, 6, 1)}));
-    {
-        const std::lock_guard<std::mutex> lock(promptRequestsMutex);
-        promptRequests.clear();
-    }
-    auto pair = rpc::loopbackPair();
-    std::thread worker(fakePromptWorker, std::move(pair.second), false);
-    auto remote = std::make_unique<RemoteWorker>(std::move(pair.first));
-    Progress prog;
-    prog.ctx.remote = remote.get();
+    clearPromptRequests();
     std::string error;
-    try {
-        (void)op.run(inputOf(data, meta), p, prog.ctx);
-    } catch (const std::exception& e) {
-        error = e.what();
-    }
-    remote->close();
-    worker.join();
+    (void)runWithFakeWorker(op, inputOf(data, meta), p, FakePrompt::NotPromptable, &error);
     CHECK(error.find("cannot be prompted") != std::string::npos);
     CHECK(error.find("'threeclass' head has no prompt decoder") != std::string::npos);
     CHECK(error.find("it offers segment") != std::string::npos);
     CHECK(promptRequests.empty());   // refused before any frame went out
 }
 
-TEST_CASE("The segmentation step prompts a micro-SAM model, plane by plane", "[app][ops][prompt][rpc]") {
+TEST_CASE("The segmentation step prompts a micro-SAM model with the same objects, plane by plane", "[app][ops][prompt][rpc]") {
     using nlohmann::json;
     const Dims5 dims{1, 2, 4, 20, 24};
     const DatasetMeta meta = metaFor(dims);
     auto data = rampArray(dims);
     const Operation& op = requireOperation("seg");
-    CHECK(op.info().promptPointsOnly);
+    CHECK(op.info().promptPlanar);
     ParamSet p = op.defaults();
     p.set("task", std::string(kPromptTask));
-    p.set(kPromptsKey, promptsValue({Prompt::point(5, 6, 1, 1), Prompt::point(9, 9, 2, 1, false)}));
+    // t 1: object 1 a box on plane 1 and a correction in it, object 2 a click
+    // and a correction beside it on plane 2
+    const std::vector<Prompt> prompts = {Prompt::boxOf({2, 2, 1, 8, 8, 2}, 1, 1), Prompt::point(5, 5, 1, 1, false, 1),
+                                         Prompt::point(15, 9, 2, 1, true, 2), Prompt::point(16, 9, 2, 1, false, 2)};
+    p.set(kPromptsKey, promptsValue(prompts));
     p.set("model", std::string("cellpose:cyto3"));
     Validation v = op.validate(p, meta);
     REQUIRE_FALSE(v.ok());
@@ -2062,65 +2270,62 @@ TEST_CASE("The segmentation step prompts a micro-SAM model, plane by plane", "[a
     REQUIRE_FALSE(v.ok());
     CHECK(std::any_of(v.errors.begin(), v.errors.end(), [](const std::string& e) { return e.find("Only micro-SAM") != std::string::npos; }));
     p.set("model", std::string("microsam:vit_b_lm"));
-    REQUIRE(op.validate(p, meta).ok());
+    REQUIRE(op.validate(p, meta).ok());   // boxes and corrections too, inside an object
     CHECK(op.summary(p, meta).find("micro-SAM vit_b_lm") != std::string::npos);
     CHECK(op.summary(p, meta).find("prompt") != std::string::npos);
     {
-        // the worker's family path takes points only
-        ParamSet boxed = p;
-        boxed.set(kPromptsKey, promptsValue({Prompt::boxOf({0, 0, 0, 4, 4, 2}, 1)}));
-        const Validation b = op.validate(boxed, meta);
+        // micro-SAM is 2-D: an object whose prompts straddle planes is refused,
+        // as the worker would, while it is being placed
+        ParamSet across = p;
+        std::vector<Prompt> more = prompts;
+        more.push_back(Prompt::point(5, 5, 3, 1, false, 1));
+        across.set(kPromptsKey, promptsValue(more));
+        const Validation b = op.validate(across, meta);
         REQUIRE_FALSE(b.ok());
-        CHECK(b.firstError().find("points only") != std::string::npos);
+        CHECK(b.firstError().find("Object 1 on time point 1 has prompts on planes z 1, 3") != std::string::npos);
+        CHECK(b.firstError().find("2-D model") != std::string::npos);
     }
     // Segment all objects keeps every parameter of the automatic path
     ParamSet automatic = op.defaults();
     CHECK(automatic.getString("task") == "Segment all objects");
     CHECK_FALSE(isPromptStep(automatic));
 
-    {
-        const std::lock_guard<std::mutex> lock(promptRequestsMutex);
-        promptRequests.clear();
-    }
-    const bool promptable = GENERATE(true, false);
-    auto pair = rpc::loopbackPair();
-    std::thread worker(fakePromptWorker, std::move(pair.second), promptable);
-    auto remote = std::make_unique<RemoteWorker>(std::move(pair.first));
-    Progress prog;
-    prog.ctx.remote = remote.get();
-    if (!promptable) {
+    clearPromptRequests();
+    const FakePrompt mode = GENERATE(FakePrompt::Promptable, FakePrompt::NotPromptable, FakePrompt::Refuses);
+    std::string error;
+    const StepOutput r = runWithFakeWorker(op, inputOf(data, meta), p, mode, &error);
+    if (mode == FakePrompt::NotPromptable) {
         // the worker's own word (family_info's promptable) is the last one
-        std::string error;
-        try {
-            (void)op.run(inputOf(data, meta), p, prog.ctx);
-        } catch (const std::exception& e) {
-            error = e.what();
-        }
-        remote->close();
-        worker.join();
         CHECK(error.find("cannot be prompted") != std::string::npos);
         CHECK(promptRequests.empty());
         return;
     }
-    const StepOutput r = op.run(inputOf(data, meta), p, prog.ctx);
-    remote->close();
-    worker.join();
     REQUIRE(promptRequests.size() == 1);   // t 0 has no prompts
     CHECK(promptRequests[0].kind == "torch_segment");
     CHECK(promptRequests[0].shape == std::vector<Index>{4, 20, 24});
     CHECK(promptRequests[0].params["task"] == "prompt");
-    CHECK(promptRequests[0].params["points"] == json::parse("[[9, 9, 2], [5, 6, 1]]"));
-    CHECK(promptRequests[0].params["point_labels"] == json::parse("[0, 1]"));
+    for (const char* flat : {"points", "point_labels", "boxes", "scribbles"}) CHECK_FALSE(promptRequests[0].params.contains(flat));
+    CHECK(promptRequests[0].params["objects"] == json::parse(R"([
+        {"box": [2, 2, 1, 8, 8, 2], "points": [[5, 5, 1]], "point_labels": [0]},
+        {"points": [[15, 9, 2], [16, 9, 2]], "point_labels": [1, 0]}])"));
+    if (mode == FakePrompt::Refuses) {
+        // the worker's refusal reaches the person whole, saying whose it is
+        CHECK(error.find("micro-SAM vit_b_lm refused the prompts of time point 1: ") != std::string::npos);
+        CHECK(error.find("is a 2-D model and cannot refine across z") != std::string::npos);
+        return;
+    }
+    REQUIRE(error.empty());
     REQUIRE(r.labels);
-    CHECK(r.labels->volume(1)[(1 * dims.y + 6) * dims.x + 5] == 1);
-    CHECK(r.labels->volume(1)[(2 * dims.y + 9) * dims.x + 9] == 0);
+    const auto at = [&](Index z, Index y, Index x) { return r.labels->volume(1)[(z * dims.y + y) * dims.x + x]; };
+    CHECK(at(1, 3, 3) == 1);
+    CHECK(at(1, 5, 5) == 0);   // corrected
+    CHECK(at(2, 9, 15) == 2);
+    CHECK(at(2, 9, 16) == 0);  // corrected
     // micro-SAM's masks are per plane, and the step says so
     REQUIRE_FALSE(r.diagnostics.warnings.empty());
     CHECK(r.diagnostics.warnings.back().find("2-D model") != std::string::npos);
     CHECK(r.note.find("per plane") != std::string::npos);
-    bool scores = false;
-    for (const DiagnosticFact& f : r.diagnostics.facts) scores = scores || (f.key == "Mask scores" && f.value == "t 1: #1 0.80");
-    CHECK(scores);
+    CHECK(factOf(r.diagnostics, "Mask scores") == "t 1: #1 0.90, #2 0.80");
 }
 
 // --- deconvolution ----------------------------------------------------------------

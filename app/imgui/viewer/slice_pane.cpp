@@ -284,27 +284,41 @@ namespace sirius::app::gui {
             const float pen = px(1.5f);
             const ImU32 edge = theme::withAlpha(theme::kViewerGround, 0.85f);
             const auto centre = [this](const DPoint& v) { return toScreenAbs(v + DPoint(0.5, 0.5)); };
+            // the object's number, in its colour on a dark edge, at `at` (its top left)
+            const auto tag = [&](const PromptMark& m, ImVec2 at) {
+                if (m.tag.empty()) return;
+                const float opacity = m.inPlane || m.pending ? 1.0f : 0.6f;
+                const ImU32 shade = theme::withAlpha(theme::kViewerGround, 0.9f * opacity);
+                for (const ImVec2 d : {ImVec2(-1, 0), ImVec2(1, 0), ImVec2(0, -1), ImVec2(0, 1)})
+                    widgets::drawText(dl, ImVec2(at.x + d.x * px(1.0f), at.y + d.y * px(1.0f)), m.tag, 11, shade, theme::Weight::ExtraBold);
+                widgets::drawText(dl, at, m.tag, 11, theme::withAlpha(m.color, opacity), theme::Weight::ExtraBold);
+            };
             // the faint projections first, so nothing on the plane is under one
             for (const bool onPlane : {false, true})
                 for (const PromptMark& m : promptMarks_) {
                     if ((m.inPlane || m.pending) != onPlane) continue;
-                    const ImU32 ink = m.object ? theme::kAccent : theme::kViewerText;
+                    const ImU32 ink = m.positive ? m.color : theme::kViewerText;
                     switch (m.shape) {
                         case PromptMark::Shape::Point: {
                             const ImVec2 c = centre(m.a);
                             if (!m.inPlane) {
                                 const float r = px(3.0f);
                                 dl->AddCircle(c, r, theme::withAlpha(theme::kViewerGround, 0.5f), 0, px(3.0f));
-                                dl->AddCircle(c, r, theme::withAlpha(ink, 0.6f), 0, pen);
+                                dl->AddCircle(c, r, theme::withAlpha(m.color, 0.6f), 0, pen);
+                                tag(m, ImVec2(c.x + r + px(2.0f), c.y - r - px(10.0f)));
                                 break;
                             }
+                            // an object point: filled in the object's colour, a
+                            // plus; a correction: dark, ringed in the colour, a minus
                             const float r = px(5.5f), ring = px(1.5f);
                             dl->AddCircleFilled(c, r + ring + px(1.0f), edge);
-                            dl->AddCircleFilled(c, r + ring, theme::kViewerText);
-                            dl->AddCircleFilled(c, r, m.object ? theme::kAccent : theme::kViewerGround);
+                            dl->AddCircleFilled(c, r + ring, m.positive ? theme::kViewerText : m.color);
+                            dl->AddCircleFilled(c, r, m.positive ? m.color : theme::kViewerGround);
                             const float arm = r * 0.55f;
-                            dl->AddLine(ImVec2(c.x - arm, c.y), ImVec2(c.x + arm, c.y), theme::kViewerText, pen);
-                            if (m.object) dl->AddLine(ImVec2(c.x, c.y - arm), ImVec2(c.x, c.y + arm), theme::kViewerText, pen);
+                            const ImU32 sign = m.positive ? theme::kViewerGround : theme::kViewerText;
+                            dl->AddLine(ImVec2(c.x - arm, c.y), ImVec2(c.x + arm, c.y), sign, pen);
+                            if (m.positive) dl->AddLine(ImVec2(c.x, c.y - arm), ImVec2(c.x, c.y + arm), sign, pen);
+                            tag(m, ImVec2(c.x + r + ring + px(2.0f), c.y - r - ring - px(10.0f)));
                             break;
                         }
                         case PromptMark::Shape::Box: {
@@ -313,11 +327,12 @@ namespace sirius::app::gui {
                                 dl->AddRect(r0, r1, edge, 0.0f, ImDrawFlags_None, px(3.0f));
                                 dashedOutline(dl, r0, r1, theme::kViewerText, pen);
                             } else if (!m.inPlane) {
-                                dashedOutline(dl, r0, r1, theme::withAlpha(theme::kAccent, 0.55f), px(1.0f));
+                                dashedOutline(dl, r0, r1, theme::withAlpha(m.color, 0.55f), px(1.0f));
                             } else {
                                 dl->AddRect(r0, r1, edge, 0.0f, ImDrawFlags_None, px(4.0f));
-                                dl->AddRect(r0, r1, theme::kAccent, 0.0f, ImDrawFlags_None, px(2.0f));
+                                dl->AddRect(r0, r1, m.color, 0.0f, ImDrawFlags_None, px(2.0f));
                             }
+                            tag(m, ImVec2(r0.x + px(3.0f), r0.y - px(15.0f)));
                             break;
                         }
                         case PromptMark::Shape::Stroke: {
@@ -326,6 +341,7 @@ namespace sirius::app::gui {
                             for (const DPoint& v : m.stroke) line.push_back(centre(v));
                             if (line.size() == 1) line.push_back(ImVec2(line[0].x + 0.5f, line[0].y));
                             const int n = static_cast<int>(line.size());
+                            tag(m, ImVec2(line[0].x + px(6.0f), line[0].y - px(16.0f)));
                             if (!m.inPlane && !m.pending) {
                                 dl->AddPolyline(line.data(), n, theme::withAlpha(ink, 0.5f), ImDrawFlags_None, px(1.0f));
                                 break;

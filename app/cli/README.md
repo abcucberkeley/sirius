@@ -566,18 +566,26 @@ or a `seg` step with a `microsam:` model, whose `task` is `"Prompt objects"`,
 segments only what its `prompts` parameter points at. `add_step` and
 `set_params` take the list, `get_step` returns it, `describe_operation` gives
 its schema (type `prompts`): records in voxels of the step's input, x y z
-order, each on one time point `t` (default 0) --
-`{"kind": "point", "x", "y", "z", "t", "label"}` (label 1 object, 0
-background), `{"kind": "box", "x0", "y0", "z0", "x1", "y1", "z1", "t"}` (upper
-corner exclusive) and `{"kind": "scribble", "points": [[x, y, z], ...], "t",
-"label"}`; an entry without a kind is a point. One mask per prompt; a time
-point without prompts is left empty and costs no worker call. micro-SAM takes
-points only, and its masks are per plane.
+order, each on one time point `t` (default 0) and belonging to one object
+`object` (an id >= 1) --
+`{"kind": "point", "x", "y", "z", "t", "label", "object"}` (label 1 object, 0
+background), `{"kind": "box", "x0", "y0", "z0", "x1", "y1", "z1", "t",
+"object"}` (upper corner exclusive, one per object) and `{"kind": "scribble",
+"points": [[x, y, z], ...], "t", "label", "object"}`; an entry without a kind
+is a point. **One mask per object**: all of an object's prompts on a time
+point are sent together (the worker's joint `objects` form), so a background
+point with an object's id is a correction that refines that object's mask, and
+the mask comes back with the object's id as its label, the same id on every
+re-run. Without `object`, a box, object point or scribble starts an object of
+its own and a background point joins the nearest object on its time point. An
+object with only background prompts is not sent; a time point without objects
+is left empty and costs no worker call. micro-SAM's masks are per plane, so
+all of one object's prompts must share a plane.
 
 ```
 sirius-cli --dataset raw.tif call add_step --args '{"kind": "foundation", "params": {"model": "cells.ltb",
-  "task": "Prompt objects", "prompts": [{"kind": "box", "x0": 10, "y0": 12, "z0": 60, "x1": 30, "y1": 34, "z1": 75},
-  {"x": 40, "y": 40, "z": 67}, {"x": 50, "y": 20, "z": 67, "label": 0}]}}'
+  "task": "Prompt objects", "prompts": [{"kind": "box", "x0": 10, "y0": 12, "z0": 60, "x1": 30, "y1": 34, "z1": 75, "object": 1},
+  {"x": 22, "y": 30, "z": 67, "label": 0, "object": 1}, {"x": 40, "y": 40, "z": 67, "object": 2}]}}'
 ```
 
 **Inspecting a step without an output.** `render`, `statistics`, `probe` and

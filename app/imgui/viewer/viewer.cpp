@@ -8,6 +8,7 @@
 #include <exception>
 #include <functional>
 #include <limits>
+#include <map>
 #include <optional>
 #include <set>
 #include <tuple>
@@ -213,6 +214,11 @@ namespace sirius::app::gui {
         struct Dirty {
             bool xy = true, xz = true, yz = true, mip = true, cmp = true, vol = true;
         } dirty;
+        // A cluster dataset's views arrive on a thread of their own: the
+        // revision they had at the last redraw, and the 3-D bricks made of them.
+        std::uint64_t remoteRev = 0;
+        std::string remoteError;
+        std::map<Index, std::pair<const void*, std::shared_ptr<Buffer<float>>>> remoteBricks;
         bool updateQueued = false;
         ViewState prev;
         bool havePrev = false;
@@ -333,6 +339,7 @@ namespace sirius::app::gui {
             Kind kind = Kind::None;
             bool active = false;
             bool background = false;            // Alt was held at the press
+            bool forceNew = false;              // Shift was: a click starts a new object
             SlicePane::Kind pane = SlicePane::Kind::XY;
             DPoint start, last;                 // pane coordinates
             std::vector<DPoint> stroke;
@@ -343,19 +350,29 @@ namespace sirius::app::gui {
         // A z range dragged in XZ / YZ in Box mode: the next box drawn in XY
         // spans it, [z0, z1).
         std::optional<std::array<Index, 2>> nextBoxZ;
-        // The Prompt step takes points only (micro-SAM): Box and Scribble
-        // fall back to clicks.
-        bool promptPointsOnly() const {
+        // The Prompt step's model is 2-D (micro-SAM): an object's prompts
+        // share a plane, so a box is one plane deep, there is no z range to
+        // drag in XZ / YZ, and a correction goes to an object on its plane.
+        bool promptPlanar() const {
             const int i = promptStep();
-            return i >= 0 && wb.pipeline().at(i).op().info().promptPointsOnly;
+            return i >= 0 && wb.pipeline().at(i).op().info().promptPlanar;
         }
-        PromptMode promptMode() const { return promptPointsOnly() ? PromptMode::Click : vs().promptMode; }
+        PromptMode promptMode() const { return vs().promptMode; }
         void promptPress(const SlicePane& pane, const DPoint& v, ImGuiKeyChord m);
         void promptMove(const SlicePane& pane, const DPoint& v);
         void promptRelease(const SlicePane& pane);
-        // A click: removes the prompt under it, else places an object or a
-        // background point there. False when there was nothing to do.
-        bool promptClick(const SlicePane& pane, const DPoint& v, bool object);
+        // A click: removes the prompt under it, else places a point where
+        // promptClickTarget (ops/common.hpp) says -- an object click inside
+        // an object's mask grows that object, elsewhere (or with Shift,
+        // `forceNew`) starts one; a background click corrects the object
+        // under it or the nearest. False when there was nothing to do.
+        bool promptClick(const SlicePane& pane, const DPoint& v, bool positive, bool forceNew = false);
+        // The label the Prompt step's last result has at a voxel of the
+        // time point on screen: the id of the object whose mask is there.
+        std::uint32_t promptMaskAt(int step, Index z, Index y, Index x) const;
+        // Why the last click placed nothing (a correction with no object to
+        // correct), shown as the tool's hint until the next edit.
+        std::string promptNotice;
         // The prompt of the frame on `pane`'s plane under `v` (a point's
         // disc, a box's outline, a scribble's stroke), by its index in the
         // step's list; -1 when none is within kPromptHitPx.
@@ -643,6 +660,7 @@ namespace sirius::app::gui {
         const bool viewChanged = r.viewState != seen.viewState;
         seen = r;
         if (promptsMoved) {
+            promptNotice.clear();   // why a click placed nothing: about prompts that have changed
             pushMarkers();
             refreshHints();
         }
@@ -694,6 +712,7 @@ namespace sirius::app::gui {
             haveVol = haveMip = false;
             return;
         }
+        if (m.isRemote()) return;   // the worker re-slices and projects: nothing to hold here
         for (Index c = 0; c < m.dims().c; ++c) {
             if (!vs().channelOn(c)) continue;
             if (!m.volumeIfReady(c, t)) haveVol = false;
@@ -917,11 +936,12 @@ namespace sirius::app::gui {
             case ViewerTool::Prompt:
                 if (!canPaint()) hint = "prompts are paused while a run is in progress";
                 else if (promptStep() < 0) hint = "select or view a step whose task is Prompt objects";
+                else if (!promptNotice.empty()) hint = promptNotice;
                 else if (promptMode() == PromptMode::Box)
-                    hint = "drag \xC2\xB7 box   click \xC2\xB7 point   Alt \xC2\xB7 background";
+                    hint = "drag \xC2\xB7 new object   click \xC2\xB7 point   Alt \xC2\xB7 correct";
                 else if (promptMode() == PromptMode::Scribble)
-                    hint = "draw \xC2\xB7 scribble   click \xC2\xB7 point   Alt \xC2\xB7 background";
-                else hint = "click \xC2\xB7 object   Alt / right-click \xC2\xB7 background";
+                    hint = "draw \xC2\xB7 new object   click \xC2\xB7 point   Alt \xC2\xB7 correct";
+                else hint = "click \xC2\xB7 point   Alt \xC2\xB7 correct   Shift \xC2\xB7 new object";
                 break;
             case ViewerTool::Paint: {
                 if (!canPaint()) {
@@ -961,7 +981,7 @@ namespace sirius::app::gui {
         // XZ says what a drag does there in Box mode: the z of a box (YZ is
         // too narrow for the line, and does the same)
         std::string side;
-        if (s.tool == ViewerTool::Prompt && canPaint() && promptStep() >= 0 && promptMode() == PromptMode::Box) {
+        if (s.tool == ViewerTool::Prompt && canPaint() && promptStep() >= 0 && promptMode() == PromptMode::Box && !promptPlanar()) {
             side = "drag \xC2\xB7 next box's z   a box's edge \xC2\xB7 its z";
             if (nextBoxZ)
                 side = format("next box z %lld\xE2\x80\x93%lld   Esc \xC2\xB7 clear", static_cast<long long>((*nextBoxZ)[0]),
@@ -1459,15 +1479,34 @@ namespace sirius::app::gui {
         mix(static_cast<std::uint64_t>(t));
         for (Index c = 0; c < model.dims().c; ++c) {
             if (!s.channelOn(c)) continue;
-            const float* v = model.volumeIfReady(c, t);
-            if (!v) continue;
             ViewerLoader::Channel ch;
-            ch.out = model.output();
-            ch.hold = model.volumeHold(c, t);
-            ch.data = v;
-            ch.z = nz();
-            ch.y = ny();
-            ch.x = nx();
+            if (model.isRemote()) {
+                // a cluster dataset: the worker's small volume (longest side 256), sent once per (c, t)
+                const std::shared_ptr<const ViewTile> tile = model.remoteVolume(c, t);
+                if (!tile) continue;
+                auto& brick = remoteBricks[c];
+                if (brick.first != tile.get()) {
+                    auto buf = std::make_shared<Buffer<float>>(Shape{tile->d, tile->h, tile->w});
+                    std::copy(tile->data.begin(), tile->data.end(), buf->data());
+                    brick = {tile.get(), std::move(buf)};
+                }
+                ch.out = model.output();
+                ch.hold = brick.second;
+                ch.data = brick.second->data();
+                ch.z = tile->d;
+                ch.y = tile->h;
+                ch.x = tile->w;
+                mix(static_cast<std::uint64_t>(reinterpret_cast<std::uintptr_t>(tile.get())));
+            } else {
+                const float* v = model.volumeIfReady(c, t);
+                if (!v) continue;
+                ch.out = model.output();
+                ch.hold = model.volumeHold(c, t);
+                ch.data = v;
+                ch.z = nz();
+                ch.y = ny();
+                ch.x = nx();
+            }
             const DisplayWindow w = model.window(c, t);
             ch.lo = w.lo;
             ch.hi = w.hi;
@@ -1481,7 +1520,9 @@ namespace sirius::app::gui {
             mix(bits(w.hi));
             chans.push_back(ch);
         }
-        if (chans.empty()) {
+        if (chans.empty() && model.isRemote()) {
+            volume.setPreparing("Loading volume from the cluster\xE2\x80\xA6");
+        } else if (chans.empty()) {
             volume.clearVolumes();
             volume.setPreparing(std::string());
             volumeKey = shownVolumeKey = 0;
@@ -1822,7 +1863,11 @@ namespace sirius::app::gui {
                     const SlicePane::Kind kind = kinds[pane];
                     const auto onPlane = [&](double depth) { return static_cast<Index>(std::floor(depth)) == planes[pane]; };
                     SlicePane::PromptMark m;
-                    m.object = p.object;
+                    // each object in the colour its mask has in the label overlay:
+                    // its id is the mask's label
+                    m.positive = p.positive;
+                    m.objectId = p.objectId;
+                    m.color = theme::fromFloat(labelColor(p.objectId));
                     switch (p.kind) {
                         case Prompt::Kind::Point:
                             m.a = onPane(kind, p.at);
@@ -1846,6 +1891,17 @@ namespace sirius::app::gui {
                     }
                     marks[pane].push_back(std::move(m));
                 }
+            }
+            // the object's number beside its first prompt on the pane's plane
+            // (or its first anywhere, when none is on the plane)
+            for (std::vector<SlicePane::PromptMark>& list : marks) {
+                std::vector<std::uint32_t> tagged;
+                for (const bool inPlane : {true, false})
+                    for (SlicePane::PromptMark& m : list) {
+                        if (m.inPlane != inPlane || std::find(tagged.begin(), tagged.end(), m.objectId) != tagged.end()) continue;
+                        m.tag = std::to_string(m.objectId);
+                        tagged.push_back(m.objectId);
+                    }
             }
         }
         // what is being drawn
@@ -1979,7 +2035,15 @@ namespace sirius::app::gui {
         schedulePromptRun(id);
     }
 
-    bool Viewer::Impl::promptClick(const SlicePane& pane, const DPoint& v, bool object) {
+    std::uint32_t Viewer::Impl::promptMaskAt(int step, Index z, Index y, Index x) const {
+        const std::shared_ptr<const StepOutput> out = wb.output(step);
+        const LabelVolume* L = out ? out->labels.get() : nullptr;
+        const Index t = curT();
+        if (!L || t >= L->t() || z < 0 || z >= L->z() || y < 0 || y >= L->y() || x < 0 || x >= L->x()) return 0;
+        return L->at(t, z, y, x);
+    }
+
+    bool Viewer::Impl::promptClick(const SlicePane& pane, const DPoint& v, bool positive, bool forceNew) {
         // a run holds the pipeline, and its parameters with it (Workbench::canEdit)
         if (!model.valid() || !canPaint()) return false;
         const int i = promptStep();
@@ -1988,12 +2052,14 @@ namespace sirius::app::gui {
         std::vector<Prompt> prompts = promptsOf(st.params);
         const int hit = promptAt(pane, v);
         if (hit >= 0) {
-            static const char* const names[] = {"point", "box", "scribble"};
+            static const char* const names[] = {"a point", "the box", "a scribble"};
             const Prompt gone = prompts[static_cast<std::size_t>(hit)];
-            prompts.erase(prompts.begin() + hit);
-            const std::string what = gone.kind == Prompt::Kind::Point ? (gone.object ? "object point" : "background point")
-                                                                      : names[static_cast<int>(gone.kind)];
-            editPrompts(i, prompts, st.name + " \xC2\xB7 removed a " + what);
+            const std::vector<Prompt> kept = removePrompt(prompts, static_cast<std::size_t>(hit));
+            const char* what = gone.kind == Prompt::Kind::Point ? (gone.positive ? "a point" : "a correction") : names[static_cast<int>(gone.kind)];
+            // the object's last object prompt takes its corrections with it
+            const bool whole = std::none_of(kept.begin(), kept.end(), [&](const Prompt& p) { return p.objectId == gone.objectId && p.t == gone.t; });
+            promptNotice.clear();
+            editPrompts(i, kept, format("%s \xC2\xB7 removed %s of object %u", st.name.c_str(), whole ? "the last prompt" : what, gone.objectId));
             return true;
         }
         // A click beside the image places nothing: the worker refuses a point
@@ -2009,8 +2075,18 @@ namespace sirius::app::gui {
             y = static_cast<double>(clampIndex(v.y, ny()));
             z = static_cast<double>(clampIndex(v.x, nz()));
         }
-        prompts.push_back(Prompt::point(x, y, z, curT(), object));
-        editPrompts(i, prompts, format("%s \xC2\xB7 %s point at x %g, y %g, z %g", st.name.c_str(), object ? "object" : "background", x, y, z));
+        const std::uint32_t under = promptMaskAt(i, static_cast<Index>(z), static_cast<Index>(y), static_cast<Index>(x));
+        const PromptClick target = promptClickTarget(prompts, curT(), {x, y, z}, under, positive, forceNew, promptPlanar());
+        if (target.action == PromptClick::Action::None) {
+            promptNotice = target.why;
+            refreshHints();
+            return false;
+        }
+        promptNotice.clear();
+        prompts.push_back(Prompt::point(x, y, z, curT(), positive, target.object));
+        const char* what = target.action == PromptClick::Action::NewObject ? "new object" : positive ? "grew object"
+                                                                                                     : "corrected object";
+        editPrompts(i, prompts, format("%s \xC2\xB7 %s %u at x %g, y %g, z %g", st.name.c_str(), what, target.object, x, y, z));
         return true;
     }
 
@@ -2021,7 +2097,8 @@ namespace sirius::app::gui {
         gesture.pane = pane.kind();
         gesture.start = gesture.last = v;
         gesture.background = (m & ImGuiMod_Alt) != 0;
-        if (pane.kind() != SlicePane::Kind::XY && !promptPointsOnly()) {
+        gesture.forceNew = (m & ImGuiMod_Shift) != 0;
+        if (pane.kind() != SlicePane::Kind::XY && !promptPlanar()) {
             int edge = 0;
             const int k = boxEdgeAt(pane, v, edge);
             if (k >= 0) {
@@ -2047,7 +2124,7 @@ namespace sirius::app::gui {
             else if (pane.kind() == SlicePane::Kind::XY && mode == PromptMode::Scribble) {
                 gesture.kind = PromptGesture::Kind::Stroke;
                 gesture.stroke = {gesture.start};
-            } else if (pane.kind() != SlicePane::Kind::XY && mode == PromptMode::Box) {
+            } else if (pane.kind() != SlicePane::Kind::XY && mode == PromptMode::Box && !promptPlanar()) {
                 gesture.kind = PromptGesture::Kind::ZRange;
             }
             if (gesture.kind == PromptGesture::Kind::None) return;
@@ -2072,7 +2149,7 @@ namespace sirius::app::gui {
         const Step& st = wb.pipeline().at(i);
         std::vector<Prompt> prompts = promptsOf(st.params);
         switch (g.kind) {
-            case PromptGesture::Kind::None: promptClick(pane, g.start, !g.background); break;
+            case PromptGesture::Kind::None: promptClick(pane, g.start, !g.background, g.forceNew); break;
             case PromptGesture::Kind::Box: {
                 const auto span = [](double a, double b, Index n, double& lo, double& hi) {
                     lo = static_cast<double>(clampIndex(std::min(a, b), n));
@@ -2082,11 +2159,15 @@ namespace sirius::app::gui {
                 span(g.start.x, g.last.x, nx(), x0, x1);
                 span(g.start.y, g.last.y, ny(), y0, y1);
                 if (x1 - x0 < 2.0 || y1 - y0 < 2.0) {   // a box of a voxel is a click that slipped
-                    promptClick(pane, g.start, true);
+                    promptClick(pane, g.start, true, g.forceNew);
                     break;
                 }
                 double z0 = 0.0, z1 = 0.0;
-                if (nextBoxZ) {
+                if (promptPlanar()) {
+                    // a 2-D model answers a box in its middle plane: this one
+                    z0 = static_cast<double>(curZ());
+                    z1 = z0 + 1.0;
+                } else if (nextBoxZ) {
                     z0 = static_cast<double>((*nextBoxZ)[0]);
                     z1 = static_cast<double>((*nextBoxZ)[1]);
                     nextBoxZ.reset();
@@ -2099,8 +2180,13 @@ namespace sirius::app::gui {
                     z0 = std::max(0.0, static_cast<double>(curZ()) - half);
                     z1 = std::min(static_cast<double>(nz()), static_cast<double>(curZ()) + half + 1.0);
                 }
-                prompts.push_back(Prompt::boxOf({x0, y0, z0, x1, y1, z1}, curT()));
-                editPrompts(i, prompts, format("%s \xC2\xB7 box x %g\xE2\x80\x93%g, y %g\xE2\x80\x93%g, z %g\xE2\x80\x93%g", st.name.c_str(), x0, x1 - 1, y0, y1 - 1, z0, z1 - 1));
+                // a box starts a new object: one object takes one box
+                const std::uint32_t id = nextPromptObject(prompts);
+                prompts.push_back(Prompt::boxOf({x0, y0, z0, x1, y1, z1}, curT(), id));
+                promptNotice.clear();
+                editPrompts(i, prompts,
+                            format("%s \xC2\xB7 new object %u, box x %g\xE2\x80\x93%g, y %g\xE2\x80\x93%g, z %g\xE2\x80\x93%g", st.name.c_str(), id, x0, x1 - 1, y0,
+                                   y1 - 1, z0, z1 - 1));
                 break;
             }
             case PromptGesture::Kind::Stroke: {
@@ -2112,14 +2198,18 @@ namespace sirius::app::gui {
                     if (stroke.empty() || stroke.back() != q) stroke.push_back(q);
                 }
                 if (stroke.size() < 2) {
-                    promptClick(pane, g.start, true);
+                    promptClick(pane, g.start, true, g.forceNew);
                     break;
                 }
                 // every voxel the stroke passed, up to a length the pipeline file
                 // still reads well with; the run sends a few of them
                 stroke = scribbleSample(stroke, 256);
-                prompts.push_back(Prompt::scribble(stroke, curT(), true));
-                editPrompts(i, prompts, format("%s \xC2\xB7 scribble over %zu voxels at z %lld", st.name.c_str(), stroke.size(), static_cast<long long>(curZ())));
+                const std::uint32_t id = nextPromptObject(prompts);   // a scribble starts a new object
+                prompts.push_back(Prompt::scribble(stroke, curT(), true, id));
+                promptNotice.clear();
+                editPrompts(i, prompts,
+                            format("%s \xC2\xB7 new object %u, scribble over %zu voxels at z %lld", st.name.c_str(), id, stroke.size(),
+                                   static_cast<long long>(curZ())));
                 break;
             }
             case PromptGesture::Kind::ZRange: {
@@ -2132,7 +2222,7 @@ namespace sirius::app::gui {
             }
             case PromptGesture::Kind::ZEdge: {
                 if (g.z == g.from || g.prompt < 0 || static_cast<std::size_t>(g.prompt) >= prompts.size()) {
-                    promptClick(pane, g.start, true);   // not moved: a click on the box, which removes it
+                    promptClick(pane, g.start, true, g.forceNew);   // not moved: a click on the box, which removes it
                     break;
                 }
                 Prompt& box = prompts[static_cast<std::size_t>(g.prompt)];
@@ -2344,7 +2434,7 @@ namespace sirius::app::gui {
                                                                                              : yz;
             int edge = 0;
             ImGuiMouseCursor shape = ImGuiMouseCursor_Arrow;
-            if (!promptPointsOnly() && boxEdgeAt(pane, v, edge) >= 0)
+            if (!promptPlanar() && boxEdgeAt(pane, v, edge) >= 0)
                 shape = kind == SlicePane::Kind::XZ ? ImGuiMouseCursor_ResizeNS : ImGuiMouseCursor_ResizeEW;
             else if (promptAt(pane, v) >= 0)
                 shape = ImGuiMouseCursor_Hand;
@@ -2732,26 +2822,24 @@ namespace sirius::app::gui {
             // While Prompt is the tool, what it places: one button that shows
             // the mode and steps to the next (Box, Click, Scribble), so the
             // strip stays short enough for the default window; the
-            // Parameters panel has the three side by side. A step that takes
-            // points only (micro-SAM) stays on Click.
+            // Parameters panel has the three side by side.
             if (t.tool == ViewerTool::Prompt && s.tool == ViewerTool::Prompt && promptStep() >= 0) {
                 static const struct {
                     Icon icon;
                     const char* name;
                     const char* what;
-                } modeDefs[] = {{Icon::Roi, "Box", "drag around an object in XY; its z span follows its size, or a drag in XZ / YZ"},
-                                {Icon::Pick, "Click", "click an object; Alt or right click marks background"},
-                                {Icon::Pencil, "Scribble", "draw a stroke over an object in XY"}};
+                } modeDefs[] = {{Icon::Roi, "Box", "drag around a new object in XY; its z span follows its size, or a drag in XZ / YZ"},
+                                {Icon::Pick, "Click", "click an object; inside its mask a click grows it, Alt or right click corrects it"},
+                                {Icon::Pencil, "Scribble", "draw a stroke over a new object in XY"}};
                 const int mode = static_cast<int>(promptMode());
                 const int nextMode = (mode + 1) % 3;
                 const float mb = px(24);
                 ImGui::SetCursorScreenPos(ImVec2(cx - mb * 0.5f, y));
                 widgets::GlyphOpts mo;
-                mo.enabled = promptOk && !promptPointsOnly();
+                mo.enabled = promptOk;
                 mo.tooltip = std::string("Prompt with a ") + modeDefs[mode].name + ": " + modeDefs[mode].what + ". Click for " +
                              modeDefs[nextMode].name + ".";
-                if (promptPointsOnly())
-                    mo.tooltip = "Prompt with clicks: micro-SAM takes points only here; boxes and scribbles need a Foundation model step.";
+                if (promptPlanar()) mo.tooltip += " micro-SAM is 2-D: an object and its corrections stay on one plane.";
                 if (widgets::glyphButton("##promptMode", modeDefs[mode].icon, 24, mo)) {
                     ViewState ns = vs();
                     ns.promptMode = static_cast<PromptMode>(nextMode);
@@ -2809,6 +2897,19 @@ namespace sirius::app::gui {
             app.requestRedraw();
         }
         sync();
+        // a cluster dataset: redraw what has arrived, keep frames coming while fetches run
+        if (model.isRemote() || rawModel.isRemote()) {
+            const std::uint64_t rev = model.remoteRevision() + rawModel.remoteRevision();
+            if (rev != remoteRev) {
+                remoteRev = rev;
+                dirty = Dirty{};
+                scheduleUpdate();
+                const std::string err = model.remoteError();
+                if (!err.empty() && err != remoteError) wb.logLine("Viewer: the cluster could not send a view: " + err);
+                remoteError = err;
+            }
+            if (model.remoteBusy() || rawModel.remoteBusy()) app.requestRedraw();
+        }
 
         // regions: toolbar, rule, canvas, rule, dims strip
         const float rule = theme::crispPen(theme::kRule);

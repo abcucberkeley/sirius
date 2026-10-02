@@ -197,14 +197,29 @@ namespace sirius::app {
     // A Prompt step segments the objects a person points at instead of every
     // object: its "task" is kPromptTask and its kPromptsKey parameter holds
     // the prompts, in voxels of the step's input and the application's axis
-    // order, each on one time point t:
-    //   {"kind": "point", "x", "y", "z", "t", "label"}   label 1 object, 0 background
-    //   {"kind": "box", "x0", "y0", "z0", "x1", "y1", "z1", "t"}
+    // order, each on one time point t and each belonging to one object:
+    //   {"kind": "point", "x", "y", "z", "t", "label", "object"}
+    //       label 1 object, 0 background
+    //   {"kind": "box", "x0", "y0", "z0", "x1", "y1", "z1", "t", "object"}
     //       corners inclusive-exclusive; a box always names an object
-    //   {"kind": "scribble", "points": [[x, y, z], ...], "t", "label"}
-    //       the stroke as drawn; one stroke names one object (or background)
+    //   {"kind": "scribble", "points": [[x, y, z], ...], "t", "label", "object"}
+    //       the stroke as drawn
+    // "object" is an id >= 1. One object is one mask: all of its prompts on a
+    // time point go to the model together (the worker's joint `objects`
+    // form), so a background point -- a correction -- refines that object's
+    // mask instead of asking for another one, and the mask comes back with
+    // the object's id as its label, the same id on every re-run.
     // An entry without a kind is a point; a kind this build does not know is
     // refused rather than read as something else.
+    //
+    // A list written before objects existed (no "object" keys) still reads:
+    // an object prompt (a box, an object point or scribble) without an id
+    // becomes an object of its own, numbered after the highest id in the
+    // list, in list order; a background prompt without an id joins the
+    // nearest object on its time point (promptDistance to that object's
+    // prompts, the lower id on a tie), and when its time point has no object
+    // it becomes an object with only background prompts, which is kept but
+    // never sent (validatePrompts warns).
     inline constexpr const char* kPromptsKey = "prompts";
     inline constexpr const char* kPromptTask = "Prompt objects";
 
@@ -217,24 +232,32 @@ namespace sirius::app {
         std::array<double, 6> box{};                    // a box: (x0, y0, z0, x1, y1, z1)
         std::vector<std::array<double, 3>> stroke;      // a scribble: its points
         std::int64_t t = 0;
-        bool object = true;                             // false: background (never for a box)
+        bool positive = true;                           // false: background (never for a box)
+        std::uint32_t objectId = 0;                     // >= 1 once stored; 0 asks for one (above)
 
-        static Prompt point(double x, double y, double z, std::int64_t t = 0, bool object = true);
-        static Prompt boxOf(std::array<double, 6> corners, std::int64_t t = 0);
-        static Prompt scribble(std::vector<std::array<double, 3>> points, std::int64_t t = 0, bool object = true);
+        static Prompt point(double x, double y, double z, std::int64_t t = 0, bool positive = true, std::uint32_t objectId = 0);
+        static Prompt boxOf(std::array<double, 6> corners, std::int64_t t = 0, std::uint32_t objectId = 0);
+        static Prompt scribble(std::vector<std::array<double, 3>> points, std::int64_t t = 0, bool positive = true,
+                               std::uint32_t objectId = 0);
         friend bool operator==(const Prompt& a, const Prompt& b) noexcept {
-            return a.kind == b.kind && a.at == b.at && a.box == b.box && a.stroke == b.stroke && a.t == b.t && a.object == b.object;
+            return a.kind == b.kind && a.at == b.at && a.box == b.box && a.stroke == b.stroke && a.t == b.t &&
+                   a.positive == b.positive && a.objectId == b.objectId;
         }
     };
 
-    // The prompts stored under `key`; none when there are none or the value is
-    // not a list of prompts.
+    // The prompts stored under `key`, each with its object id; none when
+    // there are none or the value is not a list of prompts.
     std::vector<Prompt> promptsOf(const ParamSet& p, const std::string& key = kPromptsKey);
-    // The parameter value that stores `prompts`, in the canonical form.
+    // The parameter value that stores `prompts`, in the canonical form (a
+    // prompt with objectId 0 gets one, as in a list written before objects).
     ParamValue promptsValue(const std::vector<Prompt>& prompts);
     // Whether a step with these parameters is a Prompt step: its task is
     // kPromptTask and it has a place for the prompts.
     bool isPromptStep(const ParamSet& p);
+    // Voxels from `q` to the prompt: to a point, to the nearest voxel of a box
+    // (0 inside it), to the nearest point of a scribble. Its time point is not
+    // looked at.
+    double promptDistance(const Prompt& p, const std::array<double, 3>& q);
 
 } // namespace sirius::app
 

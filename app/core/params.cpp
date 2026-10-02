@@ -4,6 +4,7 @@
 #include <cmath>
 #include <cstdio>
 #include <functional>
+#include <limits>
 #include <sstream>
 #include <stdexcept>
 
@@ -299,13 +300,18 @@ namespace sirius::app {
                 return out;
             }
             // What a person reads in an undo entry or a tool's change list:
-            // "1 box, 2 points", not the JSON of them.
+            // "2 objects: 1 box, 2 points", not the JSON of them.
             std::string operator()(const ParamJson& v) const {
                 const json j = json::parse(v.text, nullptr, false);
                 if (!j.is_array()) return v.text;
                 if (j.empty()) return "none";
                 std::size_t points = 0, boxes = 0, scribbles = 0, other = 0;
+                std::vector<std::int64_t> objects;
                 for (const json& e : j) {
+                    if (e.is_object() && e.contains("object") && e["object"].is_number_integer()) {
+                        const std::int64_t id = e["object"].get<std::int64_t>();
+                        if (std::find(objects.begin(), objects.end(), id) == objects.end()) objects.push_back(id);
+                    }
                     const std::string kind = e.is_object() && e.contains("kind") && e["kind"].is_string() ? e["kind"].get<std::string>()
                                              : e.is_object() && e.contains("x")                           ? std::string("point")
                                                                                                           : std::string();
@@ -323,6 +329,7 @@ namespace sirius::app {
                 part(points, "point", "points");
                 part(scribbles, "scribble", "scribbles");
                 part(other, "entry", "entries");
+                if (!objects.empty()) out = std::to_string(objects.size()) + (objects.size() == 1 ? " object: " : " objects: ") + out;
                 return out;
             }
         };
@@ -349,6 +356,66 @@ namespace sirius::app {
             return out;
         }
 
+        // A canonical record (coercePrompts) as a Prompt.
+        Prompt promptOfRecord(const json& e) {
+            const std::string kind = e.at("kind").get<std::string>();
+            const std::int64_t t = e.at("t").get<std::int64_t>();
+            const std::uint32_t id = e.contains("object") ? e["object"].get<std::uint32_t>() : 0u;
+            if (kind == "box")
+                return Prompt::boxOf({e.at("x0").get<double>(), e.at("y0").get<double>(), e.at("z0").get<double>(), e.at("x1").get<double>(),
+                                      e.at("y1").get<double>(), e.at("z1").get<double>()},
+                                     t, id);
+            if (kind == "scribble") {
+                std::vector<std::array<double, 3>> stroke;
+                for (const json& q : e.at("points")) stroke.push_back({q[0].get<double>(), q[1].get<double>(), q[2].get<double>()});
+                return Prompt::scribble(std::move(stroke), t, e.at("label").get<int>() != 0, id);
+            }
+            return Prompt::point(e.at("x").get<double>(), e.at("y").get<double>(), e.at("z").get<double>(), t, e.at("label").get<int>() != 0, id);
+        }
+
+        // The object ids a list written before objects did not have
+        // (params.hpp): an object prompt starts an object of its own,
+        // numbered after the highest id in the list; a background prompt
+        // joins the object nearest to it on its time point, or, on a time
+        // point without any, the one object that holds that time point's
+        // stray background prompts and is never sent.
+        void assignPromptObjects(const json& records, std::vector<std::uint32_t>& ids) {
+            if (std::none_of(ids.begin(), ids.end(), [](std::uint32_t id) { return id == 0; })) return;
+            std::vector<Prompt> prompts;
+            for (const json& e : records) prompts.push_back(promptOfRecord(e));
+            std::uint32_t top = 0;
+            for (const std::uint32_t id : ids) top = std::max(top, id);
+            for (std::size_t i = 0; i < prompts.size(); ++i)
+                if (ids[i] == 0 && prompts[i].positive) ids[i] = ++top;
+            std::vector<std::pair<std::int64_t, std::uint32_t>> strays;   // time point, its background-only object
+            for (std::size_t i = 0; i < prompts.size(); ++i) {
+                if (ids[i] != 0) continue;
+                const Prompt& q = prompts[i];
+                const std::vector<std::array<double, 3>> from = q.kind == Prompt::Kind::Scribble ? q.stroke : std::vector<std::array<double, 3>>{q.at};
+                std::uint32_t best = 0;
+                double bestD = std::numeric_limits<double>::infinity();
+                for (std::size_t j = 0; j < prompts.size(); ++j) {
+                    if (j == i || ids[j] == 0 || !prompts[j].positive || prompts[j].t != q.t) continue;
+                    double d = std::numeric_limits<double>::infinity();
+                    for (const std::array<double, 3>& a : from) d = std::min(d, promptDistance(prompts[j], a));
+                    if (d < bestD || (d == bestD && ids[j] < best)) {
+                        bestD = d;
+                        best = ids[j];
+                    }
+                }
+                if (best == 0) {
+                    const auto it = std::find_if(strays.begin(), strays.end(), [&](const auto& s) { return s.first == q.t; });
+                    if (it != strays.end()) {
+                        best = it->second;
+                    } else {
+                        best = ++top;
+                        strays.emplace_back(q.t, best);
+                    }
+                }
+                ids[i] = best;
+            }
+        }
+
         // The canonical list of prompts, or invalid_argument naming the entry
         // that is wrong and why. Accepted: the list itself, its JSON text, and
         // the list of JSON texts an older reader of the file made of it.
@@ -356,8 +423,8 @@ namespace sirius::app {
             const std::function<std::invalid_argument(const std::string&)> bad = [&](const std::string& what) {
                 return std::invalid_argument("parameter '" + spec.key + "': " + what);
             };
-            const std::string shapes = R"(points {"x", "y", "z", "t", "label"}, boxes {"kind": "box", "x0", "y0", "z0", "x1", "y1", "z1", "t"} )"
-                                       R"(and scribbles {"kind": "scribble", "points": [[x, y, z], ...], "t", "label"})";
+            const std::string shapes = R"(points {"x", "y", "z", "t", "label", "object"}, boxes {"kind": "box", "x0", "y0", "z0", "x1", "y1", "z1", "t", "object"} )"
+                                       R"(and scribbles {"kind": "scribble", "points": [[x, y, z], ...], "t", "label", "object"})";
             json list = given;
             if (list.is_string()) {
                 const std::string text = list.get<std::string>();
@@ -367,6 +434,7 @@ namespace sirius::app {
             if (list.is_null()) list = json::array();
             if (!list.is_array()) throw bad("expected a list of " + shapes + ", got " + given.dump());
             json out = json::array();
+            std::vector<std::uint32_t> ids;   // per entry, 0 until assigned
             for (std::size_t i = 0; i < list.size(); ++i) {
                 json e = list[i];
                 if (e.is_string()) e = json::parse(e.get<std::string>(), nullptr, false);
@@ -426,8 +494,19 @@ namespace sirius::app {
                 } else {
                     p["label"] = label;
                 }
+                std::uint32_t id = 0;
+                if (e.contains("object") && !e["object"].is_null()) {
+                    const json& o = e["object"];
+                    const double ov = o.is_number() ? o.get<double>() : 0.0;
+                    if (!(ov >= 1.0) || ov > 1e9 || std::floor(ov) != ov)
+                        throw bad(which + ": 'object' is the id of the object the prompt belongs to, an integer >= 1, got " + o.dump());
+                    id = static_cast<std::uint32_t>(ov);
+                }
+                ids.push_back(id);
                 out.push_back(std::move(p));
             }
+            assignPromptObjects(out, ids);
+            for (std::size_t i = 0; i < out.size(); ++i) out[i]["object"] = ids[i];
             return ParamJson{out.dump()};
         }
     } // namespace
@@ -576,9 +655,14 @@ namespace sirius::app {
                 const json voxel = {{"type", "number"}, {"minimum", 0}};
                 const json frame = {{"type", "integer"}, {"minimum", 0}, {"description", "time point (default 0)"}};
                 const json label = {{"type", "integer"}, {"enum", {0, 1}}, {"description", "1 object (default), 0 background"}};
+                const json object = {{"type", "integer"},
+                                     {"minimum", 1},
+                                     {"description", "the object it belongs to: one object is one mask, whose label is this id, and a "
+                                                     "background prompt refines its object's mask. Default: an object prompt starts a "
+                                                     "new object, a background one joins the nearest object on its time point"}};
                 s["type"] = "array";
                 s["items"] = {{"type", "object"},
-                              {"description", "voxels of the step's input, x y z order; one mask per prompt"},
+                              {"description", "voxels of the step's input, x y z order; one mask per object"},
                               {"properties",
                                {{"kind", {{"type", "string"}, {"enum", {"point", "box", "scribble"}}, {"description", "default point"}}},
                                 {"x", voxel},
@@ -592,8 +676,10 @@ namespace sirius::app {
                                 {"z1", voxel},
                                 {"points", {{"type", "array"}, {"items", {{"type", "array"}, {"items", voxel}, {"minItems", 3}, {"maxItems", 3}}}}},
                                 {"t", frame},
-                                {"label", label}}}};
-                desc += " (a point needs x, y, z; a box x0, y0, z0, x1, y1, z1, the upper corner exclusive; a scribble points)";
+                                {"label", label},
+                                {"object", object}}}};
+                desc += " (a point needs x, y, z; a box x0, y0, z0, x1, y1, z1, the upper corner exclusive; a scribble points; the "
+                        "prompts with one object id are one object, refined together, at most one box each)";
                 break;
             }
         }
@@ -603,29 +689,32 @@ namespace sirius::app {
 
     // --- prompts --------------------------------------------------------------
 
-    Prompt Prompt::point(double x, double y, double z, std::int64_t t, bool object) {
+    Prompt Prompt::point(double x, double y, double z, std::int64_t t, bool positive, std::uint32_t objectId) {
         Prompt p;
         p.kind = Kind::Point;
         p.at = {x, y, z};
         p.t = t;
-        p.object = object;
+        p.positive = positive;
+        p.objectId = objectId;
         return p;
     }
 
-    Prompt Prompt::boxOf(std::array<double, 6> corners, std::int64_t t) {
+    Prompt Prompt::boxOf(std::array<double, 6> corners, std::int64_t t, std::uint32_t objectId) {
         Prompt p;
         p.kind = Kind::Box;
         p.box = corners;
         p.t = t;
+        p.objectId = objectId;
         return p;
     }
 
-    Prompt Prompt::scribble(std::vector<std::array<double, 3>> points, std::int64_t t, bool object) {
+    Prompt Prompt::scribble(std::vector<std::array<double, 3>> points, std::int64_t t, bool positive, std::uint32_t objectId) {
         Prompt p;
         p.kind = Kind::Scribble;
         p.stroke = std::move(points);
         p.t = t;
-        p.object = object;
+        p.positive = positive;
+        p.objectId = objectId;
         return p;
     }
 
@@ -642,39 +731,27 @@ namespace sirius::app {
         } catch (const std::exception&) {
             return out;   // not a list of prompts: nothing to place, the step's validation says why
         }
-        for (const json& e : json::parse(std::get<ParamJson>(canonical).text)) {
-            const std::string kind = e.at("kind").get<std::string>();
-            const std::int64_t t = e.at("t").get<std::int64_t>();
-            if (kind == "box") {
-                out.push_back(Prompt::boxOf({e.at("x0").get<double>(), e.at("y0").get<double>(), e.at("z0").get<double>(),
-                                             e.at("x1").get<double>(), e.at("y1").get<double>(), e.at("z1").get<double>()},
-                                            t));
-            } else if (kind == "scribble") {
-                std::vector<std::array<double, 3>> stroke;
-                for (const json& q : e.at("points")) stroke.push_back({q[0].get<double>(), q[1].get<double>(), q[2].get<double>()});
-                out.push_back(Prompt::scribble(std::move(stroke), t, e.at("label").get<int>() != 0));
-            } else {
-                out.push_back(Prompt::point(e.at("x").get<double>(), e.at("y").get<double>(), e.at("z").get<double>(), t,
-                                            e.at("label").get<int>() != 0));
-            }
-        }
+        for (const json& e : json::parse(std::get<ParamJson>(canonical).text)) out.push_back(promptOfRecord(e));
         return out;
     }
 
     ParamValue promptsValue(const std::vector<Prompt>& prompts) {
         json list = json::array();
         for (const Prompt& p : prompts) {
+            json e;
             switch (p.kind) {
                 case Prompt::Kind::Point:
-                    list.push_back({{"kind", "point"}, {"x", p.at[0]}, {"y", p.at[1]}, {"z", p.at[2]}, {"t", p.t}, {"label", p.object ? 1 : 0}});
+                    e = {{"kind", "point"}, {"x", p.at[0]}, {"y", p.at[1]}, {"z", p.at[2]}, {"t", p.t}, {"label", p.positive ? 1 : 0}};
                     break;
                 case Prompt::Kind::Box:
-                    list.push_back({{"kind", "box"}, {"x0", p.box[0]}, {"y0", p.box[1]}, {"z0", p.box[2]}, {"x1", p.box[3]}, {"y1", p.box[4]}, {"z1", p.box[5]}, {"t", p.t}});
+                    e = {{"kind", "box"}, {"x0", p.box[0]}, {"y0", p.box[1]}, {"z0", p.box[2]}, {"x1", p.box[3]}, {"y1", p.box[4]}, {"z1", p.box[5]}, {"t", p.t}};
                     break;
                 case Prompt::Kind::Scribble:
-                    list.push_back({{"kind", "scribble"}, {"points", p.stroke}, {"t", p.t}, {"label", p.object ? 1 : 0}});
+                    e = {{"kind", "scribble"}, {"points", p.stroke}, {"t", p.t}, {"label", p.positive ? 1 : 0}};
                     break;
             }
+            if (p.objectId != 0) e["object"] = p.objectId;
+            list.push_back(std::move(e));
         }
         ParamSpec s;
         s.key = kPromptsKey;
@@ -683,5 +760,26 @@ namespace sirius::app {
     }
 
     bool isPromptStep(const ParamSet& p) { return p.has(kPromptsKey) && p.getString("task") == kPromptTask; }
+
+    double promptDistance(const Prompt& p, const std::array<double, 3>& q) {
+        const auto dist = [](const std::array<double, 3>& a, const std::array<double, 3>& b) {
+            return std::sqrt((a[0] - b[0]) * (a[0] - b[0]) + (a[1] - b[1]) * (a[1] - b[1]) + (a[2] - b[2]) * (a[2] - b[2]));
+        };
+        switch (p.kind) {
+            case Prompt::Kind::Point: return dist(p.at, q);
+            case Prompt::Kind::Box: {
+                // the box's voxels are [lo, hi - 1] on each axis
+                std::array<double, 3> near{};
+                for (std::size_t a = 0; a < 3; ++a) near[a] = std::clamp(q[a], p.box[a], std::max(p.box[a], p.box[a + 3] - 1.0));
+                return dist(near, q);
+            }
+            case Prompt::Kind::Scribble: {
+                double d = std::numeric_limits<double>::infinity();
+                for (const std::array<double, 3>& a : p.stroke) d = std::min(d, dist(a, q));
+                return d;
+            }
+        }
+        return std::numeric_limits<double>::infinity();
+    }
 
 } // namespace sirius::app
