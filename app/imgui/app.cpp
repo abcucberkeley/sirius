@@ -1144,7 +1144,6 @@ namespace sirius::app::gui {
         const ImVec2 pos = ImGui::GetCursorScreenPos();
         const ImGuiStyle& style = ImGui::GetStyle();
         const float spacing = std::trunc(style.ItemSpacing.x * 0.5f);
-        const ImVec2 ts = ImGui::CalcTextSize(name.c_str());
         ImGui::PushStyleColor(ImGuiCol_Text, theme::kTransparent);
         ImGui::PushStyleColor(ImGuiCol_Header, theme::kText);
         ImGui::PushStyleColor(ImGuiCol_HeaderHovered, theme::kText);
@@ -1153,20 +1152,18 @@ namespace sirius::app::gui {
         ImGui::PushStyleVar(ImGuiStyleVar_PopupBorderSize, theme::crispPen(2));
         ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, px(0, 4));
         ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, ImVec2(style.ItemSpacing.x, 0.0f));
-        const float barTop = ImGui::GetWindowPos().y, barBottom = barTop + ImGui::GetCurrentWindow()->MenuBarHeight;
-        const ImVec2 hitMin(pos.x, barTop), hitMax(pos.x + ts.x + 2 * spacing + style.ItemSpacing.x, barBottom);
-        const bool hot = ImGui::IsMouseHoveringRect(hitMin, hitMax) && ImGui::IsWindowHovered(ImGuiHoveredFlags_AllowWhenBlockedByPopup |
-                                                                                              ImGuiHoveredFlags_ChildWindows);
         ImDrawList* barList = ImGui::GetWindowDrawList();
         const bool open = ImGui::BeginMenu(name.c_str());
+        // The title's own box as Dear ImGui laid it out: the hover test, the
+        // ink fill and the paper text all follow it, so they never disagree.
+        const ImVec2 hitMin = ImGui::GetItemRectMin(), hitMax = ImGui::GetItemRectMax();
+        const bool hot = ImGui::IsMouseHoveringRect(hitMin, hitMax) && ImGui::IsWindowHovered(ImGuiHoveredFlags_AllowWhenBlockedByPopup |
+                                                                                              ImGuiHoveredFlags_ChildWindows);
         ImGui::PopStyleVar(1);   // the item spacing was for the title only
         ImGui::PopStyleColor(4);
         ImGui::PushStyleColor(ImGuiCol_Text, theme::kText);
         ImGui::PushStyleColor(ImGuiCol_HeaderHovered, theme::kNeutral200);
         ImGui::PushStyleColor(ImGuiCol_HeaderActive, theme::kNeutral300);
-        // The ink fill is drawn here, from the same test as the text's colour:
-        // Dear ImGui's own hover rectangle is narrower than this one, and paper
-        // text over its missing fill left the title blank at the edges.
         if (open || hot) barList->AddRectFilled(hitMin, hitMax, theme::kText);
         barList->AddText(ImVec2(pos.x + spacing, pos.y + style.FramePadding.y), open || hot ? theme::kBg : theme::kText, name.c_str());
         if (open) {
