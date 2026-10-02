@@ -162,9 +162,6 @@ sirius_core_unit(local_worker      HEADERS local_worker.hpp  SOURCES local_worke
 # watches, and the datasets that stay on the cluster, read by that worker.
 sirius_core_unit(remote_host       HEADERS remote_host.hpp   SOURCES remote_host.cpp
                                    DEPENDS process host secure_wipe LINK nlohmann_json::nlohmann_json Threads::Threads)
-sirius_core_unit(cluster           HEADERS cluster.hpp       SOURCES cluster.cpp
-                                   DEPENDS remote_host rpc cancel errors
-                                   PUBLIC_LINK nlohmann_json::nlohmann_json LINK Threads::Threads)
 
 # --- the engine: SIRIUS's C++ side of the worker protocol (`sirius-cli serve`) -------------
 #
@@ -194,6 +191,10 @@ sirius_core_unit(build_info        HEADERS build_info.hpp    SOURCES build_info.
                                    PUBLIC_LINK nlohmann_json::nlohmann_json)
 target_include_directories(sirius_core_build_info PRIVATE ${_sirius_build_info_dir})
 add_dependencies(sirius_core_build_info sirius_build_info_header)
+# The Slurm session (after build_info: an engine of other operations is refused at its hello).
+sirius_core_unit(cluster           HEADERS cluster.hpp       SOURCES cluster.cpp
+                                   DEPENDS remote_host rpc cancel errors build_info
+                                   PUBLIC_LINK nlohmann_json::nlohmann_json LINK Threads::Threads)
 # Arrays on the wire: zstd (the build's own, cmake/Dependencies.cmake) or zlib,
 # over shuffled bytes, as the client accepts.
 sirius_core_unit(array_codec       HEADERS array_codec.hpp   SOURCES array_codec.cpp
@@ -212,10 +213,6 @@ sirius_core_unit(dataset_service   HEADERS dataset_service.hpp SOURCES dataset_s
 # The datasets that stay on the cluster, read by the worker or the engine there.
 sirius_core_unit(remote_source     HEADERS remote_source.hpp SOURCES remote_source.cpp
                                    DEPENDS array_source array_codec dataset rpc errors lib/checked_math
-                                   PUBLIC_LINK nlohmann_json::nlohmann_json LINK Threads::Threads)
-# `sirius-cli serve`: the datasets in C++, the rest relayed to a Python worker child.
-sirius_core_unit(engine_server     HEADERS engine_server.hpp SOURCES engine_server.cpp
-                                   DEPENDS dataset_service rpc_server rpc array_codec build_info local_worker host cancel errors lib/device
                                    PUBLIC_LINK nlohmann_json::nlohmann_json LINK Threads::Threads)
 if(WIN32)
     target_link_libraries(sirius_core_remote_host PRIVATE ws2_32)
@@ -239,7 +236,7 @@ sirius_core_unit(pipeline
 sirius_core_unit(executor
     HEADERS executor.hpp
     SOURCES executor.cpp
-    DEPENDS operation pipeline array_source cancel
+    DEPENDS operation pipeline array_source cancel lib/device
     LINK nlohmann_json::nlohmann_json)
 
 # A step's result besides its array, for the wire to the engine: meta, reports,
@@ -347,7 +344,7 @@ sirius_core_unit(workbench
     HEADERS workbench.hpp
     SOURCES workbench.cpp
     DEPENDS array_source dataset executor history labels operation pipeline rpc session_log tracks
-            cancel ops_registry ops_factories ops_load_api plugin worker_error
+            cancel ops_registry ops_factories ops_load_api ops_contrast_api plugin worker_error remote_source serialize build_info sha256
     PUBLIC_LINK nlohmann_json::nlohmann_json)
 
 sirius_core_unit(tool_api
@@ -365,7 +362,7 @@ sirius_core_unit(image_encode      HEADERS image_encode.hpp  SOURCES image_encod
 sirius_core_unit(display_model     HEADERS display_model.hpp SOURCES display_model.cpp
                                    DEPENDS byte_budget_lru operation workbench array_source cancel)
 sirius_core_unit(statistics        HEADERS statistics.hpp    SOURCES statistics.cpp
-                                   DEPENDS operation array_source labels tracks cancel dataset lib/pixel_type
+                                   DEPENDS operation array_source labels tracks cancel dataset remote_source lib/pixel_type
                                    PUBLIC_LINK nlohmann_json::nlohmann_json)
 sirius_core_unit(agent_protocol    HEADERS agent_protocol.hpp agent_server.hpp
                                    SOURCES agent_protocol.cpp agent_session.cpp agent_mcp.cpp
@@ -377,6 +374,21 @@ sirius_core_unit(headless          HEADERS headless.hpp
                                            local_worker python_env worker_error host array_source pipeline dataset params
                                            labels tracks diagnostics display_mapping cancel app_paths rpc executor
                                            lib/tiff_io lib/device
+                                   PUBLIC_LINK nlohmann_json::nlohmann_json LINK Threads::Threads)
+
+# --- the engine's node side: the pipelines it runs and the outputs it keeps ---------------
+# (core/engine_node.hpp; above the operations and the executor, below engine_server)
+sirius_core_unit(engine_node
+    HEADERS engine_node.hpp
+    SOURCES engine_node.cpp
+    DEPENDS dataset_service rpc_server rpc executor pipeline operation ops_registry ops_factories serialize statistics
+            remote_source sha256 host cancel array_source lib/device
+    PUBLIC_LINK nlohmann_json::nlohmann_json)
+# `sirius-cli serve`: the datasets in C++, the pipelines run on the node with
+# their outputs kept there (engine_node), the rest relayed to a Python worker child.
+sirius_core_unit(engine_server     HEADERS engine_server.hpp SOURCES engine_server.cpp
+                                   DEPENDS dataset_service rpc_server rpc array_codec build_info local_worker host cancel errors
+                                           engine_node lib/device
                                    PUBLIC_LINK nlohmann_json::nlohmann_json LINK Threads::Threads)
 
 # --- the archive -------------------------------------------------------------

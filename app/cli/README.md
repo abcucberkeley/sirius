@@ -218,7 +218,7 @@ the executor's cache lives in the process: iterative work belongs in
 | `schema` | nothing | `{commands:[{name, synopsis, options:[{name, type, default, help}]}], exit_codes, error_codes, envelope}` |
 | `session [--allow-worker-setup] [--allow-network-paths] [state options]` | the session protocol | (protocol) |
 | `mcp [--allow-worker-setup] [--read-only] [--allow-network-paths] [state options]` | the MCP server | (protocol) |
-| `serve [--host H] [--port P] [--token-file F] [--max-clients N] [--device D] [--no-python-worker]` | SIRIUS's engine for the HPC backend | (the worker protocol on TCP; one announce line on stdout) |
+| `serve [--host H] [--port P] [--token-file F] [--max-clients N] [--device D] [--scratch DIR] [--no-python-worker]` | SIRIUS's engine for the HPC backend | (the worker protocol on TCP; one announce line on stdout) |
 | `worker status` | where the worker's Python comes from, and the state of SIRIUS's environment | see "The Python worker" |
 | `worker check` | starts the worker (never installs) and says hello | `{interpreter:{path, source}, capabilities, seconds}` |
 | `worker setup [options]` | plans, asks, and sets up SIRIUS's environment | `{env_dir, python, base_python, python_version, installer, mode, packages, extras, seconds}` |
@@ -886,6 +886,21 @@ Python worker.
   `datasets.py` -- reading TIFF with SIRIUS's own reader (nvTIFF on a CUDA
   device when the build has it and a request's `device` asks for one) and
   `.npy`.
+- It runs the application's pipelines (`pipeline_run`: the pipeline, the
+  step to run to and the device, `cuda` or `cpu`) with the same executor and
+  operations as the application, CUDA where SIRIUS has it, and keeps every
+  output on the node under a handle, `sirius-out:<session>/<step id>/<node
+  fingerprint>`, which `dataset_view` / `_read` / `_stats` accept in place of a
+  path: the application draws a node's result at screen size and downloads
+  nothing else. Progress frames carry the step and its state; the result
+  carries each step's report, meta, diagnostics (images as float32 tensors)
+  and where it ran. `step_preview` and `step_validate` answer for a step on
+  its input and files as the node has them, `output_stats` measures an output
+  or a dataset there, `put_file` / `stat_file` receive a file the user agreed
+  to upload (into the scratch, `--scratch`; a folder of its own, removed when
+  the engine ends), `outputs_release` and `cache_status` manage the outputs.
+  The session is the process's: a new engine holds none of an older one's
+  handles, and says so.
 - Every other request is relayed to a Python worker it starts beside it, on
   127.0.0.1 with a token of its own (`--python`, `--worker-dir` choose it);
   `--no-python-worker` refuses those requests instead, saying so.

@@ -4,6 +4,7 @@
 #include <array>
 #include <cmath>
 #include <cstdint>
+#include <cstdio>
 #include <exception>
 #include <functional>
 #include <limits>
@@ -372,13 +373,17 @@ namespace sirius::app::gui {
                     // A lazily read input reads planes here, and one that cannot
                     // be read (a truncated file, a share gone away) leaves the
                     // sliders on 0 .. 1 rather than taking the panel down.
+                    // (an input on the cluster is measured there: Workbench::contrastWindowOf)
                     try {
-                        const StepInput in = upstream->asInput();
                         float mn = std::numeric_limits<float>::infinity(), mx = -mn;
-                        for (Index c = 0; c < in.meta.dims.c; ++c) {
-                            const ContrastWindow w = contrastWindow(in, st->params, c, 8, true);
-                            mn = std::min(mn, w.dataMin);
-                            mx = std::max(mx, w.dataMax);
+                        for (Index c = 0; c < upstream->meta.dims.c; ++c) {
+                            const std::optional<ContrastWindow> w = wb().contrastWindowOf(i, st->params, c, true);
+                            if (!w) {
+                                haveUpstream = false;   // asked of the node: the panel follows when it answers
+                                break;
+                            }
+                            mn = std::min(mn, w->dataMin);
+                            mx = std::max(mx, w->dataMax);
                         }
                         if (mn < mx) {
                             dataMin = mn;
@@ -1302,9 +1307,12 @@ namespace sirius::app::gui {
                     // a plane that cannot be read leaves the window unresolved
                     // (see checkShape)
                     try {
-                        const ContrastWindow eff = contrastWindow(up->asInput(), p, 0, 8);
-                        effLo = eff.lo;
-                        effHi = eff.hi;
+                        if (const std::optional<ContrastWindow> eff = wb().contrastWindowOf(index(), p, 0, false)) {
+                            effLo = eff->lo;
+                            effHi = eff->hi;
+                        } else {
+                            haveUpstream = false;   // asked of the node
+                        }
                     } catch (const std::exception& e) {
                         haveUpstream = false;
                         readFailed(up, e);
@@ -1327,9 +1335,10 @@ namespace sirius::app::gui {
                     const std::shared_ptr<const StepOutput> up = wb().upstreamOutput(i);
                     if (readable(up)) {
                         try {
-                            const ContrastWindow eff = contrastWindow(up->asInput(), np, 0, 8);
-                            np.set("min", static_cast<double>(eff.lo));
-                            np.set("max", static_cast<double>(eff.hi));
+                            if (const std::optional<ContrastWindow> eff = wb().contrastWindowOf(i, np, 0, false)) {
+                                np.set("min", static_cast<double>(eff->lo));
+                                np.set("max", static_cast<double>(eff->hi));
+                            }
                         } catch (const std::exception& e) {
                             readFailed(up, e);
                         }
@@ -1414,8 +1423,10 @@ namespace sirius::app::gui {
                 ao.tooltip = "Min / max on the input's percentiles (see More parameters)";
                 if (widgets::button("Auto##auto", ao))
                     onStep([this](int i) {
-                        if (auto up = wb().upstreamOutput(i))
-                            wb().setStepParams(i, contrastAutoParams(wb().pipeline().at(i).params, up->asInput()), "Auto contrast");
+                        if (const std::optional<ParamSet> p = wb().contrastAutoOf(i, wb().pipeline().at(i).params))
+                            wb().setStepParams(i, *p, "Auto contrast");
+                        else if (wb().upstreamOutput(i))
+                            wb().logLine("Auto contrast: the cluster node is measuring the input; press Auto again in a moment.");
                     });
                 place(at.x + buttonWidth("Auto", true, 10) + px(8), at.y);
                 widgets::ButtonOpts ro;
@@ -1425,8 +1436,10 @@ namespace sirius::app::gui {
                 ro.tooltip = "Min / max over the input's full range, gamma 1";
                 if (widgets::button("Reset##reset", ro))
                     onStep([this](int i) {
-                        if (auto up = wb().upstreamOutput(i))
-                            wb().setStepParams(i, contrastResetParams(wb().pipeline().at(i).params, up->asInput()), "Reset contrast");
+                        if (const std::optional<ParamSet> p = wb().contrastResetOf(i, wb().pipeline().at(i).params))
+                            wb().setStepParams(i, *p, "Reset contrast");
+                        else if (wb().upstreamOutput(i))
+                            wb().logLine("Reset contrast: the cluster node is measuring the input; press Reset again in a moment.");
                     });
                 placeEnd(at.x, at.y + buttonHeight(true));
             }
@@ -1611,14 +1624,28 @@ namespace sirius::app::gui {
             // --- the fixed sections' metrics: backend, cache, footer ---
             std::string backendNote;
             if (st && w.backend() == Backend::Hpc) {
-                // Only operations the Python worker implements (OpInfo::remoteCapable)
-                // are handed to the remote worker; the C++ ones run here whatever
-                // the backend says, so the panel says which one this is.
-                backendNote = st->op().info().remoteCapable
-                                  ? std::string("Runs on the HPC worker.")
-                                  : st->op().info().name + " has no HPC implementation: this step runs on this machine even with the HPC "
-                                                           "backend selected.";
+                // With SIRIUS's engine in the job every step runs on the node;
+                // a job of the Python worker alone runs only what it implements
+                // (OpInfo::remoteCapable), and the rest is refused, never run here.
+                const RemoteConfig& rc = w.remoteConfig();
+                if (rc.hasEngine())
+                    backendNote = "Runs on the cluster node" + (rc.where.empty() ? std::string() : " (" + rc.where + ")") +
+                                  ", by SIRIUS's engine; the result stays there.";
+                else if (rc.known && !st->op().info().remoteCapable)
+                    backendNote = st->op().info().name + " needs SIRIUS's engine on the cluster, and this job runs the Python worker only: it is "
+                                                         "refused on HPC. Choose CPU/CUDA to run it on this computer.";
+                else
+                    backendNote = "Runs on the HPC worker.";
             }
+            // Where the step's last result was computed (and whether it is still there).
+            if (st && i > 0)
+                if (const std::shared_ptr<const StepOutput> out = w.output(i); out && !w.placementOf(i).empty()) {
+                    char secs[32];
+                    std::snprintf(secs, sizeof secs, "%.1f s", out->seconds);
+                    std::string last = "Last run " + placementText(*out) + ", " + secs + ".";
+                    if (!out->gone.empty()) last += " Its result is gone (" + out->gone + "): run the step again.";
+                    backendNote = backendNote.empty() ? last : backendNote + "\n" + last;
+                }
             static const char* const kCacheNotes[] = {
                 "Fastest scrubbing; evicted first when GPU/RAM fills.",
                 "Survives restarts; written to the zarr scratch directory. Best for slow steps like reconstruction.",

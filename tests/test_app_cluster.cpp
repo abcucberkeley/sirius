@@ -13,6 +13,7 @@
 #include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <cmath>
 #include <cstdint>
 #include <cstdlib>
 #include <filesystem>
@@ -26,6 +27,9 @@
 
 #include <catch2/catch_test_macros.hpp>
 
+#include <sirius/tiff_io.hpp>
+
+#include "core/build_info.hpp"
 #include "core/cluster.hpp"
 #include "core/errors.hpp"
 #include "core/host.hpp"
@@ -33,6 +37,7 @@
 #include "core/remote_host.hpp"
 #include "core/remote_source.hpp"
 #include "core/rpc.hpp"
+#include "core/workbench.hpp"
 #include "temp_path.hpp"
 
 using namespace sirius::app;
@@ -1254,4 +1259,236 @@ TEST_CASE("cluster: no bind is a warning; the binds and the Python path reach th
     CHECK(readAll(fc.slurm / "apptainer.args").find("/data:/data,/tmp") != std::string::npos);
     session.disconnect(false);
     setEnv("FAKE_CONTAINER_SITE", "");
+}
+
+// --- SIRIUS's engine as the job (the HPC engine plan, P2) ---------------------------------
+
+namespace {
+    // A uint16 ImageJ stack (t, z, y, x) in the cluster's home: a blob over a ramp.
+    void writeStackTiff(const fs::path& path, sirius::Index t, sirius::Index z, sirius::Index y, sirius::Index x) {
+        sirius::Buffer<std::uint16_t> stack(sirius::Shape{t * z, y, x});
+        for (sirius::Index i = 0; i < t * z; ++i)
+            for (sirius::Index r = 0; r < y; ++r)
+                for (sirius::Index c = 0; c < x; ++c) {
+                    const double dx = static_cast<double>(c) - 20.0, dy = static_cast<double>(r) - 16.0;
+                    stack.data()[(i * y + r) * x + c] =
+                        static_cast<std::uint16_t>(100.0 + 1500.0 * std::exp(-(dx * dx + dy * dy) / 40.0) + static_cast<double>((r + c + i) % 13));
+                }
+        sirius::TiffWriteOptions o;
+        o.description = "ImageJ=1.53t\nimages=" + std::to_string(t * z) + "\nchannels=1\nslices=" + std::to_string(z) + "\nframes=" + std::to_string(t) +
+                        "\nhyperstack=true\nspacing=0.3\nunit=micron\n";
+        o.xPixelUm = 0.1;
+        o.yPixelUm = 0.1;
+        sirius::writeTiffStack<std::uint16_t>(path.string(), stack.view(), o);
+    }
+
+    cluster::Profile engineProfile(const FakeCluster& fc) {
+        cluster::Profile p;
+        p.host = "fakecluster";
+        p.sshProgram = fc.python;
+        p.sshProgramArgs = {SIRIUS_TEST_FAKE_SSH};
+        p.checkout = "~/sirius";
+        p.venv = "";
+        p.port = ssh::freeLocalPort();
+        p.engine = true;
+        p.engineBin = SIRIUS_TEST_CLI;
+        p.gpus = 0;
+        return p;
+    }
+
+    struct ScratchDir {
+        fs::path path = sirius::test::uniqueTempPath("cluster-wb", "");
+        ~ScratchDir() {
+            std::error_code ec;
+            fs::remove_all(path, ec);
+        }
+    };
+
+    // A detached fake job (FAKE_SLURM_DETACH) outlives the ssh session: one the
+    // test did not cancel is stopped here, whatever the test's outcome.
+    struct JobReaper {
+        fs::path slurm;
+        ~JobReaper() {
+            std::error_code ec;
+            for (const auto& e : fs::directory_iterator(slurm, ec)) {
+                const std::string ext = e.path().extension().string();
+                if (ext != ".winpid" && ext != ".ospid") continue;
+                const std::string pid = readAll(e.path()).substr(0, readAll(e.path()).find_first_of("\r\n"));
+                if (pid.empty()) continue;
+                ChildProcess k;
+                ChildProcess::Options o;
+#ifdef _WIN32
+                o.program = "taskkill";
+                o.arguments = {"/F", "/T", "/PID", pid};
+#else
+                o.program = "kill";
+                o.arguments = {pid};
+#endif
+                if (k.start(o)) k.waitForExit(10000);
+            }
+        }
+    };
+} // namespace
+
+TEST_CASE("cluster: the profile keeps the engine, on by default with a container image", "[app][cluster]") {
+    cluster::Profile p;
+    CHECK_FALSE(p.engine);
+    p.engine = true;
+    p.engineBin = "/opt/sirius/bin/sirius-cli";
+    const cluster::Profile back = cluster::Profile::fromJson(p.toJson());
+    CHECK(back.engine);
+    CHECK(back.engineBin == "/opt/sirius/bin/sirius-cli");
+    CHECK(cluster::Profile::fromJson(nlohmann::json{{"container", "~/w.sif"}}).engine);
+    CHECK_FALSE(cluster::Profile::fromJson(nlohmann::json{{"container", ""}}).engine);
+    CHECK_FALSE(cluster::Profile::fromJson(nlohmann::json{{"container", "~/w.sif"}, {"engine", false}}).engine);
+}
+
+TEST_CASE("cluster: the job template runs SIRIUS's engine, in the container or not", "[app][cluster]") {
+    FakeCluster fc;
+    if (!fc.usable()) SKIP("no Python or bash for the fake ssh");
+    copyCheckout(fc.home / "sirius");
+    std::ofstream(fc.home / "w.sif") << "image\n";
+    ssh::Session s;
+    s.open(fc.options(), {}, std::chrono::seconds(60));
+    const std::string job = "cd ~/sirius && mkdir -p ~/.sirius/run && export FAKE_APPTAINER_DRY=1 SIRIUS_CONTAINER=\"$HOME/w.sif\" SIRIUS_ENGINE=1 "
+                            "SIRIUS_TOKEN_FILE=\"$HOME/.sirius/run/token.x\" SLURM_SUBMIT_DIR=\"$PWD\" && ";
+    ssh::CommandResult r = s.run(job + "bash app/python/slurm/sirius_worker.sbatch");
+    INFO(r.out << "\n"
+               << r.err);
+    CHECK(r.ok());
+    const std::string args = readAll(fc.slurm / "apptainer.args");
+    INFO(args);
+    // the image's engine, its Python worker beside it from the checkout
+    CHECK(args.find("w.sif /opt/sirius/bin/sirius-cli serve --host 0.0.0.0 --port 0 --device cuda --max-clients 8 --python python --worker-dir ") !=
+          std::string::npos);
+    CHECK(args.find("SIRIUS_TOKEN") == std::string::npos);
+    CHECK(r.out.find("SIRIUS engine: /opt/sirius/bin/sirius-cli serve") != std::string::npos);
+    s.close();
+}
+
+TEST_CASE("cluster: connect starts SIRIUS's engine; a pipeline runs there and stays there; a reconnect reattaches; the job's end takes it",
+          "[app][cluster][engine]") {
+    FakeCluster fc;
+    if (!fc.usable()) SKIP("no Python or bash for the fake ssh");
+    if (!pythonHas(fc.python, "numpy")) SKIP("no numpy in " + fc.python + " for the checks");
+    copyCheckout(fc.home / "sirius");
+    writeStackTiff(fc.home / "raw.tif", 2, 6, 32, 40);
+    setEnv("FAKE_SLURM_PENDING_POLLS", "0");
+    // a disconnect leaves the job running here, as on a cluster: the reconnect finds it
+    setEnv("FAKE_SLURM_KILL_ON_EXIT", "0");
+    setEnv("FAKE_SLURM_DETACH", "1");
+    JobReaper reaper{fc.slurm};
+    cluster::Session session;
+    session.setPollInterval(std::chrono::milliseconds(200), std::chrono::milliseconds(500));
+    const cluster::Profile p = engineProfile(fc);
+    cluster::Status st = connectUntilSettled(session, p);
+    INFO(st.reason << "\n"
+                   << st.remoteOutput);
+    REQUIRE(st.state == cluster::State::Connected);
+    REQUIRE(st.caps.engine.is_object());
+    CHECK(st.caps.engine["build"] == buildInfo().build);
+    CHECK(st.steps[static_cast<int>(cluster::Step::Hello)].detail.find("SIRIUS engine") != std::string::npos);
+    const std::string env = readAll(fc.slurm / "4711.env");
+    CHECK(env.find("SIRIUS_ENGINE=1") != std::string::npos);
+    CHECK(env.find("SIRIUS_ENGINE_BIN=") != std::string::npos);
+    const std::string session1 = st.caps.engine.value("session", std::string());
+    CHECK_FALSE(session1.empty());
+
+    // the application: the cluster's datasets through the engine, the HPC backend on it
+    auto datasets = std::make_shared<RemoteDatasets>("fakecluster", [&] { return session.connectWorker(); });
+    datasets->install();
+    const cluster::Listing home = session.list("~");
+    ScratchDir scratch;
+    Workbench wb(scratch.path / "wb");
+    wb.openDataset(makeClusterPath("fakecluster", home.path + "/raw.tif"));
+    REQUIRE(wb.hasDataset());
+    RemoteConfig rc;
+    rc.connect = [&session](const std::function<bool()>& cancelled) { return session.connectWorker(std::chrono::seconds(10), cancelled); };
+    rc.known = true;
+    rc.engine = st.caps.engine;
+    rc.where = "fakecluster \xC2\xB7 " + st.node + " \xC2\xB7 job " + st.jobId;
+    wb.setRemoteConfig(rc);
+    wb.setBackend(Backend::Hpc);
+    wb.setHpcDevice(HpcDevice::Cpu);
+    while (wb.pipeline().size() > 1) wb.removeStep(1);
+    wb.addStep("decon", -1, false);
+    wb.setStepParam(1, "iterations", std::int64_t{2});
+    wb.setStepParam(1, "psf_size", std::int64_t{7});
+    wb.addStep("contrast", -1, false);
+    wb.setStepCache(2, CachePolicy::Memory);
+    const std::uint64_t volumes = RemoteDownloads::volumeBytes(), planes = RemoteDownloads::planeBytes();
+    std::shared_ptr<RunJob> job = wb.createRun();
+    REQUIRE(job);
+    job->execute();
+    wb.finishRun(job);
+    INFO(job->error());
+    REQUIRE(job->succeeded());
+    CHECK(job->ranOnEngine());
+    // only diagnostics came back: no volume, no plane
+    CHECK(RemoteDownloads::volumeBytes() == volumes);
+    CHECK(RemoteDownloads::planeBytes() == planes);
+    std::shared_ptr<const StepOutput> out = wb.output(2);
+    REQUIRE(out);
+    auto* node = dynamic_cast<NodeOutputSource*>(const_cast<ArraySource*>(out->source.get()));
+    REQUIRE(node);
+    CHECK(node->session() == session1);
+    CHECK(wb.placementOf(2) == "node CPU");
+    ViewRequest req;
+    req.index = 3;
+    req.factor = 2;
+    bool exact = false;
+    node->view(req, exact);
+    node->waitIdle();
+    REQUIRE(node->view(req, exact));
+    CHECK(exact);
+
+    // disconnect, leaving the job: connect again reattaches to it, no new job
+    session.disconnect(false);
+    REQUIRE(session.status().state == cluster::State::Disconnected);
+    st = connectUntilSettled(session, p);
+    INFO(st.reason << "\n"
+                   << st.remoteOutput);
+    REQUIRE(st.state == cluster::State::Connected);
+    CHECK(st.jobId == "4711");
+    CHECK_FALSE(fs::exists(fc.slurm / "4712.args"));
+    CHECK(st.steps[static_cast<int>(cluster::Step::Submit)].detail.find("reattached") != std::string::npos);
+    CHECK(st.caps.engine.value("session", std::string()) == session1);
+    // the engine kept what it computed: the same handle draws again, through the new tunnel
+    ViewRequest other = req;
+    other.index = 4;
+    node->view(other, exact);
+    node->waitIdle();
+    INFO(node->lastError());
+    REQUIRE(node->view(other, exact));
+    CHECK(exact);
+    CHECK(wb.outputFresh(2));
+
+    // the job ends (cancelled): its results are gone, said so
+    session.disconnect(true);
+    CHECK(readAll(fc.slurm / "cancelled").find("4711") != std::string::npos);
+    CHECK(wb.nodeOutputsGone(session1, "held by job 4711, which ended (CANCELLED)") == 2);
+    CHECK_FALSE(wb.outputFresh(2));
+    CHECK(wb.output(2)->gone.find("CANCELLED") != std::string::npos);
+    datasets->uninstall();
+    setEnv("FAKE_SLURM_KILL_ON_EXIT", "1");
+    setEnv("FAKE_SLURM_DETACH", "0");
+}
+
+TEST_CASE("cluster: an engine of other operations is refused at its hello, in words", "[app][cluster][engine]") {
+    FakeCluster fc;
+    if (!fc.usable()) SKIP("no Python or bash for the fake ssh");
+    if (!pythonHas(fc.python, "numpy")) SKIP("no numpy in " + fc.python + " for the checks");
+    copyCheckout(fc.home / "sirius");
+    setEnv("FAKE_SLURM_PENDING_POLLS", "0");
+    setEnv("SIRIUS_TEST_ENGINE_BUILD", R"({"build": "0.0.9+gdeadbee", "ops_schema": "0000"})");
+    cluster::Session session;
+    session.setPollInterval(std::chrono::milliseconds(200), std::chrono::milliseconds(500));
+    const cluster::Status st = connectUntilSettled(session, engineProfile(fc));
+    setEnv("SIRIUS_TEST_ENGINE_BUILD", "");
+    INFO(st.reason);
+    CHECK(st.state == cluster::State::Disconnected);
+    CHECK(st.steps[static_cast<int>(cluster::Step::Hello)].status == cluster::StepStatus::Failed);
+    CHECK(st.reason.find("0.0.9+gdeadbee") != std::string::npos);
+    CHECK(st.reason.find("their operations differ") != std::string::npos);
+    session.disconnect(true);
 }

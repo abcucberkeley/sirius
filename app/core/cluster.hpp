@@ -19,7 +19,13 @@
 //   Start    the job runs on a node; its log (in ~/.sirius/run too) says
 //            when the worker listens and on which port (it takes a free one)
 //   Hello    the application connects through the SSH session's SOCKS proxy
-//            and the worker says what it is (version, device, steps)
+//            and the worker says what it is (version, device, steps); SIRIUS's
+//            engine (Profile::engine) whose operations are not this
+//            application's is refused here (core/build_info.hpp)
+//
+// Connect after a disconnect that left the job running reattaches to that
+// job when it still runs (no new submission): its engine still holds what it
+// computed.
 //
 // Then it keeps watching: ssh alive, the worker answering a ping, the job
 // still RUNNING (squeue / sacct say why not: TIMEOUT, CANCELLED, ...). A
@@ -89,6 +95,14 @@ namespace sirius::app::cluster {
         int cpus = 8;
         std::string mem = "64G";
         int port = 7645;                           // unused: the worker takes a free port (kept for old profiles)
+        // The job runs SIRIUS's engine (`sirius-cli serve`, core/engine_server.hpp)
+        // with the Python worker as its child, so every step runs on the node
+        // (SIRIUS_ENGINE=1 for sirius_worker.sbatch). On by default with a
+        // container image, which has it; off runs the Python worker alone.
+        bool engine = false;
+        // The engine's executable there: "" = /opt/sirius/bin/sirius-cli in the
+        // image, sirius-cli on the job's PATH without one.
+        std::string engineBin;
         std::string sshProgram;                    // "" = the system's ssh
         std::vector<std::string> sshProgramArgs;   // tests: a fake ssh run by an interpreter
         std::map<std::string, SlurmChoice> perHost;   // partition, account, QoS, time and binds last used on each host
@@ -227,6 +241,9 @@ namespace sirius::app::cluster {
         std::string fix;             // a command that fixes what the checks found missing
         std::string home;            // the cluster's $HOME, once the checks have said it ("" unknown)
         std::string jobId, node, jobState;
+        // Disconnected because the job ended (it was cancelled, timed out,
+        // failed): what its engine held went with it.
+        bool jobEnded = false;
         WorkerCapabilities caps;
         std::string host;
         std::chrono::steady_clock::time_point since{};   // when `state` began

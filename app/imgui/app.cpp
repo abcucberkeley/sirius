@@ -9,6 +9,7 @@
 #include <filesystem>
 #include <fstream>
 #include <map>
+#include <optional>
 #include <utility>
 
 #include <imgui_internal.h>
@@ -26,6 +27,7 @@
 #include "core/app_paths.hpp"
 #include "core/array_source.hpp"
 #include "core/export.hpp"
+#include "core/remote_source.hpp"
 #include "core/training_export.hpp"
 #include "imgui/cluster_link.hpp"
 #include "imgui/dialogs/dialogs.hpp"
@@ -49,6 +51,17 @@ namespace sirius::app::gui {
     using theme::Weight;
 
     namespace {
+
+        // Export reads an output whole: what it would cost when the output
+        // stays on the cluster (a node's result, a cluster dataset).
+        std::string downloadQuestion(const StepOutput& out, int step) {
+            const double gb = static_cast<double>(std::max<Index>(out.meta.dims.numel(), 0)) * sizeof(float) / 1e9;
+            char size[32];
+            std::snprintf(size, sizeof size, gb >= 0.1 ? "%.1f GB" : "%.0f MB", gb >= 0.1 ? gb : gb * 1000.0);
+            const std::string where = !out.where.empty() ? out.where : std::string("the cluster");
+            return "Step " + Step::number(step) + "'s data is held on " + where + ". Exporting it here downloads all of it to this computer first: " +
+                   size + " (as float32). Download it?";
+        }
 
         constexpr const char* kIssuesUrl = "https://github.com/abcucberkeley/sirius/issues";
         constexpr const char* kRepositoryUrl = "https://github.com/abcucberkeley/sirius";
@@ -2173,6 +2186,7 @@ namespace sirius::app::gui {
             // height back before Dear ImGui writes the layout (DestroyContext).
             if (d.diagCollapsed) d.fitDiagnosticsToCollapse(false);
         }
+        RemoteDownloads::setObserver({});
         bridge_.setWaker(nullptr);
         http::setGuiPoster(nullptr);
         // the panels own textures: they go while the context is current
@@ -2400,6 +2414,21 @@ namespace sirius::app::gui {
             impl_->logLine = line;
             impl_->logLineAt = Clock::now();
             requestRedraw();
+        });
+        // The HPC engine computes on the node: files of this computer go there
+        // only when the user agrees, knowing how much (never by default).
+        bridge_.uploadAsked.connect([this](int target) {
+            const RunRefusal refusal = wb().lastRunRefusal();
+            ask("Upload to the cluster", refusal.message, {"Cancel", "Upload and run"}, [this, refusal, target](int answer) {
+                if (answer != 1) return;
+                wb().allowUploads(refusal.uploads);
+                bridge_.startRun(target);
+            });
+        });
+        // A whole volume of cluster data downloaded here (an export the user
+        // agreed to, a run on this computer): one line each in the log.
+        RemoteDownloads::setObserver([this](const std::string& line) {
+            bridge_.post([this, line] { wb().logLine(line); });
         });
         bridge_.runFinished.connect([this](bool ok, const std::string& error) {
             // A cancelled run arrives with an empty error, so there is no
@@ -2979,29 +3008,43 @@ namespace sirius::app::gui {
                 message("Export", "Step " + Step::number(step) + " has not been computed yet. Run it first.", MessageIcon::Info);
                 return;
             }
-            const std::string pipelinePath = options.path + ".pipeline.toml";
-            const bool sidecar = options.includePipeline;
-            options.includePipeline = false;
-            if (sidecar) {
-                // Pipeline::save, not Workbench::savePipeline: that one makes
-                // the file the pipeline's own, so Ctrl+S after an export would
-                // overwrite <export>.pipeline.toml.
-                try {
-                    wb().pipeline().save(pipelinePath);
-                    wb().logLine("Pipeline sidecar written to " + pipelinePath);
-                } catch (const std::exception& e) {
-                    wb().logLine(std::string("Pipeline sidecar: ") + e.what());
+            // Data that stays on the cluster comes here only when the user
+            // says so, knowing how much: never as a side effect of an export.
+            const bool remote = !out->array && out->source && out->source->viewProvider();
+            auto go = [this, out, options, remote]() mutable {
+                const std::string pipelinePath = options.path + ".pipeline.toml";
+                const bool sidecar = options.includePipeline;
+                options.includePipeline = false;
+                if (sidecar) {
+                    // Pipeline::save, not Workbench::savePipeline: that one makes
+                    // the file the pipeline's own, so Ctrl+S after an export would
+                    // overwrite <export>.pipeline.toml.
+                    try {
+                        wb().pipeline().save(pipelinePath);
+                        wb().logLine("Pipeline sidecar written to " + pipelinePath);
+                    } catch (const std::exception& e) {
+                        wb().logLine(std::string("Pipeline sidecar: ") + e.what());
+                    }
                 }
+                // The labels are copied first: the task reads them on its thread
+                // while the viewer may still paint into the step's volume.
+                std::shared_ptr<const LabelVolume> labels = out->labels ? out->labels->clone() : nullptr;
+                const bool started = bridge_.startTask(
+                    "Export", [out, labels, options, remote](const Bridge::TaskProgress& progress, const Bridge::TaskCancelled& cancelled) {
+                        std::optional<RemoteDownloads::Allow> allow;
+                        if (remote) allow.emplace("an export the user asked for");
+                        ArrayPtr array = out->asInput().materialize(progress);
+                        exportArray(*array, out->meta, labels.get(), options, progress, cancelled);
+                    });
+                if (!started) message("Export", "The export could not start: another task is running. Cancel it (Esc) or wait, then export again.");
+            };
+            if (!remote) {
+                go();
+                return;
             }
-            // The labels are copied first: the task reads them on its thread
-            // while the viewer may still paint into the step's volume.
-            std::shared_ptr<const LabelVolume> labels = out->labels ? out->labels->clone() : nullptr;
-            const bool started =
-                bridge_.startTask("Export", [out, labels, options](const Bridge::TaskProgress& progress, const Bridge::TaskCancelled& cancelled) {
-                    ArrayPtr array = out->asInput().materialize(progress);
-                    exportArray(*array, out->meta, labels.get(), options, progress, cancelled);
-                });
-            if (!started) message("Export", "The export could not start: another task is running. Cancel it (Esc) or wait, then export again.");
+            ask("Download to export", downloadQuestion(*out, step), {"Cancel", "Download and export"}, [go](int answer) mutable {
+                if (answer == 1) go();
+            });
         }));
     }
 
@@ -3028,14 +3071,26 @@ namespace sirius::app::gui {
                                   {"pipeline", wb().pipeline().toJson()}};
             // a copy: the task reads on its thread while the viewer may paint
             std::shared_ptr<const LabelVolume> labels = out->labels->clone();
-            const bool started = bridge_.startTask(
-                "Export training data", [out, labels, options](const Bridge::TaskProgress& progress, const Bridge::TaskCancelled& cancelled) {
-                    ArrayPtr array = options.image || options.slices ? out->asInput().materialize(progress) : nullptr;
-                    const Array5 empty;
-                    exportTrainingData(array ? *array : empty, out->meta, *labels, options, progress, cancelled);
-                });
-            if (!started)
-                message("Export training data", "The export could not start: another task is running. Cancel it (Esc) or wait, then export again.");
+            const bool remote = (options.image || options.slices) && !out->array && out->source && out->source->viewProvider();
+            auto go = [this, out, labels, options, remote] {
+                const bool started = bridge_.startTask(
+                    "Export training data", [out, labels, options, remote](const Bridge::TaskProgress& progress, const Bridge::TaskCancelled& cancelled) {
+                        std::optional<RemoteDownloads::Allow> allow;
+                        if (remote) allow.emplace("a training export the user asked for");
+                        ArrayPtr array = options.image || options.slices ? out->asInput().materialize(progress) : nullptr;
+                        const Array5 empty;
+                        exportTrainingData(array ? *array : empty, out->meta, *labels, options, progress, cancelled);
+                    });
+                if (!started)
+                    message("Export training data", "The export could not start: another task is running. Cancel it (Esc) or wait, then export again.");
+            };
+            if (!remote) {
+                go();
+                return;
+            }
+            ask("Download to export", downloadQuestion(*out, step), {"Cancel", "Download and export"}, [go](int answer) {
+                if (answer == 1) go();
+            });
         }));
     }
 

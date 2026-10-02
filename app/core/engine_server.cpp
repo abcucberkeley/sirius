@@ -13,6 +13,7 @@
 #include "core/array_codec.hpp"
 #include "core/build_info.hpp"
 #include "core/cancel.hpp"
+#include "core/engine_node.hpp"
 #include "core/errors.hpp"
 #include "core/host.hpp"
 #include "core/local_worker.hpp"
@@ -24,8 +25,10 @@ namespace sirius::app {
     namespace {
         // What the engine serves itself.
         const std::vector<std::string>& ownMethods() {
-            static const std::vector<std::string> m{"hello", "ping", "cancel", "shutdown",
-                                                    "dataset_info", "dataset_read", "dataset_view", "dataset_stats"};
+            static const std::vector<std::string> m{"hello", "ping", "cancel", "shutdown", "dataset_info",
+                                                    "dataset_read", "dataset_view", "dataset_stats", "pipeline_run", "step_preview",
+                                                    "step_validate", "output_stats", "put_file", "stat_file", "outputs_release",
+                                                    "cache_status"};
             return m;
         }
         // What it relays to the Python worker (server.py's method list, less
@@ -60,12 +63,26 @@ namespace sirius::app {
         std::vector<std::unique_ptr<RemoteWorker>> idle;   // connections to the child, ready for the next relay
         std::thread starter;
 
+        // The pipelines run here and the outputs they leave (core/engine_node.hpp).
+        std::unique_ptr<EngineNode> node;
+
         // Last: destroyed first, so its connection and job threads (which use
         // everything above) have ended before any of it goes.
         rpc::Server server;
 
         explicit Impl(EngineOptions o)
-            : options(std::move(o)), datasets(DatasetService::Options{options.device, options.viewCacheBytes}), server(serverOptions(options)) {}
+            : options(std::move(o)), datasets(DatasetService::Options{options.device, options.viewCacheBytes}), server(serverOptions(options)) {
+            EngineNode::Options no;
+            no.scratch = options.scratch;
+            no.defaultDevice = options.device.empty() ? std::string("auto") : options.device;
+            no.log = options.log;
+            if (pythonConfigured()) {
+                no.takePython = [this](const std::function<bool()>& cancelled) { return take(cancelled); };
+                no.giveBackPython = [this](std::unique_ptr<RemoteWorker> w) { giveBack(std::move(w)); };
+            }
+            node = std::make_unique<EngineNode>(std::move(no));
+            datasets.setOutputResolver([this](const std::string& handle) { return node->resolve(handle); });
+        }
 
         static rpc::Server::Options serverOptions(const EngineOptions& o) {
             rpc::Server::Options so;
@@ -185,6 +202,14 @@ namespace sirius::app {
             }
         }
 
+        // This build's identity, as reported (with a test's override).
+        json buildJson() const {
+            json engine = toJson(buildInfo());
+            if (options.buildOverride.is_object())
+                for (const auto& [key, value] : options.buildOverride.items()) engine[key] = value;
+            return engine;
+        }
+
         std::string resolvedDevice() const {
             const std::string d = lower(options.device.empty() ? std::string("auto") : options.device);
             if (d == "cpu") return "cpu";
@@ -225,11 +250,13 @@ namespace sirius::app {
                 } catch (const std::exception&) {
                 }
             }
-            json engine = toJson(buildInfo());
+            json engine = buildJson();
             engine["cuda"] = {{"devices", devices}, {"nvtiff", builtWithNvTiff()}};
             engine["cpu_threads"] = std::max(1u, std::thread::hardware_concurrency());
             engine["view_cache_used"] = datasets.cachedBytes();
-            engine["scratch"] = options.scratch;
+            engine["scratch"] = node->scratch().generic_u8string();
+            engine["session"] = node->session();
+            engine["cache_used"] = node->cacheStatus().value("bytes", std::uint64_t{0});
             engine["job"] = {{"id", host::environment("SLURM_JOB_ID")}};
             engine["python"] = pythonStatus();
             std::string python;
@@ -256,6 +283,19 @@ namespace sirius::app {
         Impl& d = *impl_;
         for (const char* m : {"dataset_info", "dataset_read", "dataset_view", "dataset_stats"})
             d.server.handle(m, [this, m](const rpc::Request& req, rpc::CallContext&) { return impl_->datasets.handle(m, req.params); }, rpc::Dispatch::Inline);
+        // the pipelines: one run at a time; previews and statistics beside it
+        d.server.handle("pipeline_run", [this](const rpc::Request& req, rpc::CallContext& ctx) { return impl_->node->pipelineRun(req, ctx); }, rpc::Dispatch::Job);
+        d.server.handle("step_preview", [this](const rpc::Request& req, rpc::CallContext& ctx) { return impl_->node->stepPreview(req, ctx); }, rpc::Dispatch::Concurrent);
+        d.server.handle("output_stats", [this](const rpc::Request& req, rpc::CallContext& ctx) { return impl_->node->outputStats(req, ctx); }, rpc::Dispatch::Concurrent);
+        d.server.handle("step_validate", [this](const rpc::Request& req, rpc::CallContext&) { return impl_->node->stepValidate(req); });
+        d.server.handle("put_file", [this](const rpc::Request& req, rpc::CallContext&) { return impl_->node->putFile(req); });
+        d.server.handle("stat_file", [this](const rpc::Request& req, rpc::CallContext&) { return impl_->node->statFile(req); });
+        d.server.handle("outputs_release", [this](const rpc::Request& req, rpc::CallContext&) { return impl_->node->releaseOutputs(req); });
+        d.server.handle("cache_status", [this](const rpc::Request&, rpc::CallContext&) {
+            rpc::Reply r;
+            r.result = impl_->node->cacheStatus();
+            return r;
+        });
         d.server.setFallback([this](const rpc::Request& req, rpc::CallContext& ctx) { return impl_->relay(req, ctx); }, rpc::Dispatch::Concurrent);
         d.server.setCapabilities([this] { return impl_->capabilities(); });
         d.startPython();
@@ -274,7 +314,7 @@ namespace sirius::app {
     json EngineServer::capabilities() const { return impl_->capabilities(); }
 
     nlohmann::ordered_json EngineServer::announce(int port) const {
-        const json engine = toJson(buildInfo());
+        const json engine = impl_->buildJson();
         return {{"port", port},
                 {"pid", host::processId()},
                 {"host", impl_->options.host},
@@ -294,6 +334,7 @@ namespace sirius::app {
     void EngineServer::stop() { impl_->server.stop(); }
     bool EngineServer::stopping() const noexcept { return impl_->server.stopping(); }
     DatasetService& EngineServer::datasets() noexcept { return impl_->datasets; }
+    EngineNode& EngineServer::node() noexcept { return *impl_->node; }
     rpc::Server& EngineServer::server() noexcept { return impl_->server; }
 
 } // namespace sirius::app

@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
+#include <cstdio>
 #include <exception>
 #include <functional>
 #include <map>
@@ -169,6 +170,10 @@ namespace sirius::app::gui {
             bool enabled = true;
             bool pinned = false;
             CachePolicy cache = CachePolicy::Recompute;
+            // where its last output was computed: "node A100", "this computer · CPU"
+            std::string placement;
+            std::string placementTip;
+            bool gone = false;
         };
 
         // One entry of the add menu.
@@ -226,6 +231,17 @@ namespace sirius::app::gui {
                 d.enabled = step.enabled;
                 d.pinned = step.pinned;
                 d.cache = step.cache;
+                d.placement = wb.placementOf(i);
+                if (!d.placement.empty())
+                    if (const std::shared_ptr<const StepOutput> out = wb.output(i)) {
+                        char secs[32];
+                        std::snprintf(secs, sizeof secs, "%.1f s", out->seconds);
+                        d.gone = !out->gone.empty();
+                        d.placementTip = "Computed " + placementText(*out) + " in " + secs +
+                                         (d.gone               ? ". Its result is gone (" + out->gone + "): run the step again."
+                                          : out->where.empty() ? std::string(".")
+                                                               : ". The result stays there: the viewer shows it at screen size, nothing else is downloaded.");
+                    }
                 rows.push_back(std::move(d));
             }
         }
@@ -239,6 +255,9 @@ namespace sirius::app::gui {
             menuStamp = stamp;
             groups.clear();
             const bool hpc = app.wb().backend() == Backend::Hpc;
+            // SIRIUS's engine on the node runs every step there; a job of the
+            // Python worker alone runs only what the worker implements
+            const bool engine = app.wb().remoteConfig().hasEngine();
             for (const auto& [group, ops] : operationGroups()) {
                 MenuGroup g;
                 g.name = group;
@@ -246,11 +265,10 @@ namespace sirius::app::gui {
                     MenuItem item;
                     item.kind = op->kind();
                     item.name = op->info().name;
-                    // Only the operations the Python worker implements
-                    // (OpInfo::remoteCapable) actually go to the cluster; the
-                    // rest are C++ and run on this machine whatever the
-                    // backend says. Say so where the step is chosen.
-                    item.localOnly = hpc && !op->info().remoteCapable;
+                    // Without SIRIUS's engine in the job only the operations the
+                    // Python worker implements (OpInfo::remoteCapable) can run
+                    // there; the rest are refused on HPC. Say so where the step is chosen.
+                    item.localOnly = hpc && !engine && !op->info().remoteCapable;
                     if (details) {
                         item.blurb = operationBlurb(op->kind());
                         if (op->info().plugin && !op->info().source.empty())
@@ -351,7 +369,15 @@ namespace sirius::app::gui {
                     else
                         drawIcon(dl, ImVec2(cell.x + px(5.5f), cell.y + h11 * 0.5f), px(11), look.icon, cacheColor, px(1.25f));
                     tip(look.title);
-                    const float sumW = bodyW - px(12) - px(6);
+                    float sumW = bodyW - px(12) - px(6);
+                    // where it ran, at the right end of the summary line
+                    const float tagW = d.placement.empty() ? 0.0f : theme::textSize(d.placement, 11).x;
+                    if (tagW > 0.0f && sumW - tagW - px(8) >= px(40)) {
+                        sumW -= tagW + px(8);
+                        place(bodyX + bodyW - tagW, sumY);
+                        widgets::text(d.placement, 11, theme::withAlpha(d.gone ? theme::kAccentText : theme::kNeutral500, opacity));
+                        tip(d.placementTip);
+                    }
                     if (sumW > px(12)) {
                         place(bodyX + px(12) + px(6), sumY);
                         const ImU32 base = d.ok ? theme::kNeutral600 : theme::kAccentText;
@@ -610,8 +636,9 @@ namespace sirius::app::gui {
                     if (item.localOnly) {
                         ty += px(2);
                         place(row.min.x + px(10), ty);
-                        widgets::text(widgets::elideText("local only", textW, 11), 11, theme::kNeutral600);
-                        tip(item.name + " has no HPC implementation: it runs on this machine even with the HPC backend selected.");
+                        widgets::text(widgets::elideText("needs the SIRIUS engine on HPC", textW, 11), 11, theme::kNeutral600);
+                        tip(item.name + " runs on the cluster only with SIRIUS's engine in the job; this job runs the Python worker alone, so "
+                                        "it is refused on HPC. Choose CPU/CUDA to run it here, or reconnect with an engine image.");
                         ty += h11;
                     }
                     if (!item.blurb.empty()) {

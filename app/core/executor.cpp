@@ -10,6 +10,8 @@
 
 #include <nlohmann/json.hpp>
 
+#include <sirius/device.hpp>
+
 #include "core/array_source.hpp"
 #include "core/cancel.hpp"
 
@@ -37,6 +39,39 @@ namespace sirius::app {
                 h *= 1099511628211ull;
             }
             return h;
+        }
+    } // namespace
+
+    namespace {
+        // A GPU's name as a person says it: "A100-SXM4-80GB", not "NVIDIA A100-SXM4-80GB".
+        std::string gpuName(int index) {
+            std::string name;
+            try {
+                name = deviceProperties(Device::cuda(index)).name;
+            } catch (const std::exception&) {
+            }
+            for (const char* prefix : {"NVIDIA ", "GeForce "})
+                if (name.rfind(prefix, 0) == 0) name = name.substr(std::strlen(prefix));
+            return name.empty() ? "GPU " + std::to_string(index) : name;
+        }
+
+        // What a step ran on, for StepOutput::ranOnDevice: the Python worker
+        // (and the device it was asked for, as ops/common.hpp's workerDevice
+        // names it), a GPU, or the CPU.
+        std::string ranOnDeviceOf(const Operation& op, const ParamSet& params, const StepOutput& out, const StepContext& ctx) {
+            if (ctx.remote && op.needsWorker(params)) {
+                std::string device = "cuda";
+                if (ctx.backend == Backend::Cpu || (ctx.backend == Backend::Hpc && ctx.hpcDevice == HpcDevice::Cpu)) device = "cpu";
+                else if (ctx.backend == Backend::Cuda && ctx.device.isCuda() && ctx.device.index >= 0)
+                    device = "cuda:" + std::to_string(ctx.device.index);
+                return "Python " + device;
+            }
+            if (out.ranOn == Backend::Cuda) {
+                if (ctx.allCudaDevices()) return std::to_string(cudaDeviceCount()) + " GPUs";
+                return gpuName(ctx.device.isCuda() && ctx.device.index >= 0 ? ctx.device.index : 0);
+            }
+            if (out.ranOn == Backend::Hpc) return "HPC";
+            return "CPU";
         }
     } // namespace
 
@@ -311,9 +346,12 @@ namespace sirius::app {
     void Executor::evictRecomputeExcept(StepId keep) {
         for (auto& [id, other] : entries_) {
             if (!other || id == keep || other->policy != CachePolicy::Recompute || !other->output) continue;
-            if (other->output->array) {
+            // a node's output goes as the node's own cache lets it go
+            const bool nodeHeld = other->output->source && other->output->source->heldByNodeCache();
+            if (other->output->array || nodeHeld) {
                 auto shell = std::make_shared<StepOutput>(*other->output);
                 shell->array = nullptr;
+                if (nodeHeld) shell->source = nullptr;
                 other->output = shell;
                 other->bytes = 0;
             }
@@ -389,6 +427,7 @@ namespace sirius::app {
             }
             const auto t1 = std::chrono::steady_clock::now();
             out->seconds = std::chrono::duration<double>(t1 - t0).count();
+            if (out->ranOnDevice.empty()) out->ranOnDevice = ranOnDeviceOf(op, step.params, *out, ctx);
             if (out->meta.dims.numel() <= 0) out->meta.dims = input.meta.dims;
             // Labels carried through unless the step produced its own: a
             // volume of this step's own over the input's voxels, copied on
@@ -441,6 +480,58 @@ namespace sirius::app {
         std::lock_guard<std::mutex> g(mutex_);
         auto it = entries_.find(id);
         if (it != entries_.end() && it->second) it->second->fingerprint.clear();
+    }
+
+    std::optional<Executor::Held> Executor::held(StepId id) const {
+        std::lock_guard<std::mutex> g(mutex_);
+        auto it = entries_.find(id);
+        if (it == entries_.end() || !it->second || !it->second->output) return std::nullopt;
+        const Entry& e = *it->second;
+        Held h;
+        h.fingerprint = e.fingerprint;
+        h.output = e.restored.lock();
+        if (!h.output) h.output = e.output;
+        h.data = e.output->array || e.output->source || e.arrayOnDisk;
+        h.bytes = e.bytes;
+        return h;
+    }
+
+    std::shared_ptr<const StepOutput> Executor::outputWithFingerprint(StepId id, const std::string& fp) const {
+        PendingRestore pending;
+        {
+            std::lock_guard<std::mutex> g(mutex_);
+            auto it = entries_.find(id);
+            if (it == entries_.end() || !it->second || !it->second->output || fp.empty() || it->second->fingerprint != fp) return nullptr;
+            Entry& e = *it->second;
+            if (!e.output->array && !e.output->source && !e.arrayOnDisk) return nullptr;
+            if (auto out = load(e, pending)) return out;
+        }
+        return restore(pending);
+    }
+
+    bool Executor::dropData(StepId id, const std::string& gone) {
+        std::filesystem::path stale;
+        {
+            std::lock_guard<std::mutex> g(mutex_);
+            auto it = entries_.find(id);
+            if (it == entries_.end() || !it->second || !it->second->output) return false;
+            Entry& e = *it->second;
+            auto shell = std::make_shared<StepOutput>(*e.output);
+            shell->array = nullptr;
+            shell->source = nullptr;
+            shell->gone = gone;
+            e.output = shell;
+            e.bytes = 0;
+            e.arrayOnDisk = false;
+            e.restored.reset();
+            stale = std::move(e.diskPath);
+            e.diskPath.clear();
+        }
+        if (!stale.empty()) {
+            std::error_code ec;
+            std::filesystem::remove(stale, ec);
+        }
+        return true;
     }
 
     void Executor::invalidate(StepId id) {

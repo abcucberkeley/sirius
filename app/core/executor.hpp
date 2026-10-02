@@ -83,6 +83,26 @@ namespace sirius::app {
         // Keep the step's last output for the viewer but stop serving it as
         // fresh (what a label edit upstream does to every step below it).
         void markStale(StepId id);
+        // What the executor holds for a step, without reading a spilled array
+        // back: the fingerprint it was stored under, the output (its array
+        // may be on disk or evicted), whether it still has data, and its
+        // bytes in memory. nullopt when there is no entry.
+        struct Held {
+            std::string fingerprint;
+            std::shared_ptr<const StepOutput> output;
+            bool data = false;
+            std::size_t bytes = 0;
+        };
+        std::optional<Held> held(StepId id) const;
+        // The step's output when it was stored under fingerprint `fp` and
+        // still holds its data (a spilled array is read back); null otherwise.
+        // How the engine on a node resolves an output handle.
+        std::shared_ptr<const StepOutput> outputWithFingerprint(StepId id, const std::string& fp) const;
+        // The data of the step's output went away (the cluster job holding it
+        // ended): the entry keeps its diagnostics, note and placement, with
+        // StepOutput::gone = `gone`, and is not served as fresh any more.
+        // False when there is no entry.
+        bool dropData(StepId id, const std::string& gone);
         void clear();
         std::size_t cachedBytes() const;
         std::size_t cachedBytesOf(StepId id) const;

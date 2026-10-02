@@ -287,6 +287,23 @@ namespace sirius::app::gui {
                 }
                 (void)link;
                 drawBind(app, st, fo);
+                drawEngine(fo);
+            }
+
+            // SIRIUS's engine as the job: every step on the node, the results
+            // kept there (the image has it at /opt/sirius/bin/sirius-cli).
+            void drawEngine(widgets::FieldOpts fo) {
+                widgets::checkbox("Run SIRIUS's engine on the node##engine", &profile_.engine);
+                widgets::tooltip("The job runs SIRIUS's own engine (sirius-cli serve) with the Python worker beside it: every step of "
+                                 "a pipeline then runs on the node, with CUDA where SIRIUS has it, and its results stay there until "
+                                 "you look at them or export them. Off: the Python worker alone, which runs only the Python steps.");
+                if (!profile_.engine) return;
+                fo.width = design(ImGui::GetContentRegionAvail().x);
+                const Field f("Engine executable (optional)");
+                fo.hint = trimmed(profile_.container).empty() ? "sirius-cli on the job's PATH" : "/opt/sirius/bin/sirius-cli in the image";
+                widgets::inputText("##engineBin", &profile_.engineBin, fo);
+                widgets::tooltip("Where sirius-cli is on the node (or in the image): a build of the same SIRIUS as this application, or "
+                                 "one whose operations are the same; another is refused when the job answers.");
             }
 
             // Under the image: the host paths bound into it (apptainer --bind)
@@ -530,6 +547,7 @@ namespace sirius::app::gui {
                 if (profile_.launcher.empty()) profile_.launcher = "apptainer";
                 profile_.bind = trimmed(profile_.bind);
                 profile_.containerPythonPath = trimmed(profile_.containerPythonPath);
+                profile_.engineBin = trimmed(profile_.engineBin);
                 profile_.partition = trimmed(profile_.partition);
                 profile_.account = trimmed(profile_.account);
                 profile_.qos = trimmed(profile_.qos);

@@ -5,15 +5,24 @@
 #include <algorithm>
 #include <chrono>
 #include <cmath>
+#include <condition_variable>
+#include <deque>
+#include <fstream>
 #include <limits>
 #include <ctime>
 #include <filesystem>
 #include <stdexcept>
+#include <thread>
+#include <tuple>
 
+#include "core/build_info.hpp"
 #include "core/cancel.hpp"
 #include "core/ops/load.hpp"
 #include "core/ops/plugin.hpp"
 #include "core/ops/builtin.hpp"
+#include "core/remote_source.hpp"
+#include "core/serialize.hpp"
+#include "core/sha256.hpp"
 
 namespace sirius::app {
 
@@ -77,7 +86,180 @@ namespace sirius::app {
             if (!hint.empty()) message += (message.empty() ? "" : " ") + hint;
             return message;
         }
+
+        // The refusal of a built-in step on a job without SIRIUS's engine (plan 4.3).
+        const char* const kNoEngine = "The cluster job runs the Python worker only (no SIRIUS engine): built-in steps cannot run there. "
+                                      "Reconnect with an engine image, or choose CPU/CUDA to run on this computer.";
+
+        std::string bytesText(std::uint64_t bytes) {
+            char buf[32];
+            if (bytes >= 1000000000ull) std::snprintf(buf, sizeof buf, "%.1f GB", static_cast<double>(bytes) / 1e9);
+            else if (bytes >= 1000000ull) std::snprintf(buf, sizeof buf, "%.1f MB", static_cast<double>(bytes) / 1e6);
+            else std::snprintf(buf, sizeof buf, "%.0f kB", static_cast<double>(bytes) / 1e3);
+            return buf;
+        }
+
+        std::string fileNameOf(const std::string& path) { return std::filesystem::u8path(path).filename().u8string(); }
+
+        // The first parameter value of a step that names a file on the cluster ("" none).
+        std::string clusterFileOf(const ParamSet& params) {
+            const json j = params.toJson();
+            for (const auto& [key, value] : j.items()) {
+                if (value.is_string() && isRemoteDatasetPath(value.get<std::string>())) return value.get<std::string>();
+                if (value.is_array())
+                    for (const json& e : value)
+                        if (e.is_string() && isRemoteDatasetPath(e.get<std::string>())) return e.get<std::string>();
+            }
+            return {};
+        }
+
+        // Every string of `v` equal to a key of `paths` becomes its value.
+        json substituted(const json& v, const std::map<std::string, std::string>& paths) {
+            if (v.is_string()) {
+                const auto it = paths.find(v.get<std::string>());
+                return it == paths.end() ? v : json(it->second);
+            }
+            if (v.is_array()) {
+                json a = json::array();
+                for (const json& e : v) a.push_back(substituted(e, paths));
+                return a;
+            }
+            return v;
+        }
+        json pipelineWithPaths(json p, const std::map<std::string, std::string>& paths) {
+            if (paths.empty() || !p.contains("steps") || !p["steps"].is_array()) return p;
+            for (json& s : p["steps"])
+                if (s.is_object() && s.contains("params") && s["params"].is_object())
+                    for (auto& [key, value] : s["params"].items()) value = substituted(value, paths);
+            return p;
+        }
+        // The uploads that still describe the files as they are: path -> node path.
+        std::map<std::string, std::string> currentUploads(const std::map<std::string, std::string>& byStamp) {
+            std::map<std::string, std::string> out;
+            for (const auto& [key, node] : byStamp) {
+                const std::size_t nl = key.find('\n');
+                if (nl == std::string::npos) continue;
+                const std::string path = key.substr(0, nl);
+                if (fileStamp(path) == key.substr(nl + 1)) out[path] = node;
+            }
+            return out;
+        }
     } // namespace
+
+    // --- RemoteConfig ------------------------------------------------------------------
+
+    std::unique_ptr<RemoteWorker> RemoteConfig::open(const std::function<bool()>& cancelled) const {
+        if (connect) return connect(cancelled);
+        return RemoteWorker::connect(host, port, token, std::chrono::seconds(10), cancelled, socksPort);
+    }
+
+    // --- the engine on the node, as the workbench talks to it ---------------------------------
+
+    struct Workbench::EngineLink {
+        struct Endpoint {
+            std::mutex m;
+            RemoteConfig config;
+            std::unique_ptr<RemoteWorker> open(const std::function<bool()>& cancelled = {}) {
+                RemoteConfig c;
+                {
+                    const std::lock_guard<std::mutex> g(m);
+                    c = config;
+                }
+                return c.open(cancelled);
+            }
+        };
+        struct Answer {
+            json result;
+            std::vector<rpc::Tensor> tensors;
+            std::string error;
+        };
+
+        std::shared_ptr<Endpoint> endpoint = std::make_shared<Endpoint>();
+        // The node's outputs are drawn through this one (two connections).
+        std::shared_ptr<RemoteDatasets> datasets;
+
+        std::mutex qm;
+        std::condition_variable qcv;
+        std::map<std::string, Answer> answers;                         // by method + params
+        std::deque<std::tuple<std::string, std::string, json>> queue;  // key, method, params
+        std::set<std::string> asked;
+        std::atomic<bool> quit{false};
+        std::function<void()> wake;
+        std::atomic<bool> arrived{false};
+        std::thread thread;
+
+        EngineLink() {
+            auto ep = endpoint;
+            datasets = std::make_shared<RemoteDatasets>("the cluster node", [ep] { return ep->open(); });
+        }
+        ~EngineLink() {
+            {
+                const std::lock_guard<std::mutex> g(qm);
+                quit.store(true);
+            }
+            qcv.notify_all();
+            if (thread.joinable()) thread.join();
+        }
+
+        void setConfig(const RemoteConfig& c) {
+            {
+                const std::lock_guard<std::mutex> g(endpoint->m);
+                endpoint->config = c;
+            }
+            const std::lock_guard<std::mutex> g(qm);
+            answers.clear();
+            asked.clear();
+            queue.clear();
+        }
+
+        std::optional<Answer> ask(const std::string& method, const json& params) {
+            const std::string key = method + "\n" + params.dump();
+            const std::lock_guard<std::mutex> g(qm);
+            if (auto it = answers.find(key); it != answers.end()) return it->second;
+            if (asked.insert(key).second) {
+                queue.emplace_back(key, method, params);
+                if (!thread.joinable()) thread = std::thread([this] { loop(); });
+                qcv.notify_all();
+            }
+            return std::nullopt;
+        }
+
+        void loop() {
+            std::unique_ptr<RemoteWorker> w;
+            for (;;) {
+                std::string key, method;
+                json params;
+                {
+                    std::unique_lock<std::mutex> lk(qm);
+                    qcv.wait(lk, [this] { return quit.load() || !queue.empty(); });
+                    if (quit.load()) return;
+                    std::tie(key, method, params) = std::move(queue.front());
+                    queue.pop_front();
+                }
+                Answer a;
+                try {
+                    if (!w || !w->isOpen()) w = endpoint->open([this] { return quit.load(); });
+                    WorkerResult r = w->call(method, params, {}, {}, [this] { return quit.load(); });
+                    a.result = std::move(r.result);
+                    a.tensors = std::move(r.tensors);
+                } catch (const std::exception& e) {
+                    a.error = e.what();
+                    if (a.error.rfind("worker: ", 0) == 0) a.error = a.error.substr(8);
+                    if (w && !w->isOpen()) w.reset();
+                }
+                std::function<void()> wakeUp;
+                {
+                    const std::lock_guard<std::mutex> g(qm);
+                    if (!asked.count(key)) continue;   // asked of an engine that was replaced since
+                    if (answers.size() > 256) answers.clear();
+                    answers[key] = std::move(a);
+                    wakeUp = wake;
+                }
+                arrived.store(true);
+                if (wakeUp) wakeUp();
+            }
+        }
+    };
 
     std::optional<ViewMode> viewModeFromString(const std::string& s) noexcept {
         const std::string l = lower(s);
@@ -201,9 +383,11 @@ namespace sirius::app {
     void RunJob::connectWorker() {
         if (backend_ == Backend::Hpc) {
             progress_.set(0.0, -1, "Connecting to the HPC worker…");
-            ownedRemote_ = RemoteWorker::connect(remoteConfig_.host, remoteConfig_.port, remoteConfig_.token, std::chrono::seconds(10), {},
-                                                 remoteConfig_.socksPort);
-            workerNote_ = "HPC worker: " + ownedRemote_->capabilities().device + " on " + ownedRemote_->capabilities().hostname;
+            ownedRemote_ = remoteConfig_.open([this] { return cancelled_.load(); });
+            if (!ownedRemote_) throw std::runtime_error("no connection to the HPC worker");
+            const WorkerCapabilities& caps = ownedRemote_->capabilities();
+            onEngine_ = caps.engine.is_object();
+            workerNote_ = (onEngine_ ? "HPC engine: " : "HPC worker: ") + caps.device + " on " + caps.hostname;
         } else if (needsWorker_) {
             if (!launcher_) throw std::runtime_error("no Python worker launcher configured");
             progress_.set(0.0, -1, "Starting the Python worker…");
@@ -239,7 +423,35 @@ namespace sirius::app {
             if (isCancellation(e)) cancelledResult_ = true;
             else error_ = "Worker unavailable: " + withHint(e.what(), workerHint_);
         }
-        if (error_.empty() && !cancelledResult_) {
+        // The HPC job's engine must be one whose operations are this
+        // application's; a job without one runs Python steps only.
+        if (error_.empty() && !cancelledResult_ && backend_ == Backend::Hpc && ownedRemote_) {
+            if (onEngine_) {
+                if (const std::string m = engineMismatch(buildInfo(), buildInfoFromJson(ownedRemote_->capabilities().engine)); !m.empty()) error_ = m;
+            } else {
+                for (int i = 1; i <= target_; ++i) {
+                    const Step& s = pipeline_.at(i);
+                    if (!s.enabled || executor_->isFresh(pipeline_, i) || s.op().needsWorker(s.params)) continue;
+                    error_ = "Step " + Step::number(i) + " " + s.name + ": " + kNoEngine;
+                    break;
+                }
+            }
+        }
+        if (error_.empty() && !cancelledResult_ && backend_ == Backend::Hpc && onEngine_) {
+            try {
+                executeOnEngine();
+            } catch (const CancelledError&) {
+                cancelledResult_ = true;
+            } catch (const std::exception& e) {
+                if (isCancellation(e)) cancelledResult_ = true;
+                else error_ = e.what();
+            }
+        } else if (error_.empty() && !cancelledResult_) {
+            // Whole volumes of cluster data come here only for a run the user
+            // chose to compute on this computer; on the HPC backend (the Python
+            // worker's job) a step that would download one is refused.
+            std::optional<RemoteDownloads::Allow> allow;
+            if (backend_ != Backend::Hpc) allow.emplace("a run on this computer");
             // Steps that will actually run, for an overall progress fraction.
             int toRun = 0;
             for (int i = 0; i <= target_; ++i) {
@@ -293,9 +505,131 @@ namespace sirius::app {
         finished_.store(true, std::memory_order_release);
     }
 
+    void RunJob::upload(const UploadFile& f, std::map<std::string, std::string>& nodePaths) {
+        const std::string key = f.path + "\n" + f.stamp;
+        if (nodePaths.count(key)) return;
+        const std::string id = stableHash(key);
+        const std::string name = fileNameOf(f.path);
+        const std::function<bool()> cancelled = [this] { return cancelled_.load(); };
+        const WorkerResult st = ownedRemote_->call("stat_file", {{"key", id}, {"name", name}, {"size", f.bytes}}, {}, {}, cancelled);
+        if (st.result.value("exists", false)) {
+            nodePaths[key] = st.result.value("path", std::string());
+            return;
+        }
+        std::ifstream in(std::filesystem::u8path(f.path), std::ios::binary);
+        if (!in) throw std::runtime_error("cannot read " + f.path + " to upload it");
+        crypto::Sha256 hash;
+        std::vector<char> chunk(std::size_t{8} << 20);
+        std::uint64_t offset = 0;
+        std::string nodePath;
+        do {
+            in.read(chunk.data(), static_cast<std::streamsize>(chunk.size()));
+            const std::size_t n = static_cast<std::size_t>(in.gcount());
+            if (n == 0 && offset < f.bytes) throw std::runtime_error(f.path + " changed while it was uploaded: run again");
+            hash.update(chunk.data(), n);
+            json p = {{"key", id}, {"name", name}, {"size", f.bytes}, {"offset", offset}};
+            if (offset + n >= f.bytes) p["sha256"] = crypto::toHex(hash.finish());
+            const WorkerResult r =
+                ownedRemote_->call("put_file", p, {rpc::TensorRef{"data", "uint8", {static_cast<Index>(n)}, chunk.data(), n}}, {}, cancelled);
+            offset += n;
+            const double f01 = f.bytes > 0 ? static_cast<double>(offset) / static_cast<double>(f.bytes) : 1.0;
+            progress_.set(0.0, -1, "Uploading " + name + " \xC2\xB7 " + bytesText(offset) + " of " + bytesText(f.bytes) + " (" + std::to_string(static_cast<int>(f01 * 100.0)) + " %)");
+            if (r.result.contains("path")) nodePath = r.result["path"].get<std::string>();
+        } while (offset < f.bytes);
+        if (nodePath.empty()) throw std::runtime_error("the node did not confirm the upload of " + name);
+        nodePaths[key] = nodePath;
+    }
+
+    void RunJob::executeOnEngine() {
+        const std::function<bool()> cancelled = [this] { return cancelled_.load(); };
+        StepContext ctx = ctx_;
+        ctx.cancelled = cancelled;
+        // The Load step stays this computer's: a cluster dataset's lazy
+        // source, or the local file it opened (cheap either way).
+        if (!executor_->isFresh(pipeline_, 0)) {
+            progress_.set(0.0, 0, "Opening the dataset…");
+            executor_->run(pipeline_, 0, ctx, &reports_);
+            reports_.clear();
+        }
+        // Nothing to do when the target is fresh here already.
+        if (std::shared_ptr<const StepOutput> fresh = executor_->cached(pipeline_, target_)) {
+            for (int i = 0; i <= target_; ++i) {
+                StepReport r;
+                r.id = pipeline_.at(i).id;
+                r.index = i;
+                r.state = i > 0 && !pipeline_.at(i).enabled ? StepReport::State::Skipped : StepReport::State::Cached;
+                reports_.push_back(r);
+            }
+            output_ = fresh;
+            return;
+        }
+        // The files of this computer the user agreed to send, then the pipeline
+        // as the node knows it: those files under their node paths.
+        for (const UploadFile& f : uploads_) {
+            if (cancelled_.load()) throw CancelledError();
+            upload(f, nodePaths_);
+        }
+        const json pipelineJson = pipelineWithPaths(pipeline_.toJson(), currentUploads(nodePaths_));
+        // What this side holds fresh already: the node leaves out their diagnostics.
+        json have = json::array();
+        for (int i = 1; i <= target_; ++i)
+            if (std::shared_ptr<const StepOutput> out = executor_->cached(pipeline_, i))
+                if (const auto* node = dynamic_cast<const NodeOutputSource*>(out->source.get())) have.push_back(node->handle());
+        const json params = {{"pipeline", pipelineJson},
+                             {"target", target_},
+                             {"device", ctx.hpcDevice == HpcDevice::Cpu ? "cpu" : "cuda"},
+                             {"hub_token", ctx.hubToken},
+                             {"have", have}};
+        progress_.set(0.0, -1, "Running on the cluster node…");
+        const WorkerResult r = ownedRemote_->callWithFrames(
+            "pipeline_run", params, {},
+            [this](const json& frame) {
+                const int step = frame.value("step", -1);
+                progress_.set(frame.value("fraction", 0.0), step, frame.value("message", std::string()));
+            },
+            cancelled);
+        const json& result = r.result;
+        engineSession_ = result.value("session", std::string());
+        const WorkerCapabilities& caps = ownedRemote_->capabilities();
+        std::string where = remoteConfig_.where;
+        if (where.empty()) {
+            const std::string job = caps.engine.contains("job") && caps.engine["job"].is_object() ? caps.engine["job"].value("id", std::string()) : std::string();
+            where = caps.hostname + (job.empty() ? std::string() : " \xC2\xB7 job " + job);
+        }
+        where_ = where;
+        reports_.clear();
+        if (result.contains("reports") && result["reports"].is_array())
+            for (const json& j : result["reports"]) reports_.push_back(stepReportFromJson(j));
+        // The node's outputs, seeded here as if they had just run: handles,
+        // drawn at screen size, never downloaded.
+        if (result.contains("outputs") && result["outputs"].is_array())
+            for (const json& o : result["outputs"]) {
+                const int index = o.value("index", -1);
+                if (index < 1 || index > target_ || pipeline_.at(index).id != o.value("step_id", StepId{0})) continue;
+                const std::string handle = o.value("handle", std::string());
+                if (std::shared_ptr<const StepOutput> mine = executor_->cached(pipeline_, index))
+                    if (const auto* node = dynamic_cast<const NodeOutputSource*>(mine->source.get()); node && node->handle() == handle) continue;
+                auto out = std::make_shared<StepOutput>();
+                out->meta = datasetMetaFromJson(o.value("meta", json::object()));
+                if (o.value("held", false)) out->source = std::make_shared<NodeOutputSource>(nodeDatasets_, handle, out->meta, where);
+                if (o.contains("diagnostics") && o["diagnostics"].is_object()) out->diagnostics = decodeDiagnostics(o["diagnostics"], r.tensors);
+                out->note = o.value("note", std::string());
+                out->seconds = o.value("seconds", 0.0);
+                const json ranOn = o.value("ran_on", json::object());
+                out->ranOn = backendFromString(ranOn.value("backend", std::string("CPU"))).value_or(Backend::Cpu);
+                out->ranOnDevice = ranOn.value("device", std::string());
+                out->where = where;
+                if (o.contains("labels") && o["labels"].value("present", false))
+                    out->note += std::string(out->note.empty() ? "" : " \xC2\xB7 ") + "labels kept on the node";
+                executor_->seed(pipeline_, index, out);
+            }
+        if (result.contains("error")) throw std::runtime_error(result["error"].get<std::string>());
+        output_ = executor_->lastOutput(pipeline_.at(target_).id);
+    }
+
     // --- Workbench ---------------------------------------------------------------
 
-    Workbench::Workbench(std::filesystem::path scratchDir) : executor_(std::move(scratchDir)) {
+    Workbench::Workbench(std::filesystem::path scratchDir) : executor_(std::move(scratchDir)), engine_(std::make_shared<EngineLink>()) {
         registerBuiltinOperations();
         pipeline_ = Pipeline();
         // Default pipeline of the design: Load + Contrast, Contrast selected and viewed.
@@ -612,7 +946,10 @@ namespace sirius::app {
         const std::shared_ptr<const StepOutput> upstream = seedParams ? upstreamOutput(index, &actual) : nullptr;
         int nearest = index - 1;
         while (nearest > 0 && !pipeline_.at(nearest).enabled) --nearest;
-        if (upstream && actual == nearest && outputFresh(actual)) {
+        // An input that stays on the cluster is not read here for it: the
+        // defaults (an automatic window) are worked out where the step runs.
+        const bool remoteInput = upstream && !upstream->array && upstream->source && upstream->source->viewProvider();
+        if (upstream && !remoteInput && actual == nearest && outputFresh(actual)) {
             try {
                 Step& s = pipeline_.at(index);
                 s.params = s.op().initialParams(s.params, upstream->asInput());
@@ -944,6 +1281,30 @@ namespace sirius::app {
             return v;
         }
         if (const Operation* op = findOperation(s.kind)) {
+            // A file the step reads on the cluster (cluster://...) is checked
+            // there, by the engine, which reads it; here there is no such file.
+            if (const std::string file = index > 0 ? clusterFileOf(s.params) : std::string(); !file.empty()) {
+                if (!remote_.hasEngine()) {
+                    v.errors.push_back(fileNameOf(file) + " is on the cluster: SIRIUS's engine there reads it. Connect to the cluster (with the engine) to "
+                                                          "use it, or choose a file on this computer.");
+                    return v;
+                }
+                std::string error;
+                const std::optional<json> a = askEngine("step_validate", {{"pipeline", nodePipelineJson()}, {"index", index}}, &error);
+                if (!a) {
+                    v.warnings.push_back("Checking " + fileNameOf(file) + " on the cluster node\xE2\x80\xA6");
+                    return v;
+                }
+                if (!error.empty()) {
+                    v.errors.push_back("The cluster node could not check this step: " + error);
+                    return v;
+                }
+                for (const json& e : a->value("errors", json::array()))
+                    if (e.is_string()) v.errors.push_back(e.get<std::string>());
+                for (const json& w : a->value("warnings", json::array()))
+                    if (w.is_string()) v.warnings.push_back(w.get<std::string>());
+                return v;
+            }
             try {
                 return op->validate(s.params, inputMetaOf(index));
             } catch (const std::exception& e) {
@@ -1242,6 +1603,35 @@ namespace sirius::app {
         // The operation's own live preview, when it has one and an input exists.
         if (source_ && index > 0) {
             std::shared_ptr<const StepOutput> upstream = upstreamOutput(index);
+            // An input that stays on the cluster is previewed there, by the
+            // engine, on the data as the node holds it: nothing comes here but
+            // the diagnostics (answered on the engine's thread; poll()).
+            // (an input not computed on the node yet has no preview: none is guessed from another step's data)
+            if (inputOnCluster(index) && !previewedOnNode(index)) return d;
+            if (previewedOnNode(index)) {
+                std::string error;
+                std::vector<rpc::Tensor> tensors;
+                const std::optional<json> a = askEngine("step_preview", {{"pipeline", nodePipelineJson()}, {"index", index}}, &error, &tensors);
+                if (!a) {
+                    d.warnings.push_back("Computing the preview on the cluster node\xE2\x80\xA6");
+                    return d;
+                }
+                if (!error.empty()) {
+                    d.warnings.push_back("Preview on the cluster node: " + error);
+                    return d;
+                }
+                if (a->contains("diagnostics") && (*a)["diagnostics"].is_object()) {
+                    try {
+                        Diagnostics p = decodeDiagnostics((*a)["diagnostics"], tensors);
+                        p.warnings.insert(p.warnings.end(), d.warnings.begin(), d.warnings.end());
+                        if (p.summary.empty()) p.summary = d.summary;
+                        return p;
+                    } catch (const std::exception& e) {
+                        d.warnings.push_back(e.what());
+                    }
+                }
+                return d;
+            }
             if (upstream) {
                 try {
                     if (auto p = op->preview(upstream->asInput(), s.params)) {
@@ -1316,7 +1706,191 @@ namespace sirius::app {
 
     void Workbench::setRemoteConfig(RemoteConfig c) {
         remote_ = std::move(c);
+        engine_->setConfig(remote_);
         notify(&Observer::backendChanged);
+    }
+
+    int Workbench::nodeOutputsGone(const std::string& session, const std::string& reason) {
+        int n = 0;
+        for (int i = 1; i < pipeline_.size(); ++i) {
+            const StepId id = pipeline_.at(i).id;
+            const std::optional<Executor::Held> h = executor_.held(id);
+            if (!h || !h->output) continue;
+            auto* node = dynamic_cast<NodeOutputSource*>(h->output->source.get());
+            if (!node || (!session.empty() && node->session() != session)) continue;
+            node->markGone(reason);
+            if (executor_.dropData(id, reason)) {
+                ++n;
+                logLine("Step " + Step::number(i) + " " + pipeline_.at(i).name + ": its result is gone, " + reason + ". Run it again.");
+            }
+        }
+        if (session.empty() || session == engineSession_) engineSession_.clear();
+        if (n > 0) notify(&Observer::outputsChanged);
+        return n;
+    }
+
+    std::vector<UploadFile> Workbench::filesToUpload(int target) const {
+        std::vector<UploadFile> out;
+        if (target < 0 || target >= pipeline_.size()) target = pipeline_.size() - 1;
+        const auto consider = [&out](const std::string& v) {
+            if (v.empty() || isRemoteDatasetPath(v)) return;
+            std::error_code ec;
+            const std::filesystem::path p = std::filesystem::u8path(v);
+            if (!std::filesystem::is_regular_file(p, ec)) return;
+            for (const UploadFile& f : out)
+                if (f.path == v) return;
+            UploadFile f;
+            f.path = v;
+            f.bytes = static_cast<std::uint64_t>(std::filesystem::file_size(p, ec));
+            f.stamp = fileStamp(v);
+            out.push_back(std::move(f));
+        };
+        for (int i = 0; i <= target; ++i) {
+            const Step& s = pipeline_.at(i);
+            if (i > 0 && !s.enabled) continue;
+            if (i == 0) {
+                consider(s.params.getString("path"));
+                continue;
+            }
+            const Operation* op = findOperation(s.kind);
+            if (!op) continue;
+            for (const ParamSpec& spec : op->info().params) {
+                if (spec.type == ParamType::Path) consider(s.params.getString(spec.key));
+                else if (spec.type == ParamType::StringList)
+                    for (const std::string& v : s.params.getStringList(spec.key)) consider(v);
+            }
+        }
+        return out;
+    }
+
+    void Workbench::allowUploads(const std::vector<UploadFile>& files) {
+        for (const UploadFile& f : files) uploadConsent_.insert(f.path + "\n" + f.stamp);
+    }
+
+    std::string Workbench::placementOf(int index) const {
+        if (index < 1 || index >= pipeline_.size()) return {};
+        const std::optional<Executor::Held> h = executor_.held(pipeline_.at(index).id);
+        if (!h || !h->output) return {};
+        std::string tag = placementTag(*h->output);
+        if (!h->output->gone.empty()) tag += " \xC2\xB7 gone";
+        return tag;
+    }
+
+    void Workbench::setWakeHandler(std::function<void()> wake) {
+        const std::lock_guard<std::mutex> g(engine_->qm);
+        engine_->wake = std::move(wake);
+    }
+
+    bool Workbench::poll() {
+        if (!engine_->arrived.exchange(false)) return false;
+        notify(&Observer::outputsChanged);
+        return true;
+    }
+
+    json Workbench::nodePipelineJson() const { return pipelineWithPaths(pipeline_.toJson(), currentUploads(nodePaths_)); }
+
+    bool Workbench::inputOnCluster(int index) const {
+        if (!source_ || index < 1 || index >= pipeline_.size() || !remote_.hasEngine()) return false;
+        const std::shared_ptr<const StepOutput> up = upstreamOutput(index);
+        return up && !up->array && up->source && up->source->viewProvider();
+    }
+
+    bool Workbench::previewedOnNode(int index) const {
+        if (!inputOnCluster(index)) return false;
+        // the step's own input, computed: the nearest enabled step above it, fresh
+        int actual = -1;
+        (void)upstreamOutput(index, &actual);
+        int nearest = index - 1;
+        while (nearest > 0 && !pipeline_.at(nearest).enabled) --nearest;
+        return actual == nearest && outputFresh(actual);
+    }
+
+    std::optional<Diagnostics> Workbench::nodePreview(int index, const ParamSet& params) const {
+        std::string error;
+        std::vector<rpc::Tensor> tensors;
+        const std::optional<json> a =
+            askEngine("step_preview", {{"pipeline", nodePipelineJson()}, {"index", index}, {"params", params.toJson()}}, &error, &tensors);
+        if (!a) return std::nullopt;
+        if (!error.empty()) throw std::runtime_error(error);
+        if (!a->contains("diagnostics") || !(*a)["diagnostics"].is_object()) throw std::runtime_error("the node has no preview of this step");
+        return decodeDiagnostics((*a)["diagnostics"], tensors);
+    }
+
+    std::optional<ContrastWindow> Workbench::contrastWindowOf(int index, const ParamSet& params, Index c, bool wantRange) const {
+        const std::shared_ptr<const StepOutput> up = upstreamOutput(index);
+        if (!up) return std::nullopt;
+        if (!inputOnCluster(index)) return contrastWindow(up->asInput(), params, c, 8, wantRange);
+        if (!previewedOnNode(index)) return std::nullopt;   // its input is not computed on the node yet
+        const std::optional<Diagnostics> d = nodePreview(index, params);
+        if (!d) return std::nullopt;
+        if (c < 0 || static_cast<std::size_t>(c) >= d->histograms.size()) throw std::runtime_error("the node's preview has no channel " + std::to_string(c));
+        const DiagnosticHistogram& h = d->histograms[static_cast<std::size_t>(c)];
+        ContrastWindow w;
+        w.lo = static_cast<float>(h.lo);
+        w.hi = static_cast<float>(h.hi);
+        w.gamma = static_cast<float>(params.getDouble("gamma", 1.0));
+        w.dataMin = static_cast<float>(h.binLo);
+        w.dataMax = static_cast<float>(h.binHi);
+        return w;
+    }
+
+    std::optional<ParamSet> Workbench::contrastAutoOf(int index, const ParamSet& current) const {
+        const std::shared_ptr<const StepOutput> up = upstreamOutput(index);
+        if (!up) return std::nullopt;
+        if (!inputOnCluster(index)) return contrastAutoParams(current, up->asInput());
+        if (!previewedOnNode(index)) return std::nullopt;
+        // the automatic window is the preview's own when min / max say automatic
+        ParamSet p = current;
+        if (const Operation* op = findOperation("contrast")) p.applyDefaults(op->info().params);
+        ParamSet automatic = p;
+        automatic.set("min", 0.0);
+        automatic.set("max", 0.0);
+        const std::optional<Diagnostics> d = nodePreview(index, automatic);
+        if (!d) return std::nullopt;
+        float lo = std::numeric_limits<float>::infinity(), hi = -lo;
+        for (const DiagnosticHistogram& h : d->histograms) {
+            lo = std::min(lo, static_cast<float>(h.lo));
+            hi = std::max(hi, static_cast<float>(h.hi));
+        }
+        if (!(lo < hi)) {
+            lo = 0.0f;
+            hi = 1.0f;
+        }
+        p.set("min", static_cast<double>(lo));
+        p.set("max", static_cast<double>(hi));
+        return p;
+    }
+
+    std::optional<ParamSet> Workbench::contrastResetOf(int index, const ParamSet& current) const {
+        const std::shared_ptr<const StepOutput> up = upstreamOutput(index);
+        if (!up) return std::nullopt;
+        if (!inputOnCluster(index)) return contrastResetParams(current, up->asInput());
+        if (!previewedOnNode(index)) return std::nullopt;
+        const std::optional<Diagnostics> d = nodePreview(index, current);
+        if (!d) return std::nullopt;
+        float mn = std::numeric_limits<float>::infinity(), mx = -mn;
+        for (const DiagnosticHistogram& h : d->histograms) {
+            mn = std::min(mn, static_cast<float>(h.binLo));
+            mx = std::max(mx, static_cast<float>(h.binHi));
+        }
+        if (!(mn < mx)) {
+            mn = 0.0f;
+            mx = 1.0f;
+        }
+        ParamSet p = current;
+        p.set("min", static_cast<double>(mn));
+        p.set("max", static_cast<double>(mx));
+        p.set("gamma", 1.0);
+        return p;
+    }
+
+    std::optional<json> Workbench::askEngine(const std::string& method, const json& params, std::string* error,
+                                             std::vector<rpc::Tensor>* tensors) const {
+        std::optional<EngineLink::Answer> a = engine_->ask(method, params);
+        if (!a) return std::nullopt;
+        if (error) *error = a->error;
+        if (tensors) *tensors = a->tensors;
+        return a->result;
     }
 
     int Workbench::loadPlugins(bool reload) {
@@ -1407,6 +1981,47 @@ namespace sirius::app {
         if (backend_ != Backend::Hpc && needsWorker && !launcher_)
             return refuseRun(RunRefusal::Kind::NoLauncher, -1,
                              "Worker unavailable: " + withHint("no Python worker launcher configured", workerHint_));
+        // The HPC backend never computes here in silence: with SIRIUS's engine
+        // on the node the whole run goes there (an engine of other operations
+        // is refused; files of this computer go only when the user agrees),
+        // and a job with the Python worker only runs the Python steps.
+        std::vector<UploadFile> uploads;
+        if (backend_ == Backend::Hpc && remote_.hasEngine()) {
+            if (const std::string m = engineMismatch(buildInfo(), buildInfoFromJson(remote_.engine)); !m.empty())
+                return refuseRun(RunRefusal::Kind::EngineMismatch, -1, m);
+            const std::string data = pipeline_.at(0).params.getString("path");
+            std::error_code ec;
+            if (!data.empty() && !isRemoteDatasetPath(data) && std::filesystem::is_directory(std::filesystem::u8path(data), ec))
+                return refuseRun(RunRefusal::Kind::NeedsUpload, 0,
+                                 "The dataset is a folder on this computer: the HPC backend computes on the cluster node, and a folder is not "
+                                 "uploaded. Open the dataset from the cluster (cluster://\xE2\x80\xA6), or choose CPU/CUDA to run here.");
+            std::vector<UploadFile> missing;
+            std::uint64_t bytes = 0;
+            for (UploadFile& f : filesToUpload(target)) {
+                if (uploadConsent_.count(f.path + "\n" + f.stamp)) {
+                    uploads.push_back(f);
+                } else {
+                    bytes += f.bytes;
+                    missing.push_back(std::move(f));
+                }
+            }
+            if (!missing.empty()) {
+                std::string names;
+                for (const UploadFile& f : missing) names += (names.empty() ? "" : ", ") + fileNameOf(f.path) + " (" + bytesText(f.bytes) + ")";
+                const bool dataset = missing.front().path == data;
+                lastRunRefusal_.uploads = missing;
+                return refuseRun(RunRefusal::Kind::NeedsUpload, -1,
+                                 std::string(dataset ? "The dataset is on this computer: " : "Files of this computer: ") + names +
+                                     ". The HPC backend computes on the cluster node, so " + bytesText(bytes) +
+                                     " would be uploaded there first. Upload them, or open the data from the cluster (cluster://\xE2\x80\xA6).");
+            }
+        } else if (backend_ == Backend::Hpc && remote_.known) {
+            for (int i = 1; i <= target; ++i) {
+                const Step& s = pipeline_.at(i);
+                if (!s.enabled || executor_.isFresh(pipeline_, i) || s.op().needsWorker(s.params)) continue;
+                return refuseRun(RunRefusal::Kind::NoEngine, i, "Step " + Step::number(i) + " " + s.name + ": " + kNoEngine);
+            }
+        }
         endPaintStroke();
         auto job = std::make_shared<RunJob>();
         job->pipeline_ = pipeline_;
@@ -1427,12 +2042,19 @@ namespace sirius::app {
         job->launcher_ = launcher_;
         job->remoteConfig_ = remote_;
         job->workerHint_ = workerHint_;
+        job->nodeDatasets_ = engine_->datasets;
+        job->uploads_ = std::move(uploads);
+        job->nodePaths_ = nodePaths_;
         activeRun_ = job;
         if (backend_ == Backend::Cuda && cudaDevice_ == kAllCudaDevices && cudaAvailable())
             logLine("Run to step " + Step::number(target) + " on CUDA · all " +
                     std::to_string(cudaDeviceCount()) + " GPUs");
+        else if (backend_ == Backend::Hpc && remote_.hasEngine())
+            logLine("Run to step " + Step::number(target) + " on HPC · " + (remote_.where.empty() ? std::string("the cluster node") : remote_.where) +
+                    " · " + toString(hpcDevice_));
         else if (backend_ == Backend::Hpc)
-            logLine("Run to step " + Step::number(target) + " on HPC · " + toString(hpcDevice_));
+            logLine("Run to step " + Step::number(target) + " on HPC" + (remote_.known ? " (Python steps on the worker job)" : std::string()) + " · " +
+                    toString(hpcDevice_));
         else
             logLine("Run to step " + Step::number(target) + " on " + toString(backend_));
         notify(&Observer::runStateChanged);
@@ -1461,7 +2083,12 @@ namespace sirius::app {
                 case StepReport::State::Ran: {
                     char buf[32];
                     std::snprintf(buf, sizeof buf, "%.1f s", r.seconds);
-                    logLine("Step " + name + " · " + buf + (r.note.empty() ? "" : " · " + r.note));
+                    // where it ran, as the output says: the node's engine, the Python worker, this computer
+                    std::string where;
+                    if (r.index == 0 && job->onEngine_) where = " · on " + job->where_;   // the node opened it for the run
+                    else if (index >= 0)
+                        if (const std::optional<Executor::Held> h = executor_.held(r.id); h && h->output) where = " · " + placementText(*h->output);
+                    logLine("Step " + name + " · " + buf + (r.note.empty() ? "" : " · " + r.note) + where);
                     if (session_.recording()) {
                         nlohmann::json entry{{"index", index}, {"seconds", r.seconds}, {"note", r.note}};
                         if (index >= 0) {
@@ -1489,6 +2116,14 @@ namespace sirius::app {
             logLine("Run " + (job->wasCancelled() ? std::string("cancelled") : "failed: " + job->error()));
         }
         job->ownedRemote_.reset();
+        // What the node holds now belongs to the session that answered; the
+        // uploads are on the node for the next run.
+        for (const auto& [key, node] : job->nodePaths_) nodePaths_[key] = node;
+        if (!job->engineSession_.empty() && job->engineSession_ != engineSession_) {
+            if (!engineSession_.empty())
+                nodeOutputsGone(engineSession_, "held by an earlier SIRIUS engine (another cluster job), which has ended");
+            engineSession_ = job->engineSession_;
+        }
         // A run that re-ran the Load step (its tile, page order or voxel size
         // was edited) opened the data anew: that is the dataset from now on,
         // the output step 01 shows and the one the caches are seeded with

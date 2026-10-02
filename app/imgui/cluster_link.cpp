@@ -115,6 +115,20 @@ namespace sirius::app::gui {
         rc.port = e.port;
         rc.token = e.token;
         rc.socksPort = e.socksPort;
+        const cluster::Status st = session_.status();
+        if (st.state == cluster::State::Connected) {
+            // every connection the session's endpoint as it is then: a
+            // reconnect to the same job keeps the results' handles working
+            const cluster::Session* session = &session_;
+            auto alive = alive_;
+            rc.connect = [alive, session](const std::function<bool()>& cancelled) {
+                if (!alive->load()) throw ProtocolError("the application is closing");
+                return session->connectWorker(std::chrono::seconds(10), cancelled);
+            };
+            rc.known = true;
+            rc.engine = st.caps.engine;
+            rc.where = st.host + " \xC2\xB7 " + st.node + (st.jobId.empty() ? std::string() : " \xC2\xB7 job " + st.jobId);
+        }
         return rc;
     }
 
@@ -164,6 +178,13 @@ namespace sirius::app::gui {
         } else if (before == cluster::State::Connected) {
             if (datasets_) datasets_->uninstall();
             datasets_.reset();
+            // The job ended: the engine's results went with it. A job left
+            // running keeps them for a reconnect (which reattaches to it).
+            const cluster::Status st = session_.status();
+            if (st.jobEnded && !app_.wb().engineSession().empty()) {
+                const int n = app_.wb().nodeOutputsGone(app_.wb().engineSession(), "held by the cluster job, which ended (" + st.reason + ")");
+                if (n > 0) app_.wb().logLine("HPC: the results of " + std::to_string(n) + " step(s) went with the job: run them again to see them.");
+            }
         }
         app_.requestRedraw();
     }
@@ -179,9 +200,20 @@ namespace sirius::app::gui {
         // a job without a GPU computes on its CPU; with one, the session's choice stands
         if (!st.caps.cuda) wb.setHpcDevice(HpcDevice::Cpu);
         datasets_->setDevice(wb.hpcDevice() == HpcDevice::Cpu ? "cpu" : "cuda");
+        // Another engine than the one the results here came from (a new job):
+        // those are gone; the same one (a reattached job) still holds them.
+        const std::string session = st.caps.engine.is_object() ? st.caps.engine.value("session", std::string()) : std::string();
+        if (!wb.engineSession().empty() && wb.engineSession() != session)
+            wb.nodeOutputsGone(wb.engineSession(), "held by an earlier cluster job, which has ended");
         wb.setRemoteConfig(remoteConfig());
         wb.setBackend(Backend::Hpc);
-        wb.logLine("HPC: the HPC backend now runs on " + st.node + " (" + st.caps.device + "); cluster datasets open from " + st.host);
+        if (st.caps.engine.is_object())
+            wb.logLine("HPC: SIRIUS's engine on " + st.node + " (" + st.caps.device + ", job " + st.jobId +
+                       ") runs every step there; its results stay there until shown or exported. Cluster datasets open from " + st.host);
+        else
+            wb.logLine("HPC: the Python worker on " + st.node + " (" + st.caps.device + ") runs the Python steps (no SIRIUS engine in this job: "
+                                                                                        "built-in steps are refused on HPC); cluster datasets open from " +
+                       st.host);
     }
 
     std::string ClusterLink::indicator(ImU32& color) const {

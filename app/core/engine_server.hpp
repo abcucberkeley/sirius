@@ -8,12 +8,18 @@
 //
 //   "engine": {"build", "version", "commit", "dirty", "ops_schema", "api"   (core/build_info.hpp)
 //              "cuda": {"devices": [{"index", "name", "memory_gb"}], "nvtiff"},
-//              "cpu_threads", "view_cache_used", "scratch", "job": {"id"},
+//              "cpu_threads", "view_cache_used", "cache_used", "scratch",
+//              "session" (this process's: every output handle starts with it),
+//              "job": {"id"},
 //              "python": {"state": "disabled|starting|ready|failed", "caps"?, "error"?}}
 //
-// Served here, in C++: ping, cancel, shutdown and the cluster datasets
+// Served here, in C++: ping, cancel, shutdown, the cluster datasets
 // (dataset_info / _read / _view / _stats, core/dataset_service.hpp), with
-// SIRIUS's own TIFF reader (nvTIFF on a CUDA device). Every other request is
+// SIRIUS's own TIFF reader (nvTIFF on a CUDA device), and the application's
+// pipelines (pipeline_run, step_preview, step_validate, output_stats,
+// put_file, stat_file, outputs_release, cache_status: core/engine_node.hpp),
+// whose outputs stay here and are drawn through dataset_* by their handles.
+// Every other request is
 // relayed verbatim to a Python worker the engine runs as its child on
 // 127.0.0.1 with a token of its own (core/local_worker.hpp) -- progress,
 // cancel and tensors included -- or, without one, refused with a message
@@ -33,13 +39,15 @@
 
 namespace sirius::app {
 
+    class EngineNode;
+
     struct EngineOptions {
         std::string token;                                  // the shared secret; "" only on a loopback address
         std::string host = "127.0.0.1";                     // what the announce line and hello report
         int maxClients = 8;
         std::string device = "auto";                        // auto | cpu | cuda | cuda:N: the default decode device
         std::chrono::milliseconds idleTimeout{3600000};
-        std::string scratch;                                // node scratch (reported; P2 keeps its cache there)
+        std::string scratch;                                // node scratch: the step cache and uploads go in a folder of their own there ("" = the temp dir)
         long long viewCacheBytes = -1;                      // < 0: $SIRIUS_WORKER_VIEW_CACHE_MB, default 4 GiB
         // The Python worker for what the engine does not serve itself.
         bool pythonWorker = true;
@@ -47,6 +55,10 @@ namespace sirius::app {
         // Instead of starting a child: how to connect to a worker (tests).
         std::function<std::unique_ptr<RemoteWorker>(const std::function<bool()>& cancelled)> connectPython;
         std::function<void(const std::string&)> log;
+        // Tests only: fields reported in the "engine" block in place of this
+        // build's (an engine of other operations, refused at the hello).
+        // `sirius-cli serve` takes them from $SIRIUS_TEST_ENGINE_BUILD.
+        nlohmann::json buildOverride;
     };
 
     class EngineServer {
@@ -75,6 +87,7 @@ namespace sirius::app {
         bool stopping() const noexcept;
 
         DatasetService& datasets() noexcept;
+        EngineNode& node() noexcept;
         rpc::Server& server() noexcept;
 
     private:

@@ -17,6 +17,7 @@
 
 #include "core/array_source.hpp"
 #include "core/cancel.hpp"
+#include "core/remote_source.hpp"
 #include "core/tracks.hpp"
 
 namespace sirius::app {
@@ -211,6 +212,14 @@ namespace sirius::app {
         // The array when there is one: planes are read in place. A lazy
         // source (Load before a full load) is read a plane at a time.
         const Array5* array = out.array && !out.array->empty() ? out.array.get() : nullptr;
+        // Data that stays on the cluster is measured there: reading every
+        // plane here would download all of it.
+        if (const auto* remote = dynamic_cast<const RemoteSource*>(out.source.get()); remote && !array) {
+            if (progress) progress(0.0);
+            std::vector<ChannelStatistics> r = channelStatisticsFromJson(remote->statistics(statisticsOptionsToJson(o), cancelled));
+            if (progress) progress(1.0);
+            return r;
+        }
         if (!array && !out.source) throw std::runtime_error("the output holds no data");
         const Dims5 dims = array ? array->dims() : out.source->dims();
 
@@ -286,6 +295,76 @@ namespace sirius::app {
             result.push_back(std::move(st));
         }
         return result;
+    }
+
+    namespace {
+        nlohmann::json orNull(double v) { return std::isnan(v) ? nlohmann::json(nullptr) : nlohmann::json(v); }
+        double numberOr(const nlohmann::json& j, const char* key, double def) {
+            const auto it = j.find(key);
+            if (it == j.end()) return def;
+            if (it->is_null()) return kNaN;
+            return it->is_number() ? it->get<double>() : def;
+        }
+    } // namespace
+
+    nlohmann::json statisticsOptionsToJson(const StatisticsOptions& o) {
+        return {{"channels", o.channels},
+                {"t", o.t},
+                {"percentiles", o.percentiles},
+                {"histogram_bins", o.histogramBins},
+                {"max_samples", o.maxSamples},
+                {"saturation_level", o.saturationLevel}};
+    }
+
+    StatisticsOptions statisticsOptionsFromJson(const nlohmann::json& j) {
+        StatisticsOptions o;
+        if (!j.is_object()) return o;
+        if (j.contains("channels") && j["channels"].is_array()) o.channels = j["channels"].get<std::vector<Index>>();
+        if (j.contains("t") && j["t"].is_number_integer()) o.t = j["t"].get<Index>();
+        if (j.contains("percentiles") && j["percentiles"].is_array()) o.percentiles = j["percentiles"].get<std::vector<double>>();
+        if (j.contains("histogram_bins") && j["histogram_bins"].is_number_integer()) o.histogramBins = j["histogram_bins"].get<int>();
+        if (j.contains("max_samples") && j["max_samples"].is_number_unsigned()) o.maxSamples = j["max_samples"].get<std::uint64_t>();
+        if (j.contains("saturation_level") && j["saturation_level"].is_number()) o.saturationLevel = j["saturation_level"].get<double>();
+        return o;
+    }
+
+    nlohmann::json channelStatisticsToJson(const std::vector<ChannelStatistics>& stats) {
+        nlohmann::json out = nlohmann::json::array();
+        for (const ChannelStatistics& s : stats) {
+            nlohmann::json p = nlohmann::json::array();
+            for (const auto& [q, v] : s.percentiles) p.push_back({q, orNull(v)});
+            nlohmann::json c = {{"channel", s.channel}, {"min", orNull(s.min)}, {"max", orNull(s.max)}, {"mean", orNull(s.mean)}, {"stddev", orNull(s.stddev)}, {"count", s.count}, {"nan", s.nanCount}, {"percentiles", p}, {"hist_lo", s.histLo}, {"hist_hi", s.histHi}, {"histogram", s.histogram}, {"sampled", s.sampled}};
+            if (s.saturatedFraction) c["saturated_fraction"] = orNull(*s.saturatedFraction);
+            out.push_back(std::move(c));
+        }
+        return out;
+    }
+
+    std::vector<ChannelStatistics> channelStatisticsFromJson(const nlohmann::json& j) {
+        const nlohmann::json& list = j.is_object() && j.contains("channels") ? j["channels"] : j;
+        if (!list.is_array()) throw std::runtime_error("output_stats: a reply without channels");
+        std::vector<ChannelStatistics> out;
+        for (const nlohmann::json& c : list) {
+            ChannelStatistics s;
+            s.channel = c.value("channel", Index{0});
+            s.min = numberOr(c, "min", kNaN);
+            s.max = numberOr(c, "max", kNaN);
+            s.mean = numberOr(c, "mean", kNaN);
+            s.stddev = numberOr(c, "stddev", kNaN);
+            s.count = c.value("count", std::uint64_t{0});
+            s.nanCount = c.value("nan", std::uint64_t{0});
+            if (c.contains("percentiles") && c["percentiles"].is_array())
+                for (const nlohmann::json& p : c["percentiles"])
+                    if (p.is_array() && p.size() == 2 && p[0].is_number())
+                        s.percentiles.emplace_back(p[0].get<double>(), p[1].is_number() ? p[1].get<double>() : kNaN);
+            if (c.contains("saturated_fraction")) s.saturatedFraction = numberOr(c, "saturated_fraction", kNaN);
+            s.histLo = numberOr(c, "hist_lo", 0.0);
+            s.histHi = numberOr(c, "hist_hi", 0.0);
+            if (c.contains("histogram") && c["histogram"].is_array()) s.histogram = c["histogram"].get<std::vector<std::uint64_t>>();
+            s.sampled = c.value("sampled", false);
+            out.push_back(std::move(s));
+        }
+        return out;
     }
 
     double pixelTypeMaximum(const DatasetMeta& meta) {

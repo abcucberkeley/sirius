@@ -70,7 +70,7 @@ target_compile_definitions(test_app_headless_objects     PRIVATE SIRIUS_TEST_EXA
 # tests/tools/fake_slurm for Slurm, the worker in the checkout on 127.0.0.1):
 # never a real ssh, never another host. sirius_test_askpass is ssh's askpass
 # helper there, as sirius-app and sirius-cli are it themselves.
-app_test(cluster test_app_cluster.cpp UNITS cluster remote_host remote_source array_source rpc process host)
+app_test(cluster test_app_cluster.cpp UNITS cluster remote_host remote_source array_source rpc process host workbench build_info)
 sirius_unit_closure(_sirius_askpass_units sirius_core_remote_host)
 add_executable(sirius_test_askpass tools/sirius_test_askpass.cpp)
 target_link_libraries(sirius_test_askpass PRIVATE ${_sirius_askpass_units})
@@ -78,16 +78,25 @@ target_compile_definitions(test_app_cluster_objects PRIVATE
     SIRIUS_TEST_ASKPASS="$<TARGET_FILE:sirius_test_askpass>"
     SIRIUS_TEST_FAKE_SSH="${PROJECT_SOURCE_DIR}/tests/tools/fake_ssh.py"
     SIRIUS_TEST_FAKE_SLURM_DIR="${PROJECT_SOURCE_DIR}/tests/tools/fake_slurm"
-    SIRIUS_TEST_SOURCE_DIR="${PROJECT_SOURCE_DIR}")
-add_dependencies(test_app_cluster sirius_test_askpass)
+    SIRIUS_TEST_SOURCE_DIR="${PROJECT_SOURCE_DIR}"
+    SIRIUS_TEST_CLI="$<TARGET_FILE:sirius-cli>")
+add_dependencies(test_app_cluster sirius_test_askpass sirius-cli)
 
 # SIRIUS's C++ engine (`sirius-cli serve`): the build identity, the
 # serializer, the server half of the worker protocol, the cluster datasets in
 # C++ -- through the application's RemoteSource, in-process and as a real
 # sirius-cli process on 127.0.0.1 -- and their parity with the Python worker's.
-app_test(engine test_app_engine.cpp UNITS engine_server dataset_service rpc_server array_codec build_info serialize remote_source
-                                           array_source rpc local_worker process host ops_schema ops_registry tracks)
+app_test(engine test_app_engine.cpp UNITS engine_server engine_node dataset_service rpc_server array_codec build_info serialize remote_source
+                                           array_source rpc local_worker process host ops_schema ops_registry tracks workbench executor
+                                           pipeline statistics)
 target_compile_definitions(test_app_engine_objects PRIVATE
     SIRIUS_TEST_CLI="$<TARGET_FILE:sirius-cli>"
     SIRIUS_TEST_WORKER_DIR="${PROJECT_SOURCE_DIR}/app/python")
 add_dependencies(test_app_engine sirius-cli)
+# The application's pipelines on the engine: Workbench -> pipeline_run -> the
+# outputs held on the node and drawn by handle; parity with this computer; the
+# refusals, uploads, previews, validation and statistics there; job end.
+app_test(engine_runs test_app_engine_runs.cpp UNITS engine_server engine_node workbench remote_source serialize statistics errors
+                                                    executor pipeline process host rpc build_info)
+target_compile_definitions(test_app_engine_runs_objects PRIVATE SIRIUS_TEST_CLI="$<TARGET_FILE:sirius-cli>")
+add_dependencies(test_app_engine_runs sirius-cli)

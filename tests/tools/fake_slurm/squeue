@@ -13,8 +13,14 @@ done
 [ -f "$dir/$id.state" ] || exit 0
 state=$(cat "$dir/$id.state")
 if [ "$state" = RUNNING ]; then
-    pid=$(cat "$dir/$id.pid")
-    if ! kill -0 "$pid" 2>/dev/null; then echo FAILED > "$dir/$id.state"; exit 0; fi
+    if [ -f "$dir/$id.detached" ]; then
+        # a job started outside the ssh session (fake sbatch, $FAKE_SLURM_DETACH) on Windows
+        wpid=$(cat "$dir/$id.detached")
+        if ! tasklist.exe //FI "PID eq $wpid" //NH 2>/dev/null | grep -q " $wpid "; then echo FAILED > "$dir/$id.state"; exit 0; fi
+    else
+        pid=$(cat "$dir/$id.pid")
+        if ! kill -0 "$pid" 2>/dev/null; then echo FAILED > "$dir/$id.state"; exit 0; fi
+    fi
     left=$(cat "$dir/$id.pending" 2>/dev/null || echo 0)
     if [ "$left" -gt 0 ]; then
         echo $((left - 1)) > "$dir/$id.pending"

@@ -156,6 +156,9 @@ namespace sirius::app::gui {
         Signal<StepId> labelsChanged;
         Signal<> runStarted;
         Signal<bool, const std::string&> runFinished;      // ok, error ("" when cancelled)
+        // A run the HPC engine needs files of this computer for (RunRefusal::Kind::NeedsUpload,
+        // Workbench::lastRunRefusal): the target; the window asks, showing the sizes.
+        Signal<int> uploadAsked;
         Signal<> runStateChanged;                          // both edges of a run
         Signal<> historyChanged;
         Signal<> backendChanged;

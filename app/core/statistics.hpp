@@ -60,9 +60,19 @@ namespace sirius::app {
     // percentile outside [0, 100] or histogramBins outside [0, 65536];
     // std::runtime_error when the output holds no data; CancelledError
     // (core/cancel.hpp) once `cancelled` returns true, checked between planes.
+    // An output that stays on the cluster (a cluster dataset, a step's output
+    // held by the engine on the node: a RemoteSource without an array) is
+    // measured there, by the engine's output_stats, never read here plane by
+    // plane; a peer without that method (the Python worker) is refused.
     std::vector<ChannelStatistics> channelStatistics(const StepOutput& out, const StatisticsOptions& o,
                                                      const std::function<void(double)>& progress = {},
                                                      const std::function<bool()>& cancelled = {});
+    // The wire form of the options and the results (NaN as null): what
+    // output_stats takes and answers.
+    nlohmann::json statisticsOptionsToJson(const StatisticsOptions& o);
+    StatisticsOptions statisticsOptionsFromJson(const nlohmann::json& j);
+    nlohmann::json channelStatisticsToJson(const std::vector<ChannelStatistics>& stats);
+    std::vector<ChannelStatistics> channelStatisticsFromJson(const nlohmann::json& j);
     // The maximum of a source pixel type (lib/pixel_type), for saturationLevel; 0 for float types.
     double pixelTypeMaximum(const DatasetMeta& meta);
     // {count, t, voxels:{min,median,mean,max}, volume_um3:{...}, flags:{..}, classes:{..}, reviewed, tracked,

@@ -870,11 +870,16 @@ namespace sirius::app::gui {
             return;
         }
         const Step& st = wb.pipeline().at(wb.viewedIndex());
-        const StepInput in = model.output()->asInput();
         try {
+            // an input on the cluster is measured there (Workbench::contrastWindowOf);
+            // until the node answers the panes keep their own windows
             for (Index c = 0; c < model.dims().c; ++c) {
-                const ContrastWindow w = contrastWindow(in, st.params, c, 8);
-                model.setWindow(c, DisplayWindow{w.lo, w.hi, w.gamma});
+                const std::optional<ContrastWindow> w = wb.contrastWindowOf(wb.viewedIndex(), st.params, c, false);
+                if (!w) {
+                    model.resetWindows();
+                    break;
+                }
+                model.setWindow(c, DisplayWindow{w->lo, w->hi, w->gamma});
             }
         } catch (const std::exception& e) {
             // The automatic window samples planes of the input, which a lazy
@@ -3082,8 +3087,10 @@ namespace sirius::app::gui {
             const int i = d.wb.viewedIndex();
             // the window samples planes of the input, which a lazy source can fail to read
             try {
-                if (auto up = d.wb.upstreamOutput(i))
-                    d.wb.setStepParams(i, contrastAutoParams(d.wb.pipeline().at(i).params, up->asInput()), "Auto contrast");
+                if (const std::optional<ParamSet> p = d.wb.contrastAutoOf(i, d.wb.pipeline().at(i).params))
+                    d.wb.setStepParams(i, *p, "Auto contrast");
+                else if (d.wb.upstreamOutput(i))
+                    d.wb.logLine("Auto contrast: the cluster node is measuring the input; press Auto again in a moment.");
             } catch (const std::exception& e) {
                 d.wb.logLine(std::string("Auto contrast: ") + e.what());
             }
@@ -3101,8 +3108,10 @@ namespace sirius::app::gui {
             const int i = d.wb.viewedIndex();
             // the range reads planes of the input, which a lazy source can fail to read
             try {
-                if (auto up = d.wb.upstreamOutput(i))
-                    d.wb.setStepParams(i, contrastResetParams(d.wb.pipeline().at(i).params, up->asInput()), "Reset contrast");
+                if (const std::optional<ParamSet> p = d.wb.contrastResetOf(i, d.wb.pipeline().at(i).params))
+                    d.wb.setStepParams(i, *p, "Reset contrast");
+                else if (d.wb.upstreamOutput(i))
+                    d.wb.logLine("Reset contrast: the cluster node is measuring the input; press Reset again in a moment.");
             } catch (const std::exception& e) {
                 d.wb.logLine(std::string("Reset contrast: ") + e.what());
             }

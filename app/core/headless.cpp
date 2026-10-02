@@ -841,6 +841,15 @@ namespace sirius::app {
                                     {"source", in["source"]},
                                     {"fix", kSetupCommand}});
             }
+            case RunRefusal::Kind::NoEngine:
+                return ToolFailure("no_engine", r.message, "set_backend CPU or CUDA runs it on this computer", {{"step", r.step + 1}});
+            case RunRefusal::Kind::EngineMismatch: return ToolFailure("engine_mismatch", r.message, "connect to an engine built from this SIRIUS");
+            case RunRefusal::Kind::NeedsUpload: {
+                json files = json::array();
+                for (const UploadFile& f : r.uploads) files.push_back({{"path", f.path}, {"bytes", f.bytes}});
+                return ToolFailure("needs_upload", r.message, "open the data from the cluster (cluster://...), or set_backend CPU or CUDA",
+                                   {{"files", files}});
+            }
             case RunRefusal::Kind::None: break;
         }
         // The workbench did not say why: find the reason the way createRun does.

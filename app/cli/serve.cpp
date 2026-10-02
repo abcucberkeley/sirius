@@ -135,6 +135,14 @@ namespace sirius::cli {
                 o.idleTimeout = std::chrono::milliseconds(static_cast<long long>(s * 1000.0));
             }
             o.pythonWorker = !args.has("no-python-worker");
+            // tests: an engine that reports another build (the cluster tests' refused hello)
+            if (const std::string fake = app::host::environment("SIRIUS_TEST_ENGINE_BUILD"); !fake.empty()) {
+                try {
+                    o.buildOverride = nlohmann::json::parse(fake);
+                } catch (const std::exception&) {
+                    throw UsageError("$SIRIUS_TEST_ENGINE_BUILD is not a JSON object");
+                }
+            }
             o.python = g.python;
             o.workerDir = g.workerDir;
             o.scratch = g.scratch;

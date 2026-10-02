@@ -1,5 +1,6 @@
 #include "core/cluster.hpp"
 
+#include "core/build_info.hpp"
 #include "core/cancel.hpp"
 #include "core/errors.hpp"
 
@@ -34,7 +35,7 @@ namespace sirius::app::cluster {
     }
 
     json Profile::toJson() const {
-        json j = {{"host", host}, {"checkout", checkout}, {"venv", venv}, {"container", container}, {"launcher", launcher}, {"bind", bind}, {"containerPythonPath", containerPythonPath}, {"partition", partition}, {"account", account}, {"qos", qos}, {"time", time}, {"gpus", gpus}, {"cpus", cpus}, {"mem", mem}, {"port", port}, {"ssh", sshProgram}};
+        json j = {{"host", host}, {"checkout", checkout}, {"venv", venv}, {"container", container}, {"launcher", launcher}, {"bind", bind}, {"containerPythonPath", containerPythonPath}, {"partition", partition}, {"account", account}, {"qos", qos}, {"time", time}, {"gpus", gpus}, {"cpus", cpus}, {"mem", mem}, {"port", port}, {"ssh", sshProgram}, {"engine", engine}, {"engineBin", engineBin}};
         json hosts = json::object();
         for (const auto& [h, c] : perHost) {
             json one = {{"partition", c.partition}, {"account", c.account}, {"qos", c.qos}, {"time", c.time}};
@@ -72,6 +73,10 @@ namespace sirius::app::cluster {
         str("mem", p.mem);
         num("port", p.port);
         str("ssh", p.sshProgram);
+        // SIRIUS's engine: on by default with a container image (it is in the
+        // image), off for a venv job, unless the profile says
+        p.engine = j.contains("engine") && j["engine"].is_boolean() ? j["engine"].get<bool>() : !p.container.empty();
+        str("engineBin", p.engineBin);
         if (j.contains("perHost") && j["perHost"].is_object())
             for (const auto& [h, c] : j["perHost"].items()) {
                 if (!c.is_object()) continue;
@@ -757,6 +762,7 @@ namespace sirius::app::cluster {
         std::unique_ptr<ssh::AskpassServer> askpass;
         std::string token;
         int workerPort = 0;                          // what the worker announced, under m
+        std::string reattachJob;                     // a job left running at the last disconnect, to reattach to, under m
         bool submitJob = true;                       // false: log in and list the partitions only (logIn), under m
         std::optional<ClusterInfo> info;             // under m
         std::atomic<bool> querying{false};
@@ -1072,6 +1078,15 @@ namespace sirius::app::cluster {
                 script += "export SIRIUS_VENV=" + remotePathWord(p.venv) + "\n";
             }
             if (p.gpus <= 0) script += "export SIRIUS_DEVICE=cpu\n";
+            // SIRIUS's engine (`sirius-cli serve`) as the job's main process,
+            // with the Python worker as its child (sirius_worker.sbatch)
+            if (p.engine) {
+                script += "export SIRIUS_ENGINE=1\n";
+                if (const std::string bin = trim(p.engineBin); !bin.empty()) script += "export SIRIUS_ENGINE_BIN=" + remotePathWord(bin) + "\n";
+                else script += "unset SIRIUS_ENGINE_BIN\n";
+            } else {
+                script += "unset SIRIUS_ENGINE SIRIUS_ENGINE_BIN\n";
+            }
             std::string cmd = "sbatch --parsable --job-name=sirius-worker --output=\"$HOME/.sirius/run/sirius-worker-%j.log\"";
             if (!p.partition.empty()) cmd += " --partition=" + shellQuote(p.partition);
             if (!p.account.empty()) cmd += " --account=" + shellQuote(p.account);
@@ -1118,6 +1133,16 @@ namespace sirius::app::cluster {
                 return s.empty() ? std::string("no longer in the queue") : s;
             } catch (const ssh::SshError&) {
                 return "no longer in the queue";
+            }
+        }
+
+        // The job is still in the queue or running (squeue knows it).
+        bool jobRunning(const std::string& id) {
+            try {
+                const std::string state = trim(remote("squeue -h -j " + id + " -o %T 2>/dev/null", std::chrono::seconds(30)).out);
+                return state == "RUNNING" || state == "PENDING" || state == "CONFIGURING";
+            } catch (const std::exception&) {
+                return false;
             }
         }
 
@@ -1201,7 +1226,7 @@ namespace sirius::app::cluster {
             }
         }
 
-        void hello(const Profile&, const std::string& node) {
+        void hello(const Profile& p, const std::string& node) {
             int port = 0;
             {
                 const std::lock_guard<std::mutex> g(m);
@@ -1223,6 +1248,12 @@ namespace sirius::app::cluster {
             }
             w->setCancelGrace(std::chrono::milliseconds(0));
             const WorkerCapabilities caps = w->capabilities();
+            // SIRIUS's engine serves this application only when their
+            // operations are the same (core/build_info.hpp): refused here, in
+            // words, before anything is run on it.
+            if (caps.engine.is_object())
+                if (const std::string refusal = engineMismatch(buildInfo(), buildInfoFromJson(caps.engine)); !refusal.empty())
+                    throw Failure{Step::Hello, refusal, {}, "Rebuild the container image from this SIRIUS, or point the profile's engine at a matching sirius-cli."};
             int kinds = 0;
             for (const std::string& meth : caps.methods)
                 if (meth.rfind("run:", 0) == 0) ++kinds;
@@ -1231,8 +1262,20 @@ namespace sirius::app::cluster {
                 control = std::move(w);
             }
             update([&](Status& x) { x.caps = caps; });
-            stepState(Step::Hello, StepStatus::Done,
-                      "sirius_worker " + caps.version + " \xC2\xB7 " + caps.device + " \xC2\xB7 " + std::to_string(kinds) + " step kinds");
+            if (caps.engine.is_object()) {
+                const json python = caps.engine.value("python", json::object());
+                stepState(Step::Hello, StepStatus::Done,
+                          "SIRIUS engine " + caps.engine.value("build", caps.version) + " \xC2\xB7 " + caps.device + " \xC2\xB7 Python worker " +
+                              python.value("state", std::string("disabled")) + " \xC2\xB7 session " + caps.engine.value("session", std::string()));
+            } else if (p.engine) {
+                // asked for the engine, got the Python worker (an old image): built-in steps will be refused
+                stepState(Step::Hello, StepStatus::Warning,
+                          "sirius_worker " + caps.version + " \xC2\xB7 " + caps.device +
+                              " \xC2\xB7 no SIRIUS engine in this job: only the Python steps run there");
+            } else {
+                stepState(Step::Hello, StepStatus::Done,
+                          "sirius_worker " + caps.version + " \xC2\xB7 " + caps.device + " \xC2\xB7 " + std::to_string(kinds) + " step kinds");
+            }
         }
 
         void run() {
@@ -1259,8 +1302,24 @@ namespace sirius::app::cluster {
                     setState(State::Idle);
                     return;
                 }
-                checks(p);
-                submit(p);
+                // A job of this session's that still runs (left running at a
+                // disconnect) is reattached to: its engine still holds the
+                // results computed there. Otherwise a new one.
+                std::string again;
+                {
+                    const std::lock_guard<std::mutex> g(m);
+                    again = reattachJob;
+                    reattachJob.clear();
+                }
+                if (!again.empty() && jobRunning(again)) {
+                    update([&](Status& x) { x.jobId = again; });
+                    stepState(Step::Checks, StepStatus::Done, "job " + again + " still runs: nothing to check");
+                    stepState(Step::Submit, StepStatus::Done, "job " + again + " \xC2\xB7 reattached");
+                    say("Cluster: job " + again + " still runs: reattaching to it");
+                } else {
+                    checks(p);
+                    submit(p);
+                }
                 std::string id;
                 {
                     const std::lock_guard<std::mutex> g(m);
@@ -1317,7 +1376,7 @@ namespace sirius::app::cluster {
             keeper = std::thread([this] { keep(); });
         }
 
-        void lost(const std::string& reason, const std::string& remoteText = {}) {
+        void lost(const std::string& reason, const std::string& remoteText = {}, bool jobEnded = false) {
             {
                 const std::lock_guard<std::mutex> g(controlMutex);
                 control.reset();
@@ -1327,6 +1386,7 @@ namespace sirius::app::cluster {
                 x.since = std::chrono::steady_clock::now();
                 x.reason = reason;
                 x.remoteOutput = remoteText;
+                x.jobEnded = jobEnded;
                 auto s = ssh;
                 x.sshUp = s && s->isOpen();
             });
@@ -1376,7 +1436,7 @@ namespace sirius::app::cluster {
                         state = "?";
                     }
                     if (state.empty() || (state != "RUNNING" && state != "COMPLETING" && state != "?")) {
-                        lost("job " + id + " ended: " + finalState(id), jobLog(p, id));
+                        lost("job " + id + " ended: " + finalState(id), jobLog(p, id), true);
                         return;
                     }
                     if (pingFailed) {
@@ -1438,9 +1498,12 @@ namespace sirius::app::cluster {
             impl_->control.reset();
         }
         impl_->cancel.store(false);
+        std::string previousJob;
         impl_->update([&](Status& x) {
             const bool sshUp = x.sshUp;
             const std::string host = x.host;
+            // a job left running (disconnect without cancelling it) on this host
+            if (submit && !x.jobId.empty() && x.host == profile.host && x.state == State::Disconnected) previousJob = x.jobId;
             x = Status{};
             x.state = State::Connecting;
             x.since = std::chrono::steady_clock::now();
@@ -1452,6 +1515,7 @@ namespace sirius::app::cluster {
             impl_->profile = profile;
             impl_->workerPort = 0;
             impl_->submitJob = submit;
+            impl_->reattachJob = previousJob;
         }
         impl_->worker = std::thread([this] { impl_->run(); });
     }
@@ -1469,6 +1533,7 @@ namespace sirius::app::cluster {
             impl_->control.reset();
         }
         std::string id, note;
+        bool ended = false;
         {
             const std::lock_guard<std::mutex> g(impl_->m);
             id = impl_->status.jobId;
@@ -1482,6 +1547,7 @@ namespace sirius::app::cluster {
                     if (r.ok()) {
                         const std::lock_guard<std::mutex> g(impl_->m);
                         impl_->status.jobId.clear();
+                        ended = true;
                     }
                 } catch (const std::exception& e) {
                     note = "scancel " + id + " failed: " + e.what();
@@ -1495,6 +1561,7 @@ namespace sirius::app::cluster {
             x.state = State::Disconnected;
             x.since = std::chrono::steady_clock::now();
             x.reason = "disconnected" + (note.empty() ? std::string() : " (" + note + ")");
+            x.jobEnded = x.jobEnded || ended;
             x.sshUp = false;
         });
         {

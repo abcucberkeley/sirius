@@ -104,6 +104,26 @@ cd "${WORKER_DIR}"
 # the dataset it shows (read here, on the node) besides each run's.
 ARGS=(--host 0.0.0.0 --port "${SIRIUS_PORT}" --device "${SIRIUS_DEVICE}" --max-clients "${SIRIUS_MAX_CLIENTS:-8}")
 
+# --- SIRIUS's engine instead of the Python worker alone ----------------------
+# SIRIUS_ENGINE=1 (the application sets it from the profile) runs SIRIUS's C++
+# engine, `sirius-cli serve`: every step of a pipeline then runs here, on the
+# node, with CUDA where the library has it, and its results stay here until
+# the application shows them (at screen size) or downloads them. The engine
+# starts the Python worker as its child on 127.0.0.1 (torch models, plugins).
+# SIRIUS_ENGINE_BIN names the executable: /opt/sirius/bin/sirius-cli in the
+# container image by default, sirius-cli on PATH without one. The engine reads
+# the same token file and prints the same {"port": N} line.
+CMD=(python -m sirius_worker "${ARGS[@]}")
+if [[ "${SIRIUS_ENGINE:-0}" == 1 ]]; then
+    ENGINE_BIN="${SIRIUS_ENGINE_BIN:-}"
+    if [[ -z "${ENGINE_BIN}" ]]; then
+        if [[ -n "${SIRIUS_CONTAINER:-}" ]]; then ENGINE_BIN=/opt/sirius/bin/sirius-cli; else ENGINE_BIN=sirius-cli; fi
+    fi
+    CMD=("${ENGINE_BIN}" serve "${ARGS[@]}" --python python --worker-dir "${WORKER_DIR}")
+    [[ -n "${SIRIUS_ENGINE_SCRATCH:-}" ]] && CMD+=(--scratch "${SIRIUS_ENGINE_SCRATCH}")
+    echo "SIRIUS engine: ${ENGINE_BIN} serve (the Python worker beside it, from ${WORKER_DIR})"
+fi
+
 # --- a container instead of a venv -------------------------------------------
 # SIRIUS_CONTAINER=<image.sif> runs the worker inside that image. This is the
 # practical way to serve a model on a cluster: torch, scipy and scikit-image
@@ -173,7 +193,7 @@ if [[ -n "${SIRIUS_CONTAINER:-}" ]]; then
     # the worker deletes), so handing the process over with exec is safe.
     exec "${RUNTIME}" exec "${GPU[@]}" --cleanenv "${BIND[@]}" "${EXTRA[@]}" \
         --env-file "${ENV_FILE}" --pwd "${WORKER_DIR}" \
-        "${SIRIUS_CONTAINER}" python -m sirius_worker "${ARGS[@]}"
+        "${SIRIUS_CONTAINER}" "${CMD[@]}"
 fi
 
-exec python -m sirius_worker "${ARGS[@]}"
+exec "${CMD[@]}"

@@ -7,6 +7,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstdio>
 #include <cstring>
 #include <limits>
 
@@ -59,6 +60,68 @@ namespace sirius::app {
             return PixelType::Float32;
         }
     } // namespace
+
+    // --- whole volumes of what stays on the cluster -------------------------------------------
+
+    namespace {
+        thread_local bool tAllowed = false;
+        thread_local std::string tPurpose;
+        std::atomic<std::uint64_t> gVolumeBytes{0}, gPlaneBytes{0};
+        std::mutex gObserverMutex;
+        std::function<void(const std::string&)> gObserver;
+
+        std::string sizeText(std::uint64_t bytes) {
+            char buf[32];
+            if (bytes >= (std::uint64_t{1} << 30)) std::snprintf(buf, sizeof buf, "%.1f GB", static_cast<double>(bytes) / 1e9);
+            else std::snprintf(buf, sizeof buf, "%.1f MB", static_cast<double>(bytes) / 1e6);
+            return buf;
+        }
+    } // namespace
+
+    RemoteDownloads::Allow::Allow(std::string purpose) : previous_(tPurpose), had_(tAllowed) {
+        if (!had_) tPurpose = std::move(purpose);
+        tAllowed = true;
+    }
+
+    RemoteDownloads::Allow::~Allow() {
+        tAllowed = had_;
+        tPurpose = previous_;
+    }
+
+    bool RemoteDownloads::allowed() { return tAllowed; }
+    std::string RemoteDownloads::purpose() { return tPurpose; }
+    std::uint64_t RemoteDownloads::volumeBytes() { return gVolumeBytes.load(); }
+    std::uint64_t RemoteDownloads::planeBytes() { return gPlaneBytes.load(); }
+
+    void RemoteDownloads::setObserver(std::function<void(const std::string&)> observer) {
+        const std::lock_guard<std::mutex> g(gObserverMutex);
+        gObserver = std::move(observer);
+    }
+
+    // --- output handles ---------------------------------------------------------------------
+
+    std::string makeOutputHandle(const std::string& session, std::uint64_t step, const std::string& fingerprint) {
+        return std::string(kOutputHandleScheme) + session + "/" + std::to_string(step) + "/" + fingerprint;
+    }
+
+    bool isOutputHandle(const std::string& path) { return path.rfind(kOutputHandleScheme, 0) == 0; }
+
+    bool parseOutputHandle(const std::string& handle, std::string& session, std::uint64_t& step, std::string& fingerprint) {
+        if (!isOutputHandle(handle)) return false;
+        const std::string rest = handle.substr(std::strlen(kOutputHandleScheme));
+        const std::size_t a = rest.find('/');
+        if (a == std::string::npos || a == 0) return false;
+        const std::size_t b = rest.find('/', a + 1);
+        if (b == std::string::npos || b == a + 1 || b + 1 >= rest.size()) return false;
+        const std::string id = rest.substr(a + 1, b - a - 1);
+        if (id.size() > 19 || id.find_first_not_of("0123456789") != std::string::npos) return false;
+        const std::string fp = rest.substr(b + 1);
+        if (fp.find('/') != std::string::npos) return false;
+        session = rest.substr(0, a);
+        step = std::stoull(id);
+        fingerprint = fp;
+        return true;
+    }
 
     // --- names -------------------------------------------------------------------------
 
@@ -336,9 +399,34 @@ namespace sirius::app {
         return {{"path", path_}, {"options", options_}, {"c", c}, {"t", t}, {"layout", "zyx"}};
     }
 
+    void RemoteSource::markGone(const std::string& reason) {
+        {
+            const std::lock_guard<std::mutex> g(m_);
+            gone_ = reason;
+            lastError_ = reason;
+            queue_.clear();
+        }
+        revision_.fetch_add(1);
+        idle_.notify_all();
+    }
+
+    std::string RemoteSource::gone() const {
+        const std::lock_guard<std::mutex> g(m_);
+        return gone_;
+    }
+
+    json RemoteSource::statistics(const json& request, const std::function<bool()>& cancelled) const {
+        if (const std::string g = gone(); !g.empty()) throw std::runtime_error(g);
+        json p = baseParams();
+        p["statistics"] = request;
+        const WorkerResult r = datasets_->call(RemoteDatasets::Lane::Reads, "output_stats", p, cancelled);
+        return r.result;
+    }
+
     void RemoteSource::readPlane(Index c, Index t, Index z, float* out) const {
         const Dims5& d = meta_.dims;
         const std::size_t plane = static_cast<std::size_t>(d.y * d.x);
+        if (const std::string g = gone(); !g.empty()) throw std::runtime_error(g);
         {
             const std::lock_guard<std::mutex> g(volMutex_);
             for (const auto& [key, vol] : volumes_)
@@ -357,6 +445,7 @@ namespace sirius::app {
         const std::vector<float> v = decodeWorkerArray(r.result, r.tensors.front(), shape);
         if (v.size() != plane) throw ProtocolError("worker: the plane does not match the dataset's size");
         std::memcpy(out, v.data(), plane * sizeof(float));
+        gPlaneBytes.fetch_add(plane * sizeof(float));
     }
 
     void RemoteSource::readVolume(Index c, Index t, float* out, const ProgressFn& progress) const {
@@ -370,6 +459,21 @@ namespace sirius::app {
                     return;
                 }
         }
+        if (const std::string g = gone(); !g.empty()) throw std::runtime_error(g);
+        const std::uint64_t bytes = static_cast<std::uint64_t>(n) * sizeof(float);
+        const std::string what = (meta_.name.empty() ? std::string("this data") : meta_.name) + " (c " + std::to_string(c) + ", t " +
+                                 std::to_string(t) + ")";
+        if (!RemoteDownloads::allowed())
+            throw RemoteDataError(what + " stays on " + datasets_->host() + ": reading it here would download " + sizeText(bytes) +
+                                  ", which nothing asked for. Run the step on the HPC backend, or download it explicitly (Export asks first).");
+        {
+            std::function<void(const std::string&)> observer;
+            {
+                const std::lock_guard<std::mutex> g(gObserverMutex);
+                observer = gObserver;
+            }
+            if (observer) observer("Downloading " + sizeText(bytes) + " of " + what + " from " + datasets_->host() + " for " + RemoteDownloads::purpose());
+        }
         if (progress) progress(0.0, "reading c " + std::to_string(c) + " t " + std::to_string(t) + " from " + datasets_->host());
         json p = baseParams();
         p["c"] = c;
@@ -380,6 +484,7 @@ namespace sirius::app {
         auto v = std::make_shared<std::vector<float>>(decodeWorkerArray(r.result, r.tensors.front(), shape));
         if (v->size() != n) throw ProtocolError("worker: the volume does not match the dataset's size");
         std::memcpy(out, v->data(), n * sizeof(float));
+        gVolumeBytes.fetch_add(bytes);
         if (progress) progress(1.0, "");
         const std::lock_guard<std::mutex> g(volMutex_);
         volumes_.emplace_back(std::make_pair(c, t), std::move(v));
@@ -439,6 +544,10 @@ namespace sirius::app {
 
     std::shared_ptr<const ViewTile> RemoteSource::view(const ViewRequest& req, bool& exact) {
         exact = false;
+        {
+            const std::lock_guard<std::mutex> g(m_);
+            if (!gone_.empty()) return nullptr;
+        }
         const Key key = keyOf(req);
         const auto [cols, rows] = viewSize(req.kind);
         const int f = std::max(req.factor, 1);
@@ -500,6 +609,7 @@ namespace sirius::app {
     void RemoteSource::enqueue(const ViewRequest& r, bool prefetch) {
         {
             const std::lock_guard<std::mutex> g(m_);
+            if (!gone_.empty()) return;
             const std::string id = requestId(r);
             auto fit = failed_.find(id);
             if (fit != failed_.end() && std::chrono::steady_clock::now() - fit->second < std::chrono::seconds(5)) return;
@@ -550,7 +660,7 @@ namespace sirius::app {
                 const auto& w = it->second;
                 return fullRange ? std::make_pair(w[2], w[3]) : std::make_pair(w[0], w[1]);
             }
-            if (windowAsked_[{c, t}]) return std::nullopt;
+            if (!gone_.empty() || windowAsked_[{c, t}]) return std::nullopt;
             windowAsked_[{c, t}] = true;
             ViewRequest r;
             r.c = c;
@@ -663,11 +773,24 @@ namespace sirius::app {
         } catch (const std::exception& e) {
             {
                 const std::lock_guard<std::mutex> g(m_);
-                lastError_ = e.what();
+                lastError_ = gone_.empty() ? std::string(e.what()) : gone_;
                 failed_[requestId(r)] = std::chrono::steady_clock::now();
             }
             revision_.fetch_add(1);
         }
     }
+
+    // --- outputs held on a node -----------------------------------------------------------------
+
+    namespace {
+        std::string sessionOf(const std::string& handle) {
+            std::string session, fp;
+            std::uint64_t step = 0;
+            return parseOutputHandle(handle, session, step, fp) ? session : std::string();
+        }
+    } // namespace
+
+    NodeOutputSource::NodeOutputSource(std::shared_ptr<RemoteDatasets> datasets, std::string handle, DatasetMeta meta, std::string where)
+        : RemoteSource(std::move(datasets), handle, json::object(), std::move(meta)), session_(sessionOf(handle)), where_(std::move(where)) {}
 
 } // namespace sirius::app

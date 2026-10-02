@@ -192,6 +192,9 @@ namespace sirius::app {
 
     namespace {
 
+        // A step output's handle (core/remote_source.hpp, makeOutputHandle).
+        constexpr const char* kOutputPrefix = "sirius-out:";
+
         std::string lowerTrim(const std::string& s) {
             std::string out;
             for (char ch : s) out.push_back(static_cast<char>(std::tolower(static_cast<unsigned char>(ch))));
@@ -467,6 +470,30 @@ namespace sirius::app {
 
         class Dataset {
         public:
+            // A step's output the engine holds (its handle as the path): float32, read through its source.
+            Dataset(std::string handle, DatasetService::ResolvedOutput output, VolumeCache& cache)
+                : path_(handle), key_(std::move(handle)), cache_(cache), source_(std::move(output.source)), sourceMeta_(std::move(output.meta)) {
+                if (!source_) throw DatasetError(path_ + ": no data");
+                const Dims5& d = sourceMeta_.dims;
+                c_ = d.c;
+                t_ = d.t;
+                z_ = d.z;
+                y_ = d.y;
+                x_ = d.x;
+                fileDtype_ = "float32";
+                format_ = "sirius-output";
+                bytesOnDisk_ = static_cast<std::uint64_t>(std::max<Index>(d.numel(), 0)) * sizeof(float);
+                voxel_ = sourceMeta_.voxelUm;
+                frameInterval_ = std::max(sourceMeta_.frameIntervalS, 0.0);
+                rgb_ = sourceMeta_.rgb;
+                dimsFromMetadata_ = true;
+                for (const ChannelInfo& ch : sourceMeta_.channels) {
+                    json e = {{"name", ch.label}};
+                    if (ch.wavelengthNm > 0.0) e["wavelength_nm"] = ch.wavelengthNm;
+                    channels_.push_back(std::move(e));
+                }
+            }
+
             Dataset(std::string path, const json& options, VolumeCache& cache, std::string key)
                 : path_(std::move(path)), key_(std::move(key)), cache_(cache) {
                 std::error_code ec;
@@ -484,6 +511,18 @@ namespace sirius::app {
             }
 
             json meta() const {
+                if (source_)
+                    return {{"name", sourceMeta_.name},
+                            {"path", path_},
+                            {"format", format_},
+                            {"dims", {c_, t_, z_, y_, x_}},
+                            {"dtype", fileDtype_},
+                            {"bytes", bytesOnDisk_},
+                            {"voxel_um", {voxel_[0], voxel_[1], voxel_[2]}},
+                            {"frame_interval_s", frameInterval_},
+                            {"channels", channels_},
+                            {"rgb", rgb_},
+                            {"dims_from_metadata", dimsFromMetadata_}};
                 std::string name = fs::u8path(path_).filename().u8string();
                 std::string lname;
                 for (char ch : name) lname.push_back(static_cast<char>(std::tolower(static_cast<unsigned char>(ch))));
@@ -513,6 +552,11 @@ namespace sirius::app {
 
             HostArray plane(Index c, Index t, Index z, const std::string& device) {
                 check(c, t, z);
+                if (source_) {
+                    HostArray a = make("float32", {y_, x_});
+                    source_->readPlane(c, t, z, as<float>(a));
+                    return a;
+                }
                 if (npy_) return readNpy(c, t, z, 1, true);
                 if (auto cached = cache_.get(volumeKey(c, t))) return planeOf(*cached, z);
                 return planeOf(pages(pageOf(c, t, z), 1, device, c), 0);
@@ -522,6 +566,14 @@ namespace sirius::app {
                 check(c, t, std::nullopt);
                 const std::string key = volumeKey(c, t);
                 if (auto cached = cache_.get(key)) return cached;
+                // A step's output: kept like a file's volume (within the same
+                // budget), so panning a re-slice does not copy it each time.
+                if (source_) {
+                    auto vol = std::make_shared<HostArray>(make("float32", {z_, y_, x_}));
+                    source_->readVolume(c, t, as<float>(*vol));
+                    cache_.put(key, vol);
+                    return vol;
+                }
                 auto vol = std::make_shared<HostArray>(npy_ ? readNpy(c, t, 0, z_, false) : tiffVolume(c, t, device));
                 cache_.put(key, vol);
                 return vol;
@@ -892,6 +944,8 @@ namespace sirius::app {
             std::vector<std::array<Index, 3>> levels_;   // (width, height, pages) per pyramid level
             std::mutex gpuMutex_;
             std::map<std::string, bool> gpuOk_;
+            std::shared_ptr<ArraySource> source_;   // a step's output: read through this
+            DatasetMeta sourceMeta_;
         };
 
     } // namespace
@@ -905,11 +959,23 @@ namespace sirius::app {
         // the eight opened last, by (path, options), with the file's time stamp
         std::list<std::pair<std::string, std::pair<fs::file_time_type, std::shared_ptr<Dataset>>>> open;
 
+        std::mutex resolverMutex;
+        OutputResolver resolver;
+
         explicit Impl(Options o) : options(std::move(o)), volumes(cacheBudget(options.cacheBytes)) {}
 
         std::shared_ptr<Dataset> dataset(const json& params) {
             const std::string given = params.contains("path") && params["path"].is_string() ? params["path"].get<std::string>() : std::string();
             if (given.empty()) throw DatasetError("no path");
+            if (given.rfind(kOutputPrefix, 0) == 0) {
+                OutputResolver r;
+                {
+                    const std::lock_guard<std::mutex> g(resolverMutex);
+                    r = resolver;
+                }
+                if (!r) throw DatasetError(given + ": this server holds no step outputs");
+                return std::make_shared<Dataset>(given, r(given), volumes);
+            }
             std::string expanded = given;
             if (expanded.rfind("~", 0) == 0) expanded = host::homeDirectory() + expanded.substr(1);
             std::error_code ec;
@@ -959,6 +1025,11 @@ namespace sirius::app {
 
     json DatasetService::tiffReader(const std::string& device) const {
         return {{"sirius", buildInfo().version}, {"nvtiff", gpuFor(device.empty() ? impl_->options.device : device).has_value()}};
+    }
+
+    void DatasetService::setOutputResolver(OutputResolver resolver) {
+        const std::lock_guard<std::mutex> g(impl_->resolverMutex);
+        impl_->resolver = std::move(resolver);
     }
 
     void DatasetService::forgetAll() {

@@ -21,6 +21,17 @@
 // Each RemoteDatasets keeps two worker connections, one for views and one
 // for full reads, so the dataset on screen is answered while a step reads.
 // A connection that fails is dropped and made again on the next request.
+//
+// A step's output computed by SIRIUS's engine on the node stays there too
+// (core/engine_server.hpp): its handle, "sirius-out:<engine session>/<step
+// id>/<fingerprint>", takes the place of a path, and a NodeOutputSource draws
+// it exactly as a cluster dataset is drawn.
+//
+// Whole volumes of what stays on the cluster are never read here by
+// accident: RemoteSource::readVolume (and so readAll, StepInput::materialize)
+// refuses unless the thread holds a RemoteDownloads::Allow naming why (a run
+// the user chose to compute on this computer, an export the user agreed to
+// download for). Planes (a probe, a contrast sample) are read as asked.
 
 #include <array>
 #include <atomic>
@@ -32,6 +43,7 @@
 #include <memory>
 #include <mutex>
 #include <optional>
+#include <stdexcept>
 #include <string>
 #include <thread>
 #include <vector>
@@ -118,7 +130,52 @@ namespace sirius::app {
     // The page order and the axes of the Load step's options, as the worker takes them.
     nlohmann::json remoteOptionsJson(const OpenOptions& options);
 
-    class RemoteSource final : public ArraySource, public ViewProvider {
+    // --- whole volumes of what stays on the cluster ----------------------------------------
+
+    // Raised by a whole-volume read nobody allowed: what it would download and why it did not.
+    class RemoteDataError : public std::runtime_error {
+    public:
+        using std::runtime_error::runtime_error;
+    };
+
+    class RemoteDownloads {
+    public:
+        // While one is alive, this thread may read whole volumes of data that
+        // stays on the cluster; `purpose` goes into the log line each read
+        // writes ("a run on this computer", "export"). Nested ones keep the outer purpose.
+        class Allow {
+        public:
+            explicit Allow(std::string purpose);
+            ~Allow();
+            Allow(const Allow&) = delete;
+            Allow& operator=(const Allow&) = delete;
+
+        private:
+            std::string previous_;
+            bool had_ = false;
+        };
+        static bool allowed();
+        static std::string purpose();
+        // Bytes (float32, as decoded here) read so far by every thread: whole
+        // volumes, and single planes. For the tests and the measurements.
+        static std::uint64_t volumeBytes();
+        static std::uint64_t planeBytes();
+        // Called with one line per whole volume read ("downloading 3.2 GB of
+        // <name> for export"); any thread. The application logs it.
+        static void setObserver(std::function<void(const std::string&)> observer);
+    };
+
+    // --- outputs held by the engine on a node -------------------------------------------------
+
+    // "sirius-out:<session>/<step id>/<fingerprint>": a step's output as the
+    // engine holds it. The session is the engine process's (a new job, a new
+    // session); the fingerprint is the node's own.
+    inline constexpr const char* kOutputHandleScheme = "sirius-out:";
+    std::string makeOutputHandle(const std::string& session, std::uint64_t step, const std::string& fingerprint);
+    bool parseOutputHandle(const std::string& handle, std::string& session, std::uint64_t& step, std::string& fingerprint);
+    bool isOutputHandle(const std::string& path);
+
+    class RemoteSource : public ArraySource, public ViewProvider {
     public:
         RemoteSource(std::shared_ptr<RemoteDatasets> datasets, std::string remotePath, nlohmann::json options, DatasetMeta meta);
         ~RemoteSource() override;
@@ -127,6 +184,17 @@ namespace sirius::app {
         void readPlane(Index c, Index t, Index z, float* out) const override;
         void readVolume(Index c, Index t, float* out, const ProgressFn& progress = {}) const override;
         ViewProvider* viewProvider() const noexcept override { return const_cast<RemoteSource*>(this); }
+
+        // Channel statistics (core/statistics.hpp) computed where the data is:
+        // the engine's output_stats, `request` and the reply as
+        // statisticsOptionsToJson / channelStatisticsFromJson write them.
+        // Throws when the peer is the Python worker, which has no such method.
+        nlohmann::json statistics(const nlohmann::json& request, const std::function<bool()>& cancelled = {}) const;
+
+        // The data went away with what held it (the cluster job ended): every
+        // view and read from now on fails with `reason`, which lastError() says.
+        void markGone(const std::string& reason);
+        std::string gone() const;
 
         // ViewProvider
         std::shared_ptr<const ViewTile> view(const ViewRequest& request, bool& exact) override;
@@ -138,6 +206,7 @@ namespace sirius::app {
         // What a step on the HPC worker sends instead of the volume:
         // {"path", "options", "c", "t"} (layout "zyx").
         nlohmann::json inputReference(Index c, Index t) const;
+        const nlohmann::json& options() const noexcept { return options_; }
         const std::string& remotePath() const noexcept { return path_; }
         const std::shared_ptr<RemoteDatasets>& datasets() const noexcept { return datasets_; }
 
@@ -179,6 +248,7 @@ namespace sirius::app {
         std::map<std::pair<Index, Index>, bool> windowAsked_;
         std::map<std::string, std::chrono::steady_clock::time_point> failed_;
         std::string lastError_;
+        std::string gone_;
         std::atomic<std::uint64_t> revision_{1};
         bool quit_ = false;
         bool busy_ = false;
@@ -186,6 +256,24 @@ namespace sirius::app {
         // full-resolution volumes read for steps: the last few (c, t)
         mutable std::mutex volMutex_;
         mutable std::deque<std::pair<std::pair<Index, Index>, std::shared_ptr<std::vector<float>>>> volumes_;
+    };
+
+    // A step's output that the engine on a node computed and holds, drawn at
+    // screen size as a cluster dataset is (its handle is the path), never
+    // downloaded unless asked for. Its meta came with the run's result.
+    class NodeOutputSource final : public RemoteSource {
+    public:
+        // `datasets` connects to the engine; `where` says which job holds it
+        // ("fiona · n0042 · job 4711").
+        NodeOutputSource(std::shared_ptr<RemoteDatasets> datasets, std::string handle, DatasetMeta meta, std::string where);
+
+        bool heldByNodeCache() const noexcept override { return true; }
+        const std::string& handle() const noexcept { return remotePath(); }
+        const std::string& session() const noexcept { return session_; }
+        const std::string& where() const noexcept { return where_; }
+
+    private:
+        std::string session_, where_;
     };
 
 } // namespace sirius::app

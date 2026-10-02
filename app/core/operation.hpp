@@ -133,11 +133,28 @@ namespace sirius::app {
         std::string note;                          // one line for the log ("41 s · plans reused")
         double seconds = 0.0;
         Backend ranOn = Backend::Cpu;
+        // Where it ran: "" = this computer; otherwise the machine that
+        // computed and holds it ("fiona · n0042 · job 4711", a cluster node's
+        // SIRIUS engine). And on what there: "A100", "CPU", "Python cuda:0"
+        // (the executor fills it in from the context the step ran with).
+        std::string where;
+        std::string ranOnDevice;
+        // Set when the data this output stood for went away with the machine
+        // that held it ("held by job 4711, which ended (TIMEOUT)"): the
+        // output keeps its diagnostics and is no longer served as fresh.
+        std::string gone;
 
         StepInput asInput() const {
             return StepInput{meta, array, source, labels};
         }
     };
+
+    // The output's placement, short, for the ops row: "node A100", "node
+    // CPU", "node Python cuda:0", "this computer · CUDA"; "" before it ran.
+    std::string placementTag(const StepOutput& out);
+    // The same in words for the log: "on fiona · n0042 · job 4711 (A100)",
+    // "on this computer (CPU)".
+    std::string placementText(const StepOutput& out);
 
     struct StepContext {
         Backend backend = Backend::Cpu;

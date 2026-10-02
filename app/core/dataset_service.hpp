@@ -27,6 +27,7 @@
 // datasets opened last stay open while their files are unchanged.
 
 #include <cstddef>
+#include <functional>
 #include <memory>
 #include <mutex>
 #include <stdexcept>
@@ -35,6 +36,7 @@
 
 #include <nlohmann/json.hpp>
 
+#include "core/array_source.hpp"
 #include "core/rpc_server.hpp"
 
 namespace sirius::app {
@@ -81,6 +83,18 @@ namespace sirius::app {
 
         // dataset_info / dataset_read / dataset_view / dataset_stats
         static bool handles(const std::string& method);
+
+        // A step's output held by the engine (core/engine_server.hpp), named
+        // by its handle ("sirius-out:...", core/remote_source.hpp) where a
+        // request names a file: served as float32 from its source, with its
+        // meta. The resolver throws DatasetError when the handle names nothing
+        // it holds (the step was re-run, evicted, or the session is another's).
+        struct ResolvedOutput {
+            std::shared_ptr<ArraySource> source;
+            DatasetMeta meta;
+        };
+        using OutputResolver = std::function<ResolvedOutput(const std::string& handle)>;
+        void setOutputResolver(OutputResolver resolver);
         // One request; throws DatasetError (or std::exception) with the message to send back.
         rpc::Reply handle(const std::string& method, const nlohmann::json& params);
 

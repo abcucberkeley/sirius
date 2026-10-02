@@ -22,8 +22,10 @@ namespace sirius::app {
 
     // The engine's method set (pipeline_run, dataset_*, ...): bumped whenever
     // a method is added, removed or changes meaning. 1 = P1 (datasets served
-    // in C++, the rest relayed to the Python worker).
-    inline constexpr int kEngineApiVersion = 1;
+    // in C++, the rest relayed to the Python worker); 2 = P2 (pipeline_run and
+    // the outputs kept on the node, step_preview, step_validate, output_stats,
+    // put_file, stat_file, outputs_release, cache_status).
+    inline constexpr int kEngineApiVersion = 2;
 
     struct BuildInfo {
         std::string version;     // "0.1.0"

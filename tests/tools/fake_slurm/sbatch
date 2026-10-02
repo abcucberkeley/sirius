@@ -6,7 +6,9 @@
 # deletes), writes its output to the --output log, and records the job in
 # $FAKE_SLURM_DIR. Prints the job id, like --parsable. With $SIRIUS_CONTAINER
 # the worker is started through the launcher ($SIRIUS_LAUNCHER, the fake
-# apptainer) as sirius_worker.sbatch starts it.
+# apptainer) as sirius_worker.sbatch starts it. With $SIRIUS_ENGINE=1 the job
+# runs SIRIUS's engine, $SIRIUS_ENGINE_BIN serve (the build's sirius-cli), on
+# 127.0.0.1 -- without its Python worker child unless $FAKE_ENGINE_PYTHON=1.
 set -u
 dir="${FAKE_SLURM_DIR:?FAKE_SLURM_DIR is not set}"
 out="slurm-%j.out"
@@ -22,7 +24,7 @@ echo $((id + 1)) > "$dir/next"
 log="${out//%j/$id}"
 printf '%s\n' "$*" > "$dir/$id.args"
 # what reached the job's environment; the token only as "set", never its value
-env | grep -E '^SIRIUS_(PORT|VENV|DEVICE|MAX_CLIENTS|CONTAINER|CONTAINER_BIND|CONTAINER_PYTHONPATH|LAUNCHER)=' | sort > "$dir/$id.env"
+env | grep -E '^SIRIUS_(PORT|VENV|DEVICE|MAX_CLIENTS|CONTAINER|CONTAINER_BIND|CONTAINER_PYTHONPATH|LAUNCHER|ENGINE|ENGINE_BIN)=' | sort > "$dir/$id.env"
 [ -n "${SIRIUS_TOKEN:-}" ] && echo "SIRIUS_TOKEN=<set>" >> "$dir/$id.env"
 [ -n "${SIRIUS_TOKEN_FILE:-}" ] && echo "SIRIUS_TOKEN_FILE=<set>" >> "$dir/$id.env"
 # the token file's mode and the umask the job inherits (POSIX meaning only)
@@ -32,15 +34,50 @@ umask > "$dir/$id.umask"
 if [ -f "$dir/sbatch.fail" ]; then echo "sbatch: error: Batch job submission failed: refused by the test" >&2; exit 1; fi
 echo "${FAKE_SLURM_PENDING_POLLS:-0}" > "$dir/$id.pending"
 run=("${FAKE_PYTHON:?}")
+cmd=(-m sirius_worker)
+if [ "${SIRIUS_ENGINE:-0}" = 1 ]; then
+    run=("${SIRIUS_ENGINE_BIN:?SIRIUS_ENGINE_BIN names the engine for the fake job}")
+    cmd=(serve)
+    if [ "${FAKE_ENGINE_PYTHON:-0}" = 1 ]; then cmd+=(--python "$FAKE_PYTHON" --worker-dir "$PWD/app/python"); else cmd+=(--no-python-worker); fi
+fi
 if [ -n "${SIRIUS_CONTAINER:-}" ]; then
     L="${SIRIUS_LAUNCHER:-apptainer}"
     command -v "$L" >/dev/null 2>&1 || L=singularity
     run=("$L" exec)
     [ "${SIRIUS_DEVICE:-cuda}" != cpu ] && run+=(--nv)
     [ -n "${SIRIUS_CONTAINER_BIND:-}" ] && run+=(--bind "$SIRIUS_CONTAINER_BIND")
-    run+=(--bind "$PWD" --bind "$HOME/.sirius/run" "$SIRIUS_CONTAINER" python)
+    run+=(--bind "$PWD" --bind "$HOME/.sirius/run" "$SIRIUS_CONTAINER")
+    if [ "${SIRIUS_ENGINE:-0}" = 1 ]; then run+=("${SIRIUS_ENGINE_BIN}"); else run+=(python); fi
 fi
-( cd app/python && exec "${run[@]}" -m sirius_worker --host 127.0.0.1 --port "${SIRIUS_PORT:-0}" --device cpu \
+# $FAKE_SLURM_DETACH=1: the job outlives the ssh session that submitted it, as
+# a real job does (a disconnect that leaves it running, then a reconnect): on
+# POSIX in a session of its own, on Windows started by WMI, outside the job
+# object the application's ssh runs in. Such a job is told its token file by
+# --token-file (a WMI process gets none of this environment) and is an engine.
+if [ "${FAKE_SLURM_DETACH:-0}" = 1 ] && [ "${SIRIUS_ENGINE:-0}" = 1 ]; then
+    tf="${SIRIUS_TOKEN_FILE:?}"
+    case "$(uname -s)" in
+        MINGW* | MSYS* | CYGWIN*)
+            wbin=$(cygpath -w "$SIRIUS_ENGINE_BIN"); wtf=$(cygpath -w "$tf"); wlog=$(cygpath -w "$log"); wdir=$(cygpath -w "$PWD/app/python")
+            line="cmd.exe /c \"\"$wbin\" serve --no-python-worker --token-file \"$wtf\" --host 127.0.0.1 --port ${SIRIUS_PORT:-0} --device cpu --max-clients ${SIRIUS_MAX_CLIENTS:-8} > \"$wlog\" 2>&1\""
+            line=${line//\'/\'\'}
+            wpid=$(powershell.exe -NoProfile -NonInteractive -Command "(Invoke-CimMethod -ClassName Win32_Process -MethodName Create -Arguments @{CommandLine='$line'; CurrentDirectory='$wdir'}).ProcessId" | tr -d '\r')
+            echo "$wpid" > "$dir/$id.winpid"
+            echo "$wpid" > "$dir/$id.detached"
+            ;;
+        *)
+            ( cd app/python && exec setsid "$SIRIUS_ENGINE_BIN" serve --no-python-worker --token-file "$tf" --host 127.0.0.1 --port "${SIRIUS_PORT:-0}" \
+                  --device cpu --max-clients "${SIRIUS_MAX_CLIENTS:-8}" ) > "$log" 2>&1 < /dev/null &
+            pid=$!
+            echo "$pid" > "$dir/$id.pid"
+            echo "$pid" > "$dir/$id.ospid"
+            ;;
+    esac
+    echo RUNNING > "$dir/$id.state"
+    echo "$id"
+    exit 0
+fi
+( cd app/python && exec "${run[@]}" "${cmd[@]}" --host 127.0.0.1 --port "${SIRIUS_PORT:-0}" --device cpu \
       --max-clients "${SIRIUS_MAX_CLIENTS:-8}" ) > "$log" 2>&1 < /dev/null &
 pid=$!
 echo "$pid" > "$dir/$id.pid"

@@ -68,10 +68,14 @@ namespace sirius::app::gui {
 
     Bridge::Bridge(Workbench& wb) : wb_(wb), relay_(std::make_unique<Relay>(*this)) {
         wb_.addObserver(relay_.get());
+        // the engine's answers (previews, validations of the node's files)
+        // arrive on a thread of their own: a frame folds them in (update)
+        wb_.setWakeHandler([this] { wake(); });
         worker_ = std::thread([this] { workerLoop(); });
     }
 
     Bridge::~Bridge() {
+        wb_.setWakeHandler({});
         wb_.removeObserver(relay_.get());
         if (job_) job_->cancel();
         taskCancel_.store(true);   // a load in flight stops at its next progress call and installs nothing
@@ -152,6 +156,7 @@ namespace sirius::app::gui {
             if (jobDone_.exchange(false)) onJobFinished();
         }
         if (taskActive_.load() && taskDone_.exchange(false)) onTaskFinished();
+        wb_.poll();
     }
 
     // --- runs ------------------------------------------------------------------
@@ -166,7 +171,12 @@ namespace sirius::app::gui {
             return false;
         }
         std::shared_ptr<RunJob> job = wb_.createRun(target);
-        if (!job) return false;
+        if (!job) {
+            // files of this computer the HPC engine needs: the window asks, never the bridge
+            if (wb_.lastRunRefusal().kind == RunRefusal::Kind::NeedsUpload && !wb_.lastRunRefusal().uploads.empty())
+                uploadAsked.emit(target);
+            return false;
+        }
         job_ = job;
         jobDone_.store(false);
         runFraction_ = 0.0;

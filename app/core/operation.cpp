@@ -79,6 +79,18 @@ namespace sirius::app {
         return Device::cuda(static_cast<int>(i % n));
     }
 
+    // --- where a step ran ------------------------------------------------------
+
+    std::string placementTag(const StepOutput& out) {
+        if (out.where.empty()) return out.ranOnDevice.empty() ? std::string("this computer") : "this computer \xC2\xB7 " + out.ranOnDevice;
+        return out.ranOnDevice.empty() ? std::string("node") : "node " + out.ranOnDevice;
+    }
+
+    std::string placementText(const StepOutput& out) {
+        const std::string place = out.where.empty() ? std::string("this computer") : out.where;
+        return "on " + place + (out.ranOnDevice.empty() ? std::string() : " (" + out.ranOnDevice + ")");
+    }
+
     // --- StepInput --------------------------------------------------------------
 
     ArrayPtr StepInput::materialize(const std::function<void(double, const std::string&)>& progress) const {

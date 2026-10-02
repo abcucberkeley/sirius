@@ -22,9 +22,11 @@
 #include <array>
 #include <atomic>
 #include <functional>
+#include <map>
 #include <memory>
 #include <mutex>
 #include <optional>
+#include <set>
 #include <string>
 #include <vector>
 
@@ -35,12 +37,15 @@
 #include "core/labels.hpp"
 #include "core/session_log.hpp"
 #include "core/operation.hpp"
+#include "core/ops/contrast.hpp"
 #include "core/pipeline.hpp"
 #include "core/rpc.hpp"
 #include "core/tracks.hpp"
 #include "core/worker_error.hpp"
 
 namespace sirius::app {
+
+    class RemoteDatasets;
 
     enum class ViewMode { Ortho,
                           Volume,
@@ -143,6 +148,32 @@ namespace sirius::app {
         // connection of a cluster session (core/cluster.hpp), which resolves
         // the compute node's name on the cluster.
         int socksPort = 0;
+        // How a connection is made instead of host:port when set: the cluster
+        // session's connectWorker (its endpoint as it is now, after a
+        // reconnect too), an in-process engine in the tests.
+        std::function<std::unique_ptr<RemoteWorker>(const std::function<bool()>& cancelled)> connect;
+        // What the HPC worker said of itself when the host connected to it
+        // (`known`): the "engine" block of SIRIUS's engine (sirius-cli serve,
+        // core/engine_server.hpp), null for the Python worker. Not known
+        // (sirius-cli --hpc): the run finds out when it connects.
+        bool known = false;
+        nlohmann::json engine;
+        // Where the results computed there are held, for the log and the ops
+        // row: "fiona · n0042 · job 4711".
+        std::string where;
+
+        // SIRIUS's engine (known so far): the run goes to it whole.
+        bool hasEngine() const { return known && engine.is_object(); }
+        // A connection as configured.
+        std::unique_ptr<RemoteWorker> open(const std::function<bool()>& cancelled = {}) const;
+    };
+
+    // A file of this computer a run on the cluster node needs there: the
+    // dataset, a flat-field image, a PSF. Uploaded only when the user said so.
+    struct UploadFile {
+        std::string path;            // as the pipeline names it
+        std::uint64_t bytes = 0;
+        std::string stamp;           // size and modification time (fileStamp)
     };
 
     // Connects to (starting when needed) the local Python worker; installed
@@ -159,10 +190,17 @@ namespace sirius::app {
                           Running,
                           NoDataset,
                           Invalid,
-                          NoLauncher };
+                          NoLauncher,
+                          // the HPC job runs the Python worker only: built-in steps cannot run there
+                          NoEngine,
+                          // the HPC job's engine is another SIRIUS whose operations differ
+                          EngineMismatch,
+                          // files of this computer have to be uploaded first: ask (`uploads`), never by default
+                          NeedsUpload };
         Kind kind = Kind::None;
-        int step = -1;               // Invalid: the step that cannot run (its index, 0 = Load)
+        int step = -1;               // Invalid / NoEngine: the step that cannot run (its index, 0 = Load)
         std::string message;         // the line that was logged
+        std::vector<UploadFile> uploads;   // NeedsUpload: what would be sent, and how much
     };
 
     // One run, prepared on the GUI thread, executed anywhere.
@@ -215,11 +253,20 @@ namespace sirius::app {
             requireFinished("workerFailure");
             return workerFailure_;
         }
+        // True when the run went to SIRIUS's engine on the cluster node.
+        bool ranOnEngine() const {
+            requireFinished("ranOnEngine");
+            return onEngine_;
+        }
 
     private:
         friend class Workbench;
         void requireFinished(const char* what) const;
         void connectWorker();                          // on the executing thread
+        // Backend::Hpc with SIRIUS's engine: the whole run on the node (uploads
+        // first), the outputs seeded here as handles (NodeOutputSource).
+        void executeOnEngine();
+        void upload(const UploadFile& f, std::map<std::string, std::string>& nodePaths);
 
         Pipeline pipeline_;
         int target_ = 0;
@@ -231,6 +278,12 @@ namespace sirius::app {
         RemoteConfig remoteConfig_;                    // Backend::Hpc
         std::string workerHint_;                       // Workbench::setWorkerHint, when the job was made
         std::unique_ptr<RemoteWorker> ownedRemote_;    // the job's connection
+        std::shared_ptr<RemoteDatasets> nodeDatasets_; // what node outputs are drawn through
+        std::vector<UploadFile> uploads_;              // what the user agreed to upload
+        std::map<std::string, std::string> nodePaths_; // uploaded: this computer's path -> the node's (in and out)
+        std::string engineSession_;                    // the engine's session, from its result
+        std::string where_;                            // the node that answered: "fiona · n0042 · job 4711"
+        bool onEngine_ = false;
         RunProgress progress_;
         std::atomic<bool> cancelled_{false};
         // written by execute() before the release store to finished_
@@ -416,6 +469,37 @@ namespace sirius::app {
         void setHpcDevice(HpcDevice d);
         const RemoteConfig& remoteConfig() const noexcept { return remote_; }
         void setRemoteConfig(RemoteConfig c);
+        // Every result held by the engine session `session` went away (its job
+        // ended: `reason` says how): the steps keep their diagnostics, are no
+        // longer fresh, and say so. "" = every engine session. Returns the
+        // number of steps affected.
+        int nodeOutputsGone(const std::string& session, const std::string& reason);
+        // The engine session the results here were computed by ("" none).
+        const std::string& engineSession() const noexcept { return engineSession_; }
+        // The files of this computer a run to `target` on the HPC engine
+        // would have to upload, and whether the user agreed to each (the
+        // run asks for the rest: RunRefusal::Kind::NeedsUpload).
+        std::vector<UploadFile> filesToUpload(int target) const;
+        void allowUploads(const std::vector<UploadFile>& files);
+        // "node A100", "this computer · CPU": where step `index`'s last output
+        // was computed, "" when it has none; and the reason its data is gone.
+        std::string placementOf(int index) const;
+        // Answers of the engine on the node (previews, validations) arrive on
+        // a thread of their own: `wake` (any thread) asks the host to call
+        // poll() on its thread, which tells the observers. True when any arrived.
+        void setWakeHandler(std::function<void()> wake);
+        bool poll();
+
+        // --- the Contrast step's window on its input (core/ops/contrast.hpp) ---
+        // What the parameter panel and the viewer read off the input of
+        // Contrast step `index`: computed here from a few planes of an input
+        // on this computer; for one that stays on the cluster, by the engine
+        // there, from its preview (step_preview), so not a plane comes here.
+        // nullopt without an input, or while the node is asked (poll()).
+        std::optional<ContrastWindow> contrastWindowOf(int index, const ParamSet& params, Index c, bool wantRange) const;
+        // The parameters behind the Auto and Reset buttons, the same way.
+        std::optional<ParamSet> contrastAutoOf(int index, const ParamSet& current) const;
+        std::optional<ParamSet> contrastResetOf(int index, const ParamSet& current) const;
         // Steps that need the Python worker (Operation::needsWorker) get a
         // local worker from this launcher when the backend is not HPC; the
         // GUI installs one that spawns app/python/sirius_worker. A run
@@ -578,6 +662,25 @@ namespace sirius::app {
         std::string pluginError_;
         std::optional<WorkerStartError> pluginWorkerFailure_;
         std::string workerHint_;
+        // The engine on the node: the connection its outputs are drawn
+        // through, and the answers it gave to previews and validations.
+        struct EngineLink;
+        std::shared_ptr<EngineLink> engine_;
+        std::string engineSession_;
+        std::set<std::string> uploadConsent_;            // "path\nstamp" the user agreed to upload
+        std::map<std::string, std::string> nodePaths_;   // uploaded: this computer's path -> the node's
+        // The pipeline as the node knows it: uploaded files under their node paths.
+        nlohmann::json nodePipelineJson() const;
+        // The engine's answer to `method` (step_preview, step_validate), or
+        // nullopt while it is asked; `error` set when it failed.
+        std::optional<nlohmann::json> askEngine(const std::string& method, const nlohmann::json& params, std::string* error,
+                                                std::vector<rpc::Tensor>* tensors = nullptr) const;
+        // The input of step `index` stays on the cluster, and the engine there answers for it.
+        bool inputOnCluster(int index) const;
+        // ... and that input is the step's own, computed (fresh): the node can preview the step on it.
+        bool previewedOnNode(int index) const;
+        // The engine's preview of step `index` with `params`; nullopt while asked; throws its error.
+        std::optional<Diagnostics> nodePreview(int index, const ParamSet& params) const;
         // The first "before" of the merge group the top history entry belongs
         // to (History::mergesWith decides whether it still applies).
         std::optional<std::pair<std::string, Snapshot>> mergeFirst_;

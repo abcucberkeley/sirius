@@ -849,6 +849,17 @@ namespace sirius::app {
                                     const std::vector<rpc::TensorRef>& tensors,
                                     const std::function<void(double, const std::string&)>& progress,
                                     const std::function<bool()>& cancelled) {
+        return exchange(method, params, tensors, progress, {}, cancelled);
+    }
+
+    WorkerResult RemoteWorker::callWithFrames(const std::string& method, const json& params, const std::vector<rpc::TensorRef>& tensors,
+                                              const std::function<void(const json&)>& progressFrame, const std::function<bool()>& cancelled) {
+        return exchange(method, params, tensors, {}, progressFrame, cancelled);
+    }
+
+    WorkerResult RemoteWorker::exchange(const std::string& method, const json& params, const std::vector<rpc::TensorRef>& tensors,
+                                        const std::function<void(double, const std::string&)>& progress,
+                                        const std::function<void(const json&)>& progressFrame, const std::function<bool()>& cancelled) {
         if (!transport_ || !transport_->isOpen()) throw ProtocolError("worker: not connected");
         const std::uint64_t id = nextId_++;
         // The token is never sent: the handshake proved it, once.
@@ -894,6 +905,7 @@ namespace sirius::app {
             if (idField->get<std::uint64_t>() != id) continue;   // a stale reply
             if (type == "progress") {
                 if (progress) progress(h.value("fraction", 0.0), h.value("message", ""));
+                if (progressFrame) progressFrame(h);
                 continue;
             }
             if (type == "error") {

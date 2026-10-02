@@ -244,6 +244,11 @@ namespace sirius::app {
                           const std::vector<rpc::TensorRef>& tensors = {},
                           const std::function<void(double, const std::string&)>& progress = {},
                           const std::function<bool()>& cancelled = {});
+        // The same, handing each progress frame's header over whole: the
+        // engine's frames carry the step and its state besides the fraction.
+        WorkerResult callWithFrames(const std::string& method, const nlohmann::json& params, const std::vector<rpc::TensorRef>& tensors,
+                                    const std::function<void(const nlohmann::json& frame)>& progressFrame,
+                                    const std::function<bool()>& cancelled = {});
         void close();
         bool isOpen() const noexcept;
         // How long a cancelled call waits for the worker's answer before
@@ -254,6 +259,9 @@ namespace sirius::app {
 
     private:
         void handshake(const std::string& token, const std::function<bool()>& cancelled, std::chrono::milliseconds helloTimeout);
+        WorkerResult exchange(const std::string& method, const nlohmann::json& params, const std::vector<rpc::TensorRef>& tensors,
+                              const std::function<void(double, const std::string&)>& progress,
+                              const std::function<void(const nlohmann::json&)>& progressFrame, const std::function<bool()>& cancelled);
 
         std::unique_ptr<rpc::Transport> transport_;
         WorkerCapabilities caps_;

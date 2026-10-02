@@ -106,6 +106,11 @@ namespace sirius::app {
         // A source that is drawn through display-sized views (a cluster
         // dataset); null for every local one, which the viewer reads directly.
         virtual ViewProvider* viewProvider() const noexcept { return nullptr; }
+        // A step's output computed and held by SIRIUS's engine on a cluster
+        // node (core/remote_source.hpp, NodeOutputSource): the node's cache
+        // evicts it by the step's cache policy as this computer's would, so a
+        // Recompute eviction here drops the source too, not only an array.
+        virtual bool heldByNodeCache() const noexcept { return false; }
 
         // --- tiles (multi-file datasets; single-tile sources keep the defaults)
         virtual Index tileCount() const noexcept { return 1; }
