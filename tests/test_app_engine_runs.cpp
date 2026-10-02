@@ -610,6 +610,8 @@ TEST_CASE("engine runs: a real sirius-cli serve runs the pipeline; its handles e
     writeFlat(flat, 48, 40);
     const std::string tokenFile = dir.file("token");
     std::ofstream(fs::u8path(tokenFile)) << "serve-token-9\n";
+    // owner-only, as the app writes it: on POSIX `serve` refuses a token file others can read
+    fs::permissions(fs::u8path(tokenFile), fs::perms::owner_read | fs::perms::owner_write, fs::perm_options::replace);
     ChildProcess p;
     ChildProcess::Options o;
     o.program = SIRIUS_TEST_CLI;
