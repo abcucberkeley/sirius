@@ -14,6 +14,7 @@
 #include <mutex>
 #include <stdexcept>
 #include <type_traits>
+#include <utility>
 #include <vector>
 
 #include <omp.h>
@@ -44,6 +45,15 @@ namespace sirius {
             return 0;
         }
 
+        // Per-handle error filter: a codec libtiff was built without is
+        // reported by inspection (TiffImageInfo::unsupported) and by the read
+        // that needs it, in SIRIUS's words; libtiff's line on stderr, printed
+        // for every page of every inspection, adds nothing.
+        int errorFilter(TIFF*, void*, const char*, const char* fmt, va_list) {
+            if (fmt && std::strstr(fmt, "compression support is not configured")) return 1;
+            return 0;
+        }
+
         struct OpenOptionsDeleter {
             void operator()(TIFFOpenOptions* o) const { TIFFOpenOptionsFree(o); }
         };
@@ -54,59 +64,121 @@ namespace sirius {
         TiffPtr openTiff(const std::string& path, const char* mode) {
             if (mode[0] == 'r') g_readOpens.fetch_add(1, std::memory_order_relaxed);
             std::unique_ptr<TIFFOpenOptions, OpenOptionsDeleter> opts(TIFFOpenOptionsAlloc());
-            if (opts) TIFFOpenOptionsSetWarningHandlerExtR(opts.get(), warningFilter, nullptr);
+            if (opts) {
+                TIFFOpenOptionsSetWarningHandlerExtR(opts.get(), warningFilter, nullptr);
+                TIFFOpenOptionsSetErrorHandlerExtR(opts.get(), errorFilter, nullptr);
+            }
             TiffPtr tif(TIFFOpenExt(path.c_str(), mode, opts.get()));
             if (!tif) throw IoError("Failed to open TIFF: " + path);
             return tif;
         }
 
-        PixelType pixelTypeFrom(uint16_t bps, uint16_t fmt) {
-            switch (fmt) {
-                case SAMPLEFORMAT_IEEEFP:
-                    if (bps == 32) return PixelType::Float32;
-                    if (bps == 64) return PixelType::Float64;
-                    throw IoError("Unsupported float bit depth: " + std::to_string(bps));
-                case SAMPLEFORMAT_INT:
-                    if (bps == 8) return PixelType::Int8;
-                    if (bps == 16) return PixelType::Int16;
-                    if (bps == 32) return PixelType::Int32;
-                    throw IoError("Unsupported integer bit depth: " + std::to_string(bps));
-                default: // SAMPLEFORMAT_UINT and the (common) unspecified case
-                    if (bps == 8) return PixelType::UInt8;
-                    if (bps == 16) return PixelType::UInt16;
-                    if (bps == 32) return PixelType::UInt32;
-                    throw IoError("Unsupported integer bit depth: " + std::to_string(bps));
+        const char* compressionName(uint16_t c) {
+            switch (c) {
+                case COMPRESSION_NONE: return "None";
+                case COMPRESSION_CCITTRLE: return "CCITT RLE";
+                case COMPRESSION_CCITTFAX3: return "CCITT Group 3";
+                case COMPRESSION_CCITTFAX4: return "CCITT Group 4";
+                case COMPRESSION_LZW: return "LZW";
+                case COMPRESSION_OJPEG: return "old-style JPEG";
+                case COMPRESSION_JPEG: return "JPEG";
+                case COMPRESSION_ADOBE_DEFLATE: return "Adobe Deflate";
+                case COMPRESSION_DEFLATE: return "Deflate";
+                case COMPRESSION_PACKBITS: return "PackBits";
+                case 34712: return "JPEG 2000";
+                case 34887: return "LERC";
+                case 34925: return "LZMA";
+                case 50000: return "ZSTD";
+                case 50001: return "WebP";
+                case 50002:
+                case 52546: return "JPEG XL";
+                default: return "an unknown codec";
             }
         }
 
-        // Metadata of the directory `tif` currently points at.
+        // The decoded type of one sample, or "" in `why` when there is none:
+        // 1..8-bit unsigned -> UInt8, 9..16 -> UInt16, 17..32 -> UInt32; signed
+        // the same with sign extension; float16 widens to Float32.
+        PixelType sampleTypeFrom(uint16_t bps, uint16_t fmt, std::string& why) {
+            switch (fmt) {
+                case SAMPLEFORMAT_IEEEFP:
+                    if (bps == 16 || bps == 32) return PixelType::Float32;
+                    if (bps == 64) return PixelType::Float64;
+                    why = std::to_string(bps) + "-bit floating-point samples are not supported";
+                    return PixelType::Float32;
+                case SAMPLEFORMAT_INT:
+                    if (bps >= 1 && bps <= 8) return PixelType::Int8;
+                    if (bps >= 9 && bps <= 16) return PixelType::Int16;
+                    if (bps >= 17 && bps <= 32) return PixelType::Int32;
+                    why = std::to_string(bps) + "-bit signed integer samples are not supported (no int64 pixel type)";
+                    return PixelType::Int32;
+                case SAMPLEFORMAT_COMPLEXINT:
+                case SAMPLEFORMAT_COMPLEXIEEEFP:
+                    why = "complex samples are not supported";
+                    return PixelType::Float32;
+                default:   // SAMPLEFORMAT_UINT, SAMPLEFORMAT_VOID and the (common) unspecified case
+                    if (bps >= 1 && bps <= 8) return PixelType::UInt8;
+                    if (bps >= 9 && bps <= 16) return PixelType::UInt16;
+                    if (bps >= 17 && bps <= 32) return PixelType::UInt32;
+                    why = std::to_string(bps) + "-bit unsigned integer samples are not supported (no uint64 pixel type)";
+                    return PixelType::UInt32;
+            }
+        }
+
+        // Metadata of the directory `tif` currently points at. Throws only
+        // when the directory is not an image at all (no width / height /
+        // bits); one SIRIUS cannot decode is described in `unsupported`.
         TiffImageInfo readImageInfo(TIFF* tif) {
             TiffImageInfo info;
             info.ifdOffset = TIFFCurrentDirOffset(tif);
 
-            uint16_t bps = 0, fmt = SAMPLEFORMAT_UINT, planar = PLANARCONFIG_CONTIG;
             uint32_t subfileType = 0;
             if (!TIFFGetField(tif, TIFFTAG_IMAGEWIDTH, &info.width))
                 throw IoError("TIFF missing required tag: IMAGEWIDTH");
             if (!TIFFGetField(tif, TIFFTAG_IMAGELENGTH, &info.height))
                 throw IoError("TIFF missing required tag: IMAGELENGTH");
-            if (!TIFFGetField(tif, TIFFTAG_BITSPERSAMPLE, &bps))
+            if (!TIFFGetFieldDefaulted(tif, TIFFTAG_BITSPERSAMPLE, &info.bitsPerSample))
                 throw IoError("TIFF missing required tag: BITSPERSAMPLE");
             TIFFGetFieldDefaulted(tif, TIFFTAG_SAMPLESPERPIXEL, &info.samplesPerPixel);
-            TIFFGetFieldDefaulted(tif, TIFFTAG_SAMPLEFORMAT, &fmt);
+            TIFFGetFieldDefaulted(tif, TIFFTAG_SAMPLEFORMAT, &info.sampleFormat);
             TIFFGetFieldDefaulted(tif, TIFFTAG_COMPRESSION, &info.compression);
             // The predictor tag only exists for codecs that register it
             // (LZW/Deflate/...); for others libtiff reports nothing.
             if (!TIFFGetField(tif, TIFFTAG_PREDICTOR, &info.predictor) || info.predictor == 0)
                 info.predictor = 1;
-            TIFFGetFieldDefaulted(tif, TIFFTAG_PLANARCONFIG, &planar);
+            TIFFGetFieldDefaulted(tif, TIFFTAG_PLANARCONFIG, &info.planarConfig);
             TIFFGetFieldDefaulted(tif, TIFFTAG_SUBFILETYPE, &subfileType);
+            TIFFGetFieldDefaulted(tif, TIFFTAG_ORIENTATION, &info.orientation);
+            if (!TIFFGetField(tif, TIFFTAG_PHOTOMETRIC, &info.photometric))
+                info.photometric = info.samplesPerPixel >= 3 ? PHOTOMETRIC_RGB : PHOTOMETRIC_MINISBLACK;
+            if (info.samplesPerPixel == 0) info.samplesPerPixel = 1;
+            if (info.planarConfig != PLANARCONFIG_SEPARATE) info.planarConfig = PLANARCONFIG_CONTIG;
 
-            if (info.samplesPerPixel != 1)
-                throw IoError("Only single-channel (grayscale) TIFFs are supported.");
-            if (planar != PLANARCONFIG_CONTIG)
-                throw IoError("Only contiguous (chunky) planar configuration is supported.");
-            info.pixelType = pixelTypeFrom(bps, fmt);
+            uint16_t extraCount = 0;
+            uint16_t* extra = nullptr;
+            if (TIFFGetField(tif, TIFFTAG_EXTRASAMPLES, &extraCount, &extra) && extra)
+                info.extraSamples.assign(extra, extra + extraCount);
+            if (info.photometric == PHOTOMETRIC_PALETTE && info.bitsPerSample <= 16) {
+                uint16_t *r = nullptr, *g = nullptr, *b = nullptr;
+                if (TIFFGetField(tif, TIFFTAG_COLORMAP, &r, &g, &b) && r && g && b) {
+                    const std::size_t n = std::size_t{1} << info.bitsPerSample;
+                    info.colormap.reserve(3 * n);
+                    info.colormap.insert(info.colormap.end(), r, r + n);
+                    info.colormap.insert(info.colormap.end(), g, g + n);
+                    info.colormap.insert(info.colormap.end(), b, b + n);
+                }
+            }
+
+            info.pixelType = sampleTypeFrom(info.bitsPerSample, info.sampleFormat, info.unsupported);
+            if (info.unsupported.empty() && !TIFFIsCODECConfigured(info.compression))
+                info.unsupported = std::string("compression ") + std::to_string(info.compression) + " (" +
+                                   compressionName(info.compression) + ") is not built into this SIRIUS's libtiff";
+            if (info.unsupported.empty() && info.photometric == PHOTOMETRIC_YCBCR &&
+                info.compression != COMPRESSION_JPEG) {
+                uint16_t sx = 1, sy = 1;
+                TIFFGetFieldDefaulted(tif, TIFFTAG_YCBCRSUBSAMPLING, &sx, &sy);
+                if (sx != 1 || sy != 1) info.unsupported = "subsampled YCbCr samples are not supported";
+            }
 
             if (TIFFIsTiled(tif)) {
                 info.layout = TiffLayout::Tiles;
@@ -158,96 +230,343 @@ namespace sirius {
         }
 
         // ------------------------------------------------------------------
-        // Raw region decoding (native pixel type). The libtiff-facing code is
-        // deliberately untemplated: one instantiation decodes every pixel type
-        // as bytes, and conversion -- when the caller wants another type --
-        // runs afterwards on the dense native page (see decodeWithLibtiff).
+        // Decoding. libtiff turns a strip or tile (a "chunk") into raw rows:
+        // codec and predictor undone, multi-byte samples in host byte order,
+        // samples of a pixel side by side (contiguous planar configuration) or
+        // one sample per chunk (separate planes). Everything after that --
+        // unpacking 1..32-bit samples, widening float16, splitting samples
+        // into planes, cropping to the region and converting to the caller's
+        // type -- happens here, row by row, straight into the destination.
+        // The libtiff-facing code is untemplated; the per-row kernels are
+        // chosen once per read.
         // ------------------------------------------------------------------
 
-        [[noreturn]] void throwReadError(const char* what, uint32_t x, uint32_t y) {
-            throw IoError(std::string("Failed to read TIFF ") + what + " at (" +
-                          std::to_string(x) + "," + std::to_string(y) + ")");
+        [[noreturn]] void throwReadError(const char* what, uint32_t x, uint32_t y, uint16_t sample) {
+            throw IoError(std::string("Failed to read TIFF ") + what + " at (" + std::to_string(x) + "," +
+                          std::to_string(y) + ")" + (sample ? " of sample " + std::to_string(sample) : std::string()));
         }
 
-        // Strips are full-width, so a strip whose wanted rows begin at its own
-        // first row decodes straight into dst (no bounce buffer). Only strips
-        // that start above the region, or when the region is narrower than
-        // the image, go through `scratch`.
-        void readStripsRegion(TIFF* tif, const TiffImageInfo& g, const Region& r, uint8_t* dst,
-                              std::vector<uint8_t>& scratch) {
-            const std::size_t bpp = bytesPerPixel(g.pixelType);
-            const std::size_t dstPitch = static_cast<std::size_t>(r.width) * bpp;
-            const std::size_t srcPitch = static_cast<std::size_t>(g.width) * bpp;
+        // IEEE half -> float, exactly (subnormals, inf and NaN included).
+        float halfToFloat(uint16_t h) {
+            const uint32_t sign = static_cast<uint32_t>(h & 0x8000u) << 16;
+            uint32_t exp = (h >> 10) & 0x1Fu;
+            uint32_t mant = h & 0x3FFu;
+            uint32_t bits = 0;
+            if (exp == 0x1F) {
+                bits = sign | 0x7F800000u | (mant << 13);
+            } else if (exp != 0) {
+                bits = sign | ((exp + 112u) << 23) | (mant << 13);
+            } else if (mant != 0) {   // subnormal: normalize
+                exp = 113;
+                while ((mant & 0x400u) == 0) {
+                    mant <<= 1;
+                    --exp;
+                }
+                bits = sign | (exp << 23) | ((mant & 0x3FFu) << 13);
+            } else {
+                bits = sign;
+            }
+            float f;
+            std::memcpy(&f, &bits, sizeof f);
+            return f;
+        }
 
-            uint32_t rowsPerStrip = 0;
-            TIFFGetFieldDefaulted(tif, TIFFTAG_ROWSPERSTRIP, &rowsPerStrip);
-            if (rowsPerStrip == 0 || rowsPerStrip > g.height) rowsPerStrip = g.height;
-            const tmsize_t stripSize = TIFFStripSize(tif);
-            if (stripSize <= 0) throw IoError("TIFF reports invalid strip size");
+        bool hostLittleEndian() noexcept {
+            const uint16_t one = 1;
+            uint8_t first = 0;
+            std::memcpy(&first, &one, 1);
+            return first == 1;
+        }
 
-            const uint32_t yEnd = r.y + r.height;
-            const bool fullWidth = (r.x == 0 && r.width == g.width);
+        // How the samples of one chunk row are stored.
+        enum class SampleCoding : std::uint8_t {
+            Aligned,   // 8/16/32/64-bit samples, already in the decoded pixel type
+            Half,      // 16-bit float
+            Int24,     // 24-bit integers, host byte order (libtiff swaps them)
+            Packed     // any other width: an MSB-first bit stream, rows padded to a byte
+        };
 
-            for (uint32_t stripRow0 = (r.y / rowsPerStrip) * rowsPerStrip; stripRow0 < yEnd; stripRow0 += rowsPerStrip) {
-                const tstrip_t strip = TIFFComputeStrip(tif, stripRow0, 0);
-                const uint32_t stripRows = std::min(rowsPerStrip, g.height - stripRow0);
-                const uint32_t y0 = std::max(stripRow0, r.y);
-                const uint32_t y1 = std::min(stripRow0 + stripRows, yEnd);
+        SampleCoding codingOf(const TiffImageInfo& g) {
+            if (g.sampleFormat == SAMPLEFORMAT_IEEEFP && g.bitsPerSample == 16) return SampleCoding::Half;
+            if (g.bitsPerSample == 8 || g.bitsPerSample == 16 || g.bitsPerSample == 32 || g.bitsPerSample == 64)
+                return SampleCoding::Aligned;
+            if (g.bitsPerSample == 24) return SampleCoding::Int24;
+            return SampleCoding::Packed;
+        }
 
-                if (fullWidth && y0 == stripRow0) {
-                    uint8_t* out = dst + static_cast<std::size_t>(y0 - r.y) * dstPitch;
-                    const tmsize_t bytes = static_cast<tmsize_t>(y1 - y0) * static_cast<tmsize_t>(srcPitch);
-                    if (TIFFReadEncodedStrip(tif, strip, out, bytes) < 0) throwReadError("strip", 0, stripRow0);
+        // Sample `s` of pixels [px, px + count) of a raw row with `stride`
+        // samples per pixel, as the decoded type N (written to `out`).
+        template <typename N>
+        void extractRow(const uint8_t* raw, SampleCoding coding, uint16_t bps, bool isSigned, uint32_t px,
+                        uint32_t count, uint16_t stride, uint16_t s, N* out) {
+            switch (coding) {
+                case SampleCoding::Aligned: {
+                    const N* src = reinterpret_cast<const N*>(raw) + static_cast<std::size_t>(px) * stride + s;
+                    if (stride == 1) {
+                        std::memcpy(out, src, static_cast<std::size_t>(count) * sizeof(N));
+                    } else {
+                        // unaligned rows are possible (odd tile widths of 3-sample 8-bit data
+                        // never are, but stay safe): copy byte-wise per sample
+                        for (uint32_t i = 0; i < count; ++i) std::memcpy(out + i, src + static_cast<std::size_t>(i) * stride, sizeof(N));
+                    }
+                    return;
+                }
+                case SampleCoding::Half:
+                    if constexpr (std::is_same_v<N, float>) {
+                        const uint8_t* src = raw + (static_cast<std::size_t>(px) * stride + s) * 2;
+                        for (uint32_t i = 0; i < count; ++i) {
+                            uint16_t h;
+                            std::memcpy(&h, src + static_cast<std::size_t>(i) * stride * 2, 2);
+                            out[i] = halfToFloat(h);
+                        }
+                    }
+                    return;
+                case SampleCoding::Int24:
+                    if constexpr (sizeof(N) == 4 && std::is_integral_v<N>) {
+                        const uint8_t* src = raw + (static_cast<std::size_t>(px) * stride + s) * 3;
+                        for (uint32_t i = 0; i < count; ++i) {
+                            const uint8_t* b = src + static_cast<std::size_t>(i) * stride * 3;
+                            uint32_t v = 0;
+                            if (hostLittleEndian())
+                                v = uint32_t{b[0]} | (uint32_t{b[1]} << 8) | (uint32_t{b[2]} << 16);
+                            else
+                                v = (uint32_t{b[0]} << 16) | (uint32_t{b[1]} << 8) | uint32_t{b[2]};
+                            if (isSigned && (v & 0x800000u)) v |= 0xFF000000u;
+                            out[i] = static_cast<N>(v);
+                        }
+                    }
+                    return;
+                case SampleCoding::Packed: {
+                    if constexpr (std::is_integral_v<N>) {
+                        const uint64_t mask = (uint64_t{1} << bps) - 1;
+                        uint64_t bit = (static_cast<uint64_t>(px) * stride + s) * bps;
+                        const uint64_t step = static_cast<uint64_t>(stride) * bps;
+                        for (uint32_t i = 0; i < count; ++i, bit += step) {
+                            // up to 32 bits starting anywhere in a byte span 5 bytes
+                            const uint8_t* b = raw + (bit >> 3);
+                            const unsigned shift = static_cast<unsigned>(bit & 7);
+                            const unsigned nbytes = (shift + bps + 7) / 8;
+                            uint64_t acc = 0;
+                            for (unsigned k = 0; k < nbytes; ++k) acc = (acc << 8) | b[k];
+                            uint64_t v = (acc >> (nbytes * 8 - shift - bps)) & mask;
+                            if (isSigned && (v >> (bps - 1)) & 1) v |= ~mask;   // sign-extend
+                            out[i] = static_cast<N>(v);   // modular: keeps the sign bits
+                        }
+                    }
+                    return;
+                }
+            }
+        }
+
+        // extractRow for a native type known at run time.
+        using ExtractFn = void (*)(const uint8_t*, SampleCoding, uint16_t, bool, uint32_t, uint32_t, uint16_t, uint16_t,
+                                   void*);
+        template <typename N>
+        void extractRowErased(const uint8_t* raw, SampleCoding coding, uint16_t bps, bool isSigned, uint32_t px,
+                              uint32_t count, uint16_t stride, uint16_t s, void* out) {
+            extractRow<N>(raw, coding, bps, isSigned, px, count, stride, s, static_cast<N*>(out));
+        }
+
+        // Elementwise conversion of one row segment (the same scalar
+        // conversion as sirius::convert).
+        using ConvertFn = void (*)(const void*, void*, std::size_t);
+        template <typename From, typename To>
+        void convertRowErased(const void* src, void* dst, std::size_t n) {
+            const From* s = static_cast<const From*>(src);
+            To* d = static_cast<To*>(dst);
+            for (std::size_t i = 0; i < n; ++i) d[i] = detail::convertScalar<To>(s[i]);
+        }
+
+        template <typename F>
+        void withType(PixelType t, F&& f) {
+            switch (t) {
+                case PixelType::UInt8: f(std::uint8_t{}); return;
+                case PixelType::Int8: f(std::int8_t{}); return;
+                case PixelType::UInt16: f(std::uint16_t{}); return;
+                case PixelType::Int16: f(std::int16_t{}); return;
+                case PixelType::UInt32: f(std::uint32_t{}); return;
+                case PixelType::Int32: f(std::int32_t{}); return;
+                case PixelType::Float32: f(float{}); return;
+                case PixelType::Float64: f(double{}); return;
+            }
+        }
+
+        ExtractFn extractFor(PixelType native) {
+            ExtractFn fn = nullptr;
+            withType(native, [&](auto tag) { fn = &extractRowErased<decltype(tag)>; });
+            return fn;
+        }
+
+        ConvertFn convertFor(PixelType from, PixelType to) {
+            ConvertFn fn = nullptr;
+            withType(from, [&](auto f) {
+                withType(to, [&](auto t) { fn = &convertRowErased<decltype(f), decltype(t)>; });
+            });
+            return fn;
+        }
+
+        // The strips / tiles of one IFD, as the region read needs them.
+        struct ChunkGrid {
+            bool tiled = false;
+            uint32_t chunkW = 0, chunkH = 0;     // tile size, or (width, rows per strip)
+            uint32_t across = 1, down = 1;       // chunks per row / column of one plane
+            uint16_t chunkSamples = 1;           // samples per pixel inside a chunk
+            uint16_t planes = 1;                 // separate planes: samplesPerPixel, else 1
+            std::size_t rowBytes = 0;            // one decoded chunk row
+            // the region in chunk coordinates
+            uint32_t cx0 = 0, cx1 = 0, cy0 = 0, cy1 = 0;
+            uint16_t s0 = 0, s1 = 1;             // planes to decode (separate planes only)
+
+            std::size_t count() const noexcept {
+                return static_cast<std::size_t>(cx1 - cx0) * (cy1 - cy0) * (s1 - s0);
+            }
+        };
+
+        ChunkGrid gridOf(const TiffImageInfo& g, const Region& r, uint16_t firstSample, uint16_t sampleCount) {
+            ChunkGrid c;
+            c.tiled = g.layout == TiffLayout::Tiles;
+            c.chunkW = c.tiled ? g.tileWidth : g.width;
+            c.chunkH = c.tiled ? g.tileHeight : std::max<uint32_t>(1, std::min(g.rowsPerStrip, g.height));
+            c.across = c.tiled ? (g.width + c.chunkW - 1) / c.chunkW : 1;
+            c.down = (g.height + c.chunkH - 1) / c.chunkH;
+            const bool separate = g.planarConfig == PLANARCONFIG_SEPARATE && g.samplesPerPixel > 1;
+            c.chunkSamples = separate ? 1 : g.samplesPerPixel;
+            c.planes = separate ? g.samplesPerPixel : 1;
+            c.rowBytes = (static_cast<std::size_t>(c.chunkW) * c.chunkSamples * g.bitsPerSample + 7) / 8;
+            c.cx0 = r.x / c.chunkW;
+            c.cx1 = (r.x + r.width + c.chunkW - 1) / c.chunkW;
+            c.cy0 = r.y / c.chunkH;
+            c.cy1 = (r.y + r.height + c.chunkH - 1) / c.chunkH;
+            if (separate) {
+                c.s0 = firstSample;
+                c.s1 = static_cast<uint16_t>(firstSample + sampleCount);
+            }
+            return c;
+        }
+
+        // Decoded bytes of one page of a region read: every chunk it touches,
+        // whole. A measure of the work, not of the output.
+        std::size_t decodedBytes(const ChunkGrid& c) {
+            return c.count() * c.rowBytes * c.chunkH;
+        }
+
+        // One read, as every decoding thread sees it.
+        struct ReadPlan {
+            const std::vector<const TiffImageInfo*>* images = nullptr;   // per page
+            const std::vector<std::uint64_t>* ifds = nullptr;
+            Region region;
+            uint16_t firstSample = 0, sampleCount = 1;
+            PixelType nativeType = PixelType::UInt8;
+            PixelType dstType = PixelType::UInt8;
+            std::uint8_t* dst = nullptr;
+            std::size_t dstBpp = 1;
+            ExtractFn extract = nullptr;
+            ConvertFn convert = nullptr;   // null: dst is the native type
+
+            uint8_t* dstRow(std::size_t page, uint16_t sample, uint32_t y, uint32_t x) const {
+                const std::size_t plane = page * sampleCount + (sample - firstSample);
+                return dst + ((plane * region.height + (y - region.y)) * region.width + (x - region.x)) * dstBpp;
+            }
+        };
+
+        // A thread's libtiff handle, the directory it is on, and its buffers.
+        struct ChunkReader {
+            const std::string* path = nullptr;
+            TiffPtr tif;
+            std::uint64_t dir = ~std::uint64_t{0};
+            std::vector<uint8_t> chunk;
+            std::vector<uint8_t> row;   // native row segment, conversion path only
+
+            TIFF* at(std::uint64_t ifd) {
+                if (!tif) tif = openTiff(*path, "r");
+                if (dir != ifd) {
+                    dir = ~std::uint64_t{0};
+                    if (!TIFFSetSubDirectory(tif.get(), ifd))
+                        throw IoError("Failed to seek to TIFF directory at offset " + std::to_string(ifd));
+                    dir = ifd;
+                }
+                return tif.get();
+            }
+        };
+
+        // Chunks [k0, k1) of page `page`'s region, in the order of the grid
+        // (plane, chunk row, chunk column).
+        void decodeChunks(ChunkReader& rd, const ReadPlan& plan, std::size_t page, std::size_t k0, std::size_t k1) {
+            const TiffImageInfo& g = *(*plan.images)[page];
+            const Region& r = plan.region;
+            TIFF* tif = rd.at((*plan.ifds)[page]);
+            const ChunkGrid c = gridOf(g, r, plan.firstSample, plan.sampleCount);
+            const SampleCoding coding = codingOf(g);
+            const bool isSigned = g.sampleFormat == SAMPLEFORMAT_INT;
+            const std::size_t nativeBpp = bytesPerPixel(plan.nativeType);
+            const uint32_t gx = c.cx1 - c.cx0, gy = c.cy1 - c.cy0;
+            const tmsize_t chunkBytes = c.tiled ? TIFFTileSize(tif) : TIFFStripSize(tif);
+            if (chunkBytes <= 0) throw IoError(std::string("TIFF reports an invalid ") + (c.tiled ? "tile" : "strip") + " size");
+            const uint32_t chunksPerPlane = c.across * c.down;
+
+            for (std::size_t k = k0; k < k1; ++k) {
+                const uint16_t plane = static_cast<uint16_t>(c.s0 + k / (static_cast<std::size_t>(gx) * gy));
+                const std::size_t inPlane = k % (static_cast<std::size_t>(gx) * gy);
+                const uint32_t cy = c.cy0 + static_cast<uint32_t>(inPlane / gx);
+                const uint32_t cx = c.cx0 + static_cast<uint32_t>(inPlane % gx);
+                const uint32_t x0 = cx * c.chunkW, y0 = cy * c.chunkH;
+                const uint32_t ix0 = std::max(x0, r.x), ix1 = std::min({x0 + c.chunkW, r.x + r.width, g.width});
+                const uint32_t iy0 = std::max(y0, r.y), iy1 = std::min({y0 + c.chunkH, r.y + r.height, g.height});
+                const uint32_t chunkIndex = static_cast<uint32_t>(plane) * chunksPerPlane + cy * c.across + cx;
+                // the samples this chunk holds that the read wants
+                const uint16_t sFirst = c.planes > 1 ? plane : plan.firstSample;
+                const uint16_t sEnd = c.planes > 1 ? static_cast<uint16_t>(plane + 1)
+                                                   : static_cast<uint16_t>(plan.firstSample + plan.sampleCount);
+                const std::size_t n = ix1 - ix0;
+
+                // Sparse files: a chunk never written (offset or byte count 0)
+                // reads as zeros, as tifffile and GDAL read it.
+                if (TIFFGetStrileByteCount(tif, chunkIndex) == 0 || TIFFGetStrileOffset(tif, chunkIndex) == 0) {
+                    for (uint16_t s = sFirst; s < sEnd; ++s)
+                        for (uint32_t y = iy0; y < iy1; ++y)
+                            std::memset(plan.dstRow(page, s, y, ix0), 0, n * plan.dstBpp);
+                    continue;
+                }
+
+                // Strips covering the full width of a one-sample-per-chunk
+                // read decode straight into the destination when no sample
+                // needs unpacking or converting.
+                const bool direct = !c.tiled && c.chunkSamples == 1 && coding == SampleCoding::Aligned && !plan.convert &&
+                                    r.x == 0 && r.width == g.width && y0 >= r.y;
+                if (direct) {
+                    const tmsize_t bytes = static_cast<tmsize_t>(iy1 - y0) * static_cast<tmsize_t>(c.rowBytes);
+                    if (TIFFReadEncodedStrip(tif, chunkIndex, plan.dstRow(page, sFirst, y0, 0), bytes) < 0)
+                        throwReadError("strip", 0, y0, plane);
+                    continue;
+                }
+
+                rd.chunk.resize(static_cast<std::size_t>(chunkBytes));
+                if (c.tiled) {
+                    if (TIFFReadEncodedTile(tif, chunkIndex, rd.chunk.data(), chunkBytes) < 0)
+                        throwReadError("tile", x0, y0, plane);
                 } else {
-                    scratch.resize(static_cast<std::size_t>(stripSize));
-                    // Decode only through the last row we need.
-                    const tmsize_t bytes = static_cast<tmsize_t>(y1 - stripRow0) * static_cast<tmsize_t>(srcPitch);
-                    if (TIFFReadEncodedStrip(tif, strip, scratch.data(), bytes) < 0) throwReadError("strip", 0, stripRow0);
-                    for (uint32_t y = y0; y < y1; ++y)
-                        std::memcpy(dst + static_cast<std::size_t>(y - r.y) * dstPitch,
-                                    scratch.data() + static_cast<std::size_t>(y - stripRow0) * srcPitch + r.x * bpp,
-                                    dstPitch);
+                    // decode only through the last row needed
+                    const tmsize_t bytes = static_cast<tmsize_t>(iy1 - y0) * static_cast<tmsize_t>(c.rowBytes);
+                    if (TIFFReadEncodedStrip(tif, chunkIndex, rd.chunk.data(), bytes) < 0)
+                        throwReadError("strip", 0, y0, plane);
+                }
+                if (plan.convert) rd.row.resize(n * nativeBpp);
+                for (uint16_t s = sFirst; s < sEnd; ++s) {
+                    const uint16_t sInChunk = c.planes > 1 ? 0 : s;
+                    for (uint32_t y = iy0; y < iy1; ++y) {
+                        const uint8_t* raw = rd.chunk.data() + static_cast<std::size_t>(y - y0) * c.rowBytes;
+                        uint8_t* out = plan.dstRow(page, s, y, ix0);
+                        if (plan.convert) {
+                            plan.extract(raw, coding, g.bitsPerSample, isSigned, ix0 - x0, static_cast<uint32_t>(n),
+                                         c.chunkSamples, sInChunk, rd.row.data());
+                            plan.convert(rd.row.data(), out, n);
+                        } else {
+                            plan.extract(raw, coding, g.bitsPerSample, isSigned, ix0 - x0, static_cast<uint32_t>(n),
+                                         c.chunkSamples, sInChunk, out);
+                        }
+                    }
                 }
             }
-        }
-
-        // Tiled layout: every tile intersecting the region is decoded exactly
-        // once and its intersecting rows are copied out.
-        void readTilesRegion(TIFF* tif, const TiffImageInfo& g, const Region& r, uint8_t* dst,
-                             std::vector<uint8_t>& scratch) {
-            uint32_t tileW = 0, tileH = 0;
-            if (!TIFFGetField(tif, TIFFTAG_TILEWIDTH, &tileW) || tileW == 0)
-                throw IoError("TIFF missing or invalid TILEWIDTH");
-            if (!TIFFGetField(tif, TIFFTAG_TILELENGTH, &tileH) || tileH == 0)
-                throw IoError("TIFF missing or invalid TILELENGTH");
-            const tmsize_t tileSize = TIFFTileSize(tif);
-            if (tileSize <= 0) throw IoError("TIFF reports invalid tile size");
-            scratch.resize(static_cast<std::size_t>(tileSize));
-
-            const std::size_t bpp = bytesPerPixel(g.pixelType);
-            const std::size_t dstPitch = static_cast<std::size_t>(r.width) * bpp;
-            const std::size_t tilePitch = static_cast<std::size_t>(tileW) * bpp;
-            const uint32_t xEnd = r.x + r.width;
-            const uint32_t yEnd = r.y + r.height;
-
-            for (uint32_t ty = (r.y / tileH) * tileH; ty < yEnd; ty += tileH) {
-                for (uint32_t tx = (r.x / tileW) * tileW; tx < xEnd; tx += tileW) {
-                    if (TIFFReadTile(tif, scratch.data(), tx, ty, 0, 0) < 0) throwReadError("tile", tx, ty);
-                    const uint32_t y0 = std::max(ty, r.y), y1 = std::min(ty + tileH, yEnd);
-                    const uint32_t x0 = std::max(tx, r.x), x1 = std::min(tx + tileW, xEnd);
-                    const std::size_t rowBytes = static_cast<std::size_t>(x1 - x0) * bpp;
-                    for (uint32_t y = y0; y < y1; ++y)
-                        std::memcpy(dst + static_cast<std::size_t>(y - r.y) * dstPitch + (x0 - r.x) * bpp,
-                                    scratch.data() + static_cast<std::size_t>(y - ty) * tilePitch + (x0 - tx) * bpp,
-                                    rowBytes);
-                }
-            }
-        }
-
-        void readRegionRaw(TIFF* tif, const TiffImageInfo& g, const Region& r, uint8_t* dst,
-                           std::vector<uint8_t>& scratch) {
-            if (TIFFIsTiled(tif)) readTilesRegion(tif, g, r, dst, scratch);
-            else readStripsRegion(tif, g, r, dst, scratch);
         }
 
         // ------------------------------------------------------------------
@@ -447,7 +766,9 @@ namespace sirius {
         const auto& p0 = page(0);
         for (std::size_t i = 1; i < pages.size(); ++i) {
             const auto& p = page(i);
-            if (p.width != p0.width || p.height != p0.height || p.pixelType != p0.pixelType) return false;
+            if (p.width != p0.width || p.height != p0.height || p.pixelType != p0.pixelType ||
+                p.samplesPerPixel != p0.samplesPerPixel)
+                return false;
         }
         return true;
     }
@@ -472,6 +793,7 @@ namespace sirius {
         auto tif = openTiff(path, "r");
         TiffInfo info;
         info.bigTiff = TIFFIsBigTIFF(tif.get()) != 0;
+        info.bigEndian = TIFFIsBigEndian(tif.get()) != 0;
 
         // Walk the main IFD chain sequentially: directories are a linked list,
         // so this is the only O(n) way to see them all. Offsets are cached so
@@ -572,6 +894,7 @@ namespace sirius {
         s.width = first.width;
         s.height = first.height;
         s.pixelType = first.pixelType;
+        s.samplesPerPixel = first.samplesPerPixel;
         // Directory count only (next-IFD links), not every tag of every page.
         const tdir_t n = TIFFNumberOfDirectories(tif.get());
         s.pages = n > 0 ? static_cast<std::size_t>(n) : 1;
@@ -613,93 +936,96 @@ namespace sirius {
 
         std::size_t libtiffReadOpens() noexcept { return g_readOpens.load(std::memory_order_relaxed); }
 
-        namespace {
-            // Bytes libtiff decodes for one page of a region read: every strip
-            // or tile the region touches, whole. A measure of the work, not of
-            // the output: a small window of a big compressed tile costs the tile.
-            std::size_t decodedBytesPerPage(const TiffImageInfo& g, const Region& r) {
-                const std::size_t bpp = bytesPerPixel(g.pixelType);
-                const std::size_t x0 = r.x, x1 = x0 + r.width, y0 = r.y, y1 = y0 + r.height;
-                if (g.layout == TiffLayout::Tiles && g.tileWidth > 0 && g.tileHeight > 0) {
-                    const std::size_t tw = g.tileWidth, th = g.tileHeight;
-                    return ((x1 + tw - 1) / tw - x0 / tw) * ((y1 + th - 1) / th - y0 / th) * tw * th * bpp;
-                }
-                const std::size_t rps = g.rowsPerStrip > 0 ? std::min(g.rowsPerStrip, g.height) : g.height;
-                if (rps == 0) return 0;
-                return ((y1 + rps - 1) / rps - y0 / rps) * rps * g.width * bpp;
-            }
-        } // namespace
-
-        // Parallel over pages. Each thread that decodes a page opens its own
-        // handle on its first page and reuses it for the rest: libtiff handles
-        // are not thread-safe, but one handle can hop between directories with
-        // TIFFSetSubDirectory without reopening the file.
+        // Work is handed out in units: a page, or -- when there are fewer
+        // pages than threads and the pages are big (one large tiled image,
+        // a few RGB planes) -- a run of a page's strips / tiles. Each thread
+        // opens the file on its first unit and keeps its handle, hopping
+        // between directories with TIFFSetSubDirectory only when a unit is on
+        // another page: libtiff handles are not thread-safe, but one handle
+        // reads any directory without reopening the file.
         void decodeWithLibtiff(const std::string& path, const DecodeJob& job, void* dstHost) {
             const auto& ifds = *job.ifds;
-            const TiffImageInfo& g = *job.geometry;
             const Region r = job.region;
-            const auto n = static_cast<std::ptrdiff_t>(ifds.size());
-            const std::size_t pixels = static_cast<std::size_t>(r.width) * r.height;
-            const std::size_t nativePageBytes = pixels * bytesPerPixel(g.pixelType);
-            const std::size_t dstPageBytes = pixels * bytesPerPixel(job.dstType);
-            const bool needConvert = g.pixelType != job.dstType;
-            auto* dst = static_cast<std::uint8_t*>(dstHost);
+            const std::size_t n = ifds.size();
+            if (job.images.size() != n) throw std::logic_error("decodeWithLibtiff: one TiffImageInfo per IFD expected");
 
-            std::exception_ptr ex;
-            std::atomic<bool> failed{false};
-            std::atomic<std::ptrdiff_t> done{0};
-            std::mutex progressMu;
+            ReadPlan plan;
+            plan.images = &job.images;
+            plan.ifds = &ifds;
+            plan.region = r;
+            plan.firstSample = job.firstSample;
+            plan.sampleCount = job.sampleCount;
+            plan.nativeType = job.geometry->pixelType;
+            plan.dstType = job.dstType;
+            plan.dst = static_cast<std::uint8_t*>(dstHost);
+            plan.dstBpp = bytesPerPixel(job.dstType);
+            plan.extract = extractFor(plan.nativeType);
+            if (plan.nativeType != job.dstType) plan.convert = convertFor(plan.nativeType, job.dstType);
+
+            // Units: (page, first chunk, end chunk).
+            struct Unit {
+                std::size_t page, k0, k1;
+            };
+            std::vector<std::size_t> chunks(n), work(n);
+            std::size_t totalWork = 0;
+            for (std::size_t p = 0; p < n; ++p) {
+                const ChunkGrid c = gridOf(*job.images[p], r, job.firstSample, job.sampleCount);
+                chunks[p] = c.count();
+                work[p] = decodedBytes(c);
+                totalWork += work[p];
+            }
 
             // Every thread of the team used to open the file -- and parse its
             // first directory, which can carry megabytes of ImageJ / OME
             // metadata -- before the loop: 32 opens and ~10 ms for a one-page
             // read on 32 cores. A thread now opens the file only when it is
-            // handed a page, and the team is sized by the work: no more
-            // threads than pages, and about one per MiB decoded. Waking a
-            // full team for a few small pages cost ~9 ms a read; 40 pages of
-            // 96x128 decode in 0.25 ms on one thread (Release, 32 cores).
+            // handed work, and the team is sized by the work: about one thread
+            // per MiB decoded, no more threads than units.
             constexpr std::size_t kBytesPerThread = std::size_t{1} << 20;
-            const std::size_t work = decodedBytesPerPage(g, r) * static_cast<std::size_t>(n);
+            constexpr std::size_t kBytesPerSplit = std::size_t{2} << 20;   // smallest piece of a split page
             int threads = 1;
-            if (job.maxThreads == 1) {
-                threads = 1;
-            } else {
-                const std::ptrdiff_t wanted =
-                    std::min<std::ptrdiff_t>(n, static_cast<std::ptrdiff_t>(work / kBytesPerThread));
-                threads = static_cast<int>(std::clamp<std::ptrdiff_t>(wanted, 1, omp_get_max_threads()));
+            if (job.maxThreads != 1) {
+                threads = static_cast<int>(std::clamp<std::size_t>(totalWork / kBytesPerThread, 1,
+                                                                   static_cast<std::size_t>(omp_get_max_threads())));
                 if (job.maxThreads > 1) threads = std::min(threads, job.maxThreads);
             }
+            std::vector<Unit> units;
+            units.reserve(n);
+            const bool split = threads > 1 && n < static_cast<std::size_t>(threads);
+            for (std::size_t p = 0; p < n; ++p) {
+                std::size_t parts = 1;
+                if (split) {
+                    const std::size_t wanted = (static_cast<std::size_t>(threads) * 4 + n - 1) / n;
+                    parts = std::clamp<std::size_t>(work[p] / kBytesPerSplit, 1, std::min(wanted, std::max<std::size_t>(chunks[p], 1)));
+                }
+                for (std::size_t i = 0; i < parts; ++i)
+                    units.push_back(Unit{p, chunks[p] * i / parts, chunks[p] * (i + 1) / parts});
+            }
+            threads = static_cast<int>(std::min<std::size_t>(static_cast<std::size_t>(threads), units.size()));
+            const auto nUnits = static_cast<std::ptrdiff_t>(units.size());
+
+            std::exception_ptr ex;
+            std::atomic<bool> failed{false};
+            std::atomic<std::ptrdiff_t> done{0};
+            std::mutex progressMu;
 #pragma omp parallel num_threads(threads) if (threads > 1)
             {
-                TiffPtr localTif;
-                std::vector<std::uint8_t> scratch;      // one strip / tile
-                std::vector<std::uint8_t> nativePage;   // conversion path only
-
-                // A page at a time: with the team sized to the work every page
+                ChunkReader rd;
+                rd.path = &path;
+                // A unit at a time: with the team sized to the work every unit
                 // is worth handing out (chunks of 4 left most of a 3-page team idle).
 #pragma omp for schedule(dynamic, 1)
-                for (std::ptrdiff_t z = 0; z < n; ++z) {
+                for (std::ptrdiff_t u = 0; u < nUnits; ++u) {
                     if (failed.load(std::memory_order_relaxed)) continue;
                     try {
-                        if (!localTif) localTif = openTiff(path, "r");
-                        if (!TIFFSetSubDirectory(localTif.get(), ifds[static_cast<std::size_t>(z)]))
-                            throw IoError("Failed to seek to TIFF directory at offset " +
-                                          std::to_string(ifds[static_cast<std::size_t>(z)]));
-                        std::uint8_t* out = dst + static_cast<std::size_t>(z) * dstPageBytes;
-                        if (needConvert) {
-                            nativePage.resize(nativePageBytes);
-                            readRegionRaw(localTif.get(), g, r, nativePage.data(), scratch);
-                            convertPixels(nativePage.data(), g.pixelType, out, job.dstType,
-                                          static_cast<Index>(pixels), Device::cpu(), Stream::null());
-                        } else {
-                            readRegionRaw(localTif.get(), g, r, out, scratch);
-                        }
+                        const Unit& unit = units[static_cast<std::size_t>(u)];
+                        decodeChunks(rd, plan, unit.page, unit.k0, unit.k1);
                         const auto nDone = done.fetch_add(1, std::memory_order_relaxed) + 1;
                         if (job.progress) {
-                            const std::ptrdiff_t step = std::max<std::ptrdiff_t>(1, n / 50);
-                            if (nDone == n || nDone % step == 0) {
+                            const std::ptrdiff_t step = std::max<std::ptrdiff_t>(1, nUnits / 50);
+                            if (nDone == nUnits || nDone % step == 0) {
                                 std::lock_guard<std::mutex> lock(progressMu);
-                                job.progress(static_cast<double>(nDone) / static_cast<double>(n));
+                                job.progress(static_cast<double>(nDone) / static_cast<double>(nUnits));
                             }
                         }
                     } catch (...) {
@@ -731,6 +1057,25 @@ namespace sirius {
 
     namespace {
 
+        // nvTIFF decodes one sample per pixel of 8, 16, 32 or 64 bits; other
+        // layouts (RGB, packed 12-bit, float16, ...) decode with libtiff.
+        bool gpuEligible(const detail::DecodeJob& job, std::string& reason) {
+            for (const TiffImageInfo* g : job.images) {
+                if (g->samplesPerPixel != 1) {
+                    reason = std::to_string(g->samplesPerPixel) +
+                             " samples per pixel are decoded on the CPU (the GPU path reads one-sample images)";
+                    return false;
+                }
+                if (codingOf(*g) != SampleCoding::Aligned) {
+                    reason = std::to_string(g->bitsPerSample) + "-bit " +
+                             (g->sampleFormat == SAMPLEFORMAT_IEEEFP ? "float" : "integer") +
+                             " samples are decoded on the CPU";
+                    return false;
+                }
+            }
+            return true;
+        }
+
         // Untyped core of every read: CPU decode in place, or GPU decode via
         // nvTIFF with a libtiff+upload fallback.
         void decodeInto(TiffFile::Impl& impl, const detail::DecodeJob& job, void* dst, Device device,
@@ -741,7 +1086,7 @@ namespace sirius {
             }
             requireDevice(device);
             std::string reason;
-            if (detail::decodeWithNvTiff(impl, job, dst, device, stream, reason)) {
+            if (gpuEligible(job, reason) && detail::decodeWithNvTiff(impl, job, dst, device, stream, reason)) {
                 if (job.progress) job.progress(1.0);
                 return;
             }
@@ -754,17 +1099,18 @@ namespace sirius {
             const auto& ifds = *job.ifds;
             const std::size_t n = ifds.size();
             const std::size_t pageBytes = static_cast<std::size_t>(job.region.width) * job.region.height *
-                                          bytesPerPixel(job.dstType);
+                                          job.sampleCount * bytesPerPixel(job.dstType);
             constexpr std::size_t kChunkBytes = std::size_t{512} << 20;
             const std::size_t chunk = std::min(n, std::max<std::size_t>(1, kChunkBytes / std::max<std::size_t>(pageBytes, 1)));
             Buffer<std::uint8_t> staging(Shape{static_cast<Index>(chunk * pageBytes)}, Device::cpu(),
                                          HostMemory::Pinned);
             for (std::size_t first = 0; first < n; first += chunk) {
                 const std::size_t count = std::min(chunk, n - first);
-                const std::vector<std::uint64_t> part(ifds.begin() + static_cast<std::ptrdiff_t>(first),
-                                                      ifds.begin() + static_cast<std::ptrdiff_t>(first + count));
+                const auto b = static_cast<std::ptrdiff_t>(first), e = static_cast<std::ptrdiff_t>(first + count);
+                const std::vector<std::uint64_t> part(ifds.begin() + b, ifds.begin() + e);
                 detail::DecodeJob sub = job;
                 sub.ifds = &part;
+                sub.images.assign(job.images.begin() + b, job.images.begin() + e);
                 sub.progress = {};
                 if (job.progress) {
                     sub.progress = [&job, first, count, n](double f) {
@@ -786,6 +1132,26 @@ namespace sirius {
             return info.levels[level];
         }
 
+        // The samples a read takes: [first, first + count).
+        std::pair<std::uint16_t, std::uint16_t> samplesOf(std::uint16_t spp, const TiffReadOptions& opts) {
+            if (opts.firstSample >= spp)
+                throw std::out_of_range("Sample " + std::to_string(opts.firstSample) + " requested from a TIFF with " +
+                                        std::to_string(spp) + " sample(s) per pixel");
+            const std::uint16_t left = static_cast<std::uint16_t>(spp - opts.firstSample);
+            if (opts.sampleCount > left)
+                throw std::out_of_range("Samples [" + std::to_string(opts.firstSample) + ", " +
+                                        std::to_string(opts.firstSample + opts.sampleCount) +
+                                        ") requested from a TIFF with " + std::to_string(spp) +
+                                        " sample(s) per pixel");
+            return {opts.firstSample, opts.sampleCount == 0 ? left : opts.sampleCount};
+        }
+
+        Shape shapeOf(std::size_t pages, std::uint16_t samples, std::uint32_t height, std::uint32_t width) {
+            if (samples == 1) return Shape{static_cast<Index>(pages), static_cast<Index>(height), static_cast<Index>(width)};
+            return Shape{static_cast<Index>(pages), static_cast<Index>(samples), static_cast<Index>(height),
+                         static_cast<Index>(width)};
+        }
+
     } // namespace
 
     TiffFile::TiffFile(std::string path) : impl_(std::make_unique<Impl>()) {
@@ -799,6 +1165,35 @@ namespace sirius {
 
     const std::string& TiffFile::path() const noexcept { return impl_->path; }
     const TiffInfo& TiffFile::info() const noexcept { return impl_->info; }
+
+    const TiffMetadata& TiffFile::metadata() const {
+        std::call_once(impl_->metadataOnce, [this] {
+            if (!impl_->info.pages.empty()) impl_->metadata = parseTiffMetadata(impl_->info.page(0).description);
+        });
+        return impl_->metadata;
+    }
+
+    std::vector<std::vector<std::uint32_t>> TiffFile::series() const {
+        const TiffInfo& info = impl_->info;
+        const TiffMetadata& md = metadata();
+        if (md.ome && !md.omeImages.empty()) {
+            auto s = omeImagePages(md, info.pageCount(), info.pageCount() ? info.samplesPerPixel() : 1);
+            // keep the images that have pages; a file whose OME-XML maps none
+            // of its pages (another file's companion) reads as one series
+            s.erase(std::remove_if(s.begin(), s.end(), [](const auto& v) { return v.empty(); }), s.end());
+            if (!s.empty()) return s;
+        }
+        std::vector<std::uint32_t> all(info.pageCount());
+        for (std::size_t i = 0; i < all.size(); ++i) all[i] = static_cast<std::uint32_t>(i);
+        return {std::move(all)};
+    }
+
+    Shape TiffFile::readShape(std::size_t pages, std::uint32_t height, std::uint32_t width,
+                              const TiffReadOptions& opts) const {
+        const auto [first, count] = samplesOf(impl_->info.pageCount() ? impl_->info.samplesPerPixel() : 1, opts);
+        (void)first;
+        return shapeOf(pages, count, height, width);
+    }
 
     bool TiffFile::gpuDecodable(Device device, std::string* reason) const {
         std::string why;
@@ -814,10 +1209,11 @@ namespace sirius {
             detail::DecodeJob job;
             job.ifds = &info.pages;
             job.geometry = &info.page(0);
+            for (std::uint64_t off : info.pages) job.images.push_back(&info.image(off));
             job.region = Region{}.resolve(info.width(), info.height());
             job.dstType = info.pixelType();
             try {
-                ok = detail::nvTiffSupports(*impl_, job, device, why);
+                ok = gpuEligible(job, why) && detail::nvTiffSupports(*impl_, job, device, why);
             } catch (const std::exception& e) {
                 why = e.what();
             }
@@ -832,23 +1228,32 @@ namespace sirius {
         if (ifds.empty()) throw std::invalid_argument("TiffFile::decode: no image directories given");
         const TiffInfo& info = impl_->info;
         const TiffImageInfo& g = info.image(ifds[0]);
+        detail::DecodeJob job;
+        job.images.reserve(ifds.size());
         for (std::uint64_t off : ifds) {
             const auto& i = info.image(off);
-            if (i.width != g.width || i.height != g.height || i.pixelType != g.pixelType)
-                throw IoError("TIFF image at offset " + std::to_string(off) + " (" +
-                              std::to_string(i.width) + "x" + std::to_string(i.height) + " " +
-                              toString(i.pixelType) + ") does not match the first one (" +
-                              std::to_string(g.width) + "x" + std::to_string(g.height) + " " +
-                              toString(g.pixelType) + ")");
+            if (i.width != g.width || i.height != g.height || i.pixelType != g.pixelType ||
+                i.samplesPerPixel != g.samplesPerPixel)
+                throw IoError("TIFF image at offset " + std::to_string(off) + " (" + std::to_string(i.width) + "x" +
+                              std::to_string(i.height) + " " + toString(i.pixelType) + " x" +
+                              std::to_string(i.samplesPerPixel) + ") does not match the first one (" +
+                              std::to_string(g.width) + "x" + std::to_string(g.height) + " " + toString(g.pixelType) +
+                              " x" + std::to_string(g.samplesPerPixel) + ")");
+            if (!i.decodable())
+                throw IoError("Cannot decode the TIFF image at offset " + std::to_string(off) + " of " + impl_->path +
+                              ": " + i.unsupported);
+            job.images.push_back(&i);
         }
+        const auto [firstSample, sampleCount] = samplesOf(g.samplesPerPixel, opts);
         const Region r = region.resolve(g.width, g.height);
-        const Shape expected{static_cast<Index>(ifds.size()), static_cast<Index>(r.height), static_cast<Index>(r.width)};
+        const Shape expected = shapeOf(ifds.size(), sampleCount, r.height, r.width);
         if (dst.shape() != expected) detail::throwShapeMismatch("TiffFile::decode destination", dst.shape(), expected);
 
-        detail::DecodeJob job;
         job.ifds = &ifds;
         job.geometry = &g;
         job.region = r;
+        job.firstSample = firstSample;
+        job.sampleCount = sampleCount;
         job.dstType = pixelTypeOf<T>();
         job.maxThreads = opts.maxThreads;
         job.progress = opts.progress;
@@ -858,8 +1263,10 @@ namespace sirius {
     template <typename T>
     Buffer<T> TiffFile::readStack(const TiffReadOptions& opts, const Stream& stream) const {
         if (!impl_->info.uniformPages())
-            throw IoError("TIFF pages differ in size or pixel type; read them individually: " + impl_->path);
-        Buffer<T> out(stackShape(impl_->info), opts.device, opts.hostMemory, stream);
+            throw IoError("TIFF pages differ in size, pixel type or samples per pixel; read them individually: " +
+                          impl_->path);
+        Buffer<T> out(readShape(impl_->info.pageCount(), impl_->info.height(), impl_->info.width(), opts), opts.device,
+                      opts.hostMemory, stream);
         decode<T>(impl_->info.pages, Region{}, out.view(), opts, stream);
         return out;
     }
@@ -876,8 +1283,7 @@ namespace sirius {
         const std::vector<std::uint64_t> ifds(pages.begin() + static_cast<std::ptrdiff_t>(first),
                                               pages.begin() + static_cast<std::ptrdiff_t>(first + count));
         const auto& g = impl_->info.image(ifds[0]);
-        Buffer<T> out(Shape{static_cast<Index>(count), static_cast<Index>(g.height), static_cast<Index>(g.width)},
-                      opts.device, opts.hostMemory, stream);
+        Buffer<T> out(readShape(count, g.height, g.width, opts), opts.device, opts.hostMemory, stream);
         decode<T>(ifds, Region{}, out.view(), opts, stream);
         return out;
     }
@@ -885,8 +1291,75 @@ namespace sirius {
     template <typename T>
     Buffer<T> TiffFile::readLevel(std::size_t level, const TiffReadOptions& opts, const Stream& stream) const {
         const TiffLevel& l = levelAt(impl_->info, level);
-        Buffer<T> out(levelShape(l), opts.device, opts.hostMemory, stream);
+        Buffer<T> out(readShape(l.ifds.size(), l.height, l.width, opts), opts.device, opts.hostMemory, stream);
         decode<T>(l.ifds, Region{}, out.view(), opts, stream);
+        return out;
+    }
+
+    std::vector<std::uint64_t> TiffFile::seriesIfds(std::size_t index, std::size_t level) const {
+        const auto all = series();
+        if (index >= all.size())
+            throw std::out_of_range("TIFF has " + std::to_string(all.size()) + " series; series " +
+                                    std::to_string(index) + " requested");
+        const TiffInfo& info = impl_->info;
+        const auto& pages = all[index];
+        std::vector<std::uint64_t> ifds;
+        ifds.reserve(pages.size());
+        if (level == 0) {
+            for (std::uint32_t p : pages) ifds.push_back(info.pages.at(p));
+            return ifds;
+        }
+        // SubIFD pyramids hang off each page: the series has the levels its
+        // own pages have, whatever other series hold (OME-TIFF writes a
+        // pyramid per image). Flat pyramids come from TiffInfo::levels.
+        bool sub = true;
+        for (std::uint32_t p : pages) {
+            const auto& subs = info.image(info.pages.at(p)).subIfds;
+            if (subs.size() < level) {
+                sub = false;
+                break;
+            }
+            ifds.push_back(subs[level - 1]);
+        }
+        if (sub) return ifds;
+        ifds.clear();
+        if (level < info.levels.size()) {
+            const TiffLevel& l = info.levels[level];
+            for (std::uint32_t p : pages) {
+                if (p >= l.ifds.size()) break;
+                ifds.push_back(l.ifds[p]);
+            }
+            if (ifds.size() == pages.size()) return ifds;
+        }
+        throw std::out_of_range("Series " + std::to_string(index) + " has " + std::to_string(seriesLevels(index)) +
+                                " pyramid level(s); level " + std::to_string(level) + " requested");
+    }
+
+    std::size_t TiffFile::seriesLevels(std::size_t index) const {
+        const auto all = series();
+        if (index >= all.size()) return 0;
+        const TiffInfo& info = impl_->info;
+        std::size_t sub = ~std::size_t{0};
+        for (std::uint32_t p : all[index]) sub = std::min(sub, info.image(info.pages.at(p)).subIfds.size());
+        if (sub != ~std::size_t{0} && sub > 0) return 1 + sub;
+        std::size_t levels = 1;
+        for (std::size_t k = 1; k < info.levels.size(); ++k) {
+            bool all_ = true;
+            for (std::uint32_t p : all[index]) all_ = all_ && p < info.levels[k].ifds.size();
+            if (!all_) break;
+            levels = k + 1;
+        }
+        return levels;
+    }
+
+    template <typename T>
+    Buffer<T> TiffFile::readSeries(std::size_t index, std::size_t level, const TiffReadOptions& opts,
+                                   const Stream& stream) const {
+        const std::vector<std::uint64_t> ifds = seriesIfds(index, level);
+        if (ifds.empty()) throw std::out_of_range("Series " + std::to_string(index) + " has no pages");
+        const auto& g = impl_->info.image(ifds[0]);
+        Buffer<T> out(readShape(ifds.size(), g.height, g.width, opts), opts.device, opts.hostMemory, stream);
+        decode<T>(ifds, Region{}, out.view(), opts, stream);
         return out;
     }
 
@@ -895,8 +1368,7 @@ namespace sirius {
                                    const Stream& stream) const {
         const TiffLevel& l = levelAt(impl_->info, level);
         const Region r = region.resolve(l.width, l.height);
-        Buffer<T> out(Shape{static_cast<Index>(l.ifds.size()), static_cast<Index>(r.height), static_cast<Index>(r.width)},
-                      opts.device, opts.hostMemory, stream);
+        Buffer<T> out(readShape(l.ifds.size(), r.height, r.width, opts), opts.device, opts.hostMemory, stream);
         decode<T>(l.ifds, r, out.view(), opts, stream);
         return out;
     }
@@ -918,9 +1390,20 @@ namespace sirius {
 
     // --- Eigen convenience API -------------------------------------------------
 
+    namespace {
+        // The Eigen tensors hold one sample per pixel.
+        void requireOneSample(const TiffInfo& info, const std::string& path) {
+            if (info.pageCount() && info.samplesPerPixel() != 1)
+                throw IoError(path + " has " + std::to_string(info.samplesPerPixel()) +
+                              " samples per pixel; the Eigen API reads one-sample images (use TiffFile, which "
+                              "returns {pages, samples, height, width}, or TiffReadOptions::firstSample)");
+        }
+    } // namespace
+
     template <typename T>
     Image<T> readTiff(const std::string& path) {
         TiffFile file(path);
+        requireOneSample(file.info(), path);
         const auto& p = file.info().page(0);
         Image<T> image(p.height, p.width);
         file.decode<T>({p.ifdOffset}, Region{}, toView(image).asStack());
@@ -933,6 +1416,7 @@ namespace sirius {
         const TiffInfo& info = file.info();
         if (!info.uniformPages())
             throw IoError("TIFF pages differ in size or pixel type: " + path);
+        requireOneSample(info, path);
         ImageStack<T> stack(static_cast<Eigen::Index>(info.pageCount()), info.height(), info.width());
         file.decode<T>(info.pages, Region{}, toView(stack));
         return stack;
@@ -943,6 +1427,7 @@ namespace sirius {
         const TiffInfo& info = file.info();
         if (!info.uniformPages())
             throw IoError("TIFF pages differ in size or pixel type: " + path);
+        requireOneSample(info, path);
         auto read = [&](auto tag) -> AnyImageStack {
             using T = decltype(tag);
             ImageStack<T> stack(static_cast<Eigen::Index>(info.pageCount()), info.height(), info.width());
@@ -1022,19 +1507,20 @@ namespace sirius {
     }
 
     // Explicit instantiations for every supported pixel type.
-#define SIRIUS_TIFF_INSTANTIATE(T)                                                                                    \
-    template void TiffFile::decode<T>(const std::vector<std::uint64_t>&, Region, BufferView<T>,                       \
-                                      const TiffReadOptions&, const Stream&) const;                                   \
-    template Buffer<T> TiffFile::readStack<T>(const TiffReadOptions&, const Stream&) const;                           \
-    template Buffer<T> TiffFile::readPages<T>(std::size_t, std::size_t, const TiffReadOptions&, const Stream&) const; \
-    template Buffer<T> TiffFile::readLevel<T>(std::size_t, const TiffReadOptions&, const Stream&) const;              \
-    template Buffer<T> TiffFile::readRegion<T>(Region, std::size_t, const TiffReadOptions&, const Stream&) const;     \
-    template Image<T> readTiff<T>(const std::string&);                                                                \
-    template ImageStack<T> readTiffStack<T>(const std::string&);                                                      \
-    template void writeTiff<T>(const std::string&, BufferView<const T>, TiffCompression);                             \
-    template void writeTiff<T>(const std::string&, const Image<T>&, TiffCompression);                                 \
-    template void writeTiffStack<T>(const std::string&, BufferView<const T>, TiffCompression);                        \
-    template void writeTiffStack<T>(const std::string&, BufferView<const T>, const TiffWriteOptions&);                \
+#define SIRIUS_TIFF_INSTANTIATE(T)                                                                                     \
+    template void TiffFile::decode<T>(const std::vector<std::uint64_t>&, Region, BufferView<T>,                        \
+                                      const TiffReadOptions&, const Stream&) const;                                    \
+    template Buffer<T> TiffFile::readStack<T>(const TiffReadOptions&, const Stream&) const;                            \
+    template Buffer<T> TiffFile::readPages<T>(std::size_t, std::size_t, const TiffReadOptions&, const Stream&) const;  \
+    template Buffer<T> TiffFile::readLevel<T>(std::size_t, const TiffReadOptions&, const Stream&) const;               \
+    template Buffer<T> TiffFile::readSeries<T>(std::size_t, std::size_t, const TiffReadOptions&, const Stream&) const; \
+    template Buffer<T> TiffFile::readRegion<T>(Region, std::size_t, const TiffReadOptions&, const Stream&) const;      \
+    template Image<T> readTiff<T>(const std::string&);                                                                 \
+    template ImageStack<T> readTiffStack<T>(const std::string&);                                                       \
+    template void writeTiff<T>(const std::string&, BufferView<const T>, TiffCompression);                              \
+    template void writeTiff<T>(const std::string&, const Image<T>&, TiffCompression);                                  \
+    template void writeTiffStack<T>(const std::string&, BufferView<const T>, TiffCompression);                         \
+    template void writeTiffStack<T>(const std::string&, BufferView<const T>, const TiffWriteOptions&);                 \
     template void writeTiffStack<T>(const std::string&, const ImageStack<T>&, TiffCompression);
 
     SIRIUS_TIFF_INSTANTIATE(std::uint8_t)

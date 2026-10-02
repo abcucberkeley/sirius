@@ -17,8 +17,26 @@
 #include "sirius/buffer.hpp"
 #include "sirius/device.hpp"
 #include "sirius/pixel_type.hpp"
+#include "sirius/tiff_metadata.hpp"
 
-// TIFF reading and writing for grayscale scientific stacks.
+// TIFF reading and writing for scientific stacks.
+//
+// What is read: strips and tiles, classic TIFF and BigTIFF, either byte
+// order, multi-page stacks, SubIFD and flat pyramids, any number of samples
+// per pixel (RGB, RGBA, multi-sample) in either planar configuration, 1..32
+// bit unsigned integers (1, 2, 4, 12, 14 ... bit samples unpacked into the
+// next byte size), 8/16/24/32-bit signed integers, 16/32/64-bit floats
+// (float16 widened to float32), the codecs libtiff was built with (None,
+// LZW, Deflate / Adobe Deflate, PackBits, CCITT for bilevel; ZSTD, JPEG and
+// LZMA only when libtiff has them) with the horizontal and floating-point
+// predictors, sparse files (missing strips / tiles read as zeros), palette
+// images (the indices; TiffImageInfo::colormap holds the palette), and the
+// OME-XML / ImageJ metadata (tiff_metadata.hpp).
+//
+// Samples are channels: a read of more than one sample returns
+// {pages, samples, height, width} -- each sample its own plane, whatever the
+// planar configuration on disk -- and a read of one sample {pages, height,
+// width}. TiffReadOptions::firstSample / sampleCount pick the samples.
 //
 // Two layers:
 //  * TiffFile        opens a file once, exposes its metadata (pages, pyramid
@@ -93,14 +111,21 @@ namespace sirius {
     // Metadata of one image file directory (IFD).
     struct TiffImageInfo {
         std::uint64_t ifdOffset = 0;
-        std::string description;             // ImageDescription tag (OME-XML, ImageJ metadata), first page only
+        std::string description;             // ImageDescription tag (OME-XML, ImageJ metadata)
         double xResolution = 0.0;            // XResolution / YResolution tags (pixels per resolutionUnit), 0 = absent
         double yResolution = 0.0;
         std::uint16_t resolutionUnit = 2;    // 1 none, 2 inch, 3 centimetre
         std::uint32_t width = 0;
         std::uint32_t height = 0;
-        PixelType pixelType = PixelType::UInt8;
+        PixelType pixelType = PixelType::UInt8;   // of one decoded sample (12-bit -> UInt16, float16 -> Float32)
         std::uint16_t samplesPerPixel = 1;
+        std::uint16_t bitsPerSample = 8;
+        std::uint16_t sampleFormat = 1;      // 1 unsigned, 2 signed, 3 IEEE float (4 "void" reads as unsigned)
+        std::uint16_t photometric = 1;       // 0 min-is-white, 1 min-is-black, 2 RGB, 3 palette, 5 CMYK, 6 YCbCr ...
+        std::uint16_t planarConfig = 1;      // 1 contiguous (RGBRGB...), 2 separate planes (RRR...GGG...)
+        std::uint16_t orientation = 1;       // Orientation tag; 1 = rows top to bottom, columns left to right
+        std::vector<std::uint16_t> extraSamples;   // ExtraSamples: 0 unspecified, 1 associated alpha, 2 unassociated alpha
+        std::vector<std::uint16_t> colormap;       // palette images: 3 * 2^bitsPerSample entries, all R then G then B
         std::uint16_t compression = 1;       // raw Compression tag: 1 none, 5 LZW, 8/32946 Deflate, 7 JPEG ...
         std::uint16_t predictor = 1;         // 1 none, 2 horizontal differencing, 3 floating point
         TiffLayout layout = TiffLayout::Strips;
@@ -109,6 +134,13 @@ namespace sirius {
         std::uint32_t rowsPerStrip = 0;      // strips only
         bool reducedResolution = false;      // NewSubfileType bit 0: a pyramid level, not a page
         std::vector<std::uint64_t> subIfds;  // SubIFD tag (330): reduced-resolution children
+        // Why this IFD cannot be decoded (a codec libtiff was built without,
+        // a 64-bit integer or complex sample, ...); "" when it can. Inspection
+        // never fails on such an IFD -- a file may hold one next to readable
+        // pages -- a read of it throws with this text.
+        std::string unsupported;
+
+        bool decodable() const noexcept { return unsupported.empty(); }
     };
 
     // One resolution level of a (possibly multi-page) pyramid: the IFDs that
@@ -121,6 +153,7 @@ namespace sirius {
 
     struct TiffInfo {
         bool bigTiff = false;
+        bool bigEndian = false;              // "MM" byte order (decoded to the host's)
         std::vector<TiffImageInfo> images;   // every IFD found: main chain first, then SubIFDs
         std::vector<std::uint64_t> pages;    // full-resolution pages (the "stack"), in file order
         // levels[0] is the full-resolution stack (== pages). levels[k] is the
@@ -140,7 +173,9 @@ namespace sirius {
         PixelType pixelType() const { return page(0).pixelType; }
         std::uint32_t width() const { return page(0).width; }
         std::uint32_t height() const { return page(0).height; }
-        // All pages share width/height/pixel type/layout (required for readStack).
+        std::uint16_t samplesPerPixel() const { return page(0).samplesPerPixel; }
+        // All pages share width, height, pixel type and samples per pixel
+        // (required for readStack).
         bool uniformPages() const noexcept;
     };
 
@@ -154,6 +189,7 @@ namespace sirius {
         std::uint32_t height = 0;
         std::size_t pages = 0;
         PixelType pixelType = PixelType::UInt8;
+        std::uint16_t samplesPerPixel = 1;
     };
     TiffStackShape inspectTiffShape(const std::string& path);
 
@@ -181,6 +217,12 @@ namespace sirius {
         // datasets use 1 so many files stream in parallel without seeking
         // around each stack.
         int maxThreads = 0;
+        // Samples (channels) to read: [firstSample, firstSample + sampleCount);
+        // sampleCount 0 = every sample from firstSample on. One sample reads
+        // as {pages, height, width}, several as {pages, samples, height, width}.
+        // With separate planes on disk only the chosen planes are decoded.
+        std::uint16_t firstSample = 0;
+        std::uint16_t sampleCount = 0;
         // 0..1 over pages. Called from the decode threads; keep it cheap.
         std::function<void(double)> progress;
     };
@@ -200,8 +242,19 @@ namespace sirius {
 
         const std::string& path() const noexcept;
         const TiffInfo& info() const noexcept;
+        // OME-XML / ImageJ metadata of the first page, parsed on first use.
+        const TiffMetadata& metadata() const;
+        // Full-resolution page indices of every series: one per OME <Image>
+        // (omeImagePages), else one series of every page.
+        std::vector<std::vector<std::uint32_t>> series() const;
 
-        // Full-resolution stack: every page, shape {pages, height, width}.
+        // The shape a read of `pages` pages of `height` x `width` returns
+        // with `opts` (samples): {pages, h, w} or {pages, samples, h, w}.
+        Shape readShape(std::size_t pages, std::uint32_t height, std::uint32_t width,
+                        const TiffReadOptions& opts = {}) const;
+
+        // Full-resolution stack: every page, shape {pages, height, width}
+        // (or {pages, samples, height, width}; see readShape).
         template <typename T>
         Buffer<T> readStack(const TiffReadOptions& opts = {}, const Stream& stream = Stream::null()) const;
 
@@ -215,14 +268,26 @@ namespace sirius {
         Buffer<T> readLevel(std::size_t level, const TiffReadOptions& opts = {},
                             const Stream& stream = Stream::null()) const;
 
+        // Pyramid levels of series `index`: its pages' SubIFDs, else the
+        // flat levels of TiffInfo::levels that hold every one of its pages.
+        std::size_t seriesLevels(std::size_t index) const;
+        // The IFDs of series `index` at pyramid level `level`, in plane order.
+        std::vector<std::uint64_t> seriesIfds(std::size_t index, std::size_t level = 0) const;
+
+        // Series `index` (series()) at pyramid level `level`.
+        template <typename T>
+        Buffer<T> readSeries(std::size_t index, std::size_t level = 0, const TiffReadOptions& opts = {},
+                             const Stream& stream = Stream::null()) const;
+
         // `region` of every page at `level`; shape {pages, region.height, region.width}.
         template <typename T>
         Buffer<T> readRegion(Region region, std::size_t level = 0, const TiffReadOptions& opts = {},
                              const Stream& stream = Stream::null()) const;
 
-        // Lowest level: decode `region` of each IFD (all must share size and
-        // pixel type) into dst of shape {ifds.size(), region.height, region.width}
-        // on dst.device(). Pixels are converted to T when the file type differs.
+        // Lowest level: decode `region` of each IFD (all must share size,
+        // pixel type and samples per pixel) into dst of shape readShape(ifds.size(),
+        // region.height, region.width, opts) on dst.device(). Pixels are
+        // converted to T when the file type differs.
         template <typename T>
         void decode(const std::vector<std::uint64_t>& ifds, Region region, BufferView<T> dst,
                     const TiffReadOptions& opts = {}, const Stream& stream = Stream::null()) const;

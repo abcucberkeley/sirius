@@ -461,12 +461,12 @@ namespace {
         for (int page = 0; page < 2; ++page) {
             TIFFSetField(tif.get(), TIFFTAG_IMAGEWIDTH, 4);
             TIFFSetField(tif.get(), TIFFTAG_IMAGELENGTH, 4);
-            TIFFSetField(tif.get(), TIFFTAG_BITSPERSAMPLE, 16); // half-float: unsupported
+            TIFFSetField(tif.get(), TIFFTAG_BITSPERSAMPLE, 64); // uint64: no such pixel type
             TIFFSetField(tif.get(), TIFFTAG_SAMPLESPERPIXEL, 1);
-            TIFFSetField(tif.get(), TIFFTAG_SAMPLEFORMAT, SAMPLEFORMAT_IEEEFP);
+            TIFFSetField(tif.get(), TIFFTAG_SAMPLEFORMAT, SAMPLEFORMAT_UINT);
             TIFFSetField(tif.get(), TIFFTAG_PHOTOMETRIC, PHOTOMETRIC_MINISBLACK);
             TIFFSetField(tif.get(), TIFFTAG_PLANARCONFIG, PLANARCONFIG_CONTIG);
-            std::vector<uint16_t> row(4, 0);
+            std::vector<uint64_t> row(4, 0);
             for (uint32_t r = 0; r < 4; ++r)
                 TIFFWriteScanline(tif.get(), row.data(), r);
             TIFFWriteDirectory(tif.get());

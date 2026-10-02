@@ -299,11 +299,37 @@ class TestTiffLoader(unittest.TestCase):
         ij = self._write("ij.tif", pages.reshape(2, 3, 2, 4, 3), imagej=True, metadata={"axes": "TZCYX"})
         self.assertEqual(wb.load_dataset(ij, c=3)[0].shape, (3, 2, 2, 4, 3))
 
-    def test_colour_tiffs_are_refused_like_the_application(self):
-        path = self._write("rgb.tif", np.zeros((8, 8, 3), np.uint8), photometric="rgb")
-        with self.assertRaises(Exception) as cm:
-            wb.load_dataset(path)
-        self.assertIn("single-channel", str(cm.exception))
+    def test_colour_tiffs_open_with_their_samples_as_channels_like_the_application(self):
+        rgb = np.arange(2 * 8 * 6 * 3, dtype=np.uint8).reshape(2, 8, 6, 3)
+        a, meta = wb.load_dataset(self._write("rgb.tif", rgb, photometric="rgb"))
+        self.assertEqual(a.shape, (3, 1, 2, 8, 6))
+        np.testing.assert_array_equal(a[2, 0, 1], rgb[1, :, :, 2])
+        self.assertTrue(meta["rgb"])
+        self.assertEqual([ch["label"] for ch in meta["channels"]], ["R", "G", "B"])
+        # separate planes read the same
+        planar = self._write("planar.tif", np.moveaxis(rgb, -1, 1), photometric="rgb", planarconfig="separate")
+        np.testing.assert_array_equal(wb.load_dataset(planar)[0], a)
+        # an OME-TIFF's SizeC counts the samples: 2 z of one RGB channel
+        ome = self._write("rgb.ome.tif", rgb, photometric="rgb", metadata={"axes": "ZYXS"})
+        b, meta = wb.load_dataset(ome)
+        self.assertEqual(b.shape, (3, 1, 2, 8, 6))
+        np.testing.assert_array_equal(b, a)
+        self.assertTrue(meta["dims_from_metadata"])
+        # RGBA: four channels, not an RGB merge
+        rgba = self._write("rgba.tif", np.concatenate([rgb, rgb[..., :1]], axis=-1), photometric="rgb",
+                           extrasamples=["unassalpha"])
+        c, meta = wb.load_dataset(rgba)
+        self.assertEqual(c.shape, (4, 1, 2, 8, 6))
+        self.assertFalse(meta["rgb"])
+
+    def test_tiff_metadata_is_the_extension_parser_and_matches_the_python_port(self):
+        xml = ('<OME><Image><Pixels DimensionOrder="XYZCT" SizeX="4" SizeY="4" SizeZ="3" SizeC="2" SizeT="5" '
+               'PhysicalSizeX="65" PhysicalSizeXUnit="nm" PhysicalSizeY="0.065" PhysicalSizeZ="0.3" '
+               'TimeIncrement="250" TimeIncrementUnit="ms"><Channel Name="a" EmissionWavelength="520" '
+               'Color="-16776961"/><Channel Name="b"/></Pixels></Image></OME>')
+        ij = "ImageJ=1.54f\nimages=30\nchannels=2\nslices=3\nframes=5\nunit=nm\nspacing=300\nfinterval=0.5\n"
+        for text in (xml, ij, "", "nothing"):
+            self.assertEqual(wb.tiff_metadata(text), wb._parse_tiff_description(text))
 
 
 try:

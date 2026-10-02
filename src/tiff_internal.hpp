@@ -24,23 +24,32 @@ namespace sirius {
         // and reused afterwards (parsing 10k IFDs per read would dominate).
         std::shared_ptr<detail::NvTiffSession> nv;
         std::mutex nvMutex;
+        // OME / ImageJ metadata, parsed on first use (TiffFile::metadata).
+        std::once_flag metadataOnce;
+        TiffMetadata metadata;
     };
 
     namespace detail {
 
-        // A validated decode request: `ifds` share the geometry described by
-        // `geometry`, `region` is resolved (non-zero extents inside the image).
+        // A validated decode request: `ifds` share the size, pixel type and
+        // samples per pixel of `geometry` (the first one); `images` holds each
+        // IFD's own info (strip / tile layout and codec may differ by page).
+        // `region` is resolved (non-zero extents inside the image) and the
+        // samples [firstSample, firstSample + sampleCount) exist.
         struct DecodeJob {
             const std::vector<std::uint64_t>* ifds = nullptr;
             const TiffImageInfo* geometry = nullptr;
+            std::vector<const TiffImageInfo*> images;
             Region region;
+            std::uint16_t firstSample = 0;
+            std::uint16_t sampleCount = 1;
             PixelType dstType = PixelType::UInt8;
             int maxThreads = 0;   // 0 = automatic; see TiffReadOptions::maxThreads
             std::function<void(double)> progress;   // 0..1 over pages; may be called from OpenMP threads
         };
 
-        // libtiff: decode into dense host memory {ifds, region.height, region.width}
-        // of dstType, converting pixels when the on-disk type differs.
+        // libtiff: decode into dense host memory {ifds, samples, region.height,
+        // region.width} of dstType, converting pixels when the on-disk type differs.
         void decodeWithLibtiff(const std::string& path, const DecodeJob& job, void* dstHost);
 
         // libtiff handles opened for reading so far in this process (inspection
@@ -50,7 +59,8 @@ namespace sirius {
 
         // nvTIFF (only linked with SIRIUS_HAS_NVTIFF): decode into device memory
         // of the same layout. Returns false with `reason` set, and dst untouched,
-        // when nvTIFF cannot decode this file; throws on hard errors.
+        // when nvTIFF cannot decode this file; throws on hard errors. Only
+        // called for jobs gpuEligible() accepts (one sample of 8/16/32/64 bits).
         bool decodeWithNvTiff(TiffFile::Impl& impl, const DecodeJob& job, void* dstDevice, Device device,
                               const Stream& stream, std::string& reason);
         bool nvTiffSupports(TiffFile::Impl& impl, const DecodeJob& job, Device device, std::string& reason);

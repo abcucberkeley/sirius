@@ -63,6 +63,7 @@ __all__ = [
     "step_kinds",
     "step_spec",
     "tiff_dims",
+    "tiff_metadata",
     "tiff_tags",
     "tiff_voxel",
     "tiled_inference",
@@ -483,14 +484,15 @@ def _unit_to_um(unit: Any) -> float:
     u = str(unit or "").strip(" \t\r\n").lower()
     if u in ("", "\u00b5m", "\u03bcm", "um", "micron", "microns", "micrometer", "micrometre"):
         return 1.0
-    return {"nm": 1e-3, "nanometer": 1e-3, "mm": 1e3, "millimeter": 1e3, "cm": 1e4, "centimeter": 1e4,
-            "m": 1e6, "meter": 1e6, "inch": 2.54e4, "in": 2.54e4, "pixel": 0.0, "pixels": 0.0}.get(u, 1.0)
+    return {"nm": 1e-3, "nanometer": 1e-3, "nanometre": 1e-3, "mm": 1e3, "millimeter": 1e3, "millimetre": 1e3,
+            "cm": 1e4, "centimeter": 1e4, "centimetre": 1e4, "m": 1e6, "meter": 1e6, "metre": 1e6,
+            "inch": 2.54e4, "in": 2.54e4, "pixel": 0.0, "pixels": 0.0}.get(u, 1.0)
 
 
 def _time_unit_to_s(unit: Any) -> float:
     """``timeUnitToS``."""
     u = str(unit or "").strip(" \t\r\n").lower()
-    return {"ms": 1e-3, "us": 1e-6, "\u00b5s": 1e-6, "min": 60.0, "h": 3600.0}.get(u, 1.0)
+    return {"ms": 1e-3, "us": 1e-6, "\u00b5s": 1e-6, "\u03bcs": 1e-6, "ns": 1e-9, "min": 60.0, "h": 3600.0}.get(u, 1.0)
 
 
 def _xml_unescape(s: str) -> str:
@@ -638,6 +640,44 @@ def _parse_tiff_description(description: str) -> Dict[str, Any]:
     return md
 
 
+def tiff_metadata(description: str) -> Dict[str, Any]:
+    """:func:`_parse_tiff_description`'s dict, parsed by SIRIUS's C++ reader
+    (``sirius.parse_tiff_metadata``, the parser the application uses) when
+    the extension has it; the Python port otherwise (an older extension)."""
+    ext = _sirius_tiff()
+    parse = getattr(ext, "parse_tiff_metadata", None) if ext is not None else None
+    if parse is None:
+        return _parse_tiff_description(description)
+    m = parse(str(description or ""))
+    md: Dict[str, Any] = {"ome": bool(m.ome), "imagej": bool(m.imagej), "c": int(m.size_c), "t": int(m.size_t),
+                          "z": int(m.size_z), "dimension_order": str(m.dimension_order),
+                          "voxel_um": [0.0, 0.0, 0.0], "frame_interval_s": float(m.frame_interval_s), "channels": []}
+    if m.ome:
+        md["voxel_um"] = [float(v) for v in m.voxel_um]
+        for ch in m.channels:
+            entry: Dict[str, Any] = {"label": str(ch.name), "wavelength_nm": float(ch.emission_nm)}
+            color = tuple(float(v) for v in ch.color)
+            if ch.has_color and color != (1.0, 1.0, 1.0):
+                entry["color"] = _hex_color(color)
+            md["channels"].append(entry)
+    elif m.imagej:
+        md["voxel_um"][2] = float(m.voxel_um[2])
+        unit = float(m.image_j.unit_um)
+        if unit > 0:
+            md["voxel_um"][0] = md["voxel_um"][1] = -unit   # the resolution tags hold pixels per unit
+    return md
+
+
+def tiff_page_channels(md: Dict[str, Any], samples: int) -> Dict[str, Any]:
+    """`md` with its channel count in pages: OME's SizeC counts samples (an
+    RGB channel is one plane of SamplesPerPixel 3), the page order does not."""
+    samples = max(int(samples or 1), 1)
+    c = int(md.get("c") or 0)
+    if samples > 1 and md.get("ome") and c >= samples and c % samples == 0:
+        md = dict(md, c=c // samples)
+    return md
+
+
 def _normalize_order(order: str) -> str:
     """``normalizeOrder``: c, t, z once each, fastest first; the rest dropped."""
     out = ""
@@ -680,13 +720,16 @@ def _tiff_probe(path: str) -> Dict[str, Any]:
     hand over the tags yet leaves them to tifffile, and without the
     extension tifffile reads everything, skipping reduced-resolution pages."""
     info: Dict[str, Any] = {"description": "", "xres": 0.0, "yres": 0.0, "res_unit": 2, "pages": None,
-                            "dtype": None, "reader": None}
+                            "dtype": None, "reader": None, "samples": 1, "photometric": 1}
     ext = _sirius_tiff()
     if ext is not None:
         t = ext.inspect_tiff(path)
         if not t.uniform_pages:
             raise ValueError(f"TIFF pages differ in size or pixel type: {path}")
-        info.update(pages=int(t.page_count), dtype=str(np.dtype(t.dtype)), reader="sirius")
+        page0 = t.page(0)
+        info.update(pages=int(t.page_count), dtype=str(np.dtype(t.dtype)), reader="sirius",
+                    samples=int(getattr(page0, "samples_per_pixel", 1) or 1),
+                    photometric=int(getattr(page0, "photometric", 1)))
         tags = tiff_tags(t.page(0))
         if tags is not None:
             info.update(tags)
@@ -709,11 +752,12 @@ def _tiff_probe(path: str) -> Dict[str, Any]:
         if ext is None:
             full = [i for i, page in enumerate(tf.pages) if not int(getattr(page, "subfiletype", 0)) & 1]
             shapes = {(tuple(tf.pages[i].shape), str(tf.pages[i].dtype)) for i in full}
-            if int(getattr(first, "samplesperpixel", 1)) != 1:
-                raise ValueError("Only single-channel (grayscale) TIFFs are supported.")
             if len(shapes) != 1:
                 raise ValueError(f"TIFF pages differ in size or pixel type: {path}")
-            info.update(pages=len(full), dtype=str(first.dtype), reader="tifffile", full_pages=full)
+            info.update(pages=len(full), dtype=str(first.dtype), reader="tifffile", full_pages=full,
+                        samples=int(getattr(first, "samplesperpixel", 1) or 1),
+                        photometric=int(getattr(first, "photometric", 1)),
+                        contiguous=int(getattr(first, "planarconfig", 1)) == 1)
     return info
 
 
@@ -875,15 +919,20 @@ def _load_zarr(path: str) -> Tuple[np.ndarray, Dict[str, Any]]:
 def _load_tiff(path: str, page_order: str, c: Optional[int], t: Optional[int], z: Optional[int]):
     """``probeTiff`` + ``TiffArraySource``: see load_dataset."""
     probe = _tiff_probe(path)
-    md = _parse_tiff_description(probe["description"])
+    md = tiff_metadata(probe["description"])
     pages = int(probe["pages"])
+    # Samples per pixel are channels (probeTiff): an RGB page is three
+    # planes. The page order maps pages, so its channel count is in pages.
+    spp = max(int(probe.get("samples") or 1), 1)
     # dimensions: explicit page order > OME / ImageJ metadata > pages as z.
     # The Load step passes a page order as soon as a count is set or the
     # order is not "czt" (load.cpp); an axis left at 0 keeps the file's.
     pc, pt, pz = (max(int(v or 0), 0) for v in (c, t, z))
+    if spp > 1 and pc >= spp and pc % spp == 0:
+        pc //= spp
     order_text = "czt" if page_order is None else str(page_order)
     given = pc > 0 or pt > 0 or pz > 0 or order_text != "czt"
-    nc, nt, nz, order, from_meta = tiff_dims(pages, md, given, order_text, pc, pt, pz)
+    nc, nt, nz, order, from_meta = tiff_dims(pages, tiff_page_channels(md, spp), given, order_text, pc, pt, pz)
 
     if probe["reader"] == "sirius":
         stack = np.asarray(_sirius_tiff().read_tiff(path, dtype=np.float32))
@@ -892,11 +941,21 @@ def _load_tiff(path: str, page_order: str, c: Optional[int], t: Optional[int], z
 
         with tifffile.TiffFile(path) as tf:
             stack = np.stack([tf.pages[i].asarray() for i in probe["full_pages"]]).astype(np.float32, copy=False)
-    stack = stack.reshape((pages,) + stack.shape[-2:])
+        if spp > 1 and probe.get("contiguous", True):
+            stack = np.moveaxis(stack, -1, 1)   # (pages, y, x, s) -> (pages, s, y, x), as sirius reads it
+    stack = stack.reshape((pages, spp) + stack.shape[-2:])
     counts = {"c": nc, "t": nt, "z": nz}
     slowest_first = order[::-1]
     shape = tuple(counts[ax] for ax in slowest_first)
-    a = _as5(_reorder_to_ctzyx(stack.reshape(shape + stack.shape[1:]), slowest_first + "yx"))
+    if spp == 1:
+        a = _as5(_reorder_to_ctzyx(stack.reshape(shape + stack.shape[2:]), slowest_first + "yx"))
+    else:
+        # (pages..., s, y, x) -> channel c * spp + s
+        planes = stack.reshape(shape + stack.shape[1:])
+        axes = slowest_first + "syx"
+        planes = np.transpose(planes, [axes.index(ax) for ax in "cstzyx"])
+        a = _as5(planes.reshape((nc * spp,) + planes.shape[2:]))
+    rgb = spp == 3 and nc == 1 and int(probe.get("photometric", 1)) == 2
 
     fmt = "ome-tiff" if md["ome"] else "tiff"
     meta = _default_meta(a, path, fmt)
@@ -913,7 +972,8 @@ def _load_tiff(path: str, page_order: str, c: Optional[int], t: Optional[int], z
         voxel[2] = voxel[0] * 2.0 if known_xy else 0.2
     meta["voxel_um"] = [float(v) for v in voxel]
     meta["frame_interval_s"] = float(md["frame_interval_s"])
-    meta["channels"] = _normalize_channels(md["channels"] if md["ome"] else [], nc)
+    meta["rgb"] = rgb
+    meta["channels"] = _normalize_channels(md["channels"] if md["ome"] and spp == 1 else [], nc * spp, rgb)
     meta["dtype"] = probe["dtype"] or str(stack.dtype)
     meta["bytes_on_disk"] = os.path.getsize(path)
     meta["dims_from_metadata"] = bool(from_meta)

@@ -13,7 +13,7 @@ $$
 
 | Parameter | Explanation |
 |---|---|
-| **Source** <br> file or directory | A multi-page TIFF / OME-TIFF (decoded on the GPU by nvTIFF when possible) or a zarr / N5 store. Plain TIFFs without dimension metadata ask how the pages map onto channels, time points and z planes. |
+| **Source** <br> file or directory | A multi-page TIFF / OME-TIFF / ImageJ hyperstack (decoded on the GPU by nvTIFF when possible) or a zarr / N5 store. Plain TIFFs without dimension metadata ask how the pages map onto channels, time points and z planes. |
 | **Tile** <br> index | Multi-file datasets only: which tile of the folder is viewed and processed. *Stitch* with no tile files fuses all of them, whatever this is set to. |
 | **Read as** <br> full · lazy | Full load (the default) reads the current tile into RAM once — faster scrubbing, needs the whole volume in memory. Lazy reads planes on demand and keeps a bounded RAM cache. |
 | **SIM layout** <br> directions × phases | For raw structured-illumination stacks: how many pattern directions and phase steps the z axis interleaves, so the SIM step can unmix them. $Z_{\text{file}} = N_{\text{dir}} \cdot N_{\text{phase}} \cdot Z$ |
@@ -32,6 +32,8 @@ The manifest lists the channels with their names, the tiles with their nominal o
 
 Voxel sizes and channel names can be overridden here when the file's metadata is wrong; every step downstream reads the corrected values. A voxel size left at 0 keeps the file's for that axis.
 
-*Channels*, *Time points* and *Planes* (under More) map the pages of a TIFF; 0 keeps what the file says. A layout the page count does not divide into is not applied: the pages are read as z planes and the step warns. A folder's manifest and a zarr store name their own axes, so for those the three stay 0.
+**What TIFFs open.** SIRIUS reads TIFF with its own reader: strips or tiles, BigTIFF, either byte order; 1 to 32-bit integers (12- and 14-bit camera data included), float16/32/64; uncompressed, LZW, Deflate or PackBits, with or without a predictor. An RGB (or RGBA, or any multi-sample) TIFF opens with its samples as channels: an RGB image is three channels shown as an RGB merge, whether the file stores the samples interleaved or as separate planes. OME-TIFF sizes, dimension order, physical sizes and channel names, and ImageJ hyperstack axes, spacing and frame interval are read from the file. A TIFF compressed with JPEG, ZSTD, LZMA or another codec this build lacks says so when it is opened.
+
+*Channels*, *Time points* and *Planes* (under More) map the pages of a TIFF; 0 keeps what the file says. With an RGB file, *Channels* counts the samples too (3 for one RGB channel). A layout the page count does not divide into is not applied: the pages are read as z planes and the step warns. A folder's manifest and a zarr store name their own axes, so for those the three stay 0.
 
 Opening a dataset starts these overrides from their defaults; a pipeline that names the dataset opens it with its own.

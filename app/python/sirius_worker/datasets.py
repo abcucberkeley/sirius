@@ -18,7 +18,10 @@ reader (the ``sirius`` package built into the worker's Python: ``pip install
 <checkout>``; without it a TIFF request fails and says so), and ``.npy``
 arrays. A TIFF is shaped exactly as the application shapes it (page order,
 OME / ImageJ dimensions and voxel size: ``sirius.workbench.tiff_dims`` /
-``tiff_voxel``, the port of array_source.cpp's probeTiff). What is read is
+``tiff_voxel``, the port of array_source.cpp's probeTiff, on the metadata
+SIRIUS's C++ reader parses; samples per pixel are channels, so an RGB TIFF
+has three, channel c being sample c % samples of the page channel
+c // samples). What is read is
 what is needed: a z-stack is one page range, a zoomed-in XY plane only its
 visible region, a reduced XY plane a pyramid level when the file has one;
 on a CUDA device with nvTIFF the pages are decoded on the GPU. The (c, t)
@@ -175,6 +178,9 @@ class Dataset:
         self._ext: Any = None       # the sirius module that opened it
         self._array = None          # (c, t, z, y, x) view (memmap) of a .npy
         self._order = "czt"         # a TIFF's page order, fastest axis first
+        self._samples = 1           # a TIFF's samples (channels) per page
+        self._page_c = 1            # a TIFF's channels in pages (c // samples)
+        self.rgb = False
         self._levels: List[Tuple[int, int, int]] = []   # a TIFF's pyramid: (width, height, pages) per level
         self._gpu_ok: Dict[str, bool] = {}              # device -> nvTIFF can decode this file there
         self._paged_regions = True  # the extension reads a region of chosen pages (read_region first / count)
@@ -228,28 +234,45 @@ class Dataset:
             tf = ext.TiffFile(self.path)
             info = tf.info
             uniform = bool(info.uniform_pages)
-        except Exception as e:  # noqa: BLE001 - libtiff's own words: not a TIFF, RGB, planar ...
+        except Exception as e:  # noqa: BLE001 - libtiff's own words: not a TIFF, a codec it lacks ...
             raise DatasetError(f"{name}: {e}") from e
         if not uniform:
             raise DatasetError(f"{name}: the pages differ in size or pixel type")
+        page0 = info.page(0)
+        if not getattr(page0, "decodable", True):
+            raise DatasetError(f"{name}: {page0.unsupported}")
+        spp = max(int(getattr(page0, "samples_per_pixel", 1) or 1), 1)
         self._ext, self._tf = ext, tf
         pages = int(info.page_count)
         self.y, self.x = int(info.height), int(info.width)
         self.dtype = np.dtype(info.dtype)
         self._levels = [(int(lv.width), int(lv.height), len(lv.ifds)) for lv in info.levels]
-        tags = wb.tiff_tags(info.page(0)) or {"description": "", "xres": 0.0, "yres": 0.0, "res_unit": 2}
-        md = wb._parse_tiff_description(tags["description"])
+        tags = wb.tiff_tags(page0) or {"description": "", "xres": 0.0, "yres": 0.0, "res_unit": 2}
+        # the C++ reader's OME / ImageJ parser (the application's), or the
+        # Python port of it in an older extension
+        md = wb.tiff_metadata(tags["description"]) if hasattr(wb, "tiff_metadata") \
+            else wb._parse_tiff_description(tags["description"])
+        page_md = md
+        if spp > 1 and md["ome"] and md["c"] >= spp and md["c"] % spp == 0:
+            page_md = dict(md, c=md["c"] // spp)   # OME's SizeC counts samples
         # the application sends a page order exactly when it has one
-        # (remote_source.cpp remoteOptionsJson), and then it wins over the metadata
+        # (remote_source.cpp remoteOptionsJson), and then it wins over the
+        # metadata; its channel count is the dataset's (samples included)
         o = self.options
         given = o.get("page_order") is not None
-        self.c, self.t, self.z, self._order, from_meta = wb.tiff_dims(
-            pages, md, given, str(o.get("page_order") or "czt"), o.get("c"), o.get("t"), o.get("z"))
+        oc = o.get("c")
+        if spp > 1 and oc and int(oc) >= spp and int(oc) % spp == 0:
+            oc = int(oc) // spp
+        page_c, self.t, self.z, self._order, from_meta = wb.tiff_dims(
+            pages, page_md, given, str(o.get("page_order") or "czt"), oc, o.get("t"), o.get("z"))
+        self._samples, self._page_c = spp, page_c
+        self.c = page_c * spp
+        self.rgb = spp == 3 and page_c == 1 and int(getattr(page0, "photometric", 1)) == 2
         self.dims_from_metadata = bool(from_meta)
         self.format = "ome-tiff" if md["ome"] else ("imagej-tiff" if md["imagej"] else "tiff")
         self.voxel = wb.tiff_voxel(md, tags["xres"], tags["yres"], tags["res_unit"])
         self.frame_interval = max(float(md["frame_interval_s"] or 0.0), 0.0)
-        if md["ome"]:
+        if md["ome"] and spp == 1:
             for ch in md["channels"]:
                 entry: Dict[str, Any] = {"name": str(ch.get("label", ""))}
                 if float(ch.get("wavelength_nm", 0.0) or 0.0) > 0.0:
@@ -278,7 +301,7 @@ class Dataset:
             "voxel_um": [float(v) for v in self.voxel],
             "frame_interval_s": float(self.frame_interval),
             "channels": self.channels,
-            "rgb": False,
+            "rgb": bool(self.rgb),
             "dims_from_metadata": bool(self.dims_from_metadata),
         }
 
@@ -290,7 +313,12 @@ class Dataset:
     # --- reading a TIFF (sirius.TiffFile) --------------------------------------------------------
 
     def _page_of(self, c: int, t: int, z: int) -> int:
-        return _plane_of(self._order, c, t, z, self.c, self.t, self.z)
+        return _plane_of(self._order, c // self._samples, t, z, self._page_c, self.t, self.z)
+
+    def _sample_args(self, c: int) -> Dict[str, int]:
+        """A read's keywords for channel c: one sample of a multi-sample page
+        (none for one-sample files, which any extension reads)."""
+        return {"first_sample": c % self._samples, "samples": 1} if self._samples > 1 else {}
 
     def _device(self, device: Optional[str]) -> Any:
         """sirius.Device of a decode: the GPU when nvTIFF decodes this file
@@ -309,26 +337,28 @@ class Dataset:
             self._gpu_ok[key] = ok
         return gpu if ok else ext.Device.cpu()
 
-    def _pages(self, first: int, count: int, device: Optional[str]) -> np.ndarray:
-        """Pages [first, first + count) as (count, y, x)."""
-        out = self._tf.read_pages(int(first), int(count), device=self._device(device), allow_cpu_fallback=True)
+    def _pages(self, first: int, count: int, device: Optional[str], c: int = 0) -> np.ndarray:
+        """Pages [first, first + count) of channel c's sample as (count, y, x)."""
+        out = self._tf.read_pages(int(first), int(count), device=self._device(device), allow_cpu_fallback=True,
+                                  **self._sample_args(c))
         return _host(out).reshape(int(count), self.y, self.x)
 
     def _region(self, page: int, x: int, y: int, w: int, h: int, level: int,
-                device: Optional[str]) -> Optional[np.ndarray]:
-        """(h, w) at (x, y) of one page at pyramid `level`, decoding only the
-        tiles / strips it covers; None when this extension cannot read a
-        region of one page there (built before read_region took first / count)."""
+                device: Optional[str], c: int = 0) -> Optional[np.ndarray]:
+        """(h, w) at (x, y) of one page (channel c's sample) at pyramid
+        `level`, decoding only the tiles / strips it covers; None when this
+        extension cannot read a region of one page there (built before
+        read_region took first / count)."""
         if self._paged_regions:
             try:
                 out = self._tf.read_region(int(x), int(y), int(w), int(h), level=int(level), device=self._device(device),
-                                           allow_cpu_fallback=True, first=int(page), count=1)
+                                           allow_cpu_fallback=True, first=int(page), count=1, **self._sample_args(c))
                 return _host(out).reshape(int(h), int(w))
             except TypeError:
                 self._paged_regions = False   # an older extension: whole pages, cropped here
         if level != 0:
             return None
-        return self._pages(page, 1, device)[0, y:y + h, x:x + w]
+        return self._pages(page, 1, device, c)[0, y:y + h, x:x + w]
 
     def _level_for(self, factor: int) -> Optional[Tuple[int, int]]:
         """(level, scale) of the most reduced pyramid level whose integer
@@ -360,15 +390,15 @@ class Dataset:
             w, h, _ = self._levels[k]
             lx0, ly0 = x0 // s, y0 // s
             lx1, ly1 = min(_ceil_div(x1, s), w), min(_ceil_div(y1, s), h)
-            part = self._region(page, lx0, ly0, lx1 - lx0, ly1 - ly0, k, device) if lx1 > lx0 and ly1 > ly0 else None
+            part = self._region(page, lx0, ly0, lx1 - lx0, ly1 - ly0, k, device, c) if lx1 > lx0 and ly1 > ly0 else None
             if part is not None:
                 out = reduce_blocks(part, (factor // s, factor // s))
                 if out.shape == (_ceil_div(y1 - y0, factor), _ceil_div(x1 - x0, factor)):
                     return out
         if (x0, y0, x1, y1) == (0, 0, self.x, self.y):
-            full = self._pages(page, 1, device)[0]
+            full = self._pages(page, 1, device, c)[0]
         else:
-            full = self._region(page, x0, y0, x1 - x0, y1 - y0, 0, device)
+            full = self._region(page, x0, y0, x1 - x0, y1 - y0, 0, device, c)
         return reduce_blocks(full, (factor, factor))
 
     # --- reading (the file's dtype) ------------------------------------------------------------------
@@ -380,7 +410,7 @@ class Dataset:
         cached = _VOLUMES.get((self.key, c, t))
         if cached is not None:
             return cached[z]
-        return self._pages(self._page_of(c, t, z), 1, device)[0]
+        return self._pages(self._page_of(c, t, z), 1, device, c)[0]
 
     def volume(self, c: int, t: int, device: Optional[str] = "auto") -> np.ndarray:
         self._check(c, t)
@@ -403,14 +433,14 @@ class Dataset:
         first = self._page_of(c, t, 0)
         stride = self._page_of(c, t, 1) - first if self.z > 1 else 1
         if stride == 1:
-            return np.ascontiguousarray(self._pages(first, self.z, device))
+            return np.ascontiguousarray(self._pages(first, self.z, device, c))
         span = (self.z - 1) * stride + 1
         plane_bytes = self.y * self.x * np.dtype(self.dtype).itemsize
         if stride <= 4 and span * plane_bytes <= (1 << 30):
-            return np.ascontiguousarray(self._pages(first, span, device)[::stride])
+            return np.ascontiguousarray(self._pages(first, span, device, c)[::stride])
         vol = np.empty((self.z, self.y, self.x), dtype=self.dtype)
         for z in range(self.z):
-            vol[z] = self._pages(first + z * stride, 1, device)[0]
+            vol[z] = self._pages(first + z * stride, 1, device, c)[0]
         return vol
 
     # --- what a pane draws -------------------------------------------------------------------------

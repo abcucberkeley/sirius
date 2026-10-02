@@ -152,6 +152,32 @@ on either device. `inspectTiff` also reports the first page's `ImageDescription`
 (OME-XML, ImageJ metadata) and the resolution tags, which the workbench turns into
 dimensions, voxel sizes and channel names.
 
+**What the reader decodes** (the CPU path, libtiff underneath; tifffile is the
+reference the tests compare it with, `bindings/tests/test_tiff_parity.py`):
+
+| | |
+|---|---|
+| Layout | strips and tiles, classic TIFF and BigTIFF, little- and big-endian, multi-page stacks, sparse files (missing strips / tiles read as zeros) |
+| Samples | any number per pixel (RGB, RGBA, 2-sample, ...), contiguous or separate planes. Samples are channels: a read of several returns `{pages, samples, height, width}`, of one `{pages, height, width}`; `TiffReadOptions::firstSample` / `sampleCount` pick them (separate planes then decode only the chosen ones) |
+| Numbers | unsigned 1..32-bit (1, 2, 4, 12, 14-bit ... unpacked into uint8 / uint16 / uint32), signed 8/16/24/32-bit, float16 (widened to float32), float32, float64. Not: 64-bit integers, complex |
+| Codecs | None, LZW, Deflate / Adobe Deflate, PackBits, CCITT (bilevel), with the horizontal and floating-point predictors. ZSTD, JPEG, LZMA, JPEG 2000, JPEG XL, WebP and LERC need a libtiff built with them; without, `TiffImageInfo::unsupported` says so and a read of that page throws |
+| Palette | the indices; `TiffImageInfo::colormap` holds the palette. Photometric, orientation and extra samples are reported, not applied (as tifffile) |
+| Pyramids | SubIFDs and reduced-resolution IFDs on the main chain (`levels`, `readLevel`), per OME series (`seriesLevels`, `readSeries(index, level)`) |
+| Metadata | `TiffFile::metadata()` / `parseTiffMetadata()` (`tiff_metadata.hpp`): every OME `<Image>` with sizes, `DimensionOrder`, physical sizes and units, time increment, channels (name, wavelengths, colour, samples per pixel) and `TiffData` IFD mapping (`omeImagePages`, `series()`); ImageJ's images / channels / slices / frames, hyperstack, unit, spacing, frame interval and display range |
+
+Pages decode in parallel (OpenMP), and a page with many strips or tiles is
+split across threads when there are fewer pages than threads. On a 16-thread
+laptop (Ryzen AI 7 350, warm cache, `bindings/benchmarks/bench_tiff_vs_tifffile.py`)
+the whole-file read is 1.2-2.4x faster than `tifffile.imread`: 128 x 1024^2 uint16
+uncompressed 0.033 s vs 0.079 s, 64 pages Deflate 0.072 vs 0.086, one 8192^2
+Deflate-tiled page 0.071 vs 0.126, 16 x 2048^2 RGB LZW 0.125 vs 0.224. The GPU
+(nvTIFF) path decodes one-sample 8/16/32/64-bit pages; RGB, packed bit depths and
+float16 decode on the CPU and are uploaded.
+
+From Python (`sirius.TiffFile`): `info.shape`, `read_stack / read_pages / read_level /
+read_region / read_series(..., first_sample=, samples=)`, `metadata`, `series()`,
+`series_levels(i)`, and `sirius.parse_tiff_metadata(description)`.
+
 ### TIFF writing (`TiffWriteOptions`)
 
 `writeTiffStack(path, view, options)` gives full control over the container:

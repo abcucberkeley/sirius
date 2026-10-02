@@ -234,8 +234,9 @@ class _FakeObject:
 
 def _fake_sirius(nvtiff: bool = False, cuda: bool = False, paged_regions: bool = True, tags: bool = True):
     """A stand-in `sirius` module. Files are registered with add(path, levels,
-    ...), levels[0] the (pages, y, x) stack and levels[k] its k-th reduction;
-    every read is logged in .calls as (what, level, first, count, x, y, w, h, device)."""
+    ...), levels[0] the (pages, y, x) stack -- (pages, samples, y, x) with
+    several samples per pixel -- and levels[k] its k-th reduction; every read
+    is logged in .calls as (what, level, first, count, x, y, w, h, device)."""
     m = types.ModuleType("sirius")
     m.__version__ = "0.1.0-fake"
     m.files = {}
@@ -245,23 +246,26 @@ def _fake_sirius(nvtiff: bool = False, cuda: bool = False, paged_regions: bool =
     m.cuda_available = lambda: cuda
     m.cuda_device_count = lambda: 1 if cuda else 0
 
-    def add(path, levels, description="", xres=0.0, yres=0.0, unit=2, gpu_ok=True, error=None):
+    def add(path, levels, description="", xres=0.0, yres=0.0, unit=2, gpu_ok=True, error=None, photometric=1):
         with open(path, "wb") as f:
             f.write(b"II*\0")   # the worker only needs the file to exist
         m.files[os.path.abspath(path)] = {"levels": [np.asarray(lv) for lv in levels], "description": description,
-                                          "xres": xres, "yres": yres, "unit": unit, "gpu_ok": gpu_ok, "error": error}
+                                          "xres": xres, "yres": yres, "unit": unit, "gpu_ok": gpu_ok, "error": error,
+                                          "photometric": photometric}
 
     m.add = add
 
     def info_of(spec):
         a = spec["levels"][0]
-        page = {"width": a.shape[2], "height": a.shape[1], "dtype": a.dtype, "samples_per_pixel": 1}
+        samples = a.shape[1] if a.ndim == 4 else 1
+        page = {"width": a.shape[-1], "height": a.shape[-2], "dtype": a.dtype, "samples_per_pixel": samples,
+                "photometric": spec["photometric"], "decodable": True, "unsupported": ""}
         if tags:
             page.update(description=spec["description"], x_resolution=spec["xres"], y_resolution=spec["yres"],
                         resolution_unit=spec["unit"])
-        levels = [_FakeObject(width=lv.shape[2], height=lv.shape[1], ifds=list(range(lv.shape[0])))
+        levels = [_FakeObject(width=lv.shape[-1], height=lv.shape[-2], ifds=list(range(lv.shape[0])))
                   for lv in spec["levels"]]
-        return _FakeObject(page_count=a.shape[0], height=a.shape[1], width=a.shape[2], dtype=a.dtype,
+        return _FakeObject(page_count=a.shape[0], height=a.shape[-2], width=a.shape[-1], dtype=a.dtype,
                            uniform_pages=True, levels=levels, page=lambda i: _FakeObject(**page))
 
     class TiffFile:
@@ -282,28 +286,38 @@ def _fake_sirius(nvtiff: bool = False, cuda: bool = False, paged_regions: bool =
             a = np.ascontiguousarray(a)
             return _FakeBuffer(a, device) if device.is_cuda else a.copy()
 
+        @staticmethod
+        def _samples(a, first_sample, samples):
+            """The chosen samples of (pages, s, y, x), as the extension returns them."""
+            if a.ndim != 4:
+                return a
+            n = samples or a.shape[1] - first_sample
+            out = a[:, first_sample:first_sample + n]
+            return out[:, 0] if n == 1 else out
+
         def read_pages(self, first, count, dtype=None, device=_FAKE_CPU, allow_cpu_fallback=True, pinned=False,
-                       stream=None):
+                       stream=None, first_sample=0, samples=0):
             a = self._s["levels"][0]
             if count == 0 or first + count > a.shape[0]:
                 raise IndexError(f"Pages [{first}, {first + count}) of {a.shape[0]}")
-            m.calls.append(("pages", 0, first, count, 0, 0, a.shape[2], a.shape[1], device.kind))
-            return self._out(a[first:first + count], device)
+            m.calls.append(("pages", 0, first, count, 0, 0, a.shape[-1], a.shape[-2], device.kind))
+            return self._out(self._samples(a[first:first + count], first_sample, samples), device)
 
-        def _region(self, x, y, width, height, level, device, first, count, what):
+        def _region(self, x, y, width, height, level, device, first, count, what, first_sample=0, samples=0):
             a = self._s["levels"][level]
             count = count or a.shape[0] - first
-            w = width or a.shape[2] - x
-            h = height or a.shape[1] - y
-            if x + w > a.shape[2] or y + h > a.shape[1] or first + count > a.shape[0]:
+            w = width or a.shape[-1] - x
+            h = height or a.shape[-2] - y
+            if x + w > a.shape[-1] or y + h > a.shape[-2] or first + count > a.shape[0]:
                 raise ValueError("region out of bounds")
             m.calls.append((what, level, first, count, x, y, w, h, device.kind))
-            return self._out(a[first:first + count, y:y + h, x:x + w], device)
+            return self._out(self._samples(a[first:first + count, ..., y:y + h, x:x + w], first_sample, samples), device)
 
         if paged_regions:
             def read_region(self, x, y, width=0, height=0, level=0, dtype=None, device=_FAKE_CPU,
-                            allow_cpu_fallback=True, pinned=False, stream=None, first=0, count=0):
-                return self._region(x, y, width, height, level, device, first, count, "region")
+                            allow_cpu_fallback=True, pinned=False, stream=None, first=0, count=0, first_sample=0,
+                            samples=0):
+                return self._region(x, y, width, height, level, device, first, count, "region", first_sample, samples)
         else:
             # an extension built before read_region took first / count: every page
             def read_region(self, x, y, width=0, height=0, level=0, dtype=None, device=_FAKE_CPU,
@@ -470,12 +484,39 @@ class TestTiff(_WithSirius):
         self.assertEqual({c[0] for c in fake.calls}, {"pages"})
 
     def test_a_file_the_reader_refuses_says_why(self):
-        self.fake.add(self.path("rgb.tif"), [np.zeros((1, 2, 2), np.uint8)],
-                      error="Only single-channel (grayscale) TIFFs are supported.")
+        self.fake.add(self.path("zstd.tif"), [np.zeros((1, 2, 2), np.uint8)],
+                      error="compression 50000 (ZSTD) is not built into this SIRIUS's libtiff")
         with self.assertRaises(datasets.DatasetError) as e:
-            datasets.open_dataset(self.path("rgb.tif"))
-        self.assertIn("rgb.tif", str(e.exception))
-        self.assertIn("single-channel", str(e.exception))
+            datasets.open_dataset(self.path("zstd.tif"))
+        self.assertIn("zstd.tif", str(e.exception))
+        self.assertIn("ZSTD", str(e.exception))
+
+    def test_an_rgb_tiff_opens_with_three_channels(self):
+        # (pages, samples, y, x): 2 z planes of RGB
+        rgb = np.arange(2 * 3 * 6 * 8, dtype=np.uint8).reshape(2, 3, 6, 8)
+        self.fake.add(self.path("rgb.tif"), [rgb], photometric=2)
+        ds = datasets.open_dataset(self.path("rgb.tif"))
+        meta = ds.meta()
+        self.assertEqual(meta["dims"], [3, 1, 2, 6, 8])
+        self.assertTrue(meta["rgb"])
+        for c in range(3):
+            np.testing.assert_array_equal(ds.plane(c, 0, 1), rgb[1, c])
+            np.testing.assert_array_equal(ds.volume(c, 0), rgb[:, c])
+        np.testing.assert_array_equal(ds.view("xy", 2, 0, 0, 1, [2, 1, 4, 3]), rgb[0, 2, 1:4, 2:6])
+        # an OME-TIFF's SizeC counts the samples; the application's page order counts channels
+        ome = ('<OME><Image><Pixels DimensionOrder="XYCZT" SizeX="8" SizeY="6" SizeZ="2" SizeC="3" SizeT="1">'
+               '<Channel SamplesPerPixel="3"/></Pixels></Image></OME>')
+        self.fake.add(self.path("rgb.ome.tif"), [rgb], description=ome, photometric=2)
+        meta = datasets.open_dataset(self.path("rgb.ome.tif")).meta()
+        self.assertEqual(meta["dims"], [3, 1, 2, 6, 8])
+        self.assertTrue(meta["dims_from_metadata"])
+        given = datasets.open_dataset(self.path("rgb.tif"), {"page_order": "czt", "c": 3, "t": 1, "z": 2}).meta()
+        self.assertEqual(given["dims"], [3, 1, 2, 6, 8])
+        # four samples are four channels, not an RGB merge
+        self.fake.add(self.path("rgba.tif"), [np.zeros((1, 4, 2, 2), np.uint8)], photometric=2)
+        meta = datasets.open_dataset(self.path("rgba.tif")).meta()
+        self.assertEqual(meta["dims"][0], 4)
+        self.assertFalse(meta["rgb"])
 
 
 class TestTiffDevice(_WithSirius):
@@ -598,6 +639,25 @@ class TestTiffRealSirius(_Files):
         self.assertAlmostEqual(m["voxel_um"][0], 0.1, places=4)
         np.testing.assert_array_equal(ds.plane(1, 0, 2), data[0, 2, 1])
         np.testing.assert_array_equal(ds.volume(0, 1), data[1, :, 0])
+
+    @unittest.skipUnless(HAVE_TIFFFILE, "writing an RGB TIFF for the test needs tifffile")
+    def test_an_rgb_tiff_opens_with_three_channels(self):
+        if not hasattr(REAL_SIRIUS, "parse_tiff_metadata"):
+            self.skipTest("this build of the extension reads one sample per pixel")
+        rgb = np.random.default_rng(3).integers(0, 255, size=(3, 30, 20, 3)).astype(np.uint8)   # z y x s
+        for planar in ("contig", "separate"):
+            data = rgb if planar == "contig" else np.moveaxis(rgb, -1, 1)
+            tifffile.imwrite(self.path(f"{planar}.tif"), data, photometric="rgb", planarconfig=planar,
+                             tile=(16, 16) if planar == "separate" else None)
+            ds = datasets.open_dataset(self.path(f"{planar}.tif"))
+            m = ds.meta()
+            self.assertEqual(m["dims"], [3, 1, 3, 30, 20])
+            self.assertTrue(m["rgb"])
+            for c in range(3):
+                np.testing.assert_array_equal(ds.plane(c, 0, 2, "cpu"), rgb[2, :, :, c])
+                np.testing.assert_array_equal(ds.volume(c, 0, "cpu"), rgb[:, :, :, c])
+            np.testing.assert_array_equal(ds.view("xy", 1, 0, 1, 1, [3, 4, 10, 12], device="cpu"),
+                                          rgb[1, 4:16, 3:13, 1])
 
 
 class TestOverTheSocket(_Files):

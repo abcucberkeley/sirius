@@ -126,8 +126,8 @@ sirius_lib_unit(real_fft
 # --- files -------------------------------------------------------------------
 
 sirius_lib_unit(tiff_io
-    HEADERS sirius/tiff_io.hpp tiff_internal.hpp
-    SOURCES tiff_io.cpp
+    HEADERS sirius/tiff_io.hpp sirius/tiff_metadata.hpp tiff_internal.hpp
+    SOURCES tiff_io.cpp tiff_metadata.cpp
     NVTIFF_SOURCES tiff_nvtiff.cpp
     DEPENDS buffer device pixel_type downsample errors
     LINK TIFF::TIFF
@@ -264,6 +264,7 @@ target_sources(sirius
             ${PROJECT_SOURCE_DIR}/include/sirius/buffer.hpp
             ${PROJECT_SOURCE_DIR}/include/sirius/pixel_type.hpp
             ${PROJECT_SOURCE_DIR}/include/sirius/tiff_io.hpp
+            ${PROJECT_SOURCE_DIR}/include/sirius/tiff_metadata.hpp
             ${PROJECT_SOURCE_DIR}/include/sirius/tensor_util.hpp
             ${PROJECT_SOURCE_DIR}/include/sirius/fft.hpp
             ${PROJECT_SOURCE_DIR}/include/sirius/fft_common.hpp

@@ -51,7 +51,7 @@ Bottom to top; each line's unit may use the ones above it.
 | `fft_common` | `device` | FFTW's planner lock and thread count, the rigor flags, the GPU scaling kernels |
 | `fft` | `buffer`, `device`, `fft_common`, `tensor_util` | the complex transform, FFTW and cuFFT |
 | `real_fft` | `device`, `fft_common`, `tensor_util` | the real transform, FFTW and cuFFT |
-| `tiff_io` | `buffer`, `device`, `pixel_type`, `downsample`, `errors` | TIFF reading and writing, libtiff and nvTIFF |
+| `tiff_io` | `buffer`, `device`, `pixel_type`, `downsample`, `errors` | TIFF reading and writing, libtiff and nvTIFF; the OME-XML / ImageJ metadata parser (`tiff_metadata.hpp`) |
 | `zarr_io` | `buffer`, `pixel_type`, `downsample`, `errors` | zarr v2/v3, N5, OME-NGFF through TensorStore |
 | `image_ops` | `index`, `downsample`, `constants`, `checked_math` | reductions, resampling, crop/pad, intensity, histograms |
 | `registration` | `buffer`, `device`, `real_fft`, `fft_common` | masked FFT registration |

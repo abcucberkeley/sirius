@@ -624,3 +624,85 @@ TEST_CASE("openDataset maps zarr axes by name and by position", "[app][io][zarr]
         REQUIRE(plane[7] == 47.f);
     }
 }
+
+// --- multi-sample (RGB) TIFFs -----------------------------------------------------------
+
+namespace {
+    // The pattern tests/data/tifffile/make_fixtures.py writes.
+    std::uint64_t fixtureValue(int p, int s, Index y, Index x, int bits) {
+        const std::uint64_t v = static_cast<std::uint64_t>(p * 131 + s * 37 + y * 7 + x * 3 + (x * y) % 11);
+        return v & ((std::uint64_t{1} << bits) - 1);
+    }
+    std::string fixture(const char* name) { return std::string(SIRIUS_TEST_DATA_DIR) + "/tifffile/" + name; }
+} // namespace
+
+TEST_CASE("An RGB TIFF opens with its samples as three channels", "[app][io][tiff][rgb]") {
+    const bool full = GENERATE(false, true);
+    const char* name = GENERATE("rgb_contig_lzw.tif", "rgb_planar_tiled_deflate.tif");
+    const int bits = std::string(name).find("planar") != std::string::npos ? 16 : 8;
+    INFO(name << " full=" << full);
+    OpenOptions o;
+    o.readAll = full;
+    const OpenResult r = openDataset(fixture(name), o);
+    const DatasetMeta& m = r.meta;
+    CHECK(m.dims.c == 3);
+    CHECK(m.dims.t == 1);
+    CHECK(m.dims.z == 2);
+    CHECK(m.dims.y == 29);
+    CHECK(m.dims.x == 37);
+    CHECK(m.rgb);
+    REQUIRE(m.channels.size() == 3);
+    CHECK(m.channels[0].label == "R");
+    CHECK_THAT(r.metadataSummary, Catch::Matchers::ContainsSubstring("RGB"));
+    std::vector<float> plane(static_cast<std::size_t>(m.dims.planeSize()));
+    for (Index c = 0; c < 3; ++c)
+        for (Index z = 0; z < 2; ++z) {
+            r.source->readPlane(c, 0, z, plane.data());
+            for (Index y = 0; y < 29; ++y)
+                for (Index x = 0; x < 37; ++x)
+                    REQUIRE(plane[static_cast<std::size_t>(y * 37 + x)] ==
+                            static_cast<float>(fixtureValue(static_cast<int>(z), static_cast<int>(c), y, x, bits)));
+        }
+    std::vector<float> vol(static_cast<std::size_t>(2 * m.dims.planeSize()));
+    r.source->readVolume(1, 0, vol.data());
+    CHECK(vol[static_cast<std::size_t>(m.dims.planeSize() + 5)] == static_cast<float>(fixtureValue(1, 1, 0, 5, bits)));
+    const auto all = r.source->readAll();
+    CHECK(all->at(2, 0, 1, 7, 9) == static_cast<float>(fixtureValue(1, 2, 7, 9, bits)));
+}
+
+TEST_CASE("An RGB OME-TIFF takes z and voxel size from the OME-XML", "[app][io][tiff][rgb][ome]") {
+    const OpenResult r = openDataset(fixture("ome_rgb.ome.tif"));
+    const DatasetMeta& m = r.meta;
+    CHECK(m.format == "ome-tiff");
+    CHECK(m.dims.c == 3);   // SizeC 3 = one channel of SamplesPerPixel 3
+    CHECK(m.dims.z == 2);
+    CHECK(m.rgb);
+    CHECK(r.dimsFromMetadata);
+    CHECK_THAT(m.voxelUm[0], WithinRel(0.1, 1e-9));
+    CHECK_THAT(m.voxelUm[2], WithinRel(0.3, 1e-9));
+    std::vector<float> plane(static_cast<std::size_t>(m.dims.planeSize()));
+    r.source->readPlane(2, 0, 1, plane.data());
+    CHECK(plane[40] == static_cast<float>(fixtureValue(1, 2, 1, 3, 8)));
+    // an explicit page order counts the dataset's channels
+    OpenOptions o;
+    o.pageOrder = PageOrder{"czt", 3, 1, 0};
+    const DatasetMeta again = probeDataset(fixture("ome_rgb.ome.tif"), o);
+    CHECK(again.dims.c == 3);
+    CHECK(again.dims.z == 2);
+}
+
+TEST_CASE("An ImageJ hyperstack written by tifffile opens with its axes", "[app][io][tiff][imagej]") {
+    const OpenResult r = openDataset(fixture("imagej_hyperstack.tif"));
+    const DatasetMeta& m = r.meta;
+    CHECK(m.dims.c == 2);
+    CHECK(m.dims.z == 2);
+    CHECK(m.dims.t == 3);
+    CHECK_FALSE(m.rgb);
+    CHECK_THAT(m.voxelUm[0], WithinRel(0.25, 1e-6));   // resolution 4 px per um
+    CHECK_THAT(m.voxelUm[2], WithinRel(0.5, 1e-9));
+    CHECK_THAT(m.frameIntervalS, WithinRel(2.0, 1e-9));
+    // TZCYX: page = (t * 2 + z) * 2 + c
+    std::vector<float> plane(static_cast<std::size_t>(m.dims.planeSize()));
+    r.source->readPlane(1, 2, 1, plane.data());
+    CHECK(plane[0] == static_cast<float>(fixtureValue((2 * 2 + 1) * 2 + 1, 0, 0, 0, 16)));
+}

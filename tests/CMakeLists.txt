@@ -38,8 +38,9 @@ sirius_lib_test(fft_util        test_fft_util.cpp)
 sirius_lib_test(buffer          test_buffer.cpp)        # and `device`, which has no life apart from it
 sirius_lib_test(fft             test_fft1d.cpp test_fft2d.cpp test_fft3d.cpp test_fft_inplace.cpp test_fft_cuda.cpp)
 sirius_lib_test(real_fft        test_real_fft.cpp test_real_fft_cuda.cpp UNITS lib/buffer)
-# test_tiff_file reads tags back with libtiff and includes tiff_internal.hpp
-sirius_lib_test(tiff_io         test_tiff_io.cpp test_tiff_file.cpp LINK TIFF::TIFF INTERNAL)
+# test_tiff_file / test_tiff_formats write and read back tags with libtiff and
+# include tiff_internal.hpp
+sirius_lib_test(tiff_io         test_tiff_io.cpp test_tiff_file.cpp test_tiff_formats.cpp LINK TIFF::TIFF INTERNAL)
 sirius_lib_test(zarr_io         test_zarr_io.cpp)
 # downsample.hpp, the internal header image_ops shares with the writers, is tested here too
 sirius_lib_test(image_ops       test_image_ops.cpp INTERNAL)
