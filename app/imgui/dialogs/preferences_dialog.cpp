@@ -234,7 +234,12 @@ namespace sirius::app::gui {
                     widgets::ButtonOpts b;
                     b.small = true;
                     b.tooltip = "Log in once, submit the worker job and connect through the SSH tunnel: no terminals";
-                    if (widgets::button("Connect to cluster\xE2\x80\xA6", b)) app.defer([&app] { app.clusterDialog(); });
+                    // Preferences is modal: a dialog opened over it would get no input,
+                    // so it closes first and the cluster dialog takes its place.
+                    if (widgets::button("Connect to cluster\xE2\x80\xA6", b)) {
+                        close();
+                        app.defer([&app] { app.clusterDialog(); });
+                    }
                     if (link.connected())
                         note("While the cluster session is connected the HPC backend goes through it; the fields below are for a worker "
                              "you started and tunnelled yourself.");
