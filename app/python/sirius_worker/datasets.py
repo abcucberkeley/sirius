@@ -518,6 +518,26 @@ def forget_all() -> None:
         ds.close()
 
 
+def _indices(value: Any, extent: int, axis: str) -> List[int]:
+    """The channel or time indices a request names: all of them (None), one,
+    or a list -- each within the dataset and none twice, so a request cannot
+    size the output by repeating an index (a list of a billion zeros used to
+    be one np.empty of a billion volumes)."""
+    if value is None:
+        return list(range(extent))
+    raw = [value] if isinstance(value, int) else value
+    if not isinstance(raw, (list, tuple)) or len(raw) > max(extent, 1):
+        raise DatasetError(f"{axis}: expected an index or a list of at most {extent} indices")
+    out: List[int] = []
+    for v in raw:
+        if isinstance(v, bool) or not isinstance(v, int) or not 0 <= v < extent:
+            raise DatasetError(f"{axis} index {v!r} is outside the dataset (0..{extent - 1})")
+        if v in out:
+            raise DatasetError(f"{axis} index {v} is named twice")
+        out.append(v)
+    return out
+
+
 def read_ref(ref: Dict[str, Any]) -> np.ndarray:
     """A step's input named by reference instead of sent (the HPC backend
     with a cluster dataset): {path, options, c, t} -> the (z, y, x) volume as
@@ -526,10 +546,8 @@ def read_ref(ref: Dict[str, Any]) -> np.ndarray:
     layout = str(ref.get("layout", "zyx"))
     if layout == "zyx":
         return np.ascontiguousarray(ds.volume(int(ref.get("c", 0)), int(ref.get("t", 0))), dtype=np.float32)
-    cs = ref.get("c")
-    ts = ref.get("t")
-    cs = list(range(ds.c)) if cs is None else ([int(cs)] if isinstance(cs, int) else [int(v) for v in cs])
-    ts = list(range(ds.t)) if ts is None else ([int(ts)] if isinstance(ts, int) else [int(v) for v in ts])
+    cs = _indices(ref.get("c"), ds.c, "c")
+    ts = _indices(ref.get("t"), ds.t, "t")
     out = np.empty((len(cs), len(ts), ds.z, ds.y, ds.x), dtype=np.float32)
     for i, c in enumerate(cs):
         for j, t in enumerate(ts):
@@ -590,11 +608,23 @@ def decode(desc: Dict[str, Any], tensor: np.ndarray) -> np.ndarray:
     if desc.get("encoding", "raw") == "raw":
         return tensor
     data = bytes(tensor)
-    if desc["encoding"] == "zstd":
-        data = _zstd().ZstdDecompressor().decompress(data, max_output_size=int(desc["raw_bytes"]))
-    else:
-        data = zlib.decompress(data)
     dtype = np.dtype(desc["dtype"])
+    # What the shape says the bytes are, and not one byte more: a stream that
+    # inflates past it (a decompression bomb) is refused, not followed.
+    expected = dtype.itemsize
+    for n in desc["shape"]:
+        expected *= int(n)
+    if int(min(desc["shape"], default=0)) < 0 or expected > (64 << 30):
+        raise DatasetError(f"an array of {expected} bytes is not plausible")
+    if desc["encoding"] == "zstd":
+        data = _zstd().ZstdDecompressor().decompress(data, max_output_size=max(expected, 1))
+    else:
+        inflater = zlib.decompressobj()
+        data = inflater.decompress(data, max(expected, 1))   # 0 would mean "no limit"
+        if inflater.unconsumed_tail or not inflater.eof:
+            raise DatasetError("a compressed array inflates past its shape")
+    if len(data) != expected:
+        raise DatasetError(f"a compressed array of {len(data)} bytes does not match its shape ({expected} bytes)")
     raw = np.frombuffer(data, dtype=np.uint8)
     if desc.get("shuffle"):
         raw = np.ascontiguousarray(raw.reshape(dtype.itemsize, -1).T)

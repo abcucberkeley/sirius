@@ -83,7 +83,8 @@ namespace sirius::app {
                 {"get_help", "Help pages", true, true, false, false, false, true, false},
                 // running
                 {"validate", "Validate the pipeline", true, true, false, false, false, true, false},
-                {"run", "Run the pipeline", false, false, false, false, false, false, false},
+                // open-world: a step may download model weights from Hugging Face, and the hpc backend sends the data to a remote worker
+                {"run", "Run the pipeline", false, false, false, false, true, false, false},
                 {"run_status", "Run status", true, true, false, false, false, false, false},
                 {"cancel_run", "Cancel the run", true, false, false, false, false, false, false},
                 {"set_backend", "Set the compute backend", true, false, false, true, false, false, false},
@@ -176,9 +177,15 @@ namespace sirius::app {
             }
         }
 
-        // A path argument, made absolute against the working directory.
-        std::string pathArg(const json& a, const char* key) {
+        // A path argument, made absolute against the working directory. A
+        // network path is refused unless the server was started with
+        // --allow-network-paths: opening \\server\share connects to that
+        // server with the user's Windows credentials.
+        std::string pathArg(const json& a, const char* key, bool allowNetwork) {
             const std::string given = requiredString(a, key);
+            if (!allowNetwork && isNetworkPath(given))
+                invalid(std::string("'") + key + "' is a network path (" + given + "), which this server does not open",
+                        "use a local path, or ask the user to restart sirius-cli with --allow-network-paths");
             try {
                 return reported(fs::u8path(given));
             } catch (const std::exception&) {
@@ -186,8 +193,8 @@ namespace sirius::app {
             }
         }
 
-        std::string existingPath(const json& a, const char* key) {
-            const std::string path = pathArg(a, key);
+        std::string existingPath(const json& a, const char* key, bool allowNetwork) {
+            const std::string path = pathArg(a, key, allowNetwork);
             std::error_code ec;
             if (!fs::exists(fs::u8path(path), ec))
                 throw ToolFailure("not_found", "no such file or directory: " + path,
@@ -483,6 +490,7 @@ namespace sirius::app {
         // workbench's default Contrast step is for a person looking at data.
         wb.replacePipeline(Pipeline(), "Start");
         wb.history().clear();
+        api.setAllowNetworkPaths(options.allowNetworkPaths);
 
         const std::string backend = lower(options.backend);
         if (backend == "cpu") {
@@ -1019,7 +1027,7 @@ namespace sirius::app {
     // --- the tools ---------------------------------------------------------------------------
 
     json HeadlessWorkbench::Impl::openDatasetTool(const json& a) {
-        const std::string path = existingPath(a, "path");
+        const std::string path = existingPath(a, "path", options.allowNetworkPaths);
         OpenOptions o = openOptionsFromJson(a);
         if (o.readAll) o.progress = progressFn("Reading the dataset");
         OpenResult opened;
@@ -1042,7 +1050,7 @@ namespace sirius::app {
             if (!wb.hasDataset()) throw ToolFailure("no_dataset", "no dataset is open and no path was given", "pass path, or open_dataset first");
             return datasetJson();
         }
-        const std::string path = existingPath(a, "path");
+        const std::string path = existingPath(a, "path", options.allowNetworkPaths);
         OpenOptions o = openOptionsFromJson(a);
         o.readAll = false;
         try {
@@ -1060,8 +1068,8 @@ namespace sirius::app {
     }
 
     json HeadlessWorkbench::Impl::loadPipelineTool(const json& a) {
-        const std::string path = existingPath(a, "path");
-        const std::string dataset = has(a, "dataset") ? existingPath(a, "dataset") : std::string();
+        const std::string path = existingPath(a, "path", options.allowNetworkPaths);
+        const std::string dataset = has(a, "dataset") ? existingPath(a, "dataset", options.allowNetworkPaths) : std::string();
         // The file's own Load parameters, read before the workbench loads it. When
         // the dataset they name cannot be opened, the workbench puts the open
         // dataset's parameters back into the Load step, and those describe another
@@ -1069,7 +1077,17 @@ namespace sirius::app {
         ParamSet fileLoad;
         const std::uint64_t changesBefore = datasetChanges;
         try {
-            fileLoad = Pipeline::load(path).at(0).params;
+            const Pipeline file = Pipeline::load(path);
+            fileLoad = file.at(0).params;
+            // The file's paths (the dataset, a PSF, a model) are opened as if
+            // an agent had named them: no network path without the flag.
+            if (!options.allowNetworkPaths)
+                for (const Step& s : file.steps())
+                    if (const Operation* op = findOperation(s.kind))
+                        for (const ParamSpec& spec : op->info().params)
+                            if (spec.type == ParamType::Path && isNetworkPath(s.params.getString(spec.key)))
+                                throw ToolFailure("invalid_argument", "its step " + s.name + " names the network path " + s.params.getString(spec.key),
+                                                  "use local paths in the pipeline, or ask the user to restart sirius-cli with --allow-network-paths");
             wb.loadPipeline(path);
         } catch (const std::exception& e) {
             throw ToolFailure("invalid_argument", "cannot load the pipeline " + path + ": " + e.what(),
@@ -1507,6 +1525,7 @@ namespace sirius::app {
     }
 
     json HeadlessWorkbench::Impl::exportResultTool(const json& a) {
+        (void)pathArg(a, "path", options.allowNetworkPaths);   // refused before anything runs
         const int i = inspectStep(a);
         const std::shared_ptr<const StepOutput> out = outputFor(i, boolArg(a, "run", false));
         const ExportOptions o = exportOptionsFromJson(a, out->meta);
@@ -1536,7 +1555,7 @@ namespace sirius::app {
     json HeadlessWorkbench::Impl::exportPythonTool(const json& a) {
         const std::string script = wb.pipeline().toPythonScript(wb.hasDataset() ? wb.dataset().sourcePath : std::string());
         if (!has(a, "path")) return {{"script", script}};
-        const std::string path = pathArg(a, "path");
+        const std::string path = pathArg(a, "path", options.allowNetworkPaths);
         std::ofstream f(fs::u8path(path), std::ios::binary);
         if (!(f << script)) throw ToolFailure("io_error", "cannot write " + path);
         f.close();
@@ -1769,7 +1788,7 @@ namespace sirius::app {
                 [this](const json& a) { return loadPipelineTool(a); });
         addTool("save_pipeline", "Save the workspace's steps and their parameters as a pipeline file (.sirius.toml), overwriting it.",
                 schema({{"path", prop("string", "The file to write, normally ending in .sirius.toml")}}, {"path"}), [this](const json& a) {
-                    const std::string path = pathArg(a, "path");
+                    const std::string path = pathArg(a, "path", options.allowNetworkPaths);
                     try {
                         wb.savePipeline(path);
                     } catch (const std::exception& e) {

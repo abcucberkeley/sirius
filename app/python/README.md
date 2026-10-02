@@ -22,15 +22,20 @@ package SIM reconstruction, `huggingface_hub` the model hub methods,
 families (see *Segmentation models* below).
 
 ```
-python -m sirius_worker [--host 127.0.0.1] [--port 0] [--token T] [--device auto|cpu|cuda|cuda:N]
-                        [--allow-install] [--exit-with-parent] [--log-level INFO]
+python -m sirius_worker [--host 127.0.0.1] [--port 0] [--token-file F] [--device auto|cpu|cuda|cuda:N]
+                        [--allow-install] [--exit-with-parent] [--max-clients N] [--idle-timeout S]
+                        [--log-level INFO]
 python -m sirius_worker --check
 ```
 
 Once listening it prints exactly one JSON line to stdout,
-`{"port": 41237, "pid": 12345, "host": "127.0.0.1", "device": "cuda"}`, and
-logs to stderr. `--token` (or `$SIRIUS_TOKEN`) is a shared secret the client
-must present in `hello`; always set one on a shared machine. **Binding
+`{"port": 41237, "pid": 12345, "host": "127.0.0.1", "hostname": "n042", "device": "cuda"}`,
+and logs to stderr. The token is a shared secret that the client and the
+worker each prove they know in the handshake, without sending it: give it in
+a file only you can read (`--token-file` or `$SIRIUS_TOKEN_FILE`; the worker
+deletes it once read) or in `$SIRIUS_TOKEN`. `--token T` still works but
+warns, since a command line is visible to every user of the machine. Always
+set one on a shared machine. **Binding
 anything but a loopback address without a token is refused at startup** (the
 worker says so and exits 2): reaching the port is the whole of the
 authorisation model, and whoever completes the handshake can run code as the
@@ -196,13 +201,17 @@ which is itself bounded as it is computed.
 
 `hello` also agrees the protocol version: `PROTOCOL_VERSION` in
 `sirius_worker/protocol.py` and `kProtocolVersion` in `app/core/rpc.hpp`,
-currently `1`. Both ends must send the same number — a peer that sends none
+currently `2`. Both ends must send the same number — a peer that sends none
 counts as version 0 — and a mismatch is refused with a message naming both
-versions and which end to update.
+versions and which end to update. `hello` and `auth` together are the
+handshake: a challenge-response in which the worker proves first that it
+holds the token, then the client (`SECURITY.md`); the token itself is never
+sent, and requests do not carry it.
 
 | method | params | reply |
 | --- | --- | --- |
-| `hello` | `{token, protocol_version}` | `result`: `{version, protocol_version, methods, cuda, device, hostname, python, torch, sirius, workbench}`; `error` on a bad token or another protocol version, and the connection is closed |
+| `hello` | `{protocol_version, client_nonce}` | `result`: `{protocol_version, server_nonce, server_proof}`; `error` on another protocol version, and the connection is closed |
+| `auth` | `{client_proof}` | `result`: `{version, protocol_version, methods, cuda, device, hostname, python, torch, sirius, workbench, encodings, max_clients}`; `error` on a wrong proof (and the connection is closed), or `busy` when every client slot is taken |
 | `ping` | | `result`: `{time}` |
 | `model_info` | `{spec}` (or `path`) | `result`: `{format, input_shape, output_shape, dtype, size_bytes, channels_out}` for a file; `{format: "cellpose" \| "micro-sam", available, install_hint, returns: "labels"}` for a model family; `{format: "hf", cached: false, repo, file}` for an `hf:` file not downloaded yet |
 | `hub_search` | `{query, limit?, filter?, token?}` | `result`: `{models: [{id, downloads, likes, tags, last_modified, pipeline_tag, library, gated, private}]}` (Hugging Face, sorted by downloads; `gated` is `"manual"` / `"auto"` for repositories whose terms must be accepted, else `false`) |

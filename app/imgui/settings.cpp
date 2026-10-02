@@ -8,6 +8,7 @@
 #include <mutex>
 #include <optional>
 
+#include "core/host.hpp"
 #include "imgui/platform.hpp"
 
 namespace sirius::app::gui {
@@ -94,6 +95,9 @@ namespace sirius::app::gui {
         // The failure is said on stderr once, until a write succeeds again.
         // Guarded by saveMutex.
         bool failing = false;
+        // sirius-imgui.json, read at start-up because sirius-app.json was not
+        // there: deleted once its settings are written under the new name.
+        std::string legacyFile;
     };
 
     Settings& Settings::instance() {
@@ -152,11 +156,29 @@ namespace sirius::app::gui {
         std::string text;
         if (!st.loaded) {
             st.loaded = true;
+            // The settings hold tokens and the paths of plugins and models: a
+            // folder others may write is one they could put their own in.
+            std::string why;
+            if (host::writableByOthers(dir, &why))
+                std::fprintf(stderr, "settings: WARNING: %s is not private (%s); run chmod 700 on it\n", dir.c_str(), why.c_str());
+            if (platform::readFile(path, text)) {
+                const nlohmann::json j = nlohmann::json::parse(text, nullptr, false);
+                if (j.is_object()) st.data = j;
+                return;
+            }
+            if (stamp.exists) return;   // there, but not readable: nothing is taken from elsewhere
             // sirius-imgui.json: the name the file had before the application
-            // took over sirius-app's name; read once, then saved under the new one
-            if (!platform::readFile(path, text) && !platform::readFile(dir + "/sirius-imgui.json", text)) return;
+            // took over sirius-app's name. Its settings become this process's
+            // changes, so the first save writes them under the new name, and
+            // the old file is deleted then.
+            const std::string legacy = dir + "/sirius-imgui.json";
+            if (!platform::readFile(legacy, text)) return;
             const nlohmann::json j = nlohmann::json::parse(text, nullptr, false);
-            if (j.is_object()) st.data = j;
+            if (!j.is_object()) return;
+            st.data = j;
+            for (auto it = j.begin(); it != j.end(); ++it) st.pending.try_emplace(it.key(), *it);
+            st.dirty = true;
+            st.legacyFile = legacy;
             return;
         }
         // A file that is gone or does not parse leaves the settings as they are.
@@ -319,7 +341,7 @@ namespace sirius::app::gui {
 
     bool Settings::saveLocked() {
         State& st = state();
-        std::string text, dir, path;
+        std::string text, dir, path, legacy;
         Changes written;
         {
             const std::lock_guard<std::mutex> g(st.mutex);
@@ -331,10 +353,25 @@ namespace sirius::app::gui {
             // Writing back the copy read at start-up instead erased whatever
             // the other instance had stored, its tokens included. This process
             // sees the other one's keys from here on too.
-            nlohmann::json file;
+            nlohmann::json file = nlohmann::json::object();
             std::string onDisk;
-            if (platform::readFile(path, onDisk)) file = nlohmann::json::parse(onDisk, nullptr, false);
-            if (!file.is_object()) file = st.data;
+            if (stampOf(path).exists) {
+                // There but not readable (a lock, a permission): nothing is
+                // written over it now; the next save tries again.
+                if (!platform::readFile(path, onDisk)) {
+                    st.retryAfter = std::chrono::steady_clock::now() + std::chrono::seconds(1);
+                    if (!st.failing) std::fprintf(stderr, "settings: could not read %s; not saved yet\n", path.c_str());
+                    st.failing = true;
+                    return false;
+                }
+                file = nlohmann::json::parse(onDisk, nullptr, false);
+                // a file that does not parse is replaced by what this process knows
+                if (!file.is_object()) file = st.data;
+            }
+            // A missing file (removed to reset the settings) starts from
+            // nothing: only this process's own changes are written, not the
+            // whole copy it read at start-up.
+            legacy = st.legacyFile;
             nlohmann::json all = merged(std::move(file), st.data, st.pending);
             // replace: a string that is not UTF-8 (a Linux file name among the
             // recent datasets) is written with U+FFFD where the strict
@@ -353,6 +390,11 @@ namespace sirius::app::gui {
         st.seen.reset();
         if (ok) {
             st.failing = false;
+            if (!legacy.empty() && legacy == st.legacyFile) {
+                std::error_code ec;
+                std::filesystem::remove(std::filesystem::u8path(legacy), ec);
+                st.legacyFile.clear();
+            }
             return true;
         }
         // Not written: the changes go back for the next try, except where a

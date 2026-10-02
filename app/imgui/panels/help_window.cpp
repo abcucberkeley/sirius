@@ -263,6 +263,7 @@ namespace sirius::app::gui {
         // the page file, looked at while the window shows
         bool fileExists = false;
         fs::file_time_type fileTime{};
+        std::string helpRoot;   // the help directory as of the last load: what links may open
         double nextPoll = 0.0;
         double reloadAt = -1.0;
 
@@ -303,6 +304,7 @@ namespace sirius::app::gui {
             kind = k;
             page = std::move(loaded);
             source = page.markdown;
+            helpRoot = helpDirectory();
 #ifndef __APPLE__
             if (k == "shortcuts") {
                 // this application's notation, and what only it has
@@ -352,8 +354,15 @@ namespace sirius::app::gui {
             app.requestRedraw(12);
         }
 
+        // The page's file is one this window may write and open: a page in
+        // the help directory, never a file a kind or a link points elsewhere.
+        bool pageEditable() const { return !page.path.empty() && isPageInHelpDirectory(page.path, helpRoot.empty() ? helpDirectory() : helpRoot); }
+
         void editPage() {
-            if (page.path.empty()) return;
+            if (!pageEditable()) {
+                if (!page.path.empty()) app.wb().logLine("Help: " + page.path + " is not a page in the help folder; not opened");
+                return;
+            }
             std::error_code ec;
             if (!fs::exists(page.path, ec)) {
                 fs::create_directories(fs::path(page.path).parent_path(), ec);
@@ -366,7 +375,7 @@ namespace sirius::app::gui {
         // Copies the image next to the page as <kind>-figure.<ext> and
         // references it from the front matter (an image dropped on the window).
         void setFigure(const std::string& file) {
-            if (page.path.empty() || !isFigureFile(file)) return;
+            if (!pageEditable() || !isFigureFile(file)) return;
             const fs::path pagePath(page.path);
             const std::string ext = toLower(fs::u8path(file).extension().u8string()).substr(1);
             const fs::path target = pagePath.parent_path() / (kind + "-figure." + ext);
@@ -688,13 +697,13 @@ namespace sirius::app::gui {
                     if (dirty || std::abs(width - layoutWidth) > 0.5f || layoutScale != theme::scale()) build(width);
                     const float x0 = ImGui::GetCursorPosX() + margin;
                     ImGui::SetCursorPos(ImVec2(x0, ImGui::GetCursorPosY() + margin));
-                    markdown::show(top);
+                    markdown::show(top, helpRoot);
                     ImGui::SetCursorPosX(x0);
                     drawFigure(width);
                     ImGui::SetCursorPosX(x0);
                     widgets::vspace(14);
                     ImGui::SetCursorPosX(x0);
-                    markdown::show(bottom);
+                    markdown::show(bottom, helpRoot);
                     widgets::vspace(kMargin);
                 }
             }
@@ -763,6 +772,12 @@ namespace sirius::app::gui {
         const bool followCall = d.visible && sel != d.seenSelection;
         d.seenSelection = sel;
         if (followCall && !d.followSelection) return;
+        // A kind names a file in the help directory; one from a pipeline file
+        // or a plugin that would name something else is not loaded.
+        if (!helpPageNameSafe(kind)) {
+            d.app.wb().logLine("Help: '" + kind + "' is not a help page name");
+            return;
+        }
         d.followSelection = true;
         d.load(kind);
         d.visible = true;

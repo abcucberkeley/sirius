@@ -212,6 +212,11 @@ TEST_CASE("python env: credentials in URLs are redacted", "[app][python_env]") {
           "--index-url=https://***@one/simple --find-links https://***@two/wheels");
     CHECK(pyenv::redactUrl("D:/wheels") == "D:/wheels");
     CHECK(pyenv::redactUrl(pyenv::redactUrl("https://u:p@host/simple")) == "https://***@host/simple");
+    // query values: an index's token is often one
+    CHECK(pyenv::redactUrl("https://host/simple?token=abc&x=1#frag") == "https://host/simple?token=***&x=***#frag");
+    CHECK(pyenv::redactUrl("see https://u:p@host/s/?sig=zzz and https://two/?k=v") == "see https://***@host/s/?sig=*** and https://two/?k=***");
+    CHECK(pyenv::redactUrl("https://host/?flag") == "https://host/?flag");
+    CHECK(pyenv::redactUrl(pyenv::redactUrl("https://host/?a=b&c=d")) == "https://host/?a=***&c=***");
 }
 
 TEST_CASE("python env: the marker survives a JSON round trip", "[app][python_env]") {
@@ -581,6 +586,56 @@ TEST_CASE("python env: the index is named without its credentials", "[app][pytho
     CHECK(pyenv::planSetup(offline, kWorkerDir).index == "none (--no-index)");
     offline.findLinks = {"https://user:secret@mirror.example/wheels/"};
     CHECK(pyenv::planSetup(offline, kWorkerDir).index == "https://***@mirror.example/wheels/");
+}
+
+TEST_CASE("python env: the index reaches the installer through its environment, not its command line", "[app][python_env]") {
+    const ScratchEnvironment scratch;
+    pyenv::SetupOptions options;
+    options.useUv = false;
+    options.basePython = scratch.dir.path + "/no-such-python";
+    options.indexUrl = "https://user:secret@mirror.example/simple?token=abc";
+    const pyenv::SetupPlan plan = pyenv::planSetup(options, kWorkerDir);
+    for (const auto& command : plan.commands)
+        for (const std::string& a : command) {
+            CHECK_FALSE(has(a, "--index-url"));
+            CHECK_FALSE(has(a, "mirror.example"));
+        }
+    const auto pip = pyenv::installerIndexEnvironment(options, false);
+    REQUIRE(pip.size() == 1);
+    CHECK(pip.front().first == "PIP_INDEX_URL");
+    CHECK(pip.front().second == options.indexUrl);
+    const auto uv = pyenv::installerIndexEnvironment(options, true);
+    REQUIRE(uv.size() == 1);
+    CHECK(uv.front().first == "UV_INDEX_URL");
+    options.indexUrl.clear();
+    CHECK(pyenv::installerIndexEnvironment(options, false).empty());
+}
+
+TEST_CASE("python env: the application's secrets are named for the children to drop", "[app][python_env]") {
+    const std::vector<std::string>& names = pyenv::secretEnvironmentNames();
+    for (const char* name : {"SIRIUS_HPC_TOKEN", "SIRIUS_LLM_API_KEY", "OPENROUTER_API_KEY", "OPENAI_API_KEY", "ANTHROPIC_API_KEY"})
+        CHECK(std::find(names.begin(), names.end(), std::string(name)) != names.end());
+    CHECK(std::find(names.begin(), names.end(), std::string("HF_TOKEN")) == names.end());
+}
+
+TEST_CASE("python env: a directory of venv-like folders without pyvenv.cfg or the marker is not removed", "[app][python_env]") {
+    const ScratchEnvironment scratch;
+    // what ~/.local looks like: bin, lib, share, include -- and nothing that says venv
+    writeText(scratch.env + "/bin/tool", "mine");
+    writeText(scratch.env + "/lib/data.txt", "mine");
+    writeText(scratch.env + "/share/notes.txt", "mine");
+    const pyenv::SetupResult removed = pyenv::remove(scratch.env);
+    CHECK_FALSE(removed.ok);
+    CHECK(removed.failure == pyenv::Failure::Failed);
+    CHECK(has(removed.message, "pyvenv.cfg"));
+    CHECK(host::isFile(scratch.env + "/bin/tool"));
+
+    // with pyvenv.cfg it is an environment, and goes
+    writeText(scratch.env + "/pyvenv.cfg", "home = /usr/bin\n");
+    const pyenv::SetupResult again = pyenv::remove(scratch.env);
+    INFO(again.message);
+    CHECK(again.ok);
+    CHECK_FALSE(fs::exists(fs::u8path(scratch.env)));
 }
 
 TEST_CASE("python env: a package given as a URL is named without its credentials", "[app][python_env]") {

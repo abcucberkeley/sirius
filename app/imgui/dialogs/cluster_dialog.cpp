@@ -26,6 +26,7 @@
 #include <imgui.h>
 
 #include "core/remote_source.hpp"
+#include "core/secure_wipe.hpp"
 #include "imgui/cluster_link.hpp"
 #include "imgui/dialogs/export_dialog_support.hpp"
 #include "imgui/strings.hpp"
@@ -80,7 +81,6 @@ namespace sirius::app::gui {
             explicit ClusterDialog(App& app) : profile_(app.cluster().storedProfile()) {
                 gpus_ = profile_.gpus;
                 cpus_ = profile_.cpus;
-                port_ = profile_.port;
             }
 
             std::string title() const override { return "Connect to cluster"; }
@@ -129,19 +129,15 @@ namespace sirius::app::gui {
                 widgets::FieldOpts fo;
                 fo.enabled = editable;
                 {
+                    // No port: the worker takes a free one on its node and
+                    // says which in its private log.
                     const float w = columnWidth(3, 10);
-                    fo.width = design(w * 2 + px(10));
-                    {
-                        const Field f("SSH host");
-                        fo.hint = "fiona, or user@login.cluster.org";
-                        widgets::inputText("##host", &profile_.host, fo);
-                        widgets::tooltip("A host of your ~/.ssh/config works, with its user, ProxyJump and the rest.");
-                    }
-                    ImGui::SameLine(0.0f, px(10));
-                    fo.width = design(w);
+                    fo.width = design(w * 3 + px(20));
+                    const Field f("SSH host");
+                    fo.hint = "fiona, or user@login.cluster.org";
+                    widgets::inputText("##host", &profile_.host, fo);
+                    widgets::tooltip("A host of your ~/.ssh/config works, with its user, ProxyJump and the rest.");
                     fo.hint.clear();
-                    const Field f("Worker port");
-                    spinInt("##port", &port_, 1024, 65535, 1, fo);
                 }
                 {
                     const float w = columnWidth(2, 10);
@@ -291,21 +287,24 @@ namespace sirius::app::gui {
                         profile_.venv = trimmed(profile_.venv);
                         profile_.gpus = static_cast<int>(gpus_);
                         profile_.cpus = static_cast<int>(cpus_);
-                        profile_.port = static_cast<int>(port_);
                         link.connect(profile_);
                     }
                 }
             }
 
             cluster::Profile profile_;
-            std::int64_t gpus_ = 1, cpus_ = 8, port_ = 7645;
+            std::int64_t gpus_ = 1, cpus_ = 8;
         };
 
         // --- one ssh prompt ------------------------------------------------------------
 
         class PromptDialog final : public Dialog {
         public:
-            explicit PromptDialog(std::shared_ptr<ClusterPrompt> p) : p_(std::move(p)) {}
+            explicit PromptDialog(std::shared_ptr<ClusterPrompt> p) : p_(std::move(p)) {
+                // room for any answer up front: a std::string that grows
+                // leaves its old buffer, password and all, to the heap
+                answer_.reserve(1024);
+            }
             ~PromptDialog() override { finish(true); }
 
             std::string title() const override { return "Log in to " + (p_->host.empty() ? std::string("the cluster") : p_->host); }
@@ -327,6 +326,7 @@ namespace sirius::app::gui {
                     focused_ = true;
                 }
                 const bool enter = widgets::inputText("##answer", &answer_, fo);
+                fieldId_ = ImGui::GetItemID();
                 note("Handed to ssh for this login only: not stored, not logged. Cancel stops the login without sending anything.");
                 widgets::vspace(6);
                 Action a = actionRow("Continue", true);
@@ -348,13 +348,15 @@ namespace sirius::app::gui {
                 done_ = true;
                 if (!cancelled) p_->answer = answer_;
                 p_->cancelled = cancelled;
-                std::fill(answer_.begin(), answer_.end(), '\0');
-                answer_.clear();
+                // Dear ImGui's own copies of the field's text, then ours
+                widgets::forgetInputText(fieldId_);
+                secureWipe(answer_);
                 p_->answered.store(true);
             }
 
             std::shared_ptr<ClusterPrompt> p_;
             std::string answer_;
+            ImGuiID fieldId_ = 0;
             bool focused_ = false;
             bool done_ = false;
         };

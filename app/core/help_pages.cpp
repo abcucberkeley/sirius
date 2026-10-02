@@ -1251,7 +1251,50 @@ namespace sirius::app {
 
     void registerHelpPage(const std::string& kind, const std::string& markdown) { memoryPages()[kind] = markdown; }
 
+    bool helpPageNameSafe(const std::string& kind) {
+        if (kind.empty() || kind.size() > 128 || kind.front() == '.') return false;
+        for (const char c : kind) {
+            const auto u = static_cast<unsigned char>(c);
+            if (c == '/' || c == '\\' || c == ':' || u < 0x20 || u == 0x7F) return false;
+        }
+        return true;
+    }
+
+    bool isPageInHelpDirectory(const std::string& path, const std::string& helpDir) {
+        const auto sep = [](char c) { return c == '/' || c == '\\'; };
+        // \\server\share, //server/share and \\?\UNC\...: checked as text, since
+        // resolving one would connect to that server
+        for (const std::string* s : {&path, &helpDir})
+            if (s->empty() || (s->size() >= 2 && sep((*s)[0]) && sep((*s)[1]))) return false;
+        try {
+            const fs::path p = fs::u8path(path);
+            std::string ext = p.extension().u8string();
+            std::transform(ext.begin(), ext.end(), ext.begin(), [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+            if (ext != ".md") return false;
+            std::error_code ec;
+            const fs::path root = fs::weakly_canonical(fs::absolute(fs::u8path(helpDir), ec), ec);
+            if (ec) return false;
+            const fs::path file = fs::weakly_canonical(fs::absolute(p, ec), ec);
+            if (ec) return false;
+            const fs::path rel = file.lexically_relative(root);
+            if (rel.empty() || rel.is_absolute()) return false;
+            for (const fs::path& part : rel)
+                if (part == "..") return false;
+            return true;
+        } catch (const std::exception&) {
+            return false;   // a name that is not UTF-8 names no page
+        }
+    }
+
     HelpPage loadHelpPage(const std::string& kind, const std::string& hint) {
+        if (!helpPageNameSafe(kind)) {
+            HelpPage page;
+            page.kind = kind;
+            page.title = kind;
+            page.intro = "There is no help page by this name.";
+            page.markdown = page.intro + "\n";
+            return page;
+        }
         const fs::path dir = helpDirectory(hint);
         const fs::path file = dir / (kind + ".md");
         std::ifstream in(file);

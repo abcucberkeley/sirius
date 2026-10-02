@@ -188,7 +188,8 @@ namespace sirius::cli {
                  "A Model Context Protocol server on stdio (JSON-RPC, one message per line) with one live workspace. It offers tools "
                  "only, and speaks 2025-11-25, 2025-06-18, 2025-03-26 and 2024-11-05 through initialize, and 2026-07-28 per request. "
                  "With --allow-worker-setup the setup_worker_env tool may download packages (the client still asks the user each "
-                 "time); --read-only leaves out the tools that write files or download. Logs go to stderr.",
+                 "time); --read-only leaves out the tools that write files or download; tools refuse network (UNC) paths such as "
+                 "//server/share unless --allow-network-paths is given. Logs go to stderr.",
                  R"((the protocol) {"jsonrpc":"2.0","id":1,"result":{"protocolVersion":"2025-11-25","capabilities":{"tools":{}},
  "serverInfo":{"name":"sirius","title":"SIRIUS microscopy workbench","version":"0.1.0"},"instructions":"..."}})",
                  "0 at the end of input or on SIGTERM, 2 usage, 3 / 4 when the state options fail, 1 fatal",

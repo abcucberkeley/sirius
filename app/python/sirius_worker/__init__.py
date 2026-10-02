@@ -6,7 +6,7 @@ service that runs on a cluster node for the HPC backend. Protocol: see
 ``protocol.py`` (mirrors ``app/core/rpc.hpp``); step implementations: see
 ``sirius.workbench`` (located by ``steps.py``).
 
-    python -m sirius_worker --host 127.0.0.1 --port 0 --token X --device auto
+    SIRIUS_TOKEN=X python -m sirius_worker --host 127.0.0.1 --port 0 --device auto
 """
 
 # Same literal as `project(... VERSION ...)` in the top-level CMakeLists.txt, which

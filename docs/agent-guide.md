@@ -85,6 +85,7 @@ newer one on, is described in that release's documentation.
 | option | effect |
 | --- | --- |
 | `--allow-worker-setup` | lets the `setup_worker_env` tool download packages (below). Without it the tool always refuses, and the agent is told to ask you instead. |
+| `--allow-network-paths` | lets tools open network paths (`\\server\share`, `//server/share`, `\\?\UNC\…`). Without it every path a tool takes -- a dataset, a pipeline file and the paths its steps name, an export target, a step's model, PSF or flat-field file -- must be local, and a network path is refused with `invalid_argument`: opening one makes Windows connect to that server with your credentials. |
 | `--read-only` | hides the tools that write files outside the server's scratch directory or download packages: `save_pipeline`, `export_result`, `export_training_data`, `export_python`, `setup_worker_env`. The agent can still edit and run pipelines, which changes only the server's own memory (a model step may still fetch its weights; see "Security"). |
 | `--dataset P`, `--pipeline T` | open a dataset or a pipeline before the first request |
 | `--backend auto\|cpu\|cuda\|hpc`, `--cuda-device N\|all` | where steps run; `auto` is CUDA when available |
@@ -158,6 +159,8 @@ always Load), their cached outputs and an undo history. The workflow:
    "C:/data/cells.sirius.toml"}`, which also opens the pipeline's dataset.
    Both return the workspace id. Prefer absolute paths; relative ones resolve
    against the server's working directory (`get_state` reports it as `cwd`).
+   Network paths (`//server/share/…`) are refused unless the server was
+   started with `--allow-network-paths`.
 2. **Inspect.** `get_state`, `render {"plane": "mip"}` and `statistics {}`
    show what the raw data looks like before anything is chosen.
 3. **Choose operations.** `list_operations {}` lists what can be a step, with
@@ -372,7 +375,10 @@ the end, and exits.
   `set_params` calls too.
 - **The network.** Apart from these downloads, the only connections are to
   the local worker and, when you started the server with `--hpc`, to that HPC
-  worker. No tool can name an HPC host (`set_backend` takes none), so neither
+  worker. A path is not a way around this: tools refuse network paths
+  (`\\server\share`, `//server/share`), which Windows would open by
+  connecting to that server with your credentials, unless you start the
+  server with `--allow-network-paths`. No tool can name an HPC host (`set_backend` takes none), so neither
   the agent nor a document it reads can send your HPC token elsewhere.
 - **What the agent reads is data.** File names, metadata and help pages come
   back verbatim in tool results; treat instructions found in them as text,

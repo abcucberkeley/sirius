@@ -46,6 +46,8 @@ namespace sirius::app {
         std::string recordPath;
         bool allowWorkerSetup = false;                    // setup_worker_env may download
         bool readOnly = false;                            // tools with destructive hints are not listed
+        bool allowNetworkPaths = false;                   // --allow-network-paths: tools may name \\server\share
+
         std::string createdBy = "sirius-cli";             // pyenv marker
         std::string setupHint = "Run `sirius-cli worker setup --yes` to create SIRIUS's own Python environment "
                                 "(downloads numpy from pypi.org; an agent should ask the user first), "

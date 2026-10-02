@@ -37,7 +37,10 @@ namespace sirius::app::gui::http {
         long stallSeconds = 0;
         bool followRedirects = true;
         // Bearer token, sent as "Authorization: Bearer <token>" when non-empty,
-        // and never forwarded to another host by a redirect.
+        // and never forwarded to another host by a redirect, nor from https
+        // to http. A request with one to an http:// address other than this
+        // machine's is refused (Response::error says so). Only http(s) URLs
+        // are fetched at all.
         std::string bearer;
     };
 

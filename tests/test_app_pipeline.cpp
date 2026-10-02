@@ -11,6 +11,7 @@
 #include <atomic>
 #include <filesystem>
 #include <fstream>
+#include <sstream>
 #include <thread>
 
 #include <nlohmann/json.hpp>
@@ -441,6 +442,29 @@ TEST_CASE("Pipeline round-trips through JSON and TOML with ids", "[app][pipeline
     const std::string py = p.toPythonScript("/data/x.tif");
     CHECK(py.find("run_pipeline") != std::string::npos);
     CHECK(py.find("test_maxz") != std::string::npos);
+}
+
+TEST_CASE("The exported Python script holds user text only inside string literals", "[app][pipeline][security]") {
+    // A step name (or any parameter) that closes the raw literal the pipeline
+    // used to sit in would run as code when the script is run.
+    const std::string injection = "x''' + str(print('INJECTED')) + r'''";
+    Pipeline p;
+    p.rename(0, injection);
+    const std::string py = p.toPythonScript("C:\\data\\a'''b\".tif");
+    CHECK(py.find("json.loads(r") == std::string::npos);   // no raw literal left to close
+    // every line of the pipeline is a double-quoted JSON (= Python) string literal
+    const std::size_t start = py.find("PIPELINE = json.loads(\n");
+    REQUIRE(start != std::string::npos);
+    std::istringstream in(py.substr(start + std::string("PIPELINE = json.loads(\n").size()));
+    std::string line, text;
+    while (std::getline(in, line) && line != ")") {
+        REQUIRE(line.rfind("    \"", 0) == 0);
+        REQUIRE(line.back() == '"');
+        text += json::parse(line.substr(4)).get<std::string>();   // the literal's value, as Python reads it
+    }
+    CHECK(line == ")");
+    CHECK(json::parse(text) == p.toJson());
+    CHECK(json::parse(text)["steps"][0]["name"] == injection);
 }
 
 TEST_CASE("Prompts are saved with the pipeline as records, not as text", "[app][pipeline][prompt]") {
@@ -2141,12 +2165,16 @@ TEST_CASE("A run lets go of its worker when it finishes, before the GUI thread g
         auto [client, peer] = rpc::loopbackPair();
         server = std::thread([&closed, t = std::move(peer)] {
             std::vector<std::byte> buf;
+            rpc::HandshakeResponder handshake;
             try {
                 for (;;) {
                     if (auto m = rpc::decodeFrame(buf)) {
-                        json hello{{"version", "test"}, {"methods", json::array()}, {"device", "cpu"}, {"hostname", "loop"}};
-                        hello["protocol_version"] = rpc::kProtocolVersion;
-                        t->send(rpc::encodeFrame({{"id", m->header.value("id", 0ull)}, {"type", "result"}, {"result", hello}}, {}));
+                        const json caps{{"version", "test"}, {"methods", json::array()}, {"device", "cpu"}, {"hostname", "loop"}};
+                        std::string error;
+                        const auto r = handshake.answer(m->header.value("method", ""), m->header.value("params", json::object()), caps, error);
+                        t->send(rpc::encodeFrame(r ? json{{"id", m->header.value("id", 0ull)}, {"type", "result"}, {"result", *r}}
+                                                   : json{{"id", m->header.value("id", 0ull)}, {"type", "error"}, {"message", error}},
+                                                 {}));
                         continue;
                     }
                     t->receive(buf, std::chrono::milliseconds(20));

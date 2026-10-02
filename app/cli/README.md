@@ -215,8 +215,8 @@ the executor's cache lives in the process: iterative work belongs in
 | `call <tool> [--args JSON\|| `--steps <json|@file|->` | a JSON array of `{kind, preset?, params?, enabled?, name?}`, appended to the pipeline (a preset is applied before the params) |\|-] [--<param> v]…` | any tool | the tool's value |
 | `tools [--names]` | nothing | the array MCP's `tools/list` returns (names only with `--names`) |
 | `schema` | nothing | `{commands:[{name, synopsis, options:[{name, type, default, help}]}], exit_codes, error_codes, envelope}` |
-| `session [--allow-worker-setup] [state options]` | the session protocol | (protocol) |
-| `mcp [--allow-worker-setup] [--read-only] [state options]` | the MCP server | (protocol) |
+| `session [--allow-worker-setup] [--allow-network-paths] [state options]` | the session protocol | (protocol) |
+| `mcp [--allow-worker-setup] [--read-only] [--allow-network-paths] [state options]` | the MCP server | (protocol) |
 | `worker status` | where the worker's Python comes from, and the state of SIRIUS's environment | see "The Python worker" |
 | `worker check` | starts the worker (never installs) and says hello | `{interpreter:{path, source}, capabilities, seconds}` |
 | `worker setup [options]` | plans, asks, and sets up SIRIUS's environment | `{env_dir, python, base_python, python_version, installer, mode, packages, extras, seconds}` |
@@ -511,8 +511,10 @@ serve (`sirius-cli tools` prints it). Rules they share:
 - **During a run** only the tools marked *yes* below work; the others answer
   `busy`.
 - **Hints** (MCP annotations): RO = read-only, DE = destructive (writes files
-  outside the scratch directory, or downloads), ID = idempotent. Only
-  `setup_worker_env` is open-world.
+  outside the scratch directory, or downloads), ID = idempotent. Open-world
+  (reaches beyond this machine): `run`, whose steps may download model
+  weights from Hugging Face and whose `hpc` backend sends the data to a
+  remote worker, and `setup_worker_env`, which downloads packages.
 
 | tool | arguments (* = required) | returns | hints | during a run |
 | --- | --- | --- | --- | --- |
@@ -536,7 +538,7 @@ serve (`sirius-cli tools` prints it). Rules they share:
 | `describe_operation` | `kind`* | `{kind, name, group, params:[{key, label, type, default, choices, min, max, unit, advanced, schema}], presets, needs_worker, produces_labels, needs_labels, gpu, help}` | RO | yes |
 | `get_help` | `kind` \| `page` \| `step` | none given: `{pages}`; else `{page, title, path, exists, markdown, truncated}` | RO | yes |
 | `validate` | | `{ok, has_dataset, needs_worker, worker, steps:[…]}` | RO | yes |
-| `run` | `step` (the target; default the last enabled step), `wait_s` (50; 0 = return at once; -1 = to the end), `force` | RunOutcome | | |
+| `run` | `step` (the target; default the last enabled step), `wait_s` (50; 0 = return at once; -1 = to the end), `force` | RunOutcome | open-world | |
 | `run_status` | `wait_s` (0) | RunOutcome of the active or last run, or `{status:"idle"}` | RO | yes |
 | `cancel_run` | | `{cancelled, status}` | | yes |
 | `set_backend` | `backend`* (cpu, cuda, hpc), `cuda_device` (a number or "all") | `{backend, cuda_device}` | ID | yes |
@@ -754,7 +756,7 @@ A transcript (`>` stdin, `<` stdout, shortened with `…`):
 ## The MCP server (`sirius-cli mcp`)
 
 ```
-sirius-cli mcp [--allow-worker-setup] [--read-only] [global and state options]
+sirius-cli mcp [--allow-worker-setup] [--read-only] [--allow-network-paths] [global and state options]
 ```
 
 [docs/agent-guide.md](../../docs/agent-guide.md) shows how to register it
@@ -796,6 +798,15 @@ supported". The server offers tools only: no resources, prompts or logging.
 `--read-only` leaves out the tools marked DE above (`save_pipeline`,
 `export_result`, `export_training_data`, `export_python`,
 `setup_worker_env`) and refuses them if called anyway.
+
+**Network paths.** In `session` and `mcp`, every path a tool takes -- a
+dataset, a pipeline file and the paths its steps name, an export target or
+folder, a step's Path parameter (a model, a PSF, a flat field) -- must be
+local: `\\server\share`, `//server/share` and `\\?\UNC\…` are
+refused with `invalid_argument`, since Windows opens them by connecting to
+that server with the user's credentials. `--allow-network-paths` lifts this
+for a server whose user wants it. The one-shot commands take paths from the
+command line, as typed, and are not restricted.
 
 **Results.**
 

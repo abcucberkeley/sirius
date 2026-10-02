@@ -1,9 +1,10 @@
 #!/bin/bash
 # Fake sbatch for tests/test_app_cluster.cpp (through tests/tools/fake_ssh.py):
 # no Slurm is involved. It starts the SIRIUS worker on this machine, on
-# 127.0.0.1:$SIRIUS_PORT with the token the application exported, writes its
-# output to the --output log in the current directory (the checkout), and
-# records the job in $FAKE_SLURM_DIR. Prints the job id, like --parsable.
+# 127.0.0.1:$SIRIUS_PORT (0: a free port, as the real job does) with the token
+# file the application wrote ($SIRIUS_TOKEN_FILE, which the worker reads and
+# deletes), writes its output to the --output log, and records the job in
+# $FAKE_SLURM_DIR. Prints the job id, like --parsable.
 set -u
 dir="${FAKE_SLURM_DIR:?FAKE_SLURM_DIR is not set}"
 out="slurm-%j.out"
@@ -21,8 +22,12 @@ printf '%s\n' "$*" > "$dir/$id.args"
 # what reached the job's environment; the token only as "set", never its value
 env | grep -E '^SIRIUS_(PORT|VENV|DEVICE|MAX_CLIENTS)=' | sort > "$dir/$id.env"
 [ -n "${SIRIUS_TOKEN:-}" ] && echo "SIRIUS_TOKEN=<set>" >> "$dir/$id.env"
+[ -n "${SIRIUS_TOKEN_FILE:-}" ] && echo "SIRIUS_TOKEN_FILE=<set>" >> "$dir/$id.env"
+# the token file's mode and the umask the job inherits (POSIX meaning only)
+[ -n "${SIRIUS_TOKEN_FILE:-}" ] && stat -c %a "$SIRIUS_TOKEN_FILE" > "$dir/$id.tokenmode" 2>/dev/null
+umask > "$dir/$id.umask"
 echo "${FAKE_SLURM_PENDING_POLLS:-0}" > "$dir/$id.pending"
-( cd app/python && exec "${FAKE_PYTHON:?}" -m sirius_worker --host 127.0.0.1 --port "${SIRIUS_PORT:-7645}" --device cpu \
+( cd app/python && exec "${FAKE_PYTHON:?}" -m sirius_worker --host 127.0.0.1 --port "${SIRIUS_PORT:-0}" --device cpu \
       --max-clients "${SIRIUS_MAX_CLIENTS:-8}" ) > "$log" 2>&1 < /dev/null &
 pid=$!
 echo "$pid" > "$dir/$id.pid"

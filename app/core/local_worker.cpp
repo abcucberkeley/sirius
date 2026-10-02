@@ -221,6 +221,11 @@ namespace sirius::app {
         // of a process only by its owner. The Hugging Face token is not put
         // there: every request that needs it carries it (SECURITY.md).
         o.environment = {{"SIRIUS_TOKEN", token}, {"PYTHONUNBUFFERED", "1"}};
+        // Nor does it get the application's other secrets (the HPC worker's
+        // token, the assistant's API keys) that the user's environment may
+        // hold: a step or a plugin runs arbitrary code in it. HF_TOKEN stays,
+        // for the model downloads the user set it up for.
+        o.unsetEnvironment = pyenv::secretEnvironmentNames();
         // A PYTHONHOME meant for another Python would break SIRIUS's own
         // environment, and nobody set it for that one; CPython ignores an
         // empty value.

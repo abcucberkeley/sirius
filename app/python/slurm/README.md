@@ -35,26 +35,40 @@ version as the application), and in the venv
 `pip install -r app/python/requirements.txt tifffile` (tifffile lets the
 worker read TIFF datasets for *File ▸ Open from cluster…*; torch for
 segmentation models). The job runs this directory's `sirius_worker.sbatch`
-with the profile's options on the `sbatch` command line, `SIRIUS_TOKEN`,
-`SIRIUS_VENV`, `SIRIUS_PORT` and `SIRIUS_MAX_CLIENTS` in its environment.
+with the profile's options on the `sbatch` command line and `SIRIUS_VENV`,
+`SIRIUS_PORT=0` and `SIRIUS_MAX_CLIENTS` in its environment. The token is not
+there (Slurm's accounting may store a job's environment): the application
+writes it over the SSH session to a private file in `~/.sirius/run` (a `0700`
+directory, the file `0600`) and the job gets only the file's name in
+`SIRIUS_TOKEN_FILE`; the worker deletes the file as it starts. The job's log
+is `~/.sirius/run/sirius-worker-<jobid>.log`, and the worker takes a free port,
+which it announces there (`../SECURITY.md`).
 
 The manual way follows: for `sirius-cli`, or a cluster the dialog does not fit.
 
 ## 1. Start the worker on a node
 
 ```
-SIRIUS_TOKEN=$(openssl rand -hex 16)      # keep this: the app needs it
-export SIRIUS_TOKEN
-sbatch app/python/slurm/sirius_worker.sbatch
+umask 077; mkdir -p ~/.sirius/run
+TOKEN=$(openssl rand -hex 16)             # keep this: the app needs it
+printf '%s' "$TOKEN" > ~/.sirius/run/token
+SIRIUS_TOKEN_FILE=~/.sirius/run/token sbatch \
+    --output="$HOME/.sirius/run/sirius-worker-%j.log" app/python/slurm/sirius_worker.sbatch
 ```
+
+The worker reads the token file and deletes it. `SIRIUS_TOKEN=... sbatch`
+works too, but then the token is in the job's environment, which Slurm's
+accounting may store (`AccountingStoreFlags=job_env`).
 
 The template asks for one GPU and eight cores; edit the `#SBATCH` lines and
 the `module load` block for your cluster. It refuses to start without a
 token, since the port is open to every user of the node -- and so does the
 worker itself: `--host 0.0.0.0` with an empty token is refused at startup
 (`../SECURITY.md`). The log
-(`sirius-worker-<jobid>.log`) prints the node name, the port (7645 by
-default, `SIRIUS_PORT` to change) and the exact tunnel command.
+(`sirius-worker-<jobid>.log`) prints the node name and the tunnel command;
+the worker takes a free port (`SIRIUS_PORT` to fix one, at the risk of
+another user of the node taking it first) and announces it in the log's
+`{"port": N, ...}` line.
 
 The worker needs a Python with `numpy`; `torch` for segmentation models and
 the `sirius` wheel (`pip install .` from this repository) for SIM
@@ -88,11 +102,12 @@ dataset it shows besides each run's (runs still execute one at a time).
 From your workstation:
 
 ```
-ssh -N -L 7645:<node>:7645 <login-node>
+ssh -N -L 7645:<node>:<port> <login-node>
 ```
 
-`<node>` is the compute node from the log; the login node forwards the
-connection. Leave the tunnel running for the session.
+`<node>` and `<port>` are the compute node and the port from the log; the
+login node forwards the connection. Leave the tunnel running for the
+session.
 
 ## 3. Point the application at it
 
@@ -117,7 +132,7 @@ token in `SIRIUS_HPC_TOKEN` (never on its command line), for example
 The same worker runs anywhere:
 
 ```
-python -m sirius_worker --host 0.0.0.0 --port 7645 --token X --device cuda
+SIRIUS_TOKEN=X python -m sirius_worker --host 0.0.0.0 --port 7645 --device cuda
 ```
 
 The token is not optional here: a non-loopback `--host` without one is a

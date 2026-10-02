@@ -566,9 +566,7 @@ class WithScriptedHeatmap(unittest.TestCase):
         thread.start()
         sock = socket.create_connection(("127.0.0.1", port), timeout=10)
         try:
-            protocol.write_frame(sock, {"id": 1, "type": "request", "method": "hello",
-                                        "params": {"token": "t", "protocol_version": protocol.PROTOCOL_VERSION}})
-            self.assertEqual(protocol.read_frame(sock)[0]["type"], "result")
+            self.assertEqual(protocol.client_handshake(sock, "t", first_id=100)["type"], "result")
             vol = clip(6, 2, 8, 8)
             protocol.write_frame(sock, {"id": 2, "type": "request", "method": "run",
                                         "params": {"kind": "foundation", "params": {"model": self.path, "task": "segment"}}},

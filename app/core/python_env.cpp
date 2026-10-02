@@ -420,6 +420,15 @@ namespace sirius::app::pyenv {
             return r;
         }
 
+        // What no installer or probe needs from this process's environment:
+        // the application's secrets, and the Hugging Face token (pip and uv
+        // fetch nothing from the Hub).
+        std::vector<std::string> installerUnset() {
+            std::vector<std::string> out = secretEnvironmentNames();
+            out.insert(out.end(), {"HF_TOKEN", "HUGGING_FACE_HUB_TOKEN"});
+            return out;
+        }
+
         // A Python child: UTF-8 output, unbuffered, so lines arrive as they
         // are written and decode the same everywhere.
         ChildProcess::Options pythonOptions(const std::string& python, std::vector<std::string> arguments,
@@ -429,6 +438,7 @@ namespace sirius::app::pyenv {
             o.arguments = std::move(arguments);
             o.workingDirectory = workingDirectory;
             o.environment = {{"PYTHONIOENCODING", "utf-8"}, {"PYTHONUNBUFFERED", "1"}};
+            o.unsetEnvironment = installerUnset();
             return o;
         }
 
@@ -438,7 +448,7 @@ namespace sirius::app::pyenv {
         ChildProcess::Options environmentPythonOptions(const std::string& envPython, std::vector<std::string> arguments,
                                                        const std::string& workingDirectory = std::string()) {
             ChildProcess::Options o = pythonOptions(envPython, std::move(arguments), workingDirectory);
-            o.unsetEnvironment = {"PYTHONHOME"};
+            o.unsetEnvironment.emplace_back("PYTHONHOME");
             return o;
         }
 
@@ -696,21 +706,35 @@ namespace sirius::app::pyenv {
                                                      ".lock", ".ds_store", "desktop.ini", "thumbs.db"};
             std::error_code ec;
             fs::directory_iterator it(fsPath(dir), ec);
+            bool any = false, identified = false;
             // increment(ec), not a range-for, whose increment throws.
             for (; !ec && it != fs::directory_iterator(); it.increment(ec)) {
                 const std::string given = utf8(it->path().filename());
                 const std::string name = lower(given);
+                any = true;
                 // the marker and the README, and what an interrupted atomic write leaves
                 if (names.count(name) == 0 && !startsWith(name, kMarkerFile) && !startsWith(name, "readme.txt")) {
                     if (foreign) *foreign = given.empty() ? std::string("a file whose name is not valid Unicode") : given;
                     return false;
                 }
+                if (name == "pyvenv.cfg" || name == kMarkerFile) identified = true;
+            }
+            // Names alone are not enough: ~/.local holds bin, lib, share and
+            // include too. A directory is an environment when a venv
+            // (pyvenv.cfg) or this module (the marker) says so; an empty one
+            // loses nothing.
+            if (!ec && any && !identified) {
+                if (foreign) *foreign = "no pyvenv.cfg or " + std::string(kMarkerFile);
+                return false;
             }
             return !ec;
         }
 
         // " (such as .vscode)" for the messages that refuse a directory.
-        std::string foreignText(const std::string& foreign) { return foreign.empty() ? std::string() : " (such as " + foreign + ")"; }
+        std::string foreignText(const std::string& foreign) {
+            if (foreign.empty()) return std::string();
+            return startsWith(foreign, "no pyvenv.cfg") ? " (it has " + foreign + ")" : " (such as " + foreign + ")";
+        }
 
         // The message that refuses to `action` ("remove", "replace") `dir`,
         // or nothing when it is a Python environment.
@@ -828,7 +852,7 @@ namespace sirius::app::pyenv {
 
         std::vector<std::string> indexArguments(const SetupOptions& options) {
             std::vector<std::string> out;
-            if (!options.indexUrl.empty()) out.insert(out.end(), {"--index-url", options.indexUrl});
+            // The index URL is not among them: installerIndexEnvironment.
             for (const std::string& d : options.findLinks) out.insert(out.end(), {"--find-links", d});
             if (options.noIndex) out.push_back("--no-index");
             return out;
@@ -1287,22 +1311,56 @@ namespace sirius::app::pyenv {
     }
 
     std::string redactUrl(const std::string& url) {
+        constexpr std::size_t npos = std::string::npos;
         std::string out = url;
         std::size_t from = 0;
         for (;;) {
             const std::size_t scheme = out.find("://", from);
-            if (scheme == std::string::npos) return out;
+            if (scheme == npos) return out;
             const std::size_t start = scheme + 3;
             std::size_t end = out.find_first_of("/?# \t\"'", start);
-            if (end == std::string::npos) end = out.size();
+            if (end == npos) end = out.size();
             const std::size_t at = out.rfind('@', end == 0 ? 0 : end - 1);
-            if (at != std::string::npos && at >= start && at < end) {
-                out.replace(start, at - start, "***");
-                from = start + 4;
-            } else {
-                from = start;
+            if (at != npos && at >= start && at < end) out.replace(start, at - start, "***");
+            // The query: every value, whatever its name (token=, key=, sig=, X-Amz-Signature=).
+            std::size_t urlEnd = out.find_first_of(" \t\"'", start);
+            if (urlEnd == npos) urlEnd = out.size();
+            const std::size_t q = out.find('?', start);
+            if (q != npos && q < urlEnd) {
+                std::size_t limit = out.find('#', q);
+                if (limit == npos || limit > urlEnd) limit = urlEnd;
+                std::size_t i = q + 1;
+                while (i < limit) {
+                    std::size_t amp = out.find('&', i);
+                    if (amp == npos || amp > limit) amp = limit;
+                    const std::size_t eq = out.find('=', i);
+                    if (eq != npos && eq < amp) {
+                        const std::size_t length = amp - eq - 1;
+                        if (out.compare(eq + 1, length, "***") != 0) {
+                            out.replace(eq + 1, length, "***");
+                            limit = limit + 3 - length;
+                            urlEnd = urlEnd + 3 - length;
+                            amp = eq + 4;
+                        }
+                    }
+                    i = amp + 1;
+                }
             }
+            from = urlEnd;
         }
+    }
+
+    const std::vector<std::string>& secretEnvironmentNames() {
+        static const std::vector<std::string> names{"SIRIUS_TOKEN", "SIRIUS_HPC_TOKEN", "SIRIUS_LLM_API_KEY", "OPENROUTER_API_KEY",
+                                                    "OPENAI_API_KEY", "ANTHROPIC_API_KEY", "AZURE_OPENAI_API_KEY", "GEMINI_API_KEY",
+                                                    "GOOGLE_API_KEY", "MISTRAL_API_KEY", "GROQ_API_KEY", "DEEPSEEK_API_KEY",
+                                                    "XAI_API_KEY", "TOGETHER_API_KEY", "COHERE_API_KEY", "CO_API_KEY"};
+        return names;
+    }
+
+    std::vector<std::pair<std::string, std::string>> installerIndexEnvironment(const SetupOptions& options, bool uv) {
+        if (options.indexUrl.empty()) return {};
+        return {{uv ? "UV_INDEX_URL" : "PIP_INDEX_URL", options.indexUrl}};
     }
 
     // --- the marker ---------------------------------------------------------------------
@@ -1859,7 +1917,9 @@ sys.stdout.write(json.dumps(d) + "\n")
                 o.killTree = true;
                 o.mergeErrorLines = true;
                 o.environment = {{"PYTHONIOENCODING", "utf-8"}, {"PYTHONUNBUFFERED", "1"}, {"UV_PYTHON_DOWNLOADS", "never"}};
-                o.unsetEnvironment = {"PYTHONHOME"};
+                for (auto& kv : installerIndexEnvironment(options, uv)) o.environment.push_back(std::move(kv));
+                o.unsetEnvironment = installerUnset();
+                o.unsetEnvironment.emplace_back("PYTHONHOME");
                 note("$ " + commandLine(command));
                 stepLines.clear();
                 lock.touch();

@@ -1386,6 +1386,7 @@ namespace {
     // channel), using the public framing API.
     void fakeWorker(std::unique_ptr<rpc::Transport> transport) {
         std::vector<std::byte> inbox;
+        rpc::HandshakeResponder handshake;   // the token-less handshake of a local worker
         for (;;) {
             std::optional<rpc::Message> msg;
             while (!(msg = rpc::decodeFrame(inbox))) {
@@ -1398,8 +1399,11 @@ namespace {
             const nlohmann::json& h = msg->header;
             const std::string method = h.value("method", "");
             nlohmann::json reply = {{"id", h.value("id", 0)}, {"type", "result"}};
-            if (method == "hello") {
-                reply["result"] = {{"version", "test"}, {"protocol_version", rpc::kProtocolVersion}, {"methods", {"run:torch_segment", "model_info"}}, {"cuda", false}, {"device", "cpu · fake"}, {"hostname", "fake"}, {"python", "3"}};
+            if (method == "hello" || method == "auth") {
+                std::string error;
+                const nlohmann::json caps = {{"version", "test"}, {"methods", {"run:torch_segment", "model_info"}}, {"cuda", false}, {"device", "cpu · fake"}, {"hostname", "fake"}, {"python", "3"}};
+                if (auto r = handshake.answer(method, h.value("params", nlohmann::json::object()), caps, error)) reply["result"] = *r;
+                else reply = {{"id", h.value("id", 0)}, {"type", "error"}, {"message", error}};
                 transport->send(rpc::encodeFrame(reply, {}));
             } else if (method == "model_info") {
                 reply["result"] = {{"format", "TorchScript"}, {"input_shape", {1, 1, "Z", "Y", "X"}}, {"input_dtype", "float32"}, {"output_shape", {1, 2, "Z", "Y", "X"}}, {"size_bytes", 41 * 1024 * 1024}};
@@ -1515,6 +1519,7 @@ namespace {
     // probability map; model_info reports the family and its availability.
     void fakeLabelWorker(std::unique_ptr<rpc::Transport> transport, bool withProb) {
         std::vector<std::byte> inbox;
+        rpc::HandshakeResponder handshake;   // the token-less handshake of a local worker
         for (;;) {
             std::optional<rpc::Message> msg;
             while (!(msg = rpc::decodeFrame(inbox))) {
@@ -1527,8 +1532,11 @@ namespace {
             const nlohmann::json& h = msg->header;
             const std::string method = h.value("method", "");
             nlohmann::json reply = {{"id", h.value("id", 0)}, {"type", "result"}};
-            if (method == "hello") {
-                reply["result"] = {{"version", "test"}, {"protocol_version", rpc::kProtocolVersion}, {"methods", {"run:torch_segment", "model_info", "hub_search"}}, {"cuda", false}, {"device", "cpu · fake"}, {"hostname", "fake"}, {"python", "3"}};
+            if (method == "hello" || method == "auth") {
+                std::string error;
+                const nlohmann::json caps = {{"version", "test"}, {"methods", {"run:torch_segment", "model_info", "hub_search"}}, {"cuda", false}, {"device", "cpu · fake"}, {"hostname", "fake"}, {"python", "3"}};
+                if (auto r = handshake.answer(method, h.value("params", nlohmann::json::object()), caps, error)) reply["result"] = *r;
+                else reply = {{"id", h.value("id", 0)}, {"type", "error"}, {"message", error}};
                 transport->send(rpc::encodeFrame(reply, {}));
             } else if (method == "model_info") {
                 const std::string spec = h["params"].value("spec", "");
@@ -1975,6 +1983,7 @@ namespace {
     void fakePromptWorker(std::unique_ptr<rpc::Transport> transport, FakePrompt mode) {
         const bool promptable = mode != FakePrompt::NotPromptable;
         std::vector<std::byte> inbox;
+        rpc::HandshakeResponder handshake;   // the token-less handshake of a local worker
         for (;;) {
             std::optional<rpc::Message> msg;
             while (!(msg = rpc::decodeFrame(inbox))) {
@@ -1987,8 +1996,11 @@ namespace {
             const nlohmann::json& h = msg->header;
             const std::string method = h.value("method", "");
             nlohmann::json reply = {{"id", h.value("id", 0)}, {"type", "result"}};
-            if (method == "hello") {
-                reply["result"] = {{"version", "test"}, {"protocol_version", rpc::kProtocolVersion}, {"methods", {"run:foundation", "run:torch_segment", "model_info"}}, {"cuda", false}, {"device", "cpu · fake"}, {"hostname", "fake"}, {"python", "3"}};
+            if (method == "hello" || method == "auth") {
+                std::string error;
+                const nlohmann::json caps = {{"version", "test"}, {"methods", {"run:foundation", "run:torch_segment", "model_info"}}, {"cuda", false}, {"device", "cpu · fake"}, {"hostname", "fake"}, {"python", "3"}};
+                if (auto r = handshake.answer(method, h.value("params", nlohmann::json::object()), caps, error)) reply["result"] = *r;
+                else reply = {{"id", h.value("id", 0)}, {"type", "error"}, {"message", error}};
                 transport->send(rpc::encodeFrame(reply, {}));
             } else if (method == "model_info") {
                 const std::string spec = h.at("params").value("spec", std::string());

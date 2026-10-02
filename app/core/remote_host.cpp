@@ -1,6 +1,7 @@
 #include "core/remote_host.hpp"
 
 #include "core/host.hpp"
+#include "core/secure_wipe.hpp"
 
 #include <algorithm>
 #include <cstdio>
@@ -71,6 +72,13 @@ namespace sirius::app::ssh {
             ensureSockets();
             sock_t s = ::socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
             if (s == SIRIUS_BAD_SOCKET) return s;
+#ifdef _WIN32
+            // Without it Winsock lets another process bind the same port
+            // with SO_REUSEADDR and take the helper's connection (its secret
+            // and the answer); this is what POSIX gives by default.
+            const BOOL exclusive = TRUE;
+            setsockopt(s, SOL_SOCKET, SO_EXCLUSIVEADDRUSE, reinterpret_cast<const char*>(&exclusive), sizeof exclusive);
+#endif
             sockaddr_in a{};
             a.sin_family = AF_INET;
             a.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
@@ -171,6 +179,18 @@ namespace sirius::app::ssh {
 
     // --- askpass --------------------------------------------------------------------
 
+    bool isHostKeyConfirmation(const std::string& kind, const std::string& text) {
+        // OpenSSH's own question about an unknown host key, told by the
+        // environment ssh gives its helper, or by OpenSSH's exact wording in
+        // a prompt that is not a server's: keyboard-interactive prompts reach
+        // the helper prefixed with "(user@host) ", and a server can put
+        // anything after that, "(yes/no)" included -- which must not be
+        // enough to show a password in clear.
+        if (kind == "confirm") return true;
+        return text.rfind("The authenticity of host ", 0) == 0 &&
+               text.find("Are you sure you want to continue connecting (yes/no") != std::string::npos;
+    }
+
     AskpassServer::AskpassServer(Handler handler) : handler_(std::move(handler)), secret_(randomHex(24)) {
         const sock_t s = listenLoopback(port_);
         if (s == SIRIUS_BAD_SOCKET) throw SshError("cannot open a loopback port for the password prompts");
@@ -179,18 +199,44 @@ namespace sirius::app::ssh {
     }
 
     AskpassServer::~AskpassServer() {
+        close();
+        // A connection may still be in the handler (a prompt the user has
+        // not answered yet); its owner ends that wait before this runs.
+        std::vector<std::thread> conns;
+        {
+            const std::lock_guard<std::mutex> g(connMutex_);
+            conns.swap(connections_);
+            doneIds_.clear();
+        }
+        for (std::thread& t : conns)
+            if (t.joinable()) t.join();
+        secureWipe(secret_);
+    }
+
+    void AskpassServer::close() {
+        // Not the connections in flight: one may be in the handler, whose
+        // answer the caller of close() may itself be what ends.
         stop_.store(true);
-        if (thread_.joinable()) thread_.join();
-        if (listener_ != -1) closeSock(static_cast<sock_t>(listener_));
+        if (thread_.joinable() && thread_.get_id() != std::this_thread::get_id()) thread_.join();
+        if (listener_ != -1) {
+            closeSock(static_cast<sock_t>(listener_));
+            listener_ = -1;
+        }
     }
 
     std::vector<std::pair<std::string, std::string>> AskpassServer::environment(const std::string& program) const {
-        return {{"SSH_ASKPASS", program},
-                {"SSH_ASKPASS_REQUIRE", "force"},
-                // OpenSSH before 8.4 wants a DISPLAY before it uses SSH_ASKPASS at all
-                {"DISPLAY", host::hasEnvironment("DISPLAY") ? host::environment("DISPLAY") : std::string(":0")},
-                {kPortVar, std::to_string(port_)},
-                {kSecretVar, secret_}};
+        std::vector<std::pair<std::string, std::string>> env = {{"SSH_ASKPASS", program},
+                                                                {"SSH_ASKPASS_REQUIRE", "force"},
+                                                                {kPortVar, std::to_string(port_)},
+                                                                {kSecretVar, secret_}};
+#ifndef _WIN32
+        // OpenSSH before 8.4 wants a DISPLAY before it uses SSH_ASKPASS at
+        // all. Windows' OpenSSH honours SSH_ASKPASS_REQUIRE=force without
+        // one, so it is not set there; ssh runs with -x either way, so the
+        // value never opens an X11 forwarding.
+        env.emplace_back("DISPLAY", host::hasEnvironment("DISPLAY") ? host::environment("DISPLAY") : std::string(":0"));
+#endif
+        return env;
     }
 
     void AskpassServer::serve() {
@@ -199,27 +245,74 @@ namespace sirius::app::ssh {
             if (!readable(listener, 200)) continue;
             const sock_t c = ::accept(listener, nullptr, nullptr);
             if (c == SIRIUS_BAD_SOCKET) continue;
-            std::string line;
-            json reply = {{"cancel", true}};
-            if (readSockLine(c, line, 5000)) {
-                try {
-                    const json req = json::parse(line);
-                    if (sameSecret(req.value("secret", std::string()), secret_)) {
-                        Prompt p;
-                        p.text = req.value("prompt", std::string());
-                        const std::string kind = req.value("kind", std::string());
-                        p.notifyOnly = kind == "none";
-                        p.echo = kind == "confirm" || p.text.find("(yes/no") != std::string::npos;
-                        const std::optional<std::string> answer = handler_ ? handler_(p) : std::nullopt;
-                        if (answer) reply = {{"answer", *answer}};
-                    }
-                } catch (const std::exception&) {
-                    // a malformed request is answered as cancelled
+            const std::lock_guard<std::mutex> g(connMutex_);
+            // finished connections are joined as new ones come
+            for (std::size_t i = 0; i < connections_.size();) {
+                const auto done = doneIds_.find(connections_[i].get_id());
+                if (done != doneIds_.end()) {
+                    doneIds_.erase(done);
+                    connections_[i].join();
+                    connections_.erase(connections_.begin() + static_cast<std::ptrdiff_t>(i));
+                } else {
+                    ++i;
                 }
             }
-            sendAll(c, reply.dump() + "\n");
-            closeSock(c);
+            // Anyone on this machine can connect to a loopback port: one
+            // connection's thread each, so a peer that sends nothing holds
+            // neither the listener nor the prompt the real helper brings, and
+            // a cap so that many of them cannot pile up threads.
+            if (connections_.size() >= 8) {
+                closeSock(c);
+                continue;
+            }
+            connections_.emplace_back([this, c] {
+                serveOne(static_cast<std::intptr_t>(c));
+                const std::lock_guard<std::mutex> g2(connMutex_);
+                doneIds_.insert(std::this_thread::get_id());
+            });
         }
+    }
+
+    void AskpassServer::serveOne(std::intptr_t conn) {
+        const sock_t c = static_cast<sock_t>(conn);
+        std::string line;
+        json reply = {{"cancel", true}};
+        // The helper writes its one line as soon as it is connected: a
+        // second is plenty, and a silent peer is dropped after it.
+        if (readSockLine(c, line, 1000)) {
+            try {
+                json req = json::parse(line);
+                std::string secret = req.value("secret", std::string());
+                const bool ok = sameSecret(secret, secret_);
+                secureWipe(secret);
+                if (req.is_object() && req.contains("secret") && req["secret"].is_string()) secureWipe(req["secret"].get_ref<std::string&>());
+                if (ok && !stop_.load()) {
+                    Prompt p;
+                    p.text = req.value("prompt", std::string());
+                    const std::string kind = req.value("kind", std::string());
+                    p.notifyOnly = kind == "none";
+                    p.echo = isHostKeyConfirmation(kind, p.text);
+                    std::optional<std::string> answer;
+                    {
+                        // one prompt at a time, as ssh asks them
+                        const std::lock_guard<std::mutex> g(handlerMutex_);
+                        if (handler_ && !stop_.load()) answer = handler_(p);
+                    }
+                    if (answer) {
+                        reply = {{"answer", *answer}};
+                        secureWipe(*answer);
+                    }
+                }
+            } catch (const std::exception&) {
+                // a malformed request is answered as cancelled
+            }
+        }
+        secureWipe(line);
+        std::string text = reply.dump() + "\n";
+        if (reply.contains("answer") && reply["answer"].is_string()) secureWipe(reply["answer"].get_ref<std::string&>());
+        sendAll(c, text);
+        secureWipe(text);
+        closeSock(c);
     }
 
     bool isAskpassInvocation() { return host::hasEnvironment(kPortVar) && host::hasEnvironment(kSecretVar); }
@@ -244,13 +337,20 @@ namespace sirius::app::ssh {
         // the user may take a while: a one-time code from a phone
         const bool got = sendAll(s, req.dump() + "\n") && readSockLine(s, line, 15 * 60 * 1000, 1 << 20);
         closeSock(s);
-        if (!got) return 1;
+        if (!got) {
+            secureWipe(line);
+            return 1;
+        }
         std::string answer;
         try {
-            const json r = json::parse(line);
+            json r = json::parse(line);
+            secureWipe(line);
             if (!r.contains("answer") || !r["answer"].is_string()) return 1;
-            answer = r["answer"].get<std::string>() + "\n";
+            std::string& inJson = r["answer"].get_ref<std::string&>();
+            answer = inJson + "\n";
+            secureWipe(inJson);
         } catch (const std::exception&) {
+            secureWipe(line);
             return 1;
         }
 #ifdef _WIN32
@@ -261,7 +361,7 @@ namespace sirius::app::ssh {
         std::fwrite(answer.data(), 1, answer.size(), stdout);
         std::fflush(stdout);
 #endif
-        std::fill(answer.begin(), answer.end(), '\0');
+        secureWipe(answer);
         return 0;
     }
 
@@ -269,6 +369,13 @@ namespace sirius::app::ssh {
 
     std::vector<std::string> sshArguments(const Options& o, int socksPort) {
         std::vector<std::string> a = {"-T",
+                                      // no X11 and no agent towards the cluster: a login node
+                                      // must not reach this machine's display or keys
+                                      "-x", "-a",
+                                      "-o", "ForwardAgent=no",
+                                      "-o", "ForwardX11=no",
+                                      // no command of the ssh config's choosing runs here
+                                      "-o", "PermitLocalCommand=no",
                                       "-o", "BatchMode=no",
                                       // a wrong password costs one attempt, never three
                                       "-o", "NumberOfPasswordPrompts=1",
@@ -311,6 +418,16 @@ namespace sirius::app::ssh {
         const std::vector<std::string> args = sshArguments(o, socksPort_);
         co.arguments.insert(co.arguments.end(), args.begin(), args.end());
         co.environment = o.environment;
+        // ssh and whatever it starts (the askpass helper, a ProxyCommand) end
+        // with the session, and with the application however it ends: a crash
+        // must not leave an authenticated connection and its SOCKS proxy
+        // behind. Windows: a job object that closes with the application;
+        // POSIX: ssh's own process group, which stop() ends, while an
+        // application that dies closes ssh's stdin, which ends the remote
+        // shell and with it ssh. Not Linux's parent-death signal: it follows
+        // the thread that logged in, which ends long before the session.
+        co.killTree = true;
+        co.parentDeathSignal = false;
         child_ = std::make_unique<ChildProcess>();
         child_->setErrorHandler([this](const std::string& line) {
             std::string l = line;

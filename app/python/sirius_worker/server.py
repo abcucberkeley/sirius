@@ -3,7 +3,9 @@ time, streamed progress, cancellation.
 
 Requests (see protocol.py for the framing):
 
-    hello       {token, protocol_version}   -> capabilities (incl. protocol_version)
+    hello       {protocol_version, client_nonce}
+                                            -> {protocol_version, server_nonce, server_proof}
+    auth        {client_proof}              -> capabilities (incl. protocol_version)
     ping        {}                          -> {}
     list_plugins   {}                       -> {plugins: [spec + file (+ error)], dirs}
     reload_plugins {}                       -> the same, after re-importing every plugin file
@@ -52,17 +54,22 @@ Run kinds and their tensors:
 
 The reader loop runs on the connection's thread and the job on a worker
 thread, so a cancel request is read while a run is in progress. Every reply
-carries the request's id. One client at a time by default; with
---max-clients N (the cluster job) up to N connections are served at once,
-each on its own thread -- the application keeps one for its status, one
-for the dataset it shows and one per run -- while jobs still run one at a
-time (a second is refused as busy) and a connection that goes away cancels
-only its own.
+carries the request's id. Every connection has a thread of its own; one
+authenticated client at a time by default (the next one's `auth` is answered
+once the client before it has gone); with --max-clients N (the cluster job)
+up to N authenticated connections are served at once -- the application
+keeps one for its status, one for the dataset it shows and one per run --
+while jobs still run one at a time (a second is refused as busy) and a
+connection that goes away cancels only its own.
 
-Trust model (app/python/SECURITY.md): whoever completes `hello` can run code
-here, so the listener refuses a non-loopback address without a token, the
-token is compared in constant time, and everything a peer sends before its
-`hello` is capped at protocol.MAX_PREAUTH_FRAME. `hello` also exchanges
+Trust model (app/python/SECURITY.md): whoever completes the handshake can run
+code here, so the listener refuses a non-loopback address without a token.
+The token itself never crosses the wire: `hello` and `auth` are a
+challenge-response in which each side proves it holds the token
+(protocol.handshake_proof), the worker first. Before that, a peer is held to
+protocol.MAX_PREAUTH_FRAME, PREAUTH_TIMEOUT seconds and MAX_PREAUTH
+concurrent connections of its kind, so anonymous peers can neither fill the
+client slots nor hold the listener. `hello` also exchanges
 protocol.PROTOCOL_VERSION and refuses a peer that speaks another one.
 """
 
@@ -74,6 +81,7 @@ import json
 import logging
 import os
 import platform
+import secrets
 import select
 import socket
 import sys
@@ -87,7 +95,16 @@ import numpy as np
 from . import __version__, datasets
 from . import models as model_hub
 from . import plugins as plugin_registry
-from .protocol import DTYPES, MAX_PREAUTH_FRAME, PROTOCOL_VERSION, ProtocolError, encode_frame, read_frame
+from .protocol import (
+    DTYPES,
+    MAX_PREAUTH_FRAME,
+    PROTOCOL_VERSION,
+    ProtocolError,
+    encode_frame,
+    handshake_proof,
+    read_frame,
+    valid_nonce,
+)
 from .steps import workbench
 
 log = logging.getLogger("sirius_worker")
@@ -101,19 +118,34 @@ class _Cancelled(Exception):
 
 
 class WorkerServer:
+    # A peer has this long from connecting to completing `hello` and `auth`:
+    # two frames of a few hundred bytes.
+    PREAUTH_TIMEOUT = 5.0
+    # Connections still in their handshake at once; one more is closed as it
+    # is accepted, so anonymous peers cannot take every thread or slot.
+    MAX_PREAUTH = 8
+    # An authenticated connection that sends nothing, and runs nothing, for
+    # this long is closed (the application reconnects when it needs to; its
+    # status connection pings every 15 s). 0 keeps idle connections forever.
+    IDLE_TIMEOUT = 3600.0
+    # How often the connection loop looks at the stop flag while idle.
+    IDLE_POLL = 0.5
+
     def __init__(self, host: str = "127.0.0.1", port: int = 0, token: str = "", device: str = "auto",
-                 max_clients: int = 1) -> None:
+                 max_clients: int = 1, idle_timeout: Optional[float] = None) -> None:
         self.host = host
         self.port = port
         self.token = token or ""
         self.device = device
         self.max_clients = max_clients
+        self.idle_timeout = self.IDLE_TIMEOUT if idle_timeout is None else float(idle_timeout)
         self._listener: Optional[socket.socket] = None
         self._stop = threading.Event()
         self._job_lock = threading.Lock()
         self._job: Optional[Dict[str, Any]] = None
-        self._clients_lock = threading.Lock()
-        self._clients = 0
+        self._clients_cv = threading.Condition()
+        self._clients = 0       # authenticated connections holding a slot
+        self._preauth = 0       # connections still in their handshake
         self._threads: list = []
 
     # --- lifecycle ------------------------------------------------------------
@@ -124,12 +156,12 @@ class WorkerServer:
         if not self.token and not is_loopback(self.host):
             raise ValueError(
                 f"refusing to listen on {self.host or '0.0.0.0'} without a token: any host that can reach this "
-                f"port could run code as {_username()}. Pass --token (or set $SIRIUS_TOKEN), for example "
+                f"port could run code as {_username()}. Set $SIRIUS_TOKEN (or --token-file), for example "
                 "SIRIUS_TOKEN=$(openssl rand -hex 16); or bind 127.0.0.1 and reach the worker through an SSH "
                 "tunnel (app/python/SECURITY.md)")
         if not self.token:
             log.warning("no token: every client that can connect to %s:%s is served. That is only safe on a "
-                        "machine you are the only user of; pass --token to require a shared secret.",
+                        "machine you are the only user of; set $SIRIUS_TOKEN to require a shared secret.",
                         self.host, self.port or "<auto>")
         s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         # On Winsock SO_REUSEADDR lets a second socket bind a port that is
@@ -161,23 +193,22 @@ class WorkerServer:
                 except OSError:
                     break
                 peer = _peer(addr)
-                if self.max_clients <= 1:
-                    self._serve_and_close(conn, peer)
-                    continue
-                with self._clients_lock:
-                    full = self._clients >= self.max_clients
-                    if not full:
-                        self._clients += 1
-                if full:
-                    log.warning("client %s refused: %d clients are connected already", peer, self.max_clients)
+                # Every connection is served on its own thread, so one that
+                # never speaks cannot hold the listener; the ones still in
+                # their handshake are capped and have PREAUTH_TIMEOUT.
+                with self._clients_cv:
+                    crowded = self._preauth >= self.MAX_PREAUTH
+                    if not crowded:
+                        self._preauth += 1
+                if crowded:
+                    log.warning("connection from %s closed: %d connections are in their handshake already", peer,
+                                self.MAX_PREAUTH)
                     try:
-                        conn.sendall(encode_frame({"id": None, "type": "error",
-                                                   "message": f"busy: {self.max_clients} clients are connected already"}))
+                        conn.close()
                     except OSError:
                         pass
-                    conn.close()
                     continue
-                th = threading.Thread(target=self._serve_counted, args=(conn, peer), name=f"sirius-client-{peer}",
+                th = threading.Thread(target=self._serve_and_close, args=(conn, peer), name=f"sirius-client-{peer}",
                                       daemon=True)
                 self._threads = [t for t in self._threads if t.is_alive()] + [th]
                 th.start()
@@ -197,12 +228,35 @@ class WorkerServer:
                 pass
             log.info("client %s disconnected", peer)
 
-    def _serve_counted(self, conn: socket.socket, peer: str) -> None:
-        try:
-            self._serve_and_close(conn, peer)
-        finally:
-            with self._clients_lock:
-                self._clients -= 1
+    def _take_slot(self, conn: socket.socket) -> bool:
+        """A client slot for a connection that has just authenticated. With
+        --max-clients N > 1 it is there or not (busy); with one client at a
+        time the connection waits for the one before it to go -- as long as
+        it takes, unless it hangs up or the worker stops."""
+        with self._clients_cv:
+            if self.max_clients > 1:
+                if self._clients >= self.max_clients:
+                    return False
+                self._clients += 1
+                return True
+        while not self._stop.is_set():
+            with self._clients_cv:
+                if self._clients < 1:
+                    self._clients += 1
+                    return True
+                self._clients_cv.wait(self.IDLE_POLL)
+            if _peer_closed(conn):
+                return False
+        return False
+
+    def _release_slot(self) -> None:
+        with self._clients_cv:
+            self._clients -= 1
+            self._clients_cv.notify_all()
+
+    def _leave_preauth(self) -> None:
+        with self._clients_cv:
+            self._preauth -= 1
 
     def stop(self) -> None:
         self._stop.set()
@@ -278,17 +332,11 @@ class WorkerServer:
             "tifffile": _module_version("tifffile"),
         }
 
-    def _handshake(self, params: Dict[str, Any]) -> Tuple[bool, str]:
-        """Check a `hello`: the token first (constant time, so a wrong one
-        leaks nothing through timing), then the protocol version. Returns
-        (ok, message); the message is what the client is told and logged."""
-        if self.token:
-            supplied = params.get("token", "")
-            supplied = supplied if isinstance(supplied, str) else ""
-            if not hmac.compare_digest(supplied.encode("utf-8"), self.token.encode("utf-8")):
-                return False, "authentication failed: bad token"
-        # Same version required on both ends. A peer that does not send the
-        # field predates the handshake and counts as version 0.
+    def _check_version(self, params: Dict[str, Any]) -> Tuple[bool, str]:
+        """The protocol version of a `hello`: the same on both ends. A peer
+        that does not send the field predates the handshake and counts as
+        version 0. Returns (ok, message); the message is what the client is
+        told and logged."""
         raw = params.get("protocol_version", 0)
         theirs = raw if isinstance(raw, int) and not isinstance(raw, bool) else 0
         if theirs != PROTOCOL_VERSION:
@@ -301,29 +349,41 @@ class WorkerServer:
 
     # --- one connection ----------------------------------------------------------
 
-    # A peer that connects and never completes `hello` is dropped after this
-    # long: serving is serial, so a silent connection would otherwise hold
-    # the port for everyone else.
-    HELLO_TIMEOUT = 15.0
-    # How often the connection loop looks at the stop flag while idle.
-    IDLE_POLL = 0.5
-
     def _serve_client(self, conn: socket.socket, peer: str = "?") -> None:
-        conn.settimeout(None)
+        """Serve one connection. It arrives counted among the connections in
+        their handshake (serve_forever); this leaves that count, and gives
+        back the client slot it took, however it ends."""
+        state = {"preauth": True, "slot": False}
+        try:
+            conn.settimeout(None)
+            self._serve_connection(conn, peer, state)
+        finally:
+            if state["preauth"]:
+                self._leave_preauth()
+            if state["slot"]:
+                self._release_slot()
+
+    def _serve_connection(self, conn: socket.socket, peer: str, state: Dict[str, bool]) -> None:
         send_lock = threading.Lock()
         owner = object()   # this connection's jobs: its cancel and its disconnect reach only them
-        hello_deadline = time.monotonic() + self.HELLO_TIMEOUT
+        preauth_deadline = time.monotonic() + self.PREAUTH_TIMEOUT
         # Nothing is served, with or without a token, until `hello` has agreed
-        # on the protocol version -- and until then the peer's frames are held
-        # to MAX_PREAUTH_FRAME.
+        # on the protocol version and `auth` has proved the token -- and until
+        # then the peer's frames are held to MAX_PREAUTH_FRAME.
         authenticated = False
+        nonces: Optional[Tuple[str, str]] = None   # (client, worker) once `hello` is answered
+        last_activity = time.monotonic()
 
         def keep_reading() -> bool:
             # A frame in flight is read to its end only while the worker is
-            # not stopping and, before `hello`, only until the hello deadline:
-            # one byte of a header used to block the reader for good, locking
-            # everyone else out and SIGTERM with them.
-            return not self._stop.is_set() and (authenticated or time.monotonic() <= hello_deadline)
+            # not stopping and, before authentication, only until the
+            # handshake deadline: one byte of a header used to block the
+            # reader for good, locking everyone else out and SIGTERM with them.
+            return not self._stop.is_set() and (authenticated or time.monotonic() <= preauth_deadline)
+
+        def own_job_running() -> bool:
+            job = self._current_job()
+            return job is not None and job.get("owner") is owner and job["thread"].is_alive()
 
         def send(header: Dict[str, Any], tensors=None) -> None:
             data = encode_frame(header, tensors)
@@ -346,8 +406,15 @@ class WorkerServer:
             except (OSError, ValueError):
                 break
             if not readable:
-                if not authenticated and time.monotonic() > hello_deadline:
-                    log.warning("client %s sent no hello within %.0f s; dropped", peer, self.HELLO_TIMEOUT)
+                now = time.monotonic()
+                if not authenticated and now > preauth_deadline:
+                    log.warning("client %s did not complete the handshake within %.0f s; dropped", peer,
+                                self.PREAUTH_TIMEOUT)
+                    break
+                if authenticated and own_job_running():
+                    last_activity = now
+                elif authenticated and self.idle_timeout > 0 and now - last_activity > self.idle_timeout:
+                    log.info("client %s sent nothing for %.0f s; closed", peer, self.idle_timeout)
                     break
                 continue
             try:
@@ -361,8 +428,8 @@ class WorkerServer:
                 if self._stop.is_set():
                     log.info("stopping with a frame from %s half read", peer)
                 else:
-                    log.warning("client %s sent no complete hello within %.0f s (%s); dropped", peer,
-                                self.HELLO_TIMEOUT, e)
+                    log.warning("client %s did not complete the handshake within %.0f s (%s); dropped", peer,
+                                self.PREAUTH_TIMEOUT, e)
                 break
             except ProtocolError as e:
                 log.warning("protocol error from %s: %s", peer, e)
@@ -381,6 +448,7 @@ class WorkerServer:
                 except OSError:
                     pass
                 break
+            last_activity = time.monotonic()
             rid = header.get("id")
             method = str(header.get("method", ""))
             params = header.get("params")
@@ -391,15 +459,52 @@ class WorkerServer:
                 continue
             try:
                 if method == "hello":
-                    ok, message = self._handshake(params)
+                    if nonces is not None or authenticated:
+                        error(rid, "hello was sent already")
+                        break
+                    ok, message = self._check_version(params)
                     if not ok:
                         error(rid, message)
                         log.warning("%s: %s", peer, message)
                         break
+                    client_nonce = params.get("client_nonce")
+                    if not valid_nonce(client_nonce):
+                        error(rid, "hello: client_nonce is missing or malformed")
+                        log.warning("%s: hello without a valid client_nonce", peer)
+                        break
+                    # The worker proves itself first: the client sends nothing
+                    # more to a peer that cannot.
+                    nonces = (client_nonce, secrets.token_hex(16))
+                    reply(rid, {"protocol_version": PROTOCOL_VERSION, "server_nonce": nonces[1],
+                                "server_proof": handshake_proof(self.token, "worker", *nonces)})
+                elif method == "auth" and not authenticated:
+                    if nonces is None:
+                        error(rid, "not authenticated: send 'hello' first")
+                        break
+                    proof = params.get("client_proof")
+                    expected = handshake_proof(self.token, "client", *nonces)
+                    if not isinstance(proof, str) or not hmac.compare_digest(proof.encode("utf-8"),
+                                                                             expected.encode("utf-8")):
+                        error(rid, "authentication failed: the client's proof does not match this worker's token")
+                        log.warning("%s: authentication failed (wrong token)", peer)
+                        break
+                    state["preauth"] = False
+                    self._leave_preauth()
+                    state["slot"] = self._take_slot(conn)
+                    if not state["slot"]:
+                        if not self._stop.is_set():
+                            log.warning("client %s refused: %d clients are connected already", peer,
+                                        self.max_clients)
+                            try:
+                                error(rid, f"busy: {self.max_clients} clients are connected already")
+                            except OSError:
+                                pass
+                        break
                     authenticated = True
+                    last_activity = time.monotonic()
                     reply(rid, self.capabilities())
                 elif not authenticated:
-                    error(rid, "not authenticated: send 'hello' with the worker token first")
+                    error(rid, "not authenticated: complete the handshake ('hello', then 'auth') first")
                 elif method == "ping":
                     reply(rid, {"time": time.time()})
                 elif method == "shutdown":
@@ -461,7 +566,15 @@ class WorkerServer:
                 elif method == "models_delete":
                     reply(rid, model_hub.delete_cached_model(str(params.get("path", ""))))
                 elif method in ("list_plugins", "reload_plugins"):
-                    reply(rid, self.plugin_list(reload=method == "reload_plugins", extra=params.get("dirs")))
+                    extra = params.get("dirs")
+                    if extra and not is_loopback(self.host):
+                        # Importing a file is running it: a worker other
+                        # machines can reach loads plugins only from the
+                        # folders it was started with (SECURITY.md).
+                        raise ValueError(f"this worker listens on {self.host or '0.0.0.0'}: it loads plugins only "
+                                         "from the folders it was started with ($SIRIUS_PLUGIN_DIRS, ~/.sirius/plugins),"
+                                         " not from folders a client names")
+                    reply(rid, self.plugin_list(reload=method == "reload_plugins", extra=extra))
                 elif method == "cancel":
                     target = params.get("id", header.get("target"))
                     self._cancel(target, owner)
@@ -858,6 +971,17 @@ def is_loopback(host: str) -> bool:
         return False
 
 
+def _peer_closed(conn: socket.socket) -> bool:
+    """True once the peer has hung up (end-of-file waiting to be read)."""
+    try:
+        readable, _, _ = select.select([conn], [], [], 0)
+        if not readable:
+            return False
+        return conn.recv(1, socket.MSG_PEEK) == b""
+    except (OSError, ValueError):
+        return True
+
+
 def _peer(addr) -> str:
     try:
         return f"{addr[0]}:{addr[1]}"
@@ -931,5 +1055,5 @@ def announce(server: WorkerServer, stream=None) -> None:
     """Print the one JSON line the launching application waits for."""
     stream = stream or sys.stdout
     stream.write(json.dumps({"port": server.port, "pid": os.getpid(), "host": server.host,
-                             "device": server.resolved_device()}) + "\n")
+                             "hostname": platform.node(), "device": server.resolved_device()}) + "\n")
     stream.flush()

@@ -1,14 +1,21 @@
 """Command line of the SIRIUS compute worker.
 
-    python -m sirius_worker [--host H] [--port P] [--token T] [--device auto|cuda|cpu]
-                            [--allow-install] [--max-clients N] [--log-level L]
+    python -m sirius_worker [--host H] [--port P] [--token-file F] [--device auto|cuda|cpu]
+                            [--allow-install] [--max-clients N] [--idle-timeout S] [--log-level L]
     python -m sirius_worker --check
 
 Listens on host:port (port 0 picks a free one), prints one JSON line
-``{"port": N, "pid": ..., "host": ..., "device": ...}`` to stdout once it is
-ready -- the launching application reads exactly that -- and logs to stderr.
-The token, when given, must be sent with the client's ``hello``, together
-with the protocol version both ends have to agree on.
+``{"port": N, "pid": ..., "host": ..., "hostname": ..., "device": ...}`` to
+stdout once it is ready -- the launching application reads exactly that --
+and logs to stderr.
+
+The token comes from, in this order: ``--token-file`` / ``$SIRIUS_TOKEN_FILE``
+(a file only its owner can read, which is deleted once read: how the cluster
+job gets it without it ever being in the job's environment), ``$SIRIUS_TOKEN``,
+or ``--token`` (accepted, with a warning: a command line is visible to every
+user of the machine). Both variables are removed from the environment, so no
+subprocess inherits them. The client proves it knows the token, and the
+worker proves it back, without the token crossing the wire (protocol.py).
 
 When a package the worker cannot start without (``REQUIRED``, numpy) is not
 installed in this interpreter, it prints one JSON line instead,
@@ -131,8 +138,14 @@ def main(argv=None) -> int:
     parser.add_argument("--host", default="127.0.0.1",
                         help="interface to listen on (0.0.0.0 for a cluster node; then a token is required)")
     parser.add_argument("--port", type=int, default=0, help="TCP port; 0 picks a free port")
-    parser.add_argument("--token", default=os.environ.get("SIRIUS_TOKEN", ""),
-                        help="shared secret the client must present (default: $SIRIUS_TOKEN)")
+    parser.add_argument("--token", default=None,
+                        help="shared secret (prefer $SIRIUS_TOKEN or --token-file: a command line is visible to "
+                             "every user of the machine)")
+    parser.add_argument("--token-file", default=None,
+                        help="read the token from this file (mode 0600) and delete it (default: $SIRIUS_TOKEN_FILE)")
+    parser.add_argument("--idle-timeout", type=float, default=None,
+                        help="close an authenticated connection that sends nothing for this many seconds "
+                             "(default 3600; 0 never)")
     parser.add_argument("--device", default="auto", type=_device,
                         help="where models run: auto (cuda when torch sees a GPU), cpu, cuda, or cuda:N for one GPU")
     # Package installation (the `install` method: pip / conda in this
@@ -163,6 +176,12 @@ def main(argv=None) -> int:
     logging.basicConfig(stream=sys.stderr, level=getattr(logging, args.log_level.upper(), logging.INFO),
                         format="%(asctime)s %(name)s %(levelname)s %(message)s")
 
+    try:
+        token = _token(args)
+    except (OSError, ValueError) as e:
+        logging.getLogger("sirius_worker").error("%s", e)
+        return 2
+
     # Before anything imports numpy: without it the imports below end in a
     # traceback, which the application can only show as it is. This line says
     # what is missing and where, so that it can offer the fix instead.
@@ -191,7 +210,7 @@ def main(argv=None) -> int:
         logging.getLogger("sirius_worker").error("%s", e)
         return 2
 
-    server = WorkerServer(args.host, args.port, args.token, args.device, max(1, args.max_clients))
+    server = WorkerServer(args.host, args.port, token, args.device, max(1, args.max_clients), args.idle_timeout)
     try:
         server.bind()
     except (OSError, ValueError) as e:
@@ -213,6 +232,55 @@ def main(argv=None) -> int:
         watch_parent(server)
     server.serve_forever()
     return 0
+
+
+def read_token_file(path: str) -> str:
+    """The token in `path`, which is then deleted. On POSIX the file must be
+    a regular file of this user's that nobody else can read or write: a
+    token others could read is not a secret, and one they could write would
+    let them choose it."""
+    full = os.path.expanduser(path)
+    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+    fd = os.open(full, flags)
+    try:
+        st = os.fstat(fd)
+        if os.name == "posix":
+            import stat
+
+            if not stat.S_ISREG(st.st_mode):
+                raise ValueError(f"the token file {full} is not a regular file")
+            if st.st_uid != os.getuid():
+                raise ValueError(f"the token file {full} belongs to another user")
+            if st.st_mode & 0o077:
+                raise ValueError(f"the token file {full} can be read or written by others (mode "
+                                 f"{oct(st.st_mode & 0o777)}): create it with umask 077, or chmod 600 it")
+        data = os.read(fd, 4096)
+    finally:
+        os.close(fd)
+    try:
+        os.remove(full)
+    except OSError as e:
+        logging.getLogger("sirius_worker").warning("could not delete the token file %s: %s", full, e)
+    token = data.decode("utf-8", "replace").strip()
+    if not token:
+        raise ValueError(f"the token file {full} is empty")
+    return token
+
+
+def _token(args) -> str:
+    """The worker's token (see the module docstring for the order), with
+    $SIRIUS_TOKEN and $SIRIUS_TOKEN_FILE taken out of the environment."""
+    env_token = os.environ.pop("SIRIUS_TOKEN", "")
+    env_file = os.environ.pop("SIRIUS_TOKEN_FILE", "")
+    log = logging.getLogger("sirius_worker")
+    if args.token is not None:
+        log.warning("--token on the command line is visible to every user of this machine (ps, /proc); "
+                    "pass it in $SIRIUS_TOKEN or a --token-file instead")
+        return args.token
+    path = args.token_file or env_file
+    if path:
+        return read_token_file(path)
+    return env_token
 
 
 def _wait_for_stdin_eof_windows() -> None:

@@ -155,9 +155,13 @@ namespace sirius::app::gui::markdown {
     // tables, fenced code, $$ display formulas $$, images.
     Layout blocks(const std::string& markdown, const TextStyle& body, float width, const Context& context = {});
 
-    // Submits the layout as an item at the cursor and draws it; a click on a
-    // link opens it in the browser. Returns true when a link was opened.
-    bool show(const Layout& layout);
+    // Submits the layout as an item at the cursor and draws it. A click on a
+    // link opens an http(s) or mailto address in the browser, and a Markdown
+    // page (.md) inside `pageRoot` (the help folder) with its program;
+    // anything else -- another scheme, a file elsewhere, a program, a network
+    // path -- is shown in the tooltip and not opened. Returns true when a
+    // link was opened.
+    bool show(const Layout& layout, const std::string& pageRoot = {});
 
 } // namespace sirius::app::gui::markdown
 

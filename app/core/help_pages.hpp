@@ -32,6 +32,18 @@ namespace sirius::app {
     // an installed tree's share/sirius/help, the source tree's app/help, and
     // the copy beside the executable (core/app_paths.hpp).
     std::string helpDirectory(const std::string& hint = {});
+    // A page name that stays a file name in the help directory: not empty, at
+    // most 128 bytes, no '/', '\', ':' or control character, not starting
+    // with '.' (so no "..", no absolute path, no drive and no UNC share). A
+    // kind comes from a pipeline file or a plugin, so it is checked before it
+    // names a file.
+    bool helpPageNameSafe(const std::string& kind);
+    // Whether `path` is a Markdown page (.md) inside `helpDir` once both are
+    // resolved (symbolic links and ".." included). A network path is refused
+    // without being looked at.
+    bool isPageInHelpDirectory(const std::string& path, const std::string& helpDir);
+    // The page for `kind`. A name helpPageNameSafe refuses gets a placeholder
+    // with no file (path empty): nothing is read, and nothing can be edited.
     HelpPage loadHelpPage(const std::string& kind, const std::string& hint = {});
     // A page that lives in memory (a plugin's docstring); a file of the same
     // kind in the help directory still wins so users can override it.

@@ -113,6 +113,35 @@ TEST_CASE("loadHelpPage of an unknown kind yields the placeholder page", "[app][
     CHECK(contains(page.path, "no-such-operation.md"));
 }
 
+TEST_CASE("a help page name cannot leave the help directory", "[app][help][security]") {
+    for (const char* ok : {"sim", "plugin-api", "user.denoise", "seg_2d"}) CHECK(helpPageNameSafe(ok));
+    for (const char* bad : {"", "..", "../secret", "..\\secret", "a/b", R"(\\server\share\x)", "//server/share/x", "C:x", "/etc/passwd",
+                            ".hidden", "a\nb"})
+        CHECK_FALSE(helpPageNameSafe(bad));
+    CHECK_FALSE(helpPageNameSafe(std::string(129, 'a')));
+
+    const fs::path tmp = fs::temp_directory_path() / "sirius-help-name-test";
+    fs::create_directories(tmp / "help");
+    std::ofstream(tmp / "secret.md", std::ios::binary) << "---\ntitle: Secret\n---\n\nnot a help page\n";
+    std::ofstream(tmp / "help" / "page.md", std::ios::binary) << "---\ntitle: Page\n---\n\nIntro.\n";
+    const std::string dir = (tmp / "help").string();
+    // a traversing kind reads nothing and names no file to edit
+    const HelpPage up = loadHelpPage("../secret", dir);
+    CHECK(up.path.empty());
+    CHECK_FALSE(contains(up.markdown, "not a help page"));
+    CHECK(loadHelpPage((tmp / "secret").string(), dir).path.empty());
+
+    CHECK(isPageInHelpDirectory((tmp / "help" / "page.md").string(), dir));
+    CHECK(isPageInHelpDirectory((tmp / "help" / "new.md").string(), dir));   // not written yet
+    CHECK_FALSE(isPageInHelpDirectory((tmp / "help" / ".." / "secret.md").string(), dir));
+    CHECK_FALSE(isPageInHelpDirectory((tmp / "secret.md").string(), dir));
+    CHECK_FALSE(isPageInHelpDirectory((tmp / "help" / "page.exe").string(), dir));
+    CHECK_FALSE(isPageInHelpDirectory(R"(\\server\share\page.md)", dir));
+    CHECK_FALSE(isPageInHelpDirectory("//server/share/page.md", dir));
+    CHECK_FALSE(isPageInHelpDirectory("", dir));
+    fs::remove_all(tmp);
+}
+
 TEST_CASE("a page saved in a legacy 8-bit encoding loads as UTF-8", "[app][help]") {
     // An editor that saves Windows-1252 writes "é" as the single byte 0xE9.
     // Turned into a path such a byte throws on Windows (the test, like the

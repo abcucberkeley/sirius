@@ -9,7 +9,16 @@
 //     time and reads its stdout, its stderr and its exit code back;
 //   * a SOCKS5 proxy (`-D 127.0.0.1:<port>`): the application reaches the
 //     worker on a compute node through it (rpc::connectSocks5), the node's
-//     name resolved on the cluster.
+//     name resolved on the cluster. It listens on 127.0.0.1 only and lives
+//     exactly as long as the session (ssh is in a job object / its own
+//     process group and ends with it); while it lives, any process on this
+//     machine can open connections into the cluster through it as this user
+//     (app/python/SECURITY.md). Forwarding the worker's port alone would need
+//     the port before the job runs, or a second login.
+//
+// ssh runs with -x -a, ForwardAgent=no, ForwardX11=no and
+// PermitLocalCommand=no, whatever ~/.ssh/config says: the cluster gets
+// neither this machine's display nor its SSH agent.
 //
 // Logging in: ssh asks for the password, the one-time code, a host key
 // confirmation through SSH_ASKPASS with SSH_ASKPASS_REQUIRE=force, which
@@ -41,6 +50,7 @@
 #include <memory>
 #include <mutex>
 #include <optional>
+#include <set>
 #include <string>
 #include <thread>
 #include <utility>
@@ -74,14 +84,23 @@ namespace sirius::app::ssh {
     // yes/no question) or is a secret.
     struct Prompt {
         std::string text;
-        bool echo = false;        // a confirmation ("(yes/no...)?"): not a secret
+        bool echo = false;        // OpenSSH's own host key confirmation: not a secret
         bool notifyOnly = false;  // SSH_ASKPASS_PROMPT=none: show, nothing to answer
     };
 
+    // Whether a prompt is OpenSSH's own host key question, whose answer may
+    // be shown: SSH_ASKPASS_PROMPT=confirm (`kind`), or OpenSSH's exact
+    // wording ("The authenticity of host ... Are you sure you want to
+    // continue connecting (yes/no..."). A server's keyboard-interactive
+    // prompt never is, whatever it says.
+    bool isHostKeyConfirmation(const std::string& kind, const std::string& text);
+
     // The application's end of the askpass relay: a loopback listener that
     // takes one prompt per connection from askpassMain and answers it with
-    // what `handler` returns (on the listener's thread, and may block until
-    // the user answers); nullopt = cancelled.
+    // what `handler` returns (on that connection's thread, one prompt at a
+    // time, and may block until the user answers); nullopt = cancelled. A
+    // connection that has not sent its line within a second is dropped, and
+    // at most 8 are served at once: any local process can connect.
     class AskpassServer {
     public:
         using Handler = std::function<std::optional<std::string>(const Prompt& prompt)>;
@@ -91,18 +110,28 @@ namespace sirius::app::ssh {
         AskpassServer& operator=(const AskpassServer&) = delete;
 
         int port() const noexcept { return port_; }
+        // Stops listening: once the login is over nothing is asked any more,
+        // and no process on this machine should find the port open. A
+        // connection already in the handler is answered; the destructor
+        // waits for it.
+        void close();
         // The environment ssh gets: SSH_ASKPASS = `program`,
         // SSH_ASKPASS_REQUIRE=force, the port and the secret for the helper.
         std::vector<std::pair<std::string, std::string>> environment(const std::string& program) const;
 
     private:
         void serve();
+        void serveOne(std::intptr_t connection);
         Handler handler_;
         std::string secret_;
         std::intptr_t listener_ = -1;
         int port_ = 0;
         std::atomic<bool> stop_{false};
         std::thread thread_;
+        std::mutex handlerMutex_;
+        std::mutex connMutex_;
+        std::vector<std::thread> connections_;      // under connMutex_
+        std::set<std::thread::id> doneIds_;          // finished connections, under connMutex_
     };
 
     // The helper's side, for main(): true when this process was started as

@@ -12,8 +12,9 @@ What it does is chosen by $SIRIUS_FAKE_WORKER:
                        "fake worker: lingering" on stderr says it got there
     exit               a start that fails for another reason: a message, exit 1
 
-Every mode first logs its pid, its arguments and $PYTHONHOME to stderr,
-where the tests read them back from the launcher's log.
+Every mode first logs its pid, its arguments, $PYTHONHOME and which of the
+secret variables the launcher must not pass on it sees (by name, never the
+value) to stderr, where the tests read them back from the launcher's log.
 """
 
 import json
@@ -28,6 +29,8 @@ def main() -> int:
     print(f"fake worker: pid {os.getpid()}", file=sys.stderr, flush=True)
     print("fake worker: argv " + json.dumps(sys.argv[1:]), file=sys.stderr, flush=True)
     print("fake worker: PYTHONHOME " + json.dumps(os.environ.get("PYTHONHOME")), file=sys.stderr, flush=True)
+    seen = sorted(k for k in ("SIRIUS_HPC_TOKEN", "SIRIUS_LLM_API_KEY", "OPENAI_API_KEY", "HF_TOKEN") if k in os.environ)
+    print("fake worker: secrets " + json.dumps(seen), file=sys.stderr, flush=True)
     if mode == "sleep":
         time.sleep(60)
         return 0

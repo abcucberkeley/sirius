@@ -70,6 +70,9 @@ endfunction()
 # --- vocabulary --------------------------------------------------------------
 
 sirius_core_unit(cancel            HEADERS cancel.hpp)
+# Wiping secrets from memory, and the SHA-256 / HMAC of the worker handshake.
+sirius_core_unit(secure_wipe       HEADERS secure_wipe.hpp   SOURCES secure_wipe.cpp)
+sirius_core_unit(sha256            HEADERS sha256.hpp        SOURCES sha256.cpp        DEPENDS secure_wipe)
 sirius_core_unit(errors            HEADERS errors.hpp            DEPENDS lib/errors)
 sirius_core_unit(byte_budget_lru   HEADERS byte_budget_lru.hpp)
 sirius_core_unit(label_frames      HEADERS label_frames.hpp      DEPENDS lib/index)
@@ -139,7 +142,7 @@ sirius_core_unit(training_export
 sirius_core_unit(rpc
     HEADERS rpc.hpp
     SOURCES rpc.cpp
-    DEPENDS app_paths cancel errors lib/buffer lib/checked_math
+    DEPENDS app_paths cancel errors secure_wipe sha256 lib/buffer lib/checked_math
     DEFINES SIRIUS_APP_SOURCE_DIR="${CMAKE_CURRENT_SOURCE_DIR}"
     PUBLIC_LINK nlohmann_json::nlohmann_json)
 if(WIN32)
@@ -158,12 +161,12 @@ sirius_core_unit(local_worker      HEADERS local_worker.hpp  SOURCES local_worke
 # askpass relay of its prompts), the Slurm job of the worker it submits and
 # watches, and the datasets that stay on the cluster, read by that worker.
 sirius_core_unit(remote_host       HEADERS remote_host.hpp   SOURCES remote_host.cpp
-                                   DEPENDS process host LINK nlohmann_json::nlohmann_json Threads::Threads)
+                                   DEPENDS process host secure_wipe LINK nlohmann_json::nlohmann_json Threads::Threads)
 sirius_core_unit(cluster           HEADERS cluster.hpp       SOURCES cluster.cpp
                                    DEPENDS remote_host rpc cancel errors
                                    PUBLIC_LINK nlohmann_json::nlohmann_json LINK Threads::Threads)
 sirius_core_unit(remote_source     HEADERS remote_source.hpp SOURCES remote_source.cpp
-                                   DEPENDS array_source dataset rpc errors
+                                   DEPENDS array_source dataset rpc errors lib/checked_math
                                    PUBLIC_LINK nlohmann_json::nlohmann_json LINK ZLIB::ZLIB Threads::Threads)
 if(WIN32)
     target_link_libraries(sirius_core_remote_host PRIVATE ws2_32)

@@ -565,7 +565,7 @@ namespace sirius::app {
         const char* const cwd = options.workingDirectory.empty() ? nullptr : options.workingDirectory.c_str();
         const bool ownGroup = options.ownProcessGroup || options.killTree;
 #ifdef __linux__
-        const bool deathSignal = options.killTree;
+        const bool deathSignal = options.killTree && options.parentDeathSignal;
         const pid_t parent = ::getpid();
 #endif
         // The child starts with no signal blocked, whatever the thread that

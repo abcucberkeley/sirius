@@ -14,9 +14,11 @@
 #include <filesystem>
 #include <fstream>
 #include <functional>
+#include <iterator>
 #include <memory>
 #include <optional>
 #include <regex>
+#include <sstream>
 #include <string>
 #include <thread>
 #include <utility>
@@ -196,6 +198,8 @@ TEST_CASE("headless: the tool table has no view tools and strict schemas", "[app
     CHECK(byName("render").hints.readOnly);
     CHECK(byName("export_result").hints.destructive);
     CHECK(byName("setup_worker_env").hints.openWorld);
+    CHECK(byName("run").hints.openWorld);
+    CHECK_FALSE(byName("render").hints.openWorld);
     CHECK(byName("setup_worker_env").meta["anthropic/requiresUserInteraction"] == true);
     CHECK(byName("get_help").meta["anthropic/maxResultSizeChars"] == 200000);
     CHECK(byName("set_params").hints.idempotent);
@@ -934,4 +938,87 @@ TEST_CASE("headless: the option parsers refuse what they cannot honour", "[app][
     CHECK(r.format == "jpeg");
     CHECK_THROWS_AS(renderRequestFromJson({{"plane", "xz"}, {"z", {1, 2}}}), ToolFailure);
     CHECK_THROWS_AS(renderRequestFromJson({{"windows", {{{"channel", 0}, {"lo", 5}, {"hi", 1}}}}}), ToolFailure);
+}
+
+TEST_CASE("headless: tools refuse network paths unless the server allows them", "[app][headless][security]") {
+    CHECK(isNetworkPath(R"(\\server\share\a.tif)"));
+    CHECK(isNetworkPath("//server/share/a.tif"));
+    CHECK(isNetworkPath(R"(\\?\UNC\server\share\a.tif)"));
+    CHECK(isNetworkPath(R"(\\.\pipe\x)"));
+    CHECK(isNetworkPath(R"(/\server\share)"));
+    CHECK_FALSE(isNetworkPath(R"(\\?\C:\data\a.tif)"));
+    CHECK_FALSE(isNetworkPath(R"(C:\data\a.tif)"));
+    CHECK_FALSE(isNetworkPath("/data/a.tif"));
+    CHECK_FALSE(isNetworkPath("a.tif"));
+    CHECK_FALSE(isNetworkPath(""));
+
+    Fixture f;
+    const std::string unc = R"(\\attacker.example\share\a.tif)";
+    for (const auto& [tool, args] : std::vector<std::pair<std::string, json>>{
+             {"open_dataset", {{"path", unc}}},
+             {"dataset_info", {{"path", "//attacker.example/share/a.tif"}}},
+             {"load_pipeline", {{"path", unc}}},
+             {"save_pipeline", {{"path", unc}}},
+             {"export_python", {{"path", R"(\\?\UNC\attacker.example\share\x.py)"}}},
+             {"export_result", {{"path", unc}}},
+             {"export_training_data", {{"directory", unc}}},
+             {"add_step", {{"kind", "flatfield"}, {"params", {{"flat", unc}}}}}}) {
+        INFO(tool);
+        const agent::ToolResult r = f.call(tool, args);
+        CHECK_FALSE(r.ok);
+        CHECK(r.error.code == "invalid_argument");
+        CHECK_THAT(r.error.message, ContainsSubstring("network path"));
+    }
+    // a pipeline file that names one is refused before anything is opened
+    TempDir dir("headless_uncpipe");
+    const std::string pipeFile = (dir.path / "p.sirius.toml").string();
+    std::ofstream(pipeFile, std::ios::binary) << "version = 1\n\n[[steps]]\nkind = \"load\"\nname = \"Load\"\nenabled = true\n"
+                                                 "cache = \"recompute\"\n[steps.params]\npath = '//attacker.example/share/a.tif'\n";
+    const agent::ToolResult loaded = f.call("load_pipeline", {{"path", pipeFile}});
+    CHECK_FALSE(loaded.ok);
+    CHECK_THAT(loaded.error.message, ContainsSubstring("network path"));
+
+    // --allow-network-paths reaches the shared tools (nothing is opened here:
+    // a test never names a host)
+    CHECK_FALSE(f.h->toolApi().allowNetworkPaths());
+    Fixture allowed([](HeadlessOptions& o) { o.allowNetworkPaths = true; });
+    CHECK(allowed.h->toolApi().allowNetworkPaths());
+}
+
+TEST_CASE("headless: an exported Python script runs a hostile step name as text", "[app][headless][security]") {
+    const std::string python = anyPython();
+    if (python.empty()) SKIP("no Python on this machine");
+    Fixture f;
+    const std::string injection = "x''' + str(print('INJECTED')) + r'''";
+    f.ok("add_step", {{"kind", "contrast"}, {"name", injection}});
+    const std::string script = f.ok("export_python")["script"].get<std::string>();
+    TempDir dir("headless_pyscript");
+    const std::filesystem::path scriptFile = dir.path / "exported.py", driver = dir.path / "driver.py", out = dir.path / "out.txt";
+    std::ofstream(scriptFile, std::ios::binary) << script;
+    // The script's imports are stand-ins, and it runs as a module (not
+    // __main__), so only its top level executes: the literals.
+    std::ofstream(driver, std::ios::binary)
+        << "import json, sys, types\n"
+           "for name in ('numpy', 'sirius', 'sirius.workbench'):\n"
+           "    sys.modules[name] = types.ModuleType(name)\n"
+           "sys.modules['sirius'].workbench = sys.modules['sirius.workbench']\n"
+           "sys.modules['sirius.workbench'].run_pipeline = None\n"
+           "src = open(sys.argv[1], encoding='utf-8').read()\n"
+           "ns = {'__name__': 'exported'}\n"
+           "exec(compile(src, sys.argv[1], 'exec'), ns)\n"
+           "print('NAME=' + json.dumps(ns['PIPELINE']['steps'][1]['name']))\n";
+#ifdef _WIN32
+    const std::string cmd = "\"\"" + python + "\" \"" + driver.string() + "\" \"" + scriptFile.string() + "\" > \"" + out.string() + "\" 2>&1\"";
+#else
+    const std::string cmd = "'" + python + "' '" + driver.string() + "' '" + scriptFile.string() + "' > '" + out.string() + "' 2>&1";
+#endif
+    const int rc = std::system(cmd.c_str());
+    std::ifstream in(out);
+    const std::string text((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+    INFO(text);
+    CHECK(rc == 0);
+    // print() would have put INJECTED on a line of its own
+    std::istringstream lines(text);
+    for (std::string line; std::getline(lines, line);) CHECK(line.rfind("INJECTED", 0) == std::string::npos);
+    CHECK(text.find("NAME=" + json(injection).dump()) != std::string::npos);
 }

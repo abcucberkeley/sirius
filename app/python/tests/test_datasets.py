@@ -51,7 +51,8 @@ class _Client:
             return header, out
 
     def hello(self):
-        header, _ = self.call("hello", {"token": self.token, "protocol_version": protocol.PROTOCOL_VERSION})
+        header = protocol.client_handshake(self.sock, self.token, first_id=self.next_id)
+        self.next_id += 2
         return header
 
     def close(self):
@@ -100,6 +101,16 @@ class TestEncoding(unittest.TestCase):
         a = np.random.default_rng(2).integers(0, 255, size=(128, 128), dtype=np.uint8)
         desc, _ = datasets.encode(a, ["zlib"])
         self.assertEqual(desc["encoding"], "raw")
+
+    def test_a_stream_that_inflates_past_its_shape_is_refused(self):
+        import zlib
+
+        bomb = np.frombuffer(zlib.compress(bytes(1 << 20), 9), dtype=np.uint8)   # 1 MiB of zeros, ~1 KiB packed
+        desc = {"encoding": "zlib", "shuffle": False, "dtype": "uint8", "shape": [16]}
+        with self.assertRaises(datasets.DatasetError):
+            datasets.decode(desc, bomb)
+        whole = datasets.decode({**desc, "shape": [1024, 1024]}, bomb)
+        self.assertEqual(whole.shape, (1024, 1024))
 
 
 class _Files(unittest.TestCase):
@@ -152,6 +163,19 @@ class TestNpy(_Files):
         np.testing.assert_array_equal(v, a[1, 0].astype(np.float32))
         all5 = datasets.read_ref({"path": self.path("r.npy"), "layout": "ctzyx"})
         self.assertEqual(all5.shape, (2, 1, 3, 4, 5))
+
+    def test_read_ref_indices_are_bounded_by_the_dataset(self):
+        # a request names channels and times: each must exist and come once,
+        # so the request cannot size the output (a billion zeros used to be a
+        # billion volumes)
+        a = np.zeros((2, 1, 3, 4, 5), dtype=np.uint8)
+        np.save(self.path("b.npy"), a)
+        ref = {"path": self.path("b.npy"), "layout": "ctzyx"}
+        self.assertEqual(datasets.read_ref({**ref, "c": [1, 0], "t": 0}).shape, (2, 1, 3, 4, 5))
+        for c in ([0] * 1000, [0, 0], [2], [-1], ["0"], [True], "01"):
+            with self.subTest(c=c):
+                with self.assertRaises(datasets.DatasetError):
+                    datasets.read_ref({**ref, "c": c})
 
 
 @unittest.skipUnless(HAVE_TIFFFILE, "tifffile not importable")
@@ -212,13 +236,15 @@ class TestOverTheSocket(_Files):
 
     def client(self):
         c = _Client(self.port, self.token)
-        self.assertEqual(c.hello()["type"], "result")
+        header = c.hello()
+        self.assertEqual(header["type"], "result")
+        c.caps = header["result"]
         return c
 
     def test_hello_names_the_dataset_methods_and_encodings(self):
         c = self.client()
         try:
-            caps = c.hello()["result"]
+            caps = c.caps
             for m in ("dataset_info", "dataset_read", "dataset_view", "dataset_stats"):
                 self.assertIn(m, caps["methods"])
             self.assertIn("zlib", caps["encodings"])
@@ -300,8 +326,9 @@ class TestOverTheSocket(_Files):
     def test_one_client_too_many_is_told_so(self):
         clients = [self.client() for _ in range(4)]
         try:
+            # told once it has authenticated: an anonymous peer takes no slot
             extra = _Client(self.port, self.token)
-            header, _ = protocol.read_frame(extra.sock)
+            header = extra.hello()
             self.assertEqual(header["type"], "error")
             self.assertIn("busy", header["message"])
             extra.close()

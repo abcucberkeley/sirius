@@ -10,9 +10,12 @@
 //            is missing comes back with the command that fixes it
 //   Submit   app/python/slurm/sirius_worker.sbatch with the profile's
 //            partition, account, QoS, time and resources; the token is made
-//            here and reaches sbatch through the remote shell's environment
+//            here and written over the command channel to a 0600 file in
+//            ~/.sirius/run (a 0700 directory), whose name is all the job is
+//            given: never an argument, never the job's environment
 //   Queue    squeue every few seconds: state, reason, time waited
-//   Start    the job runs on a node; its log says when the worker listens
+//   Start    the job runs on a node; its log (in ~/.sirius/run too) says
+//            when the worker listens and on which port (it takes a free one)
 //   Hello    the application connects through the SSH session's SOCKS proxy
 //            and the worker says what it is (version, device, steps)
 //
@@ -60,7 +63,7 @@ namespace sirius::app::cluster {
         int gpus = 1;
         int cpus = 8;
         std::string mem = "64G";
-        int port = 7645;
+        int port = 7645;                           // unused: the worker takes a free port (kept for old profiles)
         std::string sshProgram;                    // "" = the system's ssh
         std::vector<std::string> sshProgramArgs;   // tests: a fake ssh run by an interpreter
 

@@ -496,7 +496,7 @@ TEST_CASE("tool gate: schemas() is what the assistant always had; the hints are 
         CHECK(t.readOnly == in(readOnly, t.name));
         CHECK(t.idempotent == in(idempotent, t.name));
         CHECK(t.destructive == (t.name == "export_training_data"));
-        CHECK_FALSE(t.openWorld);
+        CHECK(t.openWorld == (t.name == "run"));   // a run may download weights and use the HPC worker
         CHECK(t.meta.is_object());
         CHECK(t.meta.contains("anthropic/maxResultSizeChars") == in(big, t.name));
     }

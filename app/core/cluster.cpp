@@ -183,6 +183,7 @@ namespace sirius::app::cluster {
         std::shared_ptr<ssh::Session> ssh;            // under m
         std::unique_ptr<ssh::AskpassServer> askpass;
         std::string token;
+        int workerPort = 0;                          // what the worker announced, under m
         std::mutex controlMutex;
         std::unique_ptr<RemoteWorker> control;       // under controlMutex
 
@@ -253,7 +254,8 @@ namespace sirius::app::cluster {
         void login(const Profile& p) {
             stepState(Step::Login, StepStatus::Running, "ssh " + p.host);
             say("Cluster: logging in to " + p.host + "\xE2\x80\xA6");
-            if (!askpass) askpass = std::make_unique<ssh::AskpassServer>([this](const ssh::Prompt& pr) { return ask(pr); });
+            // A listener for this login only: closed once it is over (below).
+            askpass = std::make_unique<ssh::AskpassServer>([this](const ssh::Prompt& pr) { return ask(pr); });
             ssh::Options o;
             o.program = p.sshProgram;
             o.programArgs = p.sshProgramArgs;
@@ -266,12 +268,14 @@ namespace sirius::app::cluster {
                 s->open(o, [this] { return cancel.load() || abortLogin.load(); }, std::chrono::minutes(10));
             } catch (const ssh::SshError& e) {
                 loginActive.store(false);
+                askpass->close();
                 if (abortLogin.load()) throw Failure{Step::Login, "Login cancelled: nothing was sent for the prompt you closed.", {}, {}};
                 if (cancel.load()) throw Failure{Step::Login, "Cancelled.", {}, {}};
                 throw Failure{Step::Login, std::string("SSH login to ") + p.host + " failed: " + e.what() + ".", e.detail,
                               "Check the host, user and password, then press Connect again (a failed login is never retried)."};
             }
             loginActive.store(false);
+            askpass->close();   // nothing is asked after the login
             {
                 const std::lock_guard<std::mutex> g(m);
                 ssh = s;
@@ -326,13 +330,27 @@ namespace sirius::app::cluster {
         void submit(const Profile& p) {
             stepState(Step::Submit, StepStatus::Running, "sbatch");
             token = ssh::randomHex(16);
-            std::string script = "cd " + remotePathWord(p.checkout) + " || exit 3\n";
-            // the token reaches the job through this shell's environment (sbatch exports it); never an argument
-            script += "export SIRIUS_TOKEN=" + shellQuote(token) + "\n";
-            script += "export SIRIUS_PORT=" + std::to_string(p.port) + "\nexport SIRIUS_MAX_CLIENTS=8\n";
+            // Everything of the job's lives in ~/.sirius/run, a directory
+            // only this user can enter, and every file in it is created
+            // 0600 (umask 077, which sbatch hands on to the job's log too).
+            std::string script = "umask 077\n";
+            script += "mkdir -p \"$HOME/.sirius/run\" && chmod 700 \"$HOME/.sirius/run\" || exit 4\n";
+            // token files of jobs that never started, a day old
+            script += "find \"$HOME/.sirius/run\" -maxdepth 1 -name 'token.*' -mmin +1440 -exec rm -f {} + 2>/dev/null\n";
+            script += "cd " + remotePathWord(p.checkout) + " || exit 3\n";
+            // The token is written to a private file over this command
+            // channel (printf is a builtin: no argument list shows it) and the
+            // job is told only the file's name: in the job's environment
+            // Slurm's accounting could keep it (AccountingStoreFlags=job_env).
+            // The worker reads the file and deletes it.
+            script += "tf=$(mktemp \"$HOME/.sirius/run/token.XXXXXXXX\") || exit 4\n";
+            script += "printf '%s' " + shellQuote(token) + " > \"$tf\" || { rm -f \"$tf\"; exit 4; }\n";
+            script += "unset SIRIUS_TOKEN\nexport SIRIUS_TOKEN_FILE=\"$tf\"\n";
+            // port 0: the worker takes a free one and says which in its log
+            script += "export SIRIUS_PORT=0\nexport SIRIUS_MAX_CLIENTS=8\n";
             if (!p.venv.empty()) script += "export SIRIUS_VENV=" + remotePathWord(p.venv) + "\n";
             if (p.gpus <= 0) script += "export SIRIUS_DEVICE=cpu\n";
-            std::string cmd = "sbatch --parsable --job-name=sirius-worker --output=sirius-worker-%j.log";
+            std::string cmd = "sbatch --parsable --job-name=sirius-worker --output=\"$HOME/.sirius/run/sirius-worker-%j.log\"";
             if (!p.partition.empty()) cmd += " --partition=" + shellQuote(p.partition);
             if (!p.account.empty()) cmd += " --account=" + shellQuote(p.account);
             if (!p.qos.empty()) cmd += " --qos=" + shellQuote(p.qos);
@@ -340,10 +358,12 @@ namespace sirius::app::cluster {
             cmd += p.gpus > 0 ? " --gres=gpu:" + std::to_string(p.gpus) : std::string(" --gres=none");
             if (p.cpus > 0) cmd += " --cpus-per-task=" + std::to_string(p.cpus);
             if (!p.mem.empty()) cmd += " --mem=" + shellQuote(p.mem);
-            script += cmd + " app/python/slurm/sirius_worker.sbatch\n";
+            script += "out=$(" + cmd + " app/python/slurm/sirius_worker.sbatch) || { rc=$?; rm -f \"$tf\"; printf '%s\\n' \"$out\"; exit $rc; }\n";
+            script += "echo \"job=$out\"\n";
             const ssh::CommandResult r = remote(script, std::chrono::seconds(60));
             std::string id;
-            for (char c : trim(r.out)) {
+            const std::string job = keyValues(r.out)["job"];   // "4711" or "4711;cluster"
+            for (char c : job) {
                 if (std::isdigit(static_cast<unsigned char>(c))) id.push_back(c);
                 else if (!id.empty()) break;
             }
@@ -356,9 +376,12 @@ namespace sirius::app::cluster {
             say("Cluster: submitted job " + id + where);
         }
 
-        std::string jobLog(const Profile& p, const std::string& id) {
+        // The job's log, in the private ~/.sirius/run (submit).
+        static std::string jobLogPath(const std::string& id) { return "\"$HOME/.sirius/run/sirius-worker-" + id + ".log\""; }
+
+        std::string jobLog(const Profile&, const std::string& id) {
             try {
-                return trim(remote("tail -n 30 " + remotePathWord(p.checkout) + "/sirius-worker-" + id + ".log 2>/dev/null", std::chrono::seconds(30)).out);
+                return trim(remote("tail -n 30 " + jobLogPath(id) + " 2>/dev/null", std::chrono::seconds(30)).out);
             } catch (const ssh::SshError&) {
                 return {};
             }
@@ -412,7 +435,7 @@ namespace sirius::app::cluster {
             update([&](Status& x) { x.node = node; });
             say("Cluster: job " + id + " runs on " + node);
             const auto t0 = std::chrono::steady_clock::now();
-            const std::string logFile = remotePathWord(p.checkout) + "/sirius-worker-" + id + ".log";
+            const std::string logFile = jobLogPath(id);
             for (;;) {
                 const std::string script = "echo state=$(squeue -h -j " + id + " -o %T 2>/dev/null)\n[ -f " + logFile + " ] && grep -m1 -E '^\\{\"(port|error)\"' " +
                                            logFile + " | sed 's/^/announce=/'\ntrue\n";
@@ -432,8 +455,16 @@ namespace sirius::app::cluster {
                         throw Failure{Step::Start, "The worker on " + node + " cannot start: " + (missing.empty() ? std::string("a package is missing") : missing + " missing") + ".",
                                       jobLog(p, id), (p.venv.empty() ? std::string("python3 -m pip") : p.venv + "/bin/pip") + " install -r " + p.checkout + "/app/python/requirements.txt"};
                     }
-                    if (j.contains("port")) {
-                        stepState(Step::Start, StepStatus::Done, "listening on " + node + ":" + std::to_string(p.port));
+                    if (j.contains("port") && j["port"].is_number_integer()) {
+                        // the worker took a free port (--port 0) and says which
+                        const int port = j["port"].get<int>();
+                        if (port <= 0 || port > 65535)
+                            throw Failure{Step::Start, "The worker on " + node + " announced port " + std::to_string(port) + ".", jobLog(p, id), {}};
+                        {
+                            const std::lock_guard<std::mutex> g(m);
+                            workerPort = port;
+                        }
+                        stepState(Step::Start, StepStatus::Done, "listening on " + node + ":" + std::to_string(port));
                         return;
                     }
                 }
@@ -446,8 +477,13 @@ namespace sirius::app::cluster {
             }
         }
 
-        void hello(const Profile& p, const std::string& node) {
-            stepState(Step::Hello, StepStatus::Running, node + ":" + std::to_string(p.port) + " through the SSH tunnel");
+        void hello(const Profile&, const std::string& node) {
+            int port = 0;
+            {
+                const std::lock_guard<std::mutex> g(m);
+                port = workerPort;
+            }
+            stepState(Step::Hello, StepStatus::Running, node + ":" + std::to_string(port) + " through the SSH tunnel");
             int socks = 0;
             {
                 auto s = sshSession();
@@ -455,11 +491,11 @@ namespace sirius::app::cluster {
             }
             std::unique_ptr<RemoteWorker> w;
             try {
-                w = RemoteWorker::connect(node, p.port, token, std::chrono::seconds(20), [this] { return cancel.load(); }, socks);
+                w = RemoteWorker::connect(node, port, token, std::chrono::seconds(20), [this] { return cancel.load(); }, socks);
             } catch (const CancelledError&) {
                 throw Failure{Step::Hello, "Cancelled while the worker answers.", {}, {}};
             } catch (const std::exception& e) {
-                throw Failure{Step::Hello, "Could not reach the worker on " + node + ":" + std::to_string(p.port) + " through the SSH tunnel.", e.what(), {}};
+                throw Failure{Step::Hello, "Could not reach the worker on " + node + ":" + std::to_string(port) + " through the SSH tunnel.", e.what(), {}};
             }
             w->setCancelGrace(std::chrono::milliseconds(0));
             const WorkerCapabilities caps = w->capabilities();
@@ -668,6 +704,7 @@ namespace sirius::app::cluster {
         {
             const std::lock_guard<std::mutex> g(impl_->m);
             impl_->profile = profile;
+            impl_->workerPort = 0;
         }
         impl_->worker = std::thread([this] { impl_->run(); });
     }
@@ -745,7 +782,7 @@ namespace sirius::app::cluster {
         Endpoint e;
         if (impl_->status.state != State::Connected) return e;
         e.host = impl_->status.node;
-        e.port = impl_->profile.port;
+        e.port = impl_->workerPort;
         e.token = impl_->token;
         e.socksPort = impl_->ssh ? impl_->ssh->socksPort() : 0;
         return e;

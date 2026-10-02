@@ -182,9 +182,7 @@ class ListBundlesOverTheSocket(unittest.TestCase):
 
     def connect(self):
         sock = socket.create_connection(("127.0.0.1", self.port), timeout=30)
-        protocol.write_frame(sock, {"id": 1, "type": "request", "method": "hello",
-                                    "params": {"token": self.token, "protocol_version": protocol.PROTOCOL_VERSION}})
-        header, _ = protocol.read_frame(sock)
+        header = protocol.client_handshake(sock, self.token, first_id=100)
         self.assertEqual(header["type"], "result", header)
         return sock, header
 

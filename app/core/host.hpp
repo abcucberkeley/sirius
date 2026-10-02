@@ -36,6 +36,13 @@ namespace sirius::app::host {
     std::string findExecutable(const std::string& name);   // PATH (+".exe" on Windows), no WindowsApps aliases; "" when none
     bool isFile(const std::string& path);
     bool isDirectory(const std::string& path);
+    // POSIX: true when users other than the owner may write `path` (group or
+    // world write permission; a user-private group, umask 002, is the user
+    // alone and does not count), or it belongs to another user than this
+    // process's (root excepted), so that someone else could put files there.
+    // `why` says which. Always false on Windows, where the user's profile
+    // directories are private by their ACLs.
+    bool writableByOthers(const std::string& path, std::string* why = nullptr);
     // Creates the directory and its parents; true when it exists afterwards.
     bool makePath(const std::string& dir);
     // True when `dir` is gone afterwards, also when it never existed. An empty

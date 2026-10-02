@@ -35,9 +35,9 @@ The panels start where this list puts them; each one is moved by its tab (see *L
 
 1. **SSH login**, once per session, with your system's OpenSSH and your `~/.ssh/config` (a host alias such as `fiona` works). When the cluster asks for a password, a one-time code or a host key confirmation, SIRIUS shows the question in a box; the answer goes to ssh and is never stored or logged. A wrong answer costs one attempt and nothing is retried by itself: press *Connect again*. *Cancel* in the box stops the login without sending anything.
 2. **Checks**: `sbatch` on the host, the SIRIUS checkout (`app/python`), the Python environment and numpy in it. What is missing is named with the command that fixes it.
-3. **Submit**: the worker's job script with the profile's partition, account, QoS, time limit, GPUs, CPUs and memory. The worker's token is made here and reaches the job through the shell's environment, never a command line.
+3. **Submit**: the worker's job script with the profile's partition, account, QoS, time limit, GPUs, CPUs and memory. The worker's token is made here and written to a private file in `~/.sirius/run` on the cluster, which the worker reads and deletes as it starts: it is never on a command line or in the job's environment, and it never crosses the network — the application and the worker each prove they know it. The job's log is in `~/.sirius/run` too.
 4. **Queue**: the job's state and reason (`PENDING (Priority)`) and the time waited, every few seconds.
-5. **Start** and **Hello**: the node, then the worker's own account of itself — version, device, the steps it runs — reached through the SSH connection itself (no tunnel to type).
+5. **Start** and **Hello**: the node and the port the worker took there, then the worker's own account of itself — version, device, the steps it runs — reached through the SSH connection itself (no tunnel to type).
 
 The status bar then says *HPC: ‹node› · connected* (green), or *disconnected* and why (red: the job reached its time limit, the SSH connection dropped). The backend switches to HPC. *Disconnect…* closes the connection and asks whether to cancel the job as well (the default); quitting with a job running asks the same.
 

@@ -11,6 +11,14 @@
 // "hello" exchanges kProtocolVersion below; a peer answering with another
 // version is refused, so a framing change is never silently misread.
 //
+// The token never crosses the wire. "hello" carries the client's random
+// nonce and is answered with the worker's nonce and the worker's proof,
+// HMAC-SHA256(token, "sirius-worker-auth/2|worker|<client>|<worker>"); the
+// client checks that proof before it sends anything else, then sends its own
+// ("auth", role "client") and only then gets the capabilities. A stand-in
+// that does not know the token therefore learns nothing it could replay, and
+// the client never talks to it past the handshake (handshakeProof below).
+//
 // header: {"id": n, "type": "request"|"progress"|"result"|"error",
 //          "method": "...", "params": {...}, "tensors": [{"name", "dtype",
 //          "shape", "offset", "nbytes"}], "message", "fraction"}
@@ -38,7 +46,40 @@ namespace sirius::app::rpc {
     // method set changes in a way an older peer cannot understand. The Python
     // worker defines the same constant as PROTOCOL_VERSION in
     // app/python/sirius_worker/protocol.py.
-    inline constexpr int kProtocolVersion = 1;
+    inline constexpr int kProtocolVersion = 2;
+
+    // Most tensors one frame may describe, on both ends.
+    inline constexpr std::size_t kMaxTensors = 64;
+
+    // The largest payload a frame this side reads may announce. 8 GiB unless
+    // $SIRIUS_RPC_MAX_PAYLOAD_GIB says otherwise (read once); the setter is
+    // for tests and for a caller with a reason to change it.
+    std::uint64_t maxPayloadBytes() noexcept;
+    void setMaxPayloadBytes(std::uint64_t bytes) noexcept;
+
+    // The proof of one side of the handshake: lower-case hex of
+    // HMAC-SHA256(token, "sirius-worker-auth/2|" + role + "|" + clientNonce +
+    // "|" + serverNonce), role "worker" or "client". sirius_worker/protocol.py
+    // computes the same (handshake_proof).
+    std::string handshakeProof(const std::string& token, const std::string& role, const std::string& clientNonce,
+                               const std::string& serverNonce);
+    // A nonce as the handshake takes one: 32 to 128 lower-case hex digits.
+    bool validNonce(const nlohmann::json& value);
+    // 16 bytes from the operating system's generator, as 32 hex digits.
+    std::string randomNonce();
+
+    // The worker's half of the handshake, for a stand-in worker (the tests'):
+    // `answer` takes a "hello" or "auth" request's params and returns the
+    // result to send, or nullopt with `error` set (and the connection should
+    // then be closed). `capabilities` is what "auth" answers with.
+    struct HandshakeResponder {
+        std::string token;
+        int protocolVersion = kProtocolVersion;   // what this stand-in claims
+        std::string clientNonce, serverNonce;
+        bool authenticated = false;
+        std::optional<nlohmann::json> answer(const std::string& method, const nlohmann::json& params, const nlohmann::json& capabilities,
+                                             std::string& error);
+    };
 
     struct TensorRef {
         std::string name;
@@ -133,7 +174,9 @@ namespace sirius::app {
         // which takes minutes on a cluster's shared filesystem.
         static constexpr std::chrono::milliseconds kHelloTimeout{300000};
 
-        // Sends "hello" and waits for the answer. The worker serves one
+        // The handshake (see the top of this file), then the capabilities.
+        // A worker that cannot prove it holds `token` is refused before
+        // anything but the nonce has been sent to it. The worker serves one
         // client at a time and reads a connection's hello only once the
         // client before it (a run, the model hub) has gone, so the wait may
         // be long. With `cancelled` it lasts until the answer comes or
@@ -166,8 +209,9 @@ namespace sirius::app {
         void setCancelGrace(std::chrono::milliseconds grace) noexcept { cancelGrace_ = grace; }
 
     private:
+        void handshake(const std::string& token, const std::function<bool()>& cancelled, std::chrono::milliseconds helloTimeout);
+
         std::unique_ptr<rpc::Transport> transport_;
-        std::string token_;
         WorkerCapabilities caps_;
         std::vector<std::byte> inbox_;
         std::uint64_t nextId_ = 1;

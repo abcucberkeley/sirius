@@ -362,16 +362,18 @@ namespace sirius::cli {
             }
             c.push_back(command("schema", "schema", "the commands, their options, the exit codes and the envelope, as JSON"));
             {
-                CommandSpec s = command("session", "session [--allow-worker-setup] [state options]", "a live workbench: JSON lines on stdin / stdout");
+                CommandSpec s = command("session", "session [--allow-worker-setup] [--allow-network-paths] [state options]", "a live workbench: JSON lines on stdin / stdout");
                 s.state = true;
-                s.options = {flag("allow-worker-setup", "let the setup_worker_env tool download packages (it still needs confirm:true)")};
+                s.options = {flag("allow-worker-setup", "let the setup_worker_env tool download packages (it still needs confirm:true)"),
+                             flag("allow-network-paths", "let tools open network (UNC) paths such as //server/share")};
                 c.push_back(std::move(s));
             }
             {
-                CommandSpec s = command("mcp", "mcp [--allow-worker-setup] [--read-only] [state options]", "a Model Context Protocol server on stdio");
+                CommandSpec s = command("mcp", "mcp [--allow-worker-setup] [--read-only] [--allow-network-paths] [state options]", "a Model Context Protocol server on stdio");
                 s.state = true;
                 s.options = {flag("allow-worker-setup", "let the setup_worker_env tool download packages (the client still asks the user)"),
-                             flag("read-only", "leave out the tools that write files or download")};
+                             flag("read-only", "leave out the tools that write files or download"),
+                             flag("allow-network-paths", "let tools open network (UNC) paths such as //server/share")};
                 c.push_back(std::move(s));
             }
             c.push_back(command("worker status", "worker status", "which Python the worker runs, and the state of SIRIUS's own environment"));

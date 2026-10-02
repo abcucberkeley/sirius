@@ -27,6 +27,7 @@
 #include "core/errors.hpp"
 #include "core/ops/builtin.hpp"
 #include "core/rpc.hpp"
+#include "core/sha256.hpp"
 
 #include <nlohmann/json.hpp>
 
@@ -49,12 +50,16 @@ namespace {
         // field at all, as a worker predating the handshake does.
         int protocolVersion = rpc::kProtocolVersion;
         std::atomic<int> sawClientVersion{-1};   // the version the client sent in its hello
+        rpc::HandshakeResponder handshake;
         std::mutex sentMutex;
+        std::vector<std::string> received;       // every header the client sent, as text
         json foundationParams;   // what the last "foundation" run was sent
 
         explicit ScriptedWorker(std::unique_ptr<rpc::Transport> transport, std::string token = {}, bool slowRun = false,
                                 int version = rpc::kProtocolVersion)
             : t(std::move(transport)), expectedToken(std::move(token)), slow(slowRun), protocolVersion(version) {
+            handshake.token = expectedToken;
+            handshake.protocolVersion = protocolVersion;
             thread = std::thread([this] { loop(); });
         }
         ~ScriptedWorker() {
@@ -76,15 +81,20 @@ namespace {
                     const json& h = m->header;
                     const std::uint64_t id = h.value("id", 0ull);
                     const std::string method = h.value("method", "");
-                    if (method == "hello") {
-                        sawClientVersion = h.contains("params") ? h["params"].value("protocol_version", -1) : -1;
-                        if (!expectedToken.empty() && h.value("token", "") != expectedToken) {
-                            send({{"id", id}, {"type", "error"}, {"message", "bad token"}});
-                            continue;
-                        }
-                        json caps = {{"version", "test"}, {"methods", {"run:torch_segment", "run:foundation", "model_info"}}, {"cuda", false}, {"device", "cpu"}, {"hostname", "loop"}};
-                        if (protocolVersion >= 0) caps["protocol_version"] = protocolVersion;
-                        send({{"id", id}, {"type", "result"}, {"result", caps}});
+                    {
+                        std::lock_guard<std::mutex> lock(sentMutex);
+                        received.push_back(h.dump());
+                    }
+                    if (method == "hello" || method == "auth") {
+                        if (method == "hello") sawClientVersion = h.contains("params") ? h["params"].value("protocol_version", -1) : -1;
+                        const json caps = {{"version", "test"}, {"methods", {"run:torch_segment", "run:foundation", "model_info"}}, {"cuda", false}, {"device", "cpu"}, {"hostname", "loop"}};
+                        std::string error;
+                        if (auto r = handshake.answer(method, h.value("params", json::object()), caps, error))
+                            send({{"id", id}, {"type", "result"}, {"result", *r}});
+                        else
+                            send({{"id", id}, {"type", "error"}, {"message", error}});
+                    } else if (!handshake.authenticated) {
+                        send({{"id", id}, {"type", "error"}, {"message", "not authenticated"}});
                     } else if (method == "cancel") {
                         cancelled = true;
                     } else if (method == "run") {
@@ -282,8 +292,11 @@ TEST_CASE("RemoteWorker talks to a scripted worker over the loopback", "[app][rp
     auto [client, server] = rpc::loopbackPair();
     ScriptedWorker worker(std::move(server), "secret");
 
-    SECTION("a wrong token is refused") {
-        CHECK_THROWS_WITH(RemoteWorker(std::move(client), "nope"), Catch::Matchers::ContainsSubstring("bad token"));
+    SECTION("a wrong token is refused, and the client stops at the worker's proof") {
+        CHECK_THROWS_WITH(RemoteWorker(std::move(client), "nope"), Catch::Matchers::ContainsSubstring("could not prove"));
+        std::lock_guard<std::mutex> lock(worker.sentMutex);
+        REQUIRE(worker.received.size() == 1);   // the hello, and nothing after it
+        CHECK(json::parse(worker.received[0])["method"] == "hello");
     }
     SECTION("hello, run with progress, error") {
         RemoteWorker rw(std::move(client), "secret");
@@ -303,7 +316,59 @@ TEST_CASE("RemoteWorker talks to a scripted worker over the loopback", "[app][rp
                           Catch::Matchers::ContainsSubstring("kaboom"));
         rw.close();
         CHECK_FALSE(rw.isOpen());
+        // the token itself never crossed the wire, in the handshake or after
+        std::lock_guard<std::mutex> lock(worker.sentMutex);
+        REQUIRE(worker.received.size() >= 4);
+        for (const std::string& h : worker.received) CHECK(h.find("secret") == std::string::npos);
     }
+}
+
+// A worker of protocol version 1 compared the token in the clear and answers a
+// hello without one with "bad token": that is reported as a worker to update,
+// not as a wrong password.
+TEST_CASE("RemoteWorker names an older worker that wants the token in the clear", "[app][rpc]") {
+    auto [client, server] = rpc::loopbackPair();
+    std::thread old([t = std::move(server)]() mutable {
+        std::vector<std::byte> in;
+        std::optional<rpc::Message> m;
+        try {
+            while (!(m = rpc::decodeFrame(in))) t->receive(in, std::chrono::milliseconds(50));
+            t->send(rpc::encodeFrame({{"id", m->header["id"]}, {"type", "error"}, {"message", "authentication failed: bad token"}}, {}));
+            std::this_thread::sleep_for(std::chrono::milliseconds(200));
+        } catch (const std::exception&) {
+        }
+        t->close();
+    });
+    CHECK_THROWS_WITH(RemoteWorker(std::move(client), "secret"),
+                      Catch::Matchers::ContainsSubstring("protocol version mismatch") && Catch::Matchers::ContainsSubstring("update sirius_worker"));
+    old.join();
+}
+
+// SHA-256 (FIPS 180-4 examples) and HMAC-SHA256 (RFC 4231 test cases 1, 2,
+// 6 and 7: a short key, a text key, and keys longer than the block).
+TEST_CASE("SHA-256 and HMAC-SHA256 match the published vectors", "[app][rpc][crypto]") {
+    using sirius::app::crypto::hmacSha256;
+    using sirius::app::crypto::sha256;
+    using sirius::app::crypto::toHex;
+    CHECK(toHex(sha256("")) == "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855");
+    CHECK(toHex(sha256("abc")) == "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad");
+    CHECK(toHex(sha256("abcdbcdecdefdefgefghfghighijhijkijkljklmklmnlmnomnopnopq")) ==
+          "248d6a61d20638b8e5c026930c3e6039a33ce45964ff2167f6ecedd419db06c1");
+    CHECK(toHex(sha256(std::string(1000000, 'a'))) == "cdc76e5c9914fb9281a1c7e284d73e67f1809a48a497200e046d39ccc7112cd0");
+    CHECK(toHex(hmacSha256(std::string(20, '\x0b'), "Hi There")) == "b0344c61d8db38535ca8afceaf0bf12b881dc200c9833da726e9376c2e32cff7");
+    CHECK(toHex(hmacSha256("Jefe", "what do ya want for nothing?")) == "5bdcc146bf60754e6a042426089575c75a003f089d2739839dec58b964ec3843");
+    const std::string longKey(131, '\xaa');
+    CHECK(toHex(hmacSha256(longKey, "Test Using Larger Than Block-Size Key - Hash Key First")) ==
+          "60e431591ee0b67f0d8a26aacbf5b77f8e0bc6213728c5140546040f0ee37f54");
+    CHECK(toHex(hmacSha256(longKey, "This is a test using a larger than block-size key and a larger than block-size data. The key needs to be "
+                                    "hashed before being used by the HMAC algorithm.")) ==
+          "9b09ffa71b942fcb27635fbcd5b0e944bfdc63644f0713938a7f51535c3a35e2");
+    // the handshake's proof is the HMAC of its fixed message (protocol.py: handshake_proof)
+    CHECK(rpc::handshakeProof("tok", "worker", std::string(32, 'a'), std::string(32, 'b')) ==
+          toHex(hmacSha256("tok", "sirius-worker-auth/2|worker|" + std::string(32, 'a') + "|" + std::string(32, 'b'))));
+    CHECK(sirius::app::crypto::constantTimeEqual("abc", "abc"));
+    CHECK_FALSE(sirius::app::crypto::constantTimeEqual("abc", "abd"));
+    CHECK_FALSE(sirius::app::crypto::constantTimeEqual("abc", "ab"));
 }
 
 // The version handshake: "hello" carries rpc::kProtocolVersion both ways and
@@ -324,7 +389,7 @@ TEST_CASE("RemoteWorker refuses a worker speaking another protocol version", "[a
         CHECK_THROWS_WITH(RemoteWorker(std::move(client), "secret"),
                           Catch::Matchers::ContainsSubstring("version " + std::to_string(rpc::kProtocolVersion)) &&
                               Catch::Matchers::ContainsSubstring("version " + std::to_string(rpc::kProtocolVersion + 6)) &&
-                              Catch::Matchers::ContainsSubstring("update SIRIUS"));
+                              Catch::Matchers::ContainsSubstring("update the SIRIUS application"));
     }
     SECTION("a worker predating the handshake counts as version 0 and must be updated") {
         auto [client, server] = rpc::loopbackPair();
@@ -825,6 +890,41 @@ TEST_CASE("rpc tensor descriptors must hold non-negative integers", "[app][rpc]"
     REQUIRE(m);
     REQUIRE(m->tensors.size() == 1);
     CHECK(m->tensors[0].numel() == 1);
+
+    // Descriptors tile the payload in increasing order: two that share bytes
+    // (one tensor's memory decoded twice), or that go backwards, are refused,
+    // and so is a frame describing more tensors than any request needs.
+    auto two = [](int offsetA, int offsetB) {
+        return "{\"id\":1,\"type\":\"result\",\"tensors\":[{\"name\":\"a\",\"dtype\":\"float32\",\"shape\":[1],\"offset\":" +
+               std::to_string(offsetA) + ",\"nbytes\":4},{\"name\":\"b\",\"dtype\":\"float32\",\"shape\":[1],\"offset\":" +
+               std::to_string(offsetB) + ",\"nbytes\":4}]}";
+    };
+    {
+        std::vector<std::byte> f = frame(two(0, 4), 8);
+        CHECK(rpc::decodeFrame(f)->tensors.size() == 2);
+    }
+    for (const auto& [a, b] : std::vector<std::pair<int, int>>{{0, 0}, {0, 2}, {4, 0}}) {
+        INFO("offsets " << a << ", " << b);
+        std::vector<std::byte> f = frame(two(a, b), 8);
+        CHECK_THROWS_WITH(rpc::decodeFrame(f), Catch::Matchers::ContainsSubstring("overlaps"));
+    }
+    {
+        std::string many = "{\"id\":1,\"type\":\"result\",\"tensors\":[";
+        for (std::size_t i = 0; i <= rpc::kMaxTensors; ++i)
+            many += (i ? "," : "") + std::string("{\"name\":\"t\",\"dtype\":\"uint8\",\"shape\":[0],\"offset\":0,\"nbytes\":0}");
+        many += "]}";
+        std::vector<std::byte> f = frame(many, 0);
+        CHECK_THROWS_WITH(rpc::decodeFrame(f), Catch::Matchers::ContainsSubstring("tensors"));
+    }
+    // The payload cap is this side's own, and can be lowered (or raised).
+    {
+        const std::uint64_t cap = rpc::maxPayloadBytes();
+        CHECK(cap <= (std::uint64_t{8} << 30));
+        rpc::setMaxPayloadBytes(4);
+        std::vector<std::byte> f = frame(two(0, 4), 8);
+        CHECK_THROWS_WITH(rpc::decodeFrame(f), Catch::Matchers::ContainsSubstring("exceeds the limit"));
+        rpc::setMaxPayloadBytes(cap);
+    }
     // and the sender checks its own arithmetic the same way
     std::vector<float> one{1.f};
     std::vector<rpc::TensorRef> wrapped{{"a", "float32", {std::numeric_limits<Index>::max(), 4}, one.data(), 4}};
@@ -862,6 +962,7 @@ namespace {
             }
             void serve(PluginCatalog& catalog) {
                 std::vector<std::byte> buf;
+                rpc::HandshakeResponder handshake;
                 try {
                     for (;;) {
                         auto m = rpc::decodeFrame(buf);
@@ -872,9 +973,11 @@ namespace {
                         const std::uint64_t id = m->header.value("id", 0ull);
                         const std::string method = m->header.value("method", "");
                         json result;
-                        if (method == "hello")
-                            result = {{"version", "test"}, {"methods", json::array()}, {"protocol_version", rpc::kProtocolVersion}, {"device", "cpu"}, {"hostname", "loop"}};
-                        else if (method == "list_plugins" || method == "reload_plugins")
+                        std::string error;
+                        if (method == "hello" || method == "auth") {
+                            const json caps = {{"version", "test"}, {"methods", json::array()}, {"device", "cpu"}, {"hostname", "loop"}};
+                            if (auto r = handshake.answer(method, m->header.value("params", json::object()), caps, error)) result = *r;
+                        } else if (method == "list_plugins" || method == "reload_plugins")
                             result = {{"plugins", catalog.plugins()}, {"dirs", {"/plugins"}}};
                         if (result.is_null()) t->send(rpc::encodeFrame({{"id", id}, {"type", "error"}, {"message", "unknown method " + method}}, {}));
                         else t->send(rpc::encodeFrame({{"id", id}, {"type", "result"}, {"result", result}}, {}));
@@ -1131,15 +1234,19 @@ TEST_CASE("A worker that dies while a request is sent is an error, not SIGPIPE",
         if (s < 0) return;
         std::vector<std::byte> in;
         std::vector<char> buf(1 << 16);
-        std::optional<rpc::Message> hello;
-        while (!(hello = rpc::decodeFrame(in))) {
-            const auto n = ::recv(s, buf.data(), buf.size(), 0);
-            if (n <= 0) break;
-            in.insert(in.end(), reinterpret_cast<const std::byte*>(buf.data()), reinterpret_cast<const std::byte*>(buf.data()) + n);
-        }
-        if (hello) {
-            const std::vector<std::byte> reply = rpc::encodeFrame(
-                {{"id", hello->header["id"]}, {"type", "result"}, {"result", {{"protocol_version", rpc::kProtocolVersion}}}}, {});
+        rpc::HandshakeResponder handshake;
+        while (!handshake.authenticated) {
+            std::optional<rpc::Message> m;
+            while (!(m = rpc::decodeFrame(in))) {
+                const auto n = ::recv(s, buf.data(), buf.size(), 0);
+                if (n <= 0) break;
+                in.insert(in.end(), reinterpret_cast<const std::byte*>(buf.data()), reinterpret_cast<const std::byte*>(buf.data()) + n);
+            }
+            if (!m) break;
+            std::string error;
+            const auto r = handshake.answer(m->header.value("method", ""), m->header.value("params", json::object()), json::object(), error);
+            if (!r) break;
+            const std::vector<std::byte> reply = rpc::encodeFrame({{"id", m->header["id"]}, {"type", "result"}, {"result", *r}}, {});
             (void)::send(s, reply.data(), reply.size(), 0);
         }
         ::close(s);

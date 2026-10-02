@@ -66,6 +66,14 @@ namespace sirius::app {
         nlohmann::json meta = nlohmann::json::object();              // MCP Tool._meta
     };
 
+    // True for a path that names another machine or a device rather than a
+    // local file: \\server\share, //server/share, \\?\UNC\server\share,
+    // \\.\pipe\x (the \\?\C:\ long-path form of a local drive is local).
+    // Opening one makes Windows connect to that server with the user's
+    // credentials, so the tools an agent drives refuse it unless the host
+    // allows network paths.
+    bool isNetworkPath(const std::string& path);
+
     class ToolApi {
     public:
         explicit ToolApi(Workbench& wb);
@@ -111,6 +119,10 @@ namespace sirius::app {
         static int resolveStepIndex(const Pipeline& p, const nlohmann::json& args, const char* key = "step");
         nlohmann::json stepJson(int index) const;
         void noteAction(ActionRecord r);
+        // Whether a Path parameter (add_step, set_params) or a directory a
+        // tool writes to may be a network path (isNetworkPath); off by default.
+        void setAllowNetworkPaths(bool on) noexcept { allowNetworkPaths_ = on; }
+        bool allowNetworkPaths() const noexcept { return allowNetworkPaths_; }
 
     private:
         void add(ToolSpec t);
@@ -121,6 +133,7 @@ namespace sirius::app {
         std::vector<ActionRecord> actions_;
         std::function<nlohmann::json(int)> runHook_;
         std::function<std::string(const std::string&)> helpHook_;
+        bool allowNetworkPaths_ = false;
     };
 
 } // namespace sirius::app

@@ -24,6 +24,9 @@
 #include <cerrno>
 #include <fcntl.h>
 #include <signal.h>
+#include <grp.h>
+#include <pwd.h>
+#include <sys/stat.h>
 #include <sys/types.h>
 #include <unistd.h>
 #endif
@@ -473,6 +476,38 @@ namespace sirius::app::host {
     bool isDirectory(const std::string& path) {
         std::error_code ec;
         return !path.empty() && fs::is_directory(fsPath(path), ec);
+    }
+
+    bool writableByOthers(const std::string& path, std::string* why) {
+#ifdef _WIN32
+        (void)path;
+        (void)why;
+        return false;
+#else
+        struct stat st{};
+        if (path.empty() || ::stat(path.c_str(), &st) != 0) return false;
+        if (st.st_uid != ::getuid() && st.st_uid != 0) {
+            if (why) *why = "it belongs to another user (uid " + std::to_string(st.st_uid) + ")";
+            return true;
+        }
+        if (st.st_mode & S_IWOTH) {
+            if (why) *why = "every user may write it";
+            return true;
+        }
+        if (st.st_mode & S_IWGRP) {
+            // The user-private-group scheme (umask 002): the user's primary
+            // group, named after the user, with no other members, is the
+            // user alone.
+            const group* g = ::getgrgid(st.st_gid);
+            const passwd* pw = ::getpwuid(::getuid());
+            const bool privateGroup = g && pw && st.st_gid == ::getgid() && (!g->gr_mem || !g->gr_mem[0]) && g->gr_name && pw->pw_name &&
+                                      std::string(g->gr_name) == pw->pw_name;
+            if (privateGroup) return false;
+            if (why) *why = "its group may write it";
+            return true;
+        }
+        return false;
+#endif
     }
 
     bool makePath(const std::string& dir) {

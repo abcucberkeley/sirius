@@ -64,6 +64,10 @@ namespace sirius::app {
             // the process.
             bool killTree = false;         // Windows: Job Object KILL_ON_JOB_CLOSE (CREATE_SUSPENDED, assign, resume);
                                            // POSIX: implies ownProcessGroup, stop() signals the group; Linux: PR_SET_PDEATHSIG
+            // Linux, with killTree: PR_SET_PDEATHSIG. Off for a child that
+            // must outlive the thread starting it (ssh, logged in on a
+            // connect thread that ends long before the session does).
+            bool parentDeathSignal = true;
             // readLine() then ends only once both streams have ended.
             bool mergeErrorLines = false;  // stderr lines are also queued for readLine() (after the error handler)
         };

@@ -869,7 +869,8 @@ namespace sirius::app::gui::widgets {
         const FieldFrame frame(o);
         ImGuiInputTextFlags flags = ImGuiInputTextFlags_None;
         if (o.readOnly) flags |= ImGuiInputTextFlags_ReadOnly;
-        if (o.password) flags |= ImGuiInputTextFlags_Password;
+        // a password keeps no undo history: nothing of it outlives the field
+        if (o.password) flags |= ImGuiInputTextFlags_Password | ImGuiInputTextFlags_NoUndoRedo;
         if (o.enterReturnsTrue) flags |= ImGuiInputTextFlags_EnterReturnsTrue;
         ImGui::PushStyleColor(ImGuiCol_TextDisabled, theme::kNeutral500);
         const bool changed = o.hint.empty() ? ImGui::InputText(id, value, flags)
@@ -877,6 +878,30 @@ namespace sirius::app::gui::widgets {
         ImGui::PopStyleColor();
         if (!o.readOnly) activeRing();
         return changed;
+    }
+
+    void forgetInputText(ImGuiID id) {
+        if (id == 0 || !ImGui::GetCurrentContext()) return;
+        ImGuiContext& g = *GImGui;
+        const auto wipe = [](ImVector<char>& v) {
+            if (v.Data && v.Capacity > 0) {
+                volatile char* p = v.Data;
+                for (int i = 0; i < v.Capacity; ++i) p[i] = 0;
+            }
+            v.clear();
+        };
+        if (g.ActiveId == id) ImGui::ClearActiveID();
+        if (g.InputTextState.ID == id) {
+            wipe(g.InputTextState.TextA);
+            wipe(g.InputTextState.TextToRevertTo);
+            wipe(g.InputTextState.CallbackTextBackup);
+            g.InputTextState.TextLen = 0;
+            g.InputTextState.ID = 0;
+        }
+        if (g.InputTextDeactivatedState.ID == id) {
+            wipe(g.InputTextDeactivatedState.TextA);
+            g.InputTextDeactivatedState.ID = 0;
+        }
     }
 
     bool inputTextMultiline(const char* id, std::string* value, float heightPx, const FieldOpts& o) {

@@ -493,6 +493,20 @@ TEST_CASE("local worker: the worker may install packages only when the host allo
     CHECK(has(worker->lastLog(), R"("--allow-install")"));
 }
 
+TEST_CASE("local worker: the application's secrets stay out of the worker's environment", "[app][local_worker]") {
+    const std::string python = testPython();
+    const Sandbox box;
+    const ScopedEnv hpc("SIRIUS_HPC_TOKEN", std::string("hpc-secret"));
+    const ScopedEnv llm("SIRIUS_LLM_API_KEY", std::string("llm-secret"));
+    const ScopedEnv openai("OPENAI_API_KEY", std::string("openai-secret"));
+    const ScopedEnv hf("HF_TOKEN", std::string("hf-token"));
+    const auto worker = fakeWorker(python);
+    (void)startError(*worker);
+    // HF_TOKEN stays: the worker downloads gated models with it
+    CHECK(has(worker->lastLog(), R"(fake worker: secrets ["HF_TOKEN"])"));
+    CHECK_FALSE(has(worker->lastLog(), "secret\""));
+}
+
 TEST_CASE("local worker: an older worker's traceback and other failures reach the error", "[app][local_worker]") {
     const std::string python = testPython();
     const Sandbox box;

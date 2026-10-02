@@ -23,7 +23,13 @@ namespace sirius::app::gui {
         // case apiKeyVariable names the variable.
         std::string apiKey;
         std::string apiKeyVariable;
-        bool askBeforeActing = false;
+        // On by default: every tool call that changes something waits for
+        // Apply. Tools that write files, and a step's model, path or folder,
+        // are confirmed even when it is off (assistant_panel.cpp).
+        bool askBeforeActing = true;
+        // load() turned askBeforeActing on for settings saved before it was
+        // the default (once; the user may turn it off again).
+        bool askBeforeActingMigrated = false;
 
         static AssistantSettings load();     // the settings and the secret store
         // Everything but the key. It runs on every model pick and toggle,

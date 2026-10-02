@@ -55,7 +55,16 @@ namespace sirius::app {
         // A caller's value coerced to its spec. A number outside the spec's
         // range is clamped to it, and a line in `clamped` says so: the step
         // runs with a value the caller did not give.
-        ParamValue callerValue(const ParamSpec& spec, const json& value, json& clamped) {
+        // A network path an agent names is refused unless the host allows them.
+        void refuseNetworkPath(const std::string& path, const std::string& what, bool allowNetwork) {
+            if (allowNetwork || !isNetworkPath(path)) return;
+            throw ToolFailure("invalid_argument", what + " '" + path + "' is a network path (\\\\server\\share, //server/share), which tools may not open",
+                              "use a local path; a person can still open a network path in the application, or start sirius-cli with "
+                              "--allow-network-paths");
+        }
+
+        ParamValue callerValue(const ParamSpec& spec, const json& value, json& clamped, bool allowNetwork) {
+            if (spec.type == ParamType::Path && value.is_string()) refuseNetworkPath(value.get<std::string>(), "parameter '" + spec.key + "'", allowNetwork);
             const ParamValue v = coerceToSpec(spec, value);
             if (spec.type != ParamType::Double && spec.type != ParamType::Int && spec.type != ParamType::Channel) return v;
             double given = 0.0;
@@ -77,38 +86,40 @@ namespace sirius::app {
         // positional add({...}) calls stay as they are. refusedWhileRunning:
         // an edit the workbench refuses during a run, with only a log line
         // to say so; readOnly: changes nothing; idempotent: a repeat changes
-        // nothing more; destructive: writes files; bigResult: may answer
-        // with a long text (MCP clients cut long results unless told).
+        // nothing more; destructive: writes files; openWorld: reaches beyond
+        // this machine (a run may download model weights from Hugging Face
+        // and send the data to the HPC worker); bigResult: may answer with a
+        // long text (MCP clients cut long results unless told).
         struct ToolTraits {
             const char* name;
             const char* title;
-            bool refusedWhileRunning, readOnly, idempotent, destructive, bigResult;
+            bool refusedWhileRunning, readOnly, idempotent, destructive, openWorld, bigResult;
         };
         constexpr ToolTraits kToolTraits[] = {
-            {"get_state", "Workbench state", false, true, false, false, false},
-            {"list_operations", "List operations", false, true, false, false, true},
-            {"get_step", "Step details", false, true, false, false, false},
-            {"add_step", "Add a step", true, false, false, false, false},
-            {"remove_step", "Remove a step", true, false, false, false, false},
-            {"move_step", "Move a step", true, false, false, false, false},
-            {"set_step_enabled", "Enable or skip a step", true, false, true, false, false},
-            {"set_params", "Set step parameters", true, false, true, false, false},
-            {"apply_preset", "Apply a preset", true, false, true, false, false},
-            {"set_cache", "Set a step's cache policy", true, false, true, false, false},
-            {"run", "Run the pipeline", false, false, false, false, false},
-            {"view_step", "View a step", false, false, false, false, false},
-            {"select_step", "Select a step", false, false, false, false, false},
-            {"set_view", "Change the viewer", false, false, false, false, false},
-            {"list_tracks", "List tracks", false, true, false, false, false},
-            {"focus_track", "Focus a track", false, false, false, false, false},
-            {"get_diagnostics", "Step diagnostics", false, true, false, false, false},
-            {"get_help", "Help page", false, true, false, false, true},
-            {"undo", "Undo", true, false, false, false, false},
-            {"redo", "Redo", true, false, false, false, false},
-            {"set_backend", "Compute backend", false, false, true, false, false},
-            {"load_example_pipeline", "Load the example pipeline", true, false, false, false, false},
-            {"export_training_data", "Export training data", true, false, false, true, false},
-            {"get_log", "Workbench log", false, true, false, false, true},
+            {"get_state", "Workbench state", false, true, false, false, false, false},
+            {"list_operations", "List operations", false, true, false, false, false, true},
+            {"get_step", "Step details", false, true, false, false, false, false},
+            {"add_step", "Add a step", true, false, false, false, false, false},
+            {"remove_step", "Remove a step", true, false, false, false, false, false},
+            {"move_step", "Move a step", true, false, false, false, false, false},
+            {"set_step_enabled", "Enable or skip a step", true, false, true, false, false, false},
+            {"set_params", "Set step parameters", true, false, true, false, false, false},
+            {"apply_preset", "Apply a preset", true, false, true, false, false, false},
+            {"set_cache", "Set a step's cache policy", true, false, true, false, false, false},
+            {"run", "Run the pipeline", false, false, false, false, true, false},
+            {"view_step", "View a step", false, false, false, false, false, false},
+            {"select_step", "Select a step", false, false, false, false, false, false},
+            {"set_view", "Change the viewer", false, false, false, false, false, false},
+            {"list_tracks", "List tracks", false, true, false, false, false, false},
+            {"focus_track", "Focus a track", false, false, false, false, false, false},
+            {"get_diagnostics", "Step diagnostics", false, true, false, false, false, false},
+            {"get_help", "Help page", false, true, false, false, false, true},
+            {"undo", "Undo", true, false, false, false, false, false},
+            {"redo", "Redo", true, false, false, false, false, false},
+            {"set_backend", "Compute backend", false, false, true, false, false, false},
+            {"load_example_pipeline", "Load the example pipeline", true, false, false, false, false, false},
+            {"export_training_data", "Export training data", true, false, false, true, false, false},
+            {"get_log", "Workbench log", false, true, false, false, false, true},
         };
         // MCP's Tool._meta key for how long a result a client should keep
         // (Claude Code otherwise cuts at its default), and the length asked.
@@ -124,7 +135,7 @@ namespace sirius::app {
                     t.readOnly = tr.readOnly;
                     t.idempotent = tr.idempotent;
                     t.destructive = tr.destructive;
-                    t.openWorld = false;   // nothing here reaches beyond this machine
+                    t.openWorld = tr.openWorld;
                     if (tr.bigResult) t.meta[kMaxResultSizeKey] = kMaxResultSizeChars;
                 }
         }
@@ -145,6 +156,17 @@ namespace sirius::app {
             return s;
         }
     } // namespace
+
+    bool isNetworkPath(const std::string& path) {
+        const auto sep = [](char c) { return c == '/' || c == '\\'; };
+        if (path.size() < 2 || !sep(path[0]) || !sep(path[1])) return false;
+        // \\?\C:\... and \\.\C:\... are a local drive in the long-path form;
+        // \\?\UNC\server\..., \\.\pipe\... and the other devices are not
+        if (path.size() >= 6 && (path[2] == '?' || path[2] == '.') && sep(path[3]) && std::isalpha(static_cast<unsigned char>(path[4])) &&
+            path[5] == ':')
+            return false;
+        return true;
+    }
 
     ToolApi::ToolApi(Workbench& wb) : wb_(wb) {
         add({"get_state",
@@ -252,7 +274,7 @@ namespace sirius::app {
                  if (a.contains("params") && a["params"].is_object())
                      for (auto it = a["params"].begin(); it != a["params"].end(); ++it) {
                          const ParamSpec& spec = callerSpec(*op, it.key());
-                         values.emplace_back(spec.key, callerValue(spec, it.value(), clamped));
+                         values.emplace_back(spec.key, callerValue(spec, it.value(), clamped, allowNetworkPaths_));
                      }
                  const std::string name = a.contains("name") && a["name"].is_string() ? a["name"].get<std::string>() : std::string();
                  // Not seeded from the data on hand: that is not yet this
@@ -312,7 +334,7 @@ namespace sirius::app {
                  json clamped = json::array();
                  for (auto it = a["params"].begin(); it != a["params"].end(); ++it) {
                      const ParamSpec* spec = &callerSpec(s.op(), it.key());
-                     const ParamValue v = callerValue(*spec, it.value(), clamped);
+                     const ParamValue v = callerValue(*spec, it.value(), clamped, allowNetworkPaths_);
                      const ParamValue* old = p.find(spec->key);
                      if (!changes.empty()) changes += ", ";
                      changes += spec->label + " " + (old ? toDisplayString(*old) : "—") + " → " + toDisplayString(v);
@@ -624,6 +646,7 @@ namespace sirius::app {
                   {"image_scaling", {{"type", "string"}, {"enum", {"cast", "minmax", "percentile"}}, {"description", "How the image is rescaled into that type (default percentile)"}}}},
                  {"directory"}),
              [this](const json& a) {
+                 refuseNetworkPath(a.value("directory", std::string()), "directory", allowNetworkPaths_);
                  // The export materializes the step's input through the same
                  // ArraySource a running job may be reading; keep it under the
                  // run-state rule every other entry point follows.

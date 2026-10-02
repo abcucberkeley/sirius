@@ -696,7 +696,8 @@ runs the numpy, SIM (via the bindings) and Torch steps, raising
 (deconvolution, deskew, volume rendering, stitching, registration).
 
 On a cluster, submit [app/python/slurm/sirius_worker.sbatch](app/python/slurm/sirius_worker.sbatch)
-with `SIRIUS_TOKEN` set, tunnel the port (`ssh -N -L 7645:<node>:7645 <login-node>`)
+with the token in a private file named by `SIRIUS_TOKEN_FILE` (or in `SIRIUS_TOKEN`), tunnel the
+port the worker announces in its log (`ssh -N -L 7645:<node>:<port> <login-node>`)
 and enter host, port and token under Preferences ▸ Compute (HPC worker), or start
 `sirius-cli` with `--hpc localhost:7645` and the token in `SIRIUS_HPC_TOKEN`; see
 [app/python/slurm/README.md](app/python/slurm/README.md).

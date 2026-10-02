@@ -290,7 +290,9 @@ def check_tools(tools: dict[str, dict[str, Any]]) -> None:
         check("out" not in properties, f"{name}: an out argument (images go to the scratch directory only)")
         hints = tool.get("annotations") or {}
         check(all(isinstance(hints.get(h), bool) for h in HINTS), f"{name}: annotations incomplete: {hints}")
-        check(hints["openWorldHint"] == (name == "setup_worker_env"), f"{name}: openWorldHint is {hints['openWorldHint']}")
+        # open world: what reaches past this machine (an index, Hugging Face, the HPC worker)
+        check(hints["openWorldHint"] == (name in ("setup_worker_env", "run")),
+              f"{name}: openWorldHint is {hints['openWorldHint']}")
     check(tools["render"]["annotations"]["readOnlyHint"] is True, "render is not read-only")
     # D27: an agent picks a backend, never an endpoint or a token, whatever the argument is called
     backend_args = set(tools["set_backend"]["inputSchema"]["properties"])

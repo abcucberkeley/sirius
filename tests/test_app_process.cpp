@@ -344,6 +344,22 @@ TEST_CASE("process: killTree ends what the child started as well", "[app][proces
     }
 }
 
+TEST_CASE("process: killTree without the parent-death signal outlives the starting thread", "[app][process]") {
+    // ssh is started this way: on a connect thread that ends long before the
+    // session does. The child must live on until stop(), which still ends it.
+    ChildProcess p;
+    ChildProcess::Options o = child({"sleep", "30000"});
+    o.killTree = true;
+    o.parentDeathSignal = false;
+    bool started = false;
+    std::thread([&] { started = p.start(o); }).join();
+    REQUIRE(started);
+    std::this_thread::sleep_for(std::chrono::milliseconds(300));
+    CHECK(p.running());
+    p.stop(0);
+    CHECK_FALSE(p.running());
+}
+
 TEST_CASE("process: ownProcessGroup starts the child in a group of its own", "[app][process]") {
     ChildProcess::Options own = child({"ids"});
     own.ownProcessGroup = true;

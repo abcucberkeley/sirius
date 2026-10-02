@@ -11,6 +11,7 @@
 #include <utility>
 
 #include "core/help_pages.hpp"
+#include "imgui/panels/assistant_markdown.hpp"
 #include "imgui/platform.hpp"
 #include "imgui/strings.hpp"
 #include "imgui/widgets/controls.hpp"
@@ -1453,7 +1454,7 @@ namespace sirius::app::gui::markdown {
         return col.out;
     }
 
-    bool show(const Layout& layout) {
+    bool show(const Layout& layout, const std::string& pageRoot) {
         const ImVec2 origin = ImGui::GetCursorScreenPos();
         ImGui::Dummy(ImVec2(layout.width, layout.height));
         if (!ImGui::IsItemVisible()) return false;
@@ -1461,10 +1462,15 @@ namespace sirius::app::gui::markdown {
         if (!ImGui::IsItemHovered()) return false;
         const std::string* url = layout.linkAt(origin, ImGui::GetIO().MousePos);
         if (!url) return false;
-        ImGui::SetMouseCursor(ImGuiMouseCursor_Hand);
-        widgets::tooltip(*url);
-        if (!ImGui::IsMouseReleased(ImGuiMouseButton_Left)) return false;
-        if (isUrl(*url)) platform::openUrl(*url);
+        // A page's links come from its file or a plugin's docstring: only a
+        // web address or another help page is opened, never a program, a
+        // file elsewhere or a network share (ShellExecute runs what it opens).
+        const bool web = assistant_markdown::isWebUrl(*url);
+        const bool page = !web && !pageRoot.empty() && isPageInHelpDirectory(*url, pageRoot);
+        ImGui::SetMouseCursor((web || page) ? ImGuiMouseCursor_Hand : ImGuiMouseCursor_NotAllowed);
+        widgets::tooltip(web || page ? *url : *url + " (not opened: only web links and help pages are)");
+        if (!ImGui::IsMouseReleased(ImGuiMouseButton_Left) || !(web || page)) return false;
+        if (web) platform::openUrl(*url);
         else platform::openInFileManager(*url);
         return true;
     }

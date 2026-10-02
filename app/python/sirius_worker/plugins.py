@@ -28,14 +28,21 @@ double_list, string_list.
 Directories searched, in order: $SIRIUS_PLUGIN_DIRS (os.pathsep separated),
 ~/.sirius/plugins, and the "plugins" directory beside the application
 (app/plugins in a checkout).
+
+A plugin runs with every right of the user, so on POSIX a directory or a file
+that another user could have put there -- one owned by someone else (root
+excepted), or writable by its group (unless that is the user's own private
+group) or by everybody -- is skipped, and the log says why.
 """
 
 from __future__ import annotations
 
 import importlib.util
 import inspect
+import logging
 import os
 import re
+import stat
 import sys
 import traceback
 from pathlib import Path
@@ -43,6 +50,8 @@ from types import SimpleNamespace
 from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
+
+log = logging.getLogger("sirius_worker")
 
 PARAM_TYPES = ("double", "int", "bool", "choice", "path", "string", "channel", "axes", "double_list", "string_list")
 _KIND_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_.-]*$")
@@ -88,6 +97,43 @@ def plugin_dirs(extra: Optional[List[str]] = None) -> List[Path]:
         if d not in out:
             out.append(d)
     return out
+
+
+def _private_group(st: os.stat_result) -> bool:
+    """The user's own group in the user-private-group scheme (umask 002): the
+    user's primary group, named after the user, with no other members."""
+    try:
+        import grp
+        import pwd
+
+        group = grp.getgrgid(st.st_gid)
+        return (st.st_gid == os.getgid() and not group.gr_mem
+                and group.gr_name == pwd.getpwuid(os.getuid()).pw_name)
+    except (ImportError, KeyError, AttributeError, OSError):
+        return False
+
+
+def unsafe_reason(path: Path, st: Optional[os.stat_result] = None, uid: Optional[int] = None) -> str:
+    """Why `path` must not be imported from ("" when it may): on POSIX, owned
+    by another user than this one or root, or writable by others. Windows
+    keeps a user's folders private by ACL and is not checked (the `st` and
+    `uid` arguments let a test give the facts on any platform)."""
+    if st is None:
+        if os.name != "posix":
+            return ""
+        try:
+            st = os.stat(path)
+        except OSError:
+            return ""
+    if uid is None:
+        uid = os.getuid() if hasattr(os, "getuid") else st.st_uid
+    if st.st_uid not in (uid, 0):
+        return f"{path} belongs to another user (uid {st.st_uid})"
+    if st.st_mode & stat.S_IWOTH:
+        return f"{path} is writable by every user"
+    if st.st_mode & stat.S_IWGRP and not _private_group(st):
+        return f"{path} is writable by its group"
+    return ""
 
 
 def _normalize_param(p: Dict[str, Any], where: str) -> Dict[str, Any]:
@@ -198,8 +244,18 @@ def load_all(extra_dirs: Optional[List[str]] = None) -> Tuple[List[Plugin], List
     for d in dirs:
         if not d.is_dir():
             continue
+        why = unsafe_reason(d)
+        if why:
+            log.warning("plugins in %s are not loaded: %s (chmod go-w, or move them)", d, why)
+            continue
         for file in sorted(d.glob("*.py")):
             if file.name.startswith("_"):
+                continue
+            why = unsafe_reason(file)
+            if why:
+                log.warning("plugin %s is not loaded: %s", file, why)
+                plugins.append(Plugin(file, {"kind": file.stem, "name": file.stem, "params": []}, None,
+                                      error=f"not loaded: {why}"))
                 continue
             plugin = load_file(file)
             if not plugin.error and plugin.kind in seen:

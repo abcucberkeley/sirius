@@ -176,7 +176,9 @@ class _Client:
             return progress, header, tensors_out
 
     def hello(self, version=protocol.PROTOCOL_VERSION):
-        _, header, _ = self.call("hello", {"token": self.token, "protocol_version": version})
+        """The handshake (protocol.client_handshake): the last reply header."""
+        header = protocol.client_handshake(self.sock, self.token, version, first_id=self.next_id)
+        self.next_id += 2
         return header
 
     def close(self):
@@ -241,11 +243,13 @@ class TestServer(ServerTestCase):
             self.assertIsInstance(caps["cuda"], bool)
         finally:
             c.close()
+        # A client with the wrong token stops at the worker's proof, having
+        # sent nothing but its nonce.
         bad = _Client(self.port, "wrong")
         try:
-            header = bad.hello()
-            self.assertEqual(header["type"], "error")
-            self.assertIn("token", header["message"])
+            with self.assertRaises(protocol.ProtocolError) as e:
+                bad.hello()
+            self.assertIn("could not prove", str(e.exception))
         finally:
             bad.close()
 
@@ -611,7 +615,7 @@ class TestConnectionLifecycle(unittest.TestCase):
 
     def test_a_peer_that_never_says_hello_is_dropped_and_the_next_one_served(self):
         server = WorkerServer("127.0.0.1", 0, "t", "cpu")
-        server.HELLO_TIMEOUT = 0.5
+        server.PREAUTH_TIMEOUT = 0.5
         port = server.bind()
         thread = self._serve(server)
         try:
@@ -629,7 +633,7 @@ class TestConnectionLifecycle(unittest.TestCase):
         # one byte of a header length, then silence: the frame read used to
         # block with no deadline, so nobody else was ever served
         server = WorkerServer("127.0.0.1", 0, "t", "cpu")
-        server.HELLO_TIMEOUT = 1.0
+        server.PREAUTH_TIMEOUT = 1.0
         port = server.bind()
         thread = self._serve(server)
         try:
@@ -653,13 +657,14 @@ class TestConnectionLifecycle(unittest.TestCase):
         # every byte arrives well within the poll interval, so only a
         # deadline on the whole frame stops it; a served hello is the failure
         server = WorkerServer("127.0.0.1", 0, "t", "cpu")
-        server.HELLO_TIMEOUT = 0.5
+        server.PREAUTH_TIMEOUT = 0.5
         port = server.bind()
         thread = self._serve(server)
         try:
             frame = protocol.encode_frame({"id": 1, "type": "request", "method": "hello",
-                                           "params": {"token": "t", "protocol_version": protocol.PROTOCOL_VERSION}})
-            self.assertGreater(len(frame) * 0.03, 2 * server.HELLO_TIMEOUT)
+                                           "params": {"client_nonce": "ab" * 16,
+                                                      "protocol_version": protocol.PROTOCOL_VERSION}})
+            self.assertGreater(len(frame) * 0.03, 2 * server.PREAUTH_TIMEOUT)
             drip = socket.create_connection(("127.0.0.1", port), timeout=10)
             closed = False
             for byte in frame:
@@ -676,7 +681,7 @@ class TestConnectionLifecycle(unittest.TestCase):
                     closed = header.get("type") != "result"
                 except (ConnectionError, OSError):
                     closed = True
-            self.assertTrue(closed, "a hello that took longer than HELLO_TIMEOUT was served")
+            self.assertTrue(closed, "a hello that took longer than PREAUTH_TIMEOUT was served")
             drip.close()
         finally:
             server.stop()
@@ -861,3 +866,285 @@ class TestJobSlot(unittest.TestCase):
                 break
             time.sleep(0.02)
         self.assertIsNone(server._current_job(), "the slot is free again once the job ends")
+
+
+class TestDescriptorTiling(unittest.TestCase):
+    """Tensor descriptors tile the payload in order, at most MAX_TENSORS of
+    them: a peer cannot have one byte decoded twice, or describe more tensors
+    than any request carries."""
+
+    @staticmethod
+    def two(offset_a, offset_b, name_b="b"):
+        return {"id": 1, "tensors": [
+            {"name": "a", "dtype": "float32", "shape": [1], "offset": offset_a, "nbytes": 4},
+            {"name": name_b, "dtype": "float32", "shape": [1], "offset": offset_b, "nbytes": 4}]}
+
+    def test_in_order_and_apart_is_accepted(self):
+        header, tensors = protocol.decode_frame(raw_frame(self.two(0, 4), b"\x00" * 8))
+        self.assertEqual(sorted(tensors), ["a", "b"])
+
+    def test_overlapping_or_backwards_descriptors_are_refused(self):
+        for a, b in ((0, 0), (0, 2), (4, 0)):
+            with self.subTest(offsets=(a, b)):
+                with self.assertRaises(protocol.ProtocolError) as e:
+                    protocol.decode_frame(raw_frame(self.two(a, b), b"\x00" * 8))
+                self.assertIn("overlaps", str(e.exception))
+
+    def test_a_name_described_twice_is_refused(self):
+        with self.assertRaises(protocol.ProtocolError):
+            protocol.decode_frame(raw_frame(self.two(0, 4, name_b="a"), b"\x00" * 8))
+
+    def test_too_many_descriptors_are_refused(self):
+        header = {"id": 1, "tensors": [{"name": f"t{i}", "dtype": "uint8", "shape": [0], "offset": 0, "nbytes": 0}
+                                       for i in range(protocol.MAX_TENSORS + 1)]}
+        with self.assertRaises(protocol.ProtocolError) as e:
+            protocol.decode_frame(raw_frame(header))
+        self.assertIn("tensors", str(e.exception))
+
+
+class TestHandshake(unittest.TestCase):
+    """Protocol version 2: the token never crosses the wire, the worker proves
+    it first, and anonymous peers can hold neither a client slot nor the
+    listener (SECURITY.md)."""
+
+    def _serve(self, server):
+        port = server.bind()
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        return port, thread
+
+    def _stop(self, server, thread):
+        server.stop()
+        thread.join(timeout=5)
+
+    def test_proofs_match_the_cpp_definition(self):
+        import hashlib
+        import hmac
+
+        proof = protocol.handshake_proof("tok", "worker", "a" * 32, "b" * 32)
+        self.assertEqual(proof, hmac.new(b"tok", ("sirius-worker-auth/2|worker|" + "a" * 32 + "|" + "b" * 32).encode(),
+                                         hashlib.sha256).hexdigest())
+        self.assertNotEqual(proof, protocol.handshake_proof("tok", "client", "a" * 32, "b" * 32))
+        self.assertTrue(protocol.valid_nonce("0f" * 16))
+        for bad in ("0F" * 16, "0f" * 15, "zz" * 16, 7, None, "0f" * 65):
+            self.assertFalse(protocol.valid_nonce(bad), bad)
+
+    def test_the_hello_reply_proves_the_token_and_reveals_nothing_else(self):
+        server = WorkerServer("127.0.0.1", 0, "s3cret", "cpu")
+        port, thread = self._serve(server)
+        try:
+            sock = socket.create_connection(("127.0.0.1", port), timeout=10)
+            nonce = "12" * 16
+            protocol.write_frame(sock, {"id": 1, "type": "request", "method": "hello",
+                                        "params": {"protocol_version": protocol.PROTOCOL_VERSION,
+                                                   "client_nonce": nonce}})
+            header, _ = protocol.read_frame(sock)
+            self.assertEqual(header["type"], "result", header)
+            result = header["result"]
+            self.assertNotIn("methods", result)   # the capabilities wait for the client's proof
+            self.assertNotIn("s3cret", json.dumps(header))
+            self.assertEqual(result["server_proof"],
+                             protocol.handshake_proof("s3cret", "worker", nonce, result["server_nonce"]))
+            # nothing is served on the worker's proof alone
+            protocol.write_frame(sock, {"id": 2, "type": "request", "method": "ping", "params": {}})
+            header, _ = protocol.read_frame(sock)
+            self.assertEqual(header["type"], "error")
+            self.assertIn("handshake", header["message"])
+            sock.close()
+        finally:
+            self._stop(server, thread)
+
+    def test_a_wrong_client_proof_is_refused_and_ends_the_connection(self):
+        server = WorkerServer("127.0.0.1", 0, "s3cret", "cpu")
+        port, thread = self._serve(server)
+        try:
+            sock = socket.create_connection(("127.0.0.1", port), timeout=10)
+            protocol.write_frame(sock, {"id": 1, "type": "request", "method": "hello",
+                                        "params": {"protocol_version": protocol.PROTOCOL_VERSION,
+                                                   "client_nonce": "34" * 16}})
+            header, _ = protocol.read_frame(sock)
+            # the worker's own proof sent back as the client's: a reflection
+            protocol.write_frame(sock, {"id": 2, "type": "request", "method": "auth",
+                                        "params": {"client_proof": header["result"]["server_proof"]}})
+            header, _ = protocol.read_frame(sock)
+            self.assertEqual(header["type"], "error")
+            self.assertIn("authentication failed", header["message"])
+            self.assertEqual(sock.recv(1), b"")
+            sock.close()
+        finally:
+            self._stop(server, thread)
+
+    def test_a_version_1_hello_with_the_token_is_refused_by_version(self):
+        server = WorkerServer("127.0.0.1", 0, "s3cret", "cpu")
+        port, thread = self._serve(server)
+        try:
+            c = _Client(port, "s3cret")
+            _, header, _ = c.call("hello", {"token": "s3cret", "protocol_version": 1})
+            self.assertEqual(header["type"], "error")
+            self.assertIn("update the SIRIUS application", header["message"])
+            c.close()
+        finally:
+            self._stop(server, thread)
+
+    def test_a_silent_peer_does_not_hold_a_single_client_worker(self):
+        server = WorkerServer("127.0.0.1", 0, "t", "cpu")   # one client at a time
+        port, thread = self._serve(server)
+        try:
+            silent = socket.create_connection(("127.0.0.1", port), timeout=10)
+            t0 = time.monotonic()
+            client = _Client(port, "t")
+            self.assertEqual(client.hello()["type"], "result")
+            self.assertLess(time.monotonic() - t0, server.PREAUTH_TIMEOUT)   # served before the silent one is dropped
+            client.close()
+            silent.close()
+        finally:
+            self._stop(server, thread)
+
+    def test_the_next_client_of_a_single_client_worker_waits_for_the_first(self):
+        server = WorkerServer("127.0.0.1", 0, "t", "cpu")
+        port, thread = self._serve(server)
+        try:
+            first = _Client(port, "t")
+            self.assertEqual(first.hello()["type"], "result")
+            answered = []
+
+            def second():
+                c = _Client(port, "t")
+                answered.append(c.hello())
+                c.close()
+
+            waiter = threading.Thread(target=second, daemon=True)
+            waiter.start()
+            time.sleep(1.0)
+            self.assertEqual(answered, [], "the second client was served while the first was connected")
+            first.close()
+            waiter.join(timeout=10)
+            self.assertEqual(answered[0]["type"], "result")
+        finally:
+            self._stop(server, thread)
+
+    def test_peers_in_their_handshake_take_no_client_slot_and_are_capped(self):
+        server = WorkerServer("127.0.0.1", 0, "t", "cpu", max_clients=2)
+        port, thread = self._serve(server)
+        silent = []
+        try:
+            for _ in range(server.MAX_PREAUTH):
+                silent.append(socket.create_connection(("127.0.0.1", port), timeout=10))
+            time.sleep(0.3)
+            # one more anonymous peer is closed at once
+            extra = socket.create_connection(("127.0.0.1", port), timeout=10)
+            extra.settimeout(3)
+            self.assertEqual(extra.recv(1), b"")
+            extra.close()
+            for s_ in silent:
+                s_.close()
+            time.sleep(server.IDLE_POLL * 3)
+            # both client slots are still free for clients that authenticate
+            a, b = _Client(port, "t"), _Client(port, "t")
+            self.assertEqual(a.hello()["type"], "result")
+            self.assertEqual(b.hello()["type"], "result")
+            c = _Client(port, "t")
+            header = c.hello()
+            self.assertEqual(header["type"], "error")
+            self.assertIn("busy", header["message"])
+            for x in (a, b, c):
+                x.close()
+        finally:
+            for s_ in silent:
+                s_.close()
+            self._stop(server, thread)
+
+    def test_an_idle_authenticated_connection_is_closed(self):
+        server = WorkerServer("127.0.0.1", 0, "t", "cpu", idle_timeout=0.6)
+        port, thread = self._serve(server)
+        try:
+            c = _Client(port, "t")
+            self.assertEqual(c.hello()["type"], "result")
+            c.sock.settimeout(10)
+            self.assertEqual(c.sock.recv(1), b"")   # closed by the worker
+            c.close()
+            again = _Client(port, "t")                # and its slot is free
+            self.assertEqual(again.hello()["type"], "result")
+            again.close()
+        finally:
+            self._stop(server, thread)
+
+    def test_a_public_worker_refuses_plugin_folders_a_client_names(self):
+        server = WorkerServer("127.0.0.1", 0, "t", "cpu")
+        port = server.bind()
+        server.host = "192.0.2.7"   # as if bound to a routable address; the socket stays on loopback
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        try:
+            c = _Client(port, "t")
+            self.assertEqual(c.hello()["type"], "result")
+            _, header, _ = c.call("reload_plugins", {"dirs": [tempfile.gettempdir()]})
+            self.assertEqual(header["type"], "error")
+            self.assertIn("folders it was started with", header["message"])
+            c.close()
+        finally:
+            self._stop(server, thread)
+
+
+class TestTokenSources(unittest.TestCase):
+    """The token reaches the worker without being in its command line or, on
+    a cluster, in the job's environment (__main__.py)."""
+
+    def setUp(self):
+        from sirius_worker import __main__ as cli
+
+        self.cli = cli
+        self.saved = {k: os.environ.get(k) for k in ("SIRIUS_TOKEN", "SIRIUS_TOKEN_FILE")}
+
+    def tearDown(self):
+        for k, v in self.saved.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+
+    def args(self, **kw):
+        import argparse
+
+        return argparse.Namespace(**{"token": None, "token_file": None, **kw})
+
+    def write_token(self, text="tok-from-file"):
+        fd, path = tempfile.mkstemp(prefix="sirius-token-")
+        os.write(fd, (text + "\n").encode())
+        os.close(fd)
+        if os.name == "posix":
+            os.chmod(path, 0o600)
+        return path
+
+    def test_a_token_file_is_read_deleted_and_both_variables_dropped(self):
+        path = self.write_token()
+        os.environ["SIRIUS_TOKEN_FILE"] = path
+        os.environ["SIRIUS_TOKEN"] = "from-env"
+        self.assertEqual(self.cli._token(self.args()), "tok-from-file")
+        self.assertFalse(os.path.exists(path))
+        self.assertNotIn("SIRIUS_TOKEN", os.environ)
+        self.assertNotIn("SIRIUS_TOKEN_FILE", os.environ)
+
+    def test_the_environment_variable_still_works(self):
+        os.environ.pop("SIRIUS_TOKEN_FILE", None)
+        os.environ["SIRIUS_TOKEN"] = "from-env"
+        self.assertEqual(self.cli._token(self.args()), "from-env")
+        self.assertNotIn("SIRIUS_TOKEN", os.environ)
+
+    def test_a_token_on_the_command_line_warns(self):
+        with self.assertLogs("sirius_worker", level="WARNING") as logs:
+            self.assertEqual(self.cli._token(self.args(token="argv")), "argv")
+        self.assertTrue(any("visible to every user" in line for line in logs.output), logs.output)
+
+    @unittest.skipUnless(os.name == "posix", "file modes are POSIX")
+    def test_a_token_file_others_can_read_is_refused(self):
+        path = self.write_token()
+        os.chmod(path, 0o644)
+        try:
+            with self.assertRaises(ValueError) as e:
+                self.cli.read_token_file(path)
+            self.assertIn("chmod 600", str(e.exception))
+        finally:
+            if os.path.exists(path):
+                os.remove(path)
+

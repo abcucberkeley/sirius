@@ -23,6 +23,13 @@ on:
     branches: [dev, main]
   workflow_dispatch:
 
+# The jobs only read the repository (upload-artifact needs no token scope):
+# the GITHUB_TOKEN of every job gets nothing more than that. The third-party
+# actions are pinned by tag, not by commit; pin them by SHA before this
+# workflow is given secrets or write scopes.
+permissions:
+  contents: read
+
 # One run per branch / PR; a new push cancels the one still going.
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}

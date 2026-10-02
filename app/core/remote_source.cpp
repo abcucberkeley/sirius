@@ -2,6 +2,8 @@
 
 #include "core/errors.hpp"
 
+#include <sirius/checked_math.hpp>
+
 #include <algorithm>
 #include <cmath>
 #include <cstring>
@@ -108,19 +110,33 @@ namespace sirius::app {
     std::vector<float> decodeWorkerArray(const json& desc, const rpc::Tensor& data, std::vector<Index>& shape) {
         shape.clear();
         if (!desc.contains("shape") || !desc["shape"].is_array()) throw ProtocolError("worker: an array without a shape");
-        std::size_t n = 1;
+        if (desc["shape"].size() > 8) throw ProtocolError("worker: an array of " + std::to_string(desc["shape"].size()) + " dimensions");
         for (const json& d : desc["shape"]) {
             if (!d.is_number_integer() || d.get<std::int64_t>() < 0) throw ProtocolError("worker: a malformed array shape");
             shape.push_back(d.get<Index>());
-            n *= static_cast<std::size_t>(d.get<std::int64_t>());
         }
         const std::string dtype = desc.value("dtype", std::string("float32"));
         const std::size_t item = dtypeBytes(dtype);
+        // The shape comes from the worker: its product is checked before it
+        // sizes the output, and a compressed array may claim only what its
+        // bytes can hold (zlib inflates at most ~1032:1) -- a description
+        // that says more is refused before anything is allocated for it.
+        std::size_t n = 0, expected = 0;
+        try {
+            n = static_cast<std::size_t>(sirius::detail::checkedProduct(shape.begin(), shape.end(), "worker: array shape"));
+            expected = sirius::detail::checkedBytes(static_cast<std::ptrdiff_t>(n), item, "worker: array size");
+            (void)sirius::detail::checkedBytes(static_cast<std::ptrdiff_t>(n), sizeof(float), "worker: array size");
+        } catch (const std::exception& e) {
+            throw ProtocolError(e.what());
+        }
+        if (expected > rpc::maxPayloadBytes()) throw ProtocolError("worker: an array of " + std::to_string(expected) + " bytes exceeds the limit");
         const std::string encoding = desc.value("encoding", std::string("raw"));
         std::vector<std::byte> raw;
         const std::vector<std::byte>* bytes = &data.bytes;
         if (encoding == "zlib") {
-            raw = inflateAll(data.bytes, n * item);
+            if (expected / 1100 > data.bytes.size() + 1)
+                throw ProtocolError("worker: a compressed array of " + std::to_string(data.bytes.size()) + " bytes claims " + std::to_string(expected));
+            raw = inflateAll(data.bytes, expected);
             if (desc.value("shuffle", false) && item > 1) {
                 std::vector<std::byte> un(raw.size());
                 for (std::size_t b = 0; b < item; ++b)

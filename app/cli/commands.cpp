@@ -625,6 +625,10 @@ namespace sirius::cli {
             o.recordPath = g.record;
             o.allowWorkerSetup = args_.has("allow-worker-setup");
             o.readOnly = args_.has("read-only");
+            // The servers' tools take paths an agent chose, which must be local
+            // unless the user says otherwise; a one-shot command's paths are
+            // the ones its user typed, network shares included.
+            o.allowNetworkPaths = (command_ != "session" && command_ != "mcp") || args_.has("allow-network-paths");
             o.createdBy = std::string("sirius-cli ") + SIRIUS_VERSION;
             o.logSink = [this](const std::string& source, const std::string& line) { reporter_.log(source, line); };
             hw_ = std::make_unique<app::HeadlessWorkbench>(std::move(o));

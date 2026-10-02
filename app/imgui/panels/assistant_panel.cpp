@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <chrono>
+#include <cctype>
 #include <cfloat>
 #include <cmath>
 #include <cstdint>
@@ -41,6 +42,16 @@ namespace sirius::app::gui {
         a.model = s.getString("assistant/model", a.model);
         a.apiKey = secrets::read("assistant/apiKey");
         a.askBeforeActing = s.getBool("assistant/askBeforeActing", a.askBeforeActing);
+        // Version 2 of the setting: "Ask before acting" became the default.
+        // A choice saved before that (off, the old default, in most cases)
+        // is turned on once; turning it off afterwards is kept.
+        if (s.getInt("assistant/askBeforeActingVersion", 0) < 2) {
+            a.askBeforeActingMigrated = s.contains("assistant/askBeforeActing") && !a.askBeforeActing;
+            a.askBeforeActing = true;
+            Settings& w = gui::settings();
+            w.set("assistant/askBeforeActing", true);
+            w.set("assistant/askBeforeActingVersion", 2);
+        }
         if (a.apiKey.empty()) a.apiKey = environmentKey(a.provider, &a.apiKeyVariable);
         return a;
     }
@@ -51,6 +62,7 @@ namespace sirius::app::gui {
         s.set("assistant/baseUrl", baseUrl);
         s.set("assistant/model", model);
         s.set("assistant/askBeforeActing", askBeforeActing);
+        s.set("assistant/askBeforeActingVersion", 2);
     }
 
     std::string AssistantSettings::requestKey() const { return provider == "ollama" ? std::string() : apiKey; }
@@ -81,11 +93,57 @@ namespace sirius::app::gui {
         // Text from a model may hold bytes that are not UTF-8: replaced rather than thrown over.
         std::string dump(const json& j) { return j.dump(-1, ' ', false, json::error_handler_t::replace); }
 
-        bool mutatingTool(const std::string& name) {
-            static const char* readOnly[] = {"get_", "list_", "read_", "describe", "help", "explain", "context", "find_"};
-            for (const char* prefix : readOnly)
-                if (startsWith(name, prefix)) return false;
-            return true;
+        // Whether a call changes something: the tool's own readOnly flag, not
+        // its name (a tool called get_something may still write). A tool the
+        // table does not have counts as changing.
+        bool mutatingTool(const ToolApi& api, const std::string& name) {
+            const ToolSpec* t = api.findTool(name);
+            return !t || !t->readOnly;
+        }
+
+        // A parameter whose value is a file, a folder or a model: what a
+        // step reads from, or writes to, outside the workbench.
+        bool locationParam(const Operation* op, const std::string& key) {
+            if (op)
+                for (const ParamSpec& spec : op->info().params)
+                    if (spec.key == key && spec.type == ParamType::Path) return true;
+            std::string k = key;
+            std::transform(k.begin(), k.end(), k.begin(), [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+            for (const char* word : {"model", "path", "dir", "file", "folder"})
+                if (k.find(word) != std::string::npos) return true;
+            return false;
+        }
+
+        // Calls that wait for Apply even with "Ask before acting" off: a tool
+        // that writes files (destructive), and add_step / set_params that set
+        // a model, a path or a folder -- a file the model picks is read, or
+        // with a model spec downloaded and run.
+        bool alwaysConfirm(const ToolApi& api, const Workbench& wb, const std::string& name, const json& args) {
+            const ToolSpec* t = api.findTool(name);
+            if (t && t->destructive) return true;
+            if ((name != "set_params" && name != "add_step") || !args.is_object() || !args.contains("params") || !args["params"].is_object())
+                return false;
+            const Operation* op = nullptr;
+            if (name == "add_step") {
+                if (args.contains("kind") && args["kind"].is_string()) op = findOperation(args["kind"].get<std::string>());
+            } else {
+                try {
+                    op = &wb.pipeline().at(ToolApi::resolveStepIndex(wb.pipeline(), args)).op();
+                } catch (const std::exception&) {
+                    op = nullptr;   // the call fails anyway; the key names decide meanwhile
+                }
+            }
+            for (auto it = args["params"].begin(); it != args["params"].end(); ++it)
+                if (locationParam(op, it.key())) return true;
+            return false;
+        }
+
+        // A call's arguments as the card shows them: compact JSON when they
+        // parse, the text as sent when they do not -- whole either way.
+        std::string shownArguments(const std::string& arguments) {
+            const json args = json::parse(arguments, nullptr, false);
+            if (args.is_discarded()) return arguments;
+            return args.dump(-1, ' ', false, json::error_handler_t::replace);
         }
 
         // The first `n` characters (code points) of `s`.
@@ -207,6 +265,10 @@ namespace sirius::app::gui {
 
         explicit Impl(App& a) : app(a) {
             settings = AssistantSettings::load();
+            if (settings.askBeforeActingMigrated)
+                app.wb().logLine("Assistant: \"Ask before acting\" is now on by default and was turned on; turn it off below the input "
+                                 "if you want the assistant to act without asking (tools that write files, and a step's model, "
+                                 "path or folder, are confirmed either way)");
             client.onDelta = [this](const std::string& t) { onDelta(t); };
             client.onThinking = [this](int chars) {
                 waitingForModel = false;
@@ -521,7 +583,8 @@ namespace sirius::app::gui {
                 return;
             }
             const PendingCall call = pending.front();
-            if (settings.askBeforeActing && mutatingTool(call.name)) {
+            const json args = trimmed(call.arguments).empty() ? json::object() : json::parse(call.arguments, nullptr, false);
+            if ((settings.askBeforeActing && mutatingTool(app.tools(), call.name)) || alwaysConfirm(app.tools(), app.wb(), call.name, args)) {
                 askConfirmation(call);
                 return;
             }
@@ -596,7 +659,7 @@ namespace sirius::app::gui {
             ToolApi& api = app.tools();
             if (args.is_discarded() || !args.is_object()) {
                 result = {{"error", "the arguments of this call are not a valid JSON object (was the reply cut off?); nothing was done"}};
-            } else if (mutatingTool(call.name) && app.bridge().taskRunning()) {
+            } else if (mutatingTool(api, call.name) && app.bridge().taskRunning()) {
                 // A dataset load that finishes installs its dataset with a
                 // fresh Load step and clears the history: a change made while
                 // it runs would be lost, although it was reported as done. The
@@ -844,7 +907,8 @@ namespace sirius::app::gui {
             const float padX = px(10), padY = px(7), gap = px(8);
             const ImVec2 apply = chipSize("Apply"), skip = chipSize("Skip");
             const float textW = std::max(px(40), w - 2 * padX - apply.x - skip.x - 2 * gap);
-            const std::string text = "Apply " + a.call.name + " " + leftChars(a.call.arguments, 80) + "?";
+            // the arguments whole: what Apply does is all there, never cut off
+            const std::string text = "Apply " + a.call.name + " " + shownArguments(a.call.arguments) + "?";
             float textH = 0.0f;
             {
                 const theme::FontScope f(12);

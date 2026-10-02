@@ -17,6 +17,32 @@ namespace sirius::app::gui::http {
 
     namespace {
 
+        // The scheme of `url` in lower case ("" when it has none) and its
+        // host, without user information, port or IPv6 brackets.
+        void splitUrl(const std::string& url, std::string& scheme, std::string& host) {
+            scheme.clear();
+            host.clear();
+            const std::size_t colon = url.find("://");
+            if (colon == std::string::npos) return;
+            scheme = toLower(url.substr(0, colon));
+            std::string rest = url.substr(colon + 3);
+            rest = rest.substr(0, rest.find_first_of("/?#"));
+            const std::size_t at = rest.rfind('@');
+            if (at != std::string::npos) rest = rest.substr(at + 1);
+            if (!rest.empty() && rest.front() == '[') {
+                const std::size_t close = rest.find(']');
+                host = toLower(rest.substr(1, close == std::string::npos ? std::string::npos : close - 1));
+                return;
+            }
+            host = toLower(rest.substr(0, rest.find(':')));
+        }
+
+        bool loopbackHost(const std::string& host) {
+            if (host == "localhost" || host == "::1" || host == "0:0:0:0:0:0:0:1") return true;
+            if (host.size() > 10 && host.compare(host.size() - 10, 10, ".localhost") == 0) return true;
+            return host.rfind("127.", 0) == 0 && host.find_first_not_of("0123456789.") == std::string::npos;
+        }
+
         void ensureCurl() {
             static const bool once = [] {
                 curl_global_init(CURL_GLOBAL_DEFAULT);
@@ -126,6 +152,19 @@ namespace sirius::app::gui::http {
         Response run(const Request& request, const Callbacks& callbacks, std::ofstream* file) {
             ensureCurl();
             Response response;
+            std::string scheme, host;
+            splitUrl(request.url, scheme, host);
+            if (scheme != "https" && scheme != "http") {
+                response.error = "only https:// and http:// addresses are fetched, not " + (scheme.empty() ? request.url : scheme + "://");
+                return response;
+            }
+            // An API key over plain http is readable by everyone on the way;
+            // only a server on this machine (a local model) may be spoken to so.
+            if (!request.bearer.empty() && scheme == "http" && !loopbackHost(host)) {
+                response.error = "refusing to send the API key unencrypted to " + host +
+                                 ": use an https:// address (http:// is accepted only for a server on this machine)";
+                return response;
+            }
             CURL* curl = curl_easy_init();
             if (!curl) {
                 response.error = "cannot initialise libcurl";
@@ -151,6 +190,18 @@ namespace sirius::app::gui::http {
 #endif
             curl_easy_setopt(curl, CURLOPT_USERAGENT, "sirius-app/" SIRIUS_VERSION);
             curl_easy_setopt(curl, CURLOPT_ACCEPT_ENCODING, "");
+            // Nothing but the web: no file://, ftp://, smb:// or the like,
+            // neither asked for nor reached by a redirect. A request with a
+            // key that started encrypted is not redirected to plain http.
+            const char* redirects = !request.bearer.empty() && scheme == "https" ? "https" : "https,http";
+#if LIBCURL_VERSION_NUM >= 0x075500   // the _STR options are 7.85's
+            curl_easy_setopt(curl, CURLOPT_PROTOCOLS_STR, "https,http");
+            curl_easy_setopt(curl, CURLOPT_REDIR_PROTOCOLS_STR, redirects);
+#else
+            curl_easy_setopt(curl, CURLOPT_PROTOCOLS, static_cast<long>(CURLPROTO_HTTPS | CURLPROTO_HTTP));
+            curl_easy_setopt(curl, CURLOPT_REDIR_PROTOCOLS,
+                             static_cast<long>(std::string(redirects) == "https" ? CURLPROTO_HTTPS : (CURLPROTO_HTTPS | CURLPROTO_HTTP)));
+#endif
             curl_easy_setopt(curl, CURLOPT_FOLLOWLOCATION, request.followRedirects ? 1L : 0L);
             curl_easy_setopt(curl, CURLOPT_MAXREDIRS, 10L);
             curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT, request.connectTimeoutSeconds);

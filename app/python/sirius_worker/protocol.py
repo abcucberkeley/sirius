@@ -19,20 +19,40 @@ the given byte offsets. Nothing is pickled: every value crossing the wire is
 JSON or a plain array.
 
 Both lengths and every tensor descriptor come from the peer, so both ends cap
-them before they size an allocation or index a buffer: ``MAX_HEADER`` /
-``MAX_PAYLOAD`` here are the same numbers as ``kMaxHeaderBytes`` /
-``kMaxPayloadBytes`` in ``app/core/rpc.cpp``, and a connection that has not
-completed its ``hello`` is held to ``MAX_PREAUTH_FRAME`` (see server.py).
+them before they size an allocation or index a buffer: ``MAX_HEADER`` is
+``kMaxHeaderBytes`` in ``app/core/rpc.cpp``; ``MAX_PAYLOAD`` is what this
+worker accepts (a run's input), while the application holds the replies it
+reads to its own, lower cap (``rpc::maxPayloadBytes``, 8 GiB unless
+``$SIRIUS_RPC_MAX_PAYLOAD_GIB`` says otherwise); at most ``MAX_TENSORS``
+descriptors, which must not overlap. A connection that has not completed its
+handshake is held to ``MAX_PREAUTH_FRAME`` (see server.py).
 
 ``PROTOCOL_VERSION`` is exchanged in ``hello`` (request params and reply
 result) and must match on both ends; it is ``kProtocolVersion`` in
 ``app/core/rpc.hpp``. Bump it whenever the framing or the method set changes
 in a way an older peer cannot understand.
+
+The token never crosses the wire (version 2). Both sides prove they know it:
+
+    client -> hello {protocol_version, client_nonce}
+    worker -> {protocol_version, server_nonce, server_proof}
+    client    checks server_proof; on a mismatch it stops here
+    client -> auth  {client_proof}
+    worker -> the capabilities
+
+with ``*_proof = handshake_proof(token, role, client_nonce, server_nonce)``,
+role ``"worker"`` or ``"client"``: hex HMAC-SHA256 of a fixed message. A
+stand-in on the worker's port therefore never sees the token nor anything it
+could replay, and the client sends it nothing past the nonce.
+``client_handshake`` is the client's half, for tests and scripts.
 """
 
 from __future__ import annotations
 
+import hashlib
+import hmac
 import json
+import secrets
 import select
 import socket
 import struct
@@ -45,28 +65,35 @@ __all__ = [
     "MAX_HEADER",
     "MAX_PAYLOAD",
     "MAX_PREAUTH_FRAME",
+    "MAX_TENSORS",
     "PROTOCOL_VERSION",
     "FrameReader",
     "ProtocolError",
+    "client_handshake",
     "decode_frame",
     "encode_frame",
+    "handshake_proof",
     "read_frame",
     "recv_exactly",
+    "valid_nonce",
     "write_frame",
 ]
 
 # Wire protocol version, exchanged in `hello`; the peer must answer with the
 # same number (app/core/rpc.hpp: kProtocolVersion).
-PROTOCOL_VERSION = 1
+PROTOCOL_VERSION = 2
 
 HEADER_LEN = struct.Struct("<I")
 PAYLOAD_LEN = struct.Struct("<Q")
 MAX_HEADER = 64 << 20          # a header larger than this is a corrupt stream
-MAX_PAYLOAD = 32 << 30         # 32 GiB of tensors, the cap app/core/rpc.cpp enforces
+MAX_PAYLOAD = 32 << 30         # 32 GiB of tensors in one request (the application reads replies up to its own, lower cap)
 # Nothing legitimate is large before `hello`: a hello frame is a few hundred
 # bytes. Holding an unauthenticated peer to this keeps it from making the
 # worker allocate, or wait for, anything worth the trouble.
 MAX_PREAUTH_FRAME = 16 << 10
+# Most tensors one frame may describe (kMaxTensors in app/core/rpc.hpp): a
+# request or reply carries a handful.
+MAX_TENSORS = 64
 
 # protocol dtype name -> numpy little-endian dtype
 DTYPES: Dict[str, np.dtype] = {
@@ -181,7 +208,13 @@ def _decode_tensors(header: Dict[str, Any], payload: memoryview) -> Dict[str, np
     descriptors = header.get("tensors") or []
     if not isinstance(descriptors, list):
         raise ProtocolError("header 'tensors' is not an array")
+    if len(descriptors) > MAX_TENSORS:
+        raise ProtocolError(f"a frame describing {len(descriptors)} tensors (at most {MAX_TENSORS})")
     out: Dict[str, np.ndarray] = {}
+    # The descriptors tile the payload in order: each starts at or after the
+    # end of the one before, so no byte is decoded twice and together they
+    # never claim more than the payload holds.
+    previous_end = 0
     for d in descriptors:
         if not isinstance(d, dict):
             raise ProtocolError(f"malformed tensor descriptor {d!r}")
@@ -203,6 +236,11 @@ def _decode_tensors(header: Dict[str, Any], payload: memoryview) -> Dict[str, np
             raise ProtocolError(f"tensor '{name}': {nbytes} bytes at {offset} do not fit the payload ({len(payload)} bytes)")
         if nbytes != expected:
             raise ProtocolError(f"tensor '{name}': {nbytes} bytes do not match shape {shape} of {dtype.name}")
+        if offset < previous_end:
+            raise ProtocolError(f"tensor '{name}' overlaps the one before it, or is out of order")
+        if name in out:
+            raise ProtocolError(f"tensor '{name}' is described twice")
+        previous_end = offset + nbytes
         arr = np.frombuffer(payload[offset:offset + nbytes], dtype=dtype).reshape(shape)
         out[name] = arr.copy()  # own the memory: the buffer is reused by the reader
     return out
@@ -310,3 +348,48 @@ def read_frame(sock: socket.socket, max_header: int = MAX_HEADER, max_payload: i
 
 def write_frame(sock: socket.socket, header: Dict[str, Any], tensors: Tensors = None) -> None:
     sock.sendall(encode_frame(header, tensors))
+
+
+# --- the handshake ----------------------------------------------------------------------
+
+
+def handshake_proof(token: str, role: str, client_nonce: str, server_nonce: str) -> str:
+    """Hex HMAC-SHA256(token, "sirius-worker-auth/2|<role>|<client>|<server>"):
+    what each side sends to show that it holds the token without sending it
+    (rpc::handshakeProof in app/core/rpc.cpp)."""
+    message = f"sirius-worker-auth/2|{role}|{client_nonce}|{server_nonce}".encode()
+    return hmac.new((token or "").encode("utf-8"), message, hashlib.sha256).hexdigest()
+
+
+def valid_nonce(value: Any) -> bool:
+    """32 to 128 lower-case hex digits."""
+    return (isinstance(value, str) and 32 <= len(value) <= 128
+            and all(c in "0123456789abcdef" for c in value))
+
+
+def client_handshake(sock: socket.socket, token: str, protocol_version: int = PROTOCOL_VERSION,
+                     first_id: int = 1) -> Dict[str, Any]:
+    """The client's half of the handshake on a connected socket. Returns the
+    worker's last reply header: an error when it refused the hello or the
+    proof, else the auth reply, whose result holds the capabilities. Raises
+    ProtocolError -- having sent nothing but its nonce -- when the worker
+    cannot prove that it holds `token`. Uses request ids first_id and
+    first_id + 1."""
+    client_nonce = secrets.token_hex(16)
+    write_frame(sock, {"id": first_id, "type": "request", "method": "hello",
+                       "params": {"protocol_version": protocol_version, "client_nonce": client_nonce}})
+    header, _ = read_frame(sock)
+    if header.get("type") != "result":
+        return header
+    result = header.get("result") or {}
+    server_nonce = result.get("server_nonce")
+    proof = result.get("server_proof")
+    if (not valid_nonce(server_nonce) or server_nonce == client_nonce or not isinstance(proof, str)
+            or not hmac.compare_digest(proof.encode("utf-8"),
+                                       handshake_proof(token, "worker", client_nonce, server_nonce).encode("utf-8"))):
+        raise ProtocolError("the worker could not prove that it holds the token (a wrong token, or something else "
+                            "answers on that port); nothing else was sent to it")
+    write_frame(sock, {"id": first_id + 1, "type": "request", "method": "auth",
+                       "params": {"client_proof": handshake_proof(token, "client", client_nonce, server_nonce)}})
+    header, _ = read_frame(sock)
+    return header

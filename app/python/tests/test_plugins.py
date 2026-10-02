@@ -53,6 +53,26 @@ class PluginTests(unittest.TestCase):
     def tearDown(self):
         self.tmp.cleanup()
 
+    def test_a_plugin_others_could_write_is_not_loaded(self):
+        def facts(mode, uid=1000):
+            return os.stat_result((mode, 0, 0, 1, uid, 1000, 0, 0, 0, 0))
+
+        path = Path(self.tmp.name) / "scale.py"
+        self.assertEqual(plugins.unsafe_reason(path, facts(0o100644), uid=1000), "")
+        self.assertEqual(plugins.unsafe_reason(path, facts(0o100644, uid=0), uid=1000), "")   # root's: an install
+        self.assertIn("every user", plugins.unsafe_reason(path, facts(0o100666), uid=1000))
+        self.assertIn("another user", plugins.unsafe_reason(path, facts(0o100644, uid=1001), uid=1000))
+        self.assertIn("another user", plugins.unsafe_reason(path, facts(0o40755, uid=1001), uid=1000))
+        if os.name == "posix":
+            os.chmod(self.tmp.name, 0o777)
+            try:
+                with self.assertLogs("sirius_worker", "WARNING") as logged:
+                    found, _ = plugins.load_all([self.tmp.name])
+                self.assertNotIn("scale", {p.kind for p in found if p.file.parent == Path(self.tmp.name)})
+                self.assertIn("writable by every user", "\n".join(logged.output))
+            finally:
+                os.chmod(self.tmp.name, 0o700)
+
     def test_load_and_validate(self):
         found, dirs = plugins.load_all([self.tmp.name])
         by_kind = {p.kind: p for p in found}
@@ -100,7 +120,9 @@ class PluginTests(unittest.TestCase):
                         if header.get("type") == "progress":
                             continue
                         return header, tens
-                h, _ = call(1, "hello", {"token": "t", "protocol_version": PROTOCOL_VERSION})
+                from sirius_worker.protocol import client_handshake
+
+                h = client_handshake(conn, "t", PROTOCOL_VERSION, first_id=100)
                 self.assertIn("run:plugin", h["result"]["methods"])
                 h, _ = call(2, "list_plugins", {})
                 kinds = {p["kind"]: p for p in h["result"]["plugins"]}

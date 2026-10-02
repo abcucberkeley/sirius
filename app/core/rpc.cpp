@@ -4,10 +4,13 @@
 #include "core/cancel.hpp"
 
 #include "core/errors.hpp"
+#include "core/secure_wipe.hpp"
+#include "core/sha256.hpp"
 
 #include <sirius/checked_math.hpp>
 
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <condition_variable>
 #include <cstdlib>
@@ -15,6 +18,7 @@
 #include <deque>
 #include <filesystem>
 #include <mutex>
+#include <random>
 #include <stdexcept>
 #include <thread>
 
@@ -41,8 +45,91 @@ namespace sirius::app::rpc {
 
     // Frame size limits. Both lengths in a frame header come from the peer,
     // so they are bounded before they are used for arithmetic or indexing.
-    constexpr std::uint64_t kMaxHeaderBytes = 64ull << 20;    // 64 MiB of JSON
-    constexpr std::uint64_t kMaxPayloadBytes = 32ull << 30;   // 32 GiB of tensors
+    constexpr std::uint64_t kMaxHeaderBytes = 64ull << 20;   // 64 MiB of JSON
+    // What a reply may carry unless $SIRIUS_RPC_MAX_PAYLOAD_GIB says otherwise:
+    // a whole volume, or a model's probabilities for one, but not the worker's
+    // own 32 GiB cap, which a peer could announce to make this side wait for
+    // (and buffer) far more than it ever asks for.
+    constexpr std::uint64_t kDefaultMaxPayloadBytes = 8ull << 30;
+
+    namespace {
+        std::uint64_t payloadCapFromEnvironment() {
+            const char* env = std::getenv("SIRIUS_RPC_MAX_PAYLOAD_GIB");
+            if (!env || !*env) return kDefaultMaxPayloadBytes;
+            char* end = nullptr;
+            const unsigned long long gib = std::strtoull(env, &end, 10);
+            if (end == env || *end != '\0' || gib == 0 || gib > 1024) return kDefaultMaxPayloadBytes;
+            return static_cast<std::uint64_t>(gib) << 30;
+        }
+        std::atomic<std::uint64_t>& payloadCap() {
+            static std::atomic<std::uint64_t> cap{payloadCapFromEnvironment()};
+            return cap;
+        }
+    } // namespace
+
+    std::uint64_t maxPayloadBytes() noexcept { return payloadCap().load(); }
+    void setMaxPayloadBytes(std::uint64_t bytes) noexcept { payloadCap().store(bytes); }
+
+    // --- the handshake ---------------------------------------------------------------
+
+    std::string handshakeProof(const std::string& token, const std::string& role, const std::string& clientNonce,
+                               const std::string& serverNonce) {
+        return crypto::toHex(crypto::hmacSha256(token, "sirius-worker-auth/2|" + role + "|" + clientNonce + "|" + serverNonce));
+    }
+
+    bool validNonce(const nlohmann::json& value) {
+        if (!value.is_string()) return false;
+        const std::string& s = value.get_ref<const std::string&>();
+        if (s.size() < 32 || s.size() > 128) return false;
+        return std::all_of(s.begin(), s.end(), [](char c) { return (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f'); });
+    }
+
+    std::string randomNonce() {
+        // std::random_device is the operating system's generator on the
+        // platforms this builds for (RtlGenRandom; getrandom or /dev/urandom).
+        std::random_device rd;
+        std::uint8_t bytes[16];
+        for (std::uint8_t& b : bytes) b = static_cast<std::uint8_t>(rd() & 0xffu);
+        return crypto::toHex(bytes, sizeof bytes);
+    }
+
+    std::optional<nlohmann::json> HandshakeResponder::answer(const std::string& method, const nlohmann::json& params,
+                                                             const nlohmann::json& capabilities, std::string& error) {
+        if (method == "hello") {
+            const int theirs = params.contains("protocol_version") && params["protocol_version"].is_number_integer()
+                                   ? params["protocol_version"].get<int>()
+                                   : 0;
+            if (protocolVersion >= 0 && theirs != protocolVersion) {
+                // worded as sirius_worker words it (server.py: _check_version)
+                error = "protocol version mismatch: this worker speaks version " + std::to_string(protocolVersion) +
+                        ", the client speaks version " + std::to_string(theirs) +
+                        (theirs < protocolVersion ? "; update the SIRIUS application that connects to this worker"
+                                                  : "; update sirius_worker on this machine (app/python)");
+                return std::nullopt;
+            }
+            if (!params.contains("client_nonce") || !validNonce(params["client_nonce"])) {
+                error = "hello: client_nonce is missing or malformed";
+                return std::nullopt;
+            }
+            clientNonce = params["client_nonce"].get<std::string>();
+            serverNonce = randomNonce();
+            nlohmann::json r = {{"server_nonce", serverNonce}, {"server_proof", handshakeProof(token, "worker", clientNonce, serverNonce)}};
+            if (protocolVersion >= 0) r["protocol_version"] = protocolVersion;
+            return r;
+        }
+        if (method == "auth") {
+            const std::string proof =
+                params.contains("client_proof") && params["client_proof"].is_string() ? params["client_proof"].get<std::string>() : std::string();
+            if (serverNonce.empty() || !crypto::constantTimeEqual(proof, handshakeProof(token, "client", clientNonce, serverNonce))) {
+                error = "authentication failed: the client's proof does not match this worker's token";
+                return std::nullopt;
+            }
+            authenticated = true;
+            return capabilities;
+        }
+        error = "not authenticated: send 'hello' and 'auth' first";
+        return std::nullopt;
+    }
 
 
     using json = nlohmann::json;
@@ -128,8 +215,9 @@ namespace sirius::app::rpc {
         // Both lengths are attacker-controlled. Without the cap the total
         // below can wrap, the "is the frame complete" test then passes, and
         // the payload pointer runs past the buffer.
-        if (plen > kMaxPayloadBytes)
-            throw ProtocolError("rpc: payload of " + std::to_string(plen) + " bytes exceeds the limit");
+        if (plen > maxPayloadBytes())
+            throw ProtocolError("rpc: a payload of " + std::to_string(plen) + " bytes exceeds the limit of " + std::to_string(maxPayloadBytes()) +
+                                " bytes ($SIRIUS_RPC_MAX_PAYLOAD_GIB raises it)");
         const std::uint64_t total = 4 + hlen + 8 + plen;
         if (buffer.size() < total) return std::nullopt;
         Message m;
@@ -141,7 +229,15 @@ namespace sirius::app::rpc {
         }
         const std::byte* payload = buffer.data() + 4 + hlen + 8;
         if (m.header.contains("tensors") && m.header["tensors"].is_array()) {
+            // The descriptors must tile the payload in order: each tensor
+            // starts at or after the end of the one before it, so no two
+            // overlap and together they never claim more than the payload.
+            if (m.header["tensors"].size() > kMaxTensors)
+                throw ProtocolError("rpc: a frame describing " + std::to_string(m.header["tensors"].size()) + " tensors (at most " +
+                                    std::to_string(kMaxTensors) + ")");
+            std::uint64_t previousEnd = 0;
             for (const json& tj : m.header["tensors"]) {
+                if (!tj.is_object()) throw ProtocolError("rpc: a tensor descriptor is not an object");
                 Tensor t;
                 t.name = tj.value("name", "");
                 t.dtype = tj.value("dtype", "float32");
@@ -165,6 +261,8 @@ namespace sirius::app::rpc {
                 const std::uint64_t off = unsignedField("offset"), n = unsignedField("nbytes");
                 // Written so neither sum nor product can wrap.
                 if (n > plen || off > plen - n) throw ProtocolError("rpc: tensor '" + t.name + "' exceeds the payload");
+                if (off < previousEnd) throw ProtocolError("rpc: tensor '" + t.name + "' overlaps the one before it, or is out of order");
+                previousEnd = off + n;
                 if (sirius::detail::checkedBytes(t.numel(), dtypeSize(t.dtype), "rpc: tensor size") != n)
                     throw ProtocolError("rpc: tensor '" + t.name + "' size does not match its shape");
                 t.bytes.assign(payload + off, payload + off + n);
@@ -494,35 +592,64 @@ namespace sirius::app {
 
     RemoteWorker::RemoteWorker(std::unique_ptr<rpc::Transport> transport, std::string token, const std::function<bool()>& cancelled,
                                std::chrono::milliseconds helloTimeout)
-        : transport_(std::move(transport)), token_(std::move(token)) {
-        if (!transport_) throw std::invalid_argument("RemoteWorker: no transport");
-        // Behind another client the hello is not even read yet, so there is
-        // nothing to cancel on the worker's side: a wait that is given up
-        // closes the connection at once instead of granting the worker the
-        // cancel grace of a call, and a caller that has to join this thread
-        // (the model hub closing, the application quitting) is not held for
-        // as long as the other client keeps its connection. A caller that can
-        // cancel decides how long it waits; the deadline is for one that
-        // cannot, and it is long because a slow answer is most often a worker
-        // still importing torch for its first one.
+        : transport_(std::move(transport)) {
+        if (!transport_) {
+            secureWipe(token);
+            throw std::invalid_argument("RemoteWorker: no transport");
+        }
+        try {
+            handshake(token, cancelled, helloTimeout);
+        } catch (...) {
+            secureWipe(token);
+            throw;
+        }
+        secureWipe(token);
+    }
+
+    void RemoteWorker::handshake(const std::string& token, const std::function<bool()>& cancelled, std::chrono::milliseconds helloTimeout) {
+        // Behind another client the answer may be held back (a worker that
+        // serves one client at a time answers "auth" once the client before
+        // it has gone), so there is nothing to cancel on the worker's side: a
+        // wait that is given up closes the connection at once instead of
+        // granting the worker the cancel grace of a call, and a caller that
+        // has to join this thread (the model hub closing, the application
+        // quitting) is not held for as long as the other client keeps its
+        // connection. A caller that can cancel decides how long it waits; the
+        // deadline is for one that cannot, and it is long because a slow
+        // answer is most often a worker still importing torch for its first.
         const auto deadline = std::chrono::steady_clock::now() + helloTimeout;
         bool late = false;
         const std::chrono::milliseconds grace = cancelGrace_;
         cancelGrace_ = std::chrono::milliseconds(0);
+        const auto stop = [&] {
+            if (cancelled) return cancelled();
+            late = std::chrono::steady_clock::now() >= deadline;
+            return late;
+        };
+        const auto timedOut = [&] {
+            return ProtocolError("worker: no answer to the handshake within " + std::to_string((helloTimeout.count() + 999) / 1000) +
+                                 " s. The worker may still be starting (it imports torch for its first answer), or be serving another "
+                                 "client: it serves one at a time, and a run or the model hub may still be using it.");
+        };
+        const std::string clientNonce = rpc::randomNonce();
         WorkerResult hello;
         try {
-            hello = call("hello", {{"token", token_}, {"protocol_version", rpc::kProtocolVersion}}, {}, {}, [&] {
-                if (cancelled) return cancelled();
-                late = std::chrono::steady_clock::now() >= deadline;
-                return late;
-            });
+            hello = call("hello", {{"protocol_version", rpc::kProtocolVersion}, {"client_nonce", clientNonce}}, {}, {}, stop);
         } catch (const CancelledError&) {
             if (!late) throw;
-            throw ProtocolError("worker: no answer to the handshake within " + std::to_string((helloTimeout.count() + 999) / 1000) +
-                                " s. The worker may still be starting (it imports torch for its first answer), or be serving another "
-                                "client: it serves one at a time, and a run or the model hub may still be using it.");
+            throw timedOut();
+        } catch (const ProtocolError&) {
+            throw;
+        } catch (const std::runtime_error& e) {
+            // A version 1 worker with a token refuses a hello that carries
+            // none, and this side never sends one: that answer can only come
+            // from an older worker.
+            if (std::string(e.what()).find("bad token") != std::string::npos)
+                throw ProtocolError("worker: protocol version mismatch. This application speaks version " + std::to_string(rpc::kProtocolVersion) +
+                                    ", the worker an older one that takes its token in the clear; update sirius_worker (app/python) on "
+                                    "the machine running the worker.");
+            throw;
         }
-        cancelGrace_ = grace;
         // Same version on both ends or nothing: the framing and the method set
         // are versioned together, so a mismatch is reported here rather than
         // as a puzzling failure in the middle of a run. A worker predating the
@@ -530,27 +657,47 @@ namespace sirius::app {
         if (hello.result.contains("protocol_version") && hello.result["protocol_version"].is_number_integer())
             caps_.protocolVersion = hello.result["protocol_version"].get<int>();
         if (caps_.protocolVersion != rpc::kProtocolVersion)
-            throw ProtocolError(
-                "worker: protocol version mismatch. This application speaks version " +
-                std::to_string(rpc::kProtocolVersion) + ", the worker speaks version " +
-                std::to_string(caps_.protocolVersion) +
-                (caps_.protocolVersion < rpc::kProtocolVersion
-                     ? "; update sirius_worker (app/python) on the machine running the worker."
-                     : "; update SIRIUS on this machine."));
-        caps_.version = hello.result.value("version", "");
-        caps_.cuda = hello.result.value("cuda", false);
-        caps_.device = hello.result.value("device", "");
-        caps_.hostname = hello.result.value("hostname", "");
-        caps_.python = hello.result.value("python", "");
-        if (hello.result.contains("methods") && hello.result["methods"].is_array())
-            for (const json& m : hello.result["methods"]) caps_.methods.push_back(m.get<std::string>());
-        if (hello.result.contains("encodings") && hello.result["encodings"].is_array())
-            for (const json& e : hello.result["encodings"])
+            throw ProtocolError("worker: protocol version mismatch. This application speaks version " + std::to_string(rpc::kProtocolVersion) +
+                                ", the worker speaks version " + std::to_string(caps_.protocolVersion) +
+                                (caps_.protocolVersion < rpc::kProtocolVersion ? "; update sirius_worker (app/python) on the machine running the worker."
+                                                                               : "; update SIRIUS on this machine."));
+        // The worker proves that it holds the token before this side proves
+        // anything: a stand-in listening on the worker's port is sent a nonce
+        // and nothing it could use.
+        const json& h = hello.result;
+        if (!h.contains("server_nonce") || !rpc::validNonce(h["server_nonce"]) || !h.contains("server_proof") || !h["server_proof"].is_string()) {
+            transport_->close();
+            throw ProtocolError("worker: the handshake reply carries no proof of the token");
+        }
+        const std::string serverNonce = h["server_nonce"].get<std::string>();
+        if (serverNonce == clientNonce ||
+            !crypto::constantTimeEqual(h["server_proof"].get<std::string>(), rpc::handshakeProof(token, "worker", clientNonce, serverNonce))) {
+            transport_->close();
+            throw ProtocolError("worker: authentication failed: the worker could not prove that it holds this connection's token (a wrong "
+                                "token, or something else answers on that port). Nothing else was sent to it.");
+        }
+        WorkerResult auth;
+        try {
+            auth = call("auth", {{"client_proof", rpc::handshakeProof(token, "client", clientNonce, serverNonce)}}, {}, {}, stop);
+        } catch (const CancelledError&) {
+            if (!late) throw;
+            throw timedOut();
+        }
+        cancelGrace_ = grace;
+        const json& r = auth.result;
+        caps_.version = r.value("version", "");
+        caps_.cuda = r.value("cuda", false);
+        caps_.device = r.value("device", "");
+        caps_.hostname = r.value("hostname", "");
+        caps_.python = r.value("python", "");
+        if (r.contains("methods") && r["methods"].is_array())
+            for (const json& m : r["methods"])
+                if (m.is_string()) caps_.methods.push_back(m.get<std::string>());
+        if (r.contains("encodings") && r["encodings"].is_array())
+            for (const json& e : r["encodings"])
                 if (e.is_string()) caps_.encodings.push_back(e.get<std::string>());
-        if (hello.result.contains("max_clients") && hello.result["max_clients"].is_number_integer())
-            caps_.maxClients = hello.result["max_clients"].get<int>();
-        if (hello.result.contains("tifffile") && hello.result["tifffile"].is_string())
-            caps_.tifffile = hello.result["tifffile"].get<std::string>();
+        if (r.contains("max_clients") && r["max_clients"].is_number_integer()) caps_.maxClients = r["max_clients"].get<int>();
+        if (r.contains("tifffile") && r["tifffile"].is_string()) caps_.tifffile = r["tifffile"].get<std::string>();
     }
 
     RemoteWorker::~RemoteWorker() { close(); }
@@ -572,8 +719,8 @@ namespace sirius::app {
                                     const std::function<bool()>& cancelled) {
         if (!transport_ || !transport_->isOpen()) throw ProtocolError("worker: not connected");
         const std::uint64_t id = nextId_++;
-        json header = {{"id", id}, {"type", "request"}, {"method", method}, {"params", params}};
-        if (!token_.empty()) header["token"] = token_;
+        // The token is never sent: the handshake proved it, once.
+        const json header = {{"id", id}, {"type", "request"}, {"method", method}, {"params", params}};
         const auto t0 = std::chrono::steady_clock::now();
         transport_->send(rpc::encodeFrame(header, tensors));
         bool cancelSent = false;

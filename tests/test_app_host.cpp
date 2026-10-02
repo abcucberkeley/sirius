@@ -144,6 +144,24 @@ TEST_CASE("host: makeTempDirectory gives a new directory on every call", "[app][
     CHECK(host::removeTree(b));
 }
 
+TEST_CASE("host: writableByOthers tells a private directory from one others may write", "[app][host]") {
+    const std::string dir = host::makeTempDirectory("sirius-host-test-");
+    REQUIRE_FALSE(dir.empty());
+    CHECK_FALSE(host::writableByOthers(dir + "/no-such-thing"));
+#ifdef _WIN32
+    CHECK_FALSE(host::writableByOthers(dir));   // ACLs, not modes: never on Windows
+#else
+    REQUIRE(::chmod(dir.c_str(), 0700) == 0);
+    CHECK_FALSE(host::writableByOthers(dir));
+    std::string why;
+    REQUIRE(::chmod(dir.c_str(), 0777) == 0);
+    CHECK(host::writableByOthers(dir, &why));
+    CHECK(why == "every user may write it");
+    REQUIRE(::chmod(dir.c_str(), 0700) == 0);
+#endif
+    CHECK(host::removeTree(dir));
+}
+
 TEST_CASE("host: writeFileAtomic replaces a file whole and leaves nothing beside it", "[app][host]") {
     const TempDir dir;
     const std::string path = dir.path + "/settings.json";

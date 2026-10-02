@@ -8,6 +8,7 @@
 
 #include "core/host.hpp"
 #include "core/errors.hpp"
+#include "core/secure_wipe.hpp"
 #include "imgui/app.hpp"
 #include "imgui/settings.hpp"
 #include "imgui/theme.hpp"
@@ -127,10 +128,14 @@ namespace sirius::app::gui {
             }
             std::this_thread::sleep_for(std::chrono::milliseconds(50));
         }
-        if (req->cancelled) return std::nullopt;
-        std::optional<std::string> answer = std::move(req->answer);
-        std::fill(req->answer.begin(), req->answer.end(), '\0');
-        req->answer.clear();
+        if (req->cancelled) {
+            secureWipe(req->answer);
+            return std::nullopt;
+        }
+        // Copied, then the source wiped: a move leaves a short string's bytes
+        // where they were (the small-string buffer), and clear() keeps them.
+        std::optional<std::string> answer = req->answer;
+        secureWipe(req->answer);
         return answer;
     }
 

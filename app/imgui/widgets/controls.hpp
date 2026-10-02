@@ -180,6 +180,11 @@ namespace sirius::app::gui::widgets {
         bool enterReturnsTrue = false;   // true only when Enter was pressed (else on every edit)
     };
     bool inputText(const char* id, std::string* value, const FieldOpts& opts = {});
+    // For a field that held a secret (a password field's ImGui id, from
+    // ImGui::GetItemID() after inputText): ends its editing and overwrites
+    // the copies Dear ImGui keeps of its text (the edit buffer, the text to
+    // revert to, the deactivated-field copy). The caller wipes its own string.
+    void forgetInputText(ImGuiID id);
     bool inputTextMultiline(const char* id, std::string* value, float heightPx, const FieldOpts& opts = {});
     // Spin boxes; `step` 0 hides the arrows' effect (plain number field).
     bool inputInt(const char* id, std::int64_t* value, std::int64_t lo, std::int64_t hi, std::int64_t step = 1,

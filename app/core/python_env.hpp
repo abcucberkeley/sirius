@@ -9,6 +9,7 @@
 #include <map>
 #include <optional>
 #include <string>
+#include <utility>
 #include <vector>
 
 #include <nlohmann/json_fwd.hpp>
@@ -27,7 +28,14 @@ namespace sirius::app::pyenv {
     std::string requirementsFingerprint(const std::string& scriptDir, bool extras,
                                         const std::vector<std::string>& extraPackages = {});
     const std::vector<std::string>& optionalDistributions();         // mirrors sirius_worker.OPTIONAL's values
-    std::string redactUrl(const std::string& url);                   // scheme://user:pass@host -> scheme://***@host
+    // scheme://user:pass@host/x?key=value -> scheme://***@host/x?key=***: the credentials and every
+    // query value (an index's access token is often one), in every URL of a line.
+    std::string redactUrl(const std::string& url);
+    // The variables that hold this application's (and its assistant's) secrets: the HPC worker token,
+    // the language-model API keys. Removed from the environment of every child that does not need
+    // them -- the local worker and the installers. HF_TOKEN is not among them: the local worker may
+    // download gated models with it (the installers drop it on their own).
+    const std::vector<std::string>& secretEnvironmentNames();
 
     struct Marker {
         int schema = kMarkerSchema;
@@ -97,6 +105,10 @@ namespace sirius::app::pyenv {
         bool noIndex = false;
         std::string createdBy;
     };
+    // What the installer is given the index through: PIP_INDEX_URL (pip) or UV_INDEX_URL (uv), never
+    // --index-url, because a command line is readable by every user of the machine and the URL may
+    // carry a password or a token. Empty without an index URL.
+    std::vector<std::pair<std::string, std::string>> installerIndexEnvironment(const SetupOptions& options, bool uv);
     struct SetupPlan {
         std::string envDir, basePython, basePythonVersion, installer, uv, index;   // index redacted
         Mode mode = Mode::Create;

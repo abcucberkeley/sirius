@@ -9,6 +9,8 @@
 // ($SIRIUS_TEST_BASH, else Git's bash on Windows, bash on PATH elsewhere);
 // the end-to-end case also numpy in that Python. Cases skip without them.
 
+#include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <cstdint>
 #include <cstdlib>
@@ -200,6 +202,63 @@ TEST_CASE("cluster: shell words and the ssh command line", "[app][cluster]") {
     bool socks = false;
     for (std::size_t i = 0; i + 1 < a.size(); ++i) socks = socks || (a[i] == "-D" && a[i + 1] == "127.0.0.1:40000");
     CHECK(socks);
+    // the cluster gets neither this machine's display nor its agent, and no
+    // LocalCommand of the user's ssh config runs here; forwardings are not
+    // cleared, since -D is one
+    const auto flag = [&](const std::string& f) { return std::find(a.begin(), a.end(), f) != a.end(); };
+    CHECK(flag("-x"));
+    CHECK(flag("-a"));
+    CHECK(has("ForwardAgent=no"));
+    CHECK(has("ForwardX11=no"));
+    CHECK(has("PermitLocalCommand=no"));
+    for (const std::string& s : a) CHECK(s.find("ClearAllForwardings") == std::string::npos);
+}
+
+TEST_CASE("cluster: only OpenSSH's host key question is answered in clear", "[app][cluster]") {
+    CHECK(ssh::isHostKeyConfirmation("confirm", "anything"));
+    CHECK(ssh::isHostKeyConfirmation("", "The authenticity of host 'fiona (10.0.0.1)' can't be established.\n"
+                                         "ED25519 key fingerprint is SHA256:abc.\n"
+                                         "Are you sure you want to continue connecting (yes/no/[fingerprint])? "));
+    // a server's keyboard-interactive prompt, whatever it says
+    CHECK_FALSE(ssh::isHostKeyConfirmation("", "(tester@fiona) Password (yes/no): "));
+    CHECK_FALSE(ssh::isHostKeyConfirmation("", "(tester@fiona) Are you sure you want to continue connecting (yes/no)? "));
+    CHECK_FALSE(ssh::isHostKeyConfirmation("", "Password: "));
+}
+
+TEST_CASE("cluster: the askpass relay drops a silent peer and stops listening after the login", "[app][cluster]") {
+    std::atomic<int> asked{0};
+    ssh::AskpassServer relay([&](const ssh::Prompt&) -> std::optional<std::string> {
+        ++asked;
+        return std::string("x");
+    });
+    const auto env = relay.environment("helper");
+    bool display = false;
+    for (const auto& kv : env) display = display || kv.first == "DISPLAY";
+#ifdef _WIN32
+    CHECK_FALSE(display);   // Windows' OpenSSH needs none for SSH_ASKPASS_REQUIRE=force
+#else
+    CHECK(display);         // OpenSSH before 8.4 wants one
+#endif
+    // A peer that connects and says nothing is dropped after a second, not
+    // after five, and holds no prompt up meanwhile.
+    std::unique_ptr<rpc::Transport> silent = rpc::connectTcp("127.0.0.1", relay.port(), std::chrono::seconds(5));
+    std::unique_ptr<rpc::Transport> second = rpc::connectTcp("127.0.0.1", relay.port(), std::chrono::seconds(5));
+    const auto t0 = std::chrono::steady_clock::now();
+    bool closed = false;
+    std::vector<std::byte> in;
+    while (std::chrono::steady_clock::now() - t0 < std::chrono::seconds(6)) {
+        try {
+            silent->receive(in, std::chrono::milliseconds(100));
+        } catch (const ProtocolError&) {
+            closed = true;
+            break;
+        }
+    }
+    CHECK(closed);
+    CHECK(std::chrono::steady_clock::now() - t0 < std::chrono::seconds(3));
+    CHECK(asked.load() == 0);   // without the secret nothing reaches the handler
+    relay.close();
+    CHECK_THROWS_AS(rpc::connectTcp("127.0.0.1", relay.port(), std::chrono::seconds(3)), ProtocolError);
 }
 
 TEST_CASE("cluster: a listing comes back folders first, names as they are", "[app][cluster]") {
@@ -276,7 +335,8 @@ TEST_CASE("cluster: the command channel frames each command's output and exit co
 TEST_CASE("cluster: ssh's prompts reach the application through the askpass relay", "[app][cluster]") {
     FakeCluster fc;
     if (!fc.usable()) SKIP("no Python or bash for the fake ssh");
-    fc.prompts(R"(["Password: ", "Verification code: "])", R"(["hunter2", "123456"])");
+    // the second prompt's "(yes/no)" is the server's text: still a secret
+    fc.prompts(R"(["Password: ", "Verification code (yes/no): "])", R"(["hunter2", "123456"])");
     std::vector<std::string> asked;
     ssh::AskpassServer relay([&](const ssh::Prompt& p) -> std::optional<std::string> {
         asked.push_back(p.text);
@@ -285,11 +345,15 @@ TEST_CASE("cluster: ssh's prompts reach the application through the askpass rela
     });
     ssh::Options o = fc.options();
     o.environment = relay.environment(SIRIUS_TEST_ASKPASS);
+    // a local process that connects to the relay and says nothing holds up
+    // neither the prompts nor the login
+    std::unique_ptr<rpc::Transport> silent = rpc::connectTcp("127.0.0.1", relay.port(), std::chrono::seconds(5));
     ssh::Session s;
     s.open(o, {}, std::chrono::seconds(60));
     REQUIRE(asked.size() == 2);
     CHECK(asked[0] == "(tester@fakecluster) Password: ");
-    CHECK(asked[1] == "(tester@fakecluster) Verification code: ");
+    CHECK(asked[1] == "(tester@fakecluster) Verification code (yes/no): ");
+    CHECK(fc.sshLog().find("\"ForwardAgent=no\"") != std::string::npos);   // what ssh was really started with
     CHECK(s.run("echo in").out == "in");
     const std::string log = fc.sshLog();
     CHECK(countOf(log, "response ok") == 2);
@@ -349,6 +413,32 @@ TEST_CASE("cluster: a cancelled prompt stops ssh before its helper answers", "[a
     CHECK(countOf(log, "asking ") == 1);
     CHECK(log.find("response") == std::string::npos);   // nothing, not even an empty answer, was sent
     CHECK(log.find("answered") == std::string::npos);
+}
+
+// The worker describes each array it sends: the description's shape sizes
+// the output, so it is checked before it allocates anything, and compressed
+// bytes may inflate to that size and not one byte past it.
+TEST_CASE("cluster: an array description from the worker cannot size an allocation or inflate past itself", "[app][cluster]") {
+    using json = nlohmann::json;
+    std::vector<sirius::Index> shape;
+    rpc::Tensor data;
+    data.bytes.assign(16, std::byte{0});
+    // a shape whose product wraps a 64-bit count
+    CHECK_THROWS_AS(decodeWorkerArray(json{{"shape", {1ll << 32, 1ll << 32, 16}}, {"dtype", "uint8"}}, data, shape), ProtocolError);
+    // a compressed array claiming far more than its bytes could inflate to
+    CHECK_THROWS_AS(decodeWorkerArray(json{{"shape", {1 << 20, 1 << 10}}, {"dtype", "float32"}, {"encoding", "zlib"}}, data, shape),
+                    ProtocolError);
+    // 4096 zero bytes, deflated to 26: described as 16 bytes, they must not be followed past 16
+    const unsigned char bomb[] = {0x78, 0xda, 0xed, 0xc1, 0x01, 0x0d, 0x00, 0x00, 0x00, 0xc2, 0xa0, 0xf7, 0x4f,
+                                  0x6d, 0x0f, 0x07, 0x14, 0x00, 0x00, 0x00, 0xf0, 0x6e, 0x10, 0x00, 0x00, 0x01};
+    rpc::Tensor packed;
+    for (unsigned char b : bomb) packed.bytes.push_back(static_cast<std::byte>(b));
+    CHECK_THROWS_AS(decodeWorkerArray(json{{"shape", {16}}, {"dtype", "uint8"}, {"encoding", "zlib"}}, packed, shape), ProtocolError);
+    // and described as what it is, it decodes
+    const std::vector<float> v = decodeWorkerArray(json{{"shape", {64, 64}}, {"dtype", "uint8"}, {"encoding", "zlib"}}, packed, shape);
+    CHECK(v.size() == 4096);
+    const std::vector<sirius::Index> want{64, 64};
+    CHECK(shape == want);
 }
 
 TEST_CASE("cluster: SOCKS through the ssh proxy says when nothing listens", "[app][cluster]") {
@@ -415,10 +505,24 @@ TEST_CASE("cluster: connect submits the worker, waits, says hello and serves a d
     CHECK(st.caps.protocolVersion == rpc::kProtocolVersion);
     CHECK_FALSE(st.caps.version.empty());
     for (const auto& step : st.steps) CHECK((step.status == cluster::StepStatus::Done || step.status == cluster::StepStatus::Warning));
-    // the token reached the job through the environment, never its command line
+    // The token reached the job as a file the worker read and deleted: never
+    // its command line, never its environment (Slurm's accounting may keep
+    // that), and the job's log is in the private ~/.sirius/run.
     const std::string args = readAll(fc.slurm / "4711.args");
     const std::string env = readAll(fc.slurm / "4711.env");
-    CHECK(env.find("SIRIUS_TOKEN=<set>") != std::string::npos);
+    CHECK(env.find("SIRIUS_TOKEN_FILE=<set>") != std::string::npos);
+    CHECK(env.find("SIRIUS_TOKEN=<set>") == std::string::npos);
+    CHECK(env.find("SIRIUS_PORT=0") != std::string::npos);
+    const fs::path run = fc.home / ".sirius" / "run";
+    CHECK(fs::exists(run / "sirius-worker-4711.log"));
+    for (const auto& entry : fs::directory_iterator(run)) CHECK(entry.path().filename().string().rfind("token.", 0) != 0);
+    CHECK(readAll(run / "sirius-worker-4711.log").find(session.endpoint().token) == std::string::npos);
+#ifndef _WIN32
+    CHECK((fs::status(run).permissions() & (fs::perms::group_all | fs::perms::others_all)) == fs::perms::none);
+    CHECK(readAll(fc.slurm / "4711.tokenmode").rfind("600", 0) == 0);
+    CHECK(readAll(fc.slurm / "4711.umask").rfind("0077", 0) == 0);
+#endif
+    CHECK(session.endpoint().port > 0);
     CHECK(args.find("--parsable") != std::string::npos);
     CHECK(args.find("--partition=abc_a100") != std::string::npos);
     CHECK(args.find(session.endpoint().token) == std::string::npos);
