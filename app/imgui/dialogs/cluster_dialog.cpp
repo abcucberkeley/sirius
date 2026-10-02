@@ -131,7 +131,7 @@ namespace sirius::app::gui {
                     // the profile in one line while it is in use
                     const cluster::Profile p = link.session().profile();
                     std::string line = p.host + " \xC2\xB7 " + p.checkout;
-                    if (!p.container.empty()) line += " \xC2\xB7 " + p.container;
+                    if (!p.container.empty()) line += " \xC2\xB7 " + p.container + (p.bind.empty() ? std::string() : " (bind " + p.bind + ")");
                     for (const std::string& part : {p.partition, p.account, p.qos, p.time})
                         if (!part.empty()) line += " \xC2\xB7 " + part;
                     line += " \xC2\xB7 " + std::to_string(p.gpus) + (p.gpus == 1 ? " GPU" : " GPUs") + " \xC2\xB7 " + std::to_string(p.cpus) +
@@ -165,7 +165,7 @@ namespace sirius::app::gui {
                     const std::string h = trimmed(profile_.host);
                     if (h != lastHost_ && ImGui::GetActiveID() != hostId) {
                         lastHost_ = h;
-                        if (profile_.recall(h)) filled_ = {"the partition, account, QoS and time last used on " + h};
+                        if (profile_.recall(h)) filled_ = {"the partition, account, QoS, time and binds last used on " + h};
                         else filled_.clear();
                     }
                 }
@@ -192,6 +192,8 @@ namespace sirius::app::gui {
                                              : std::string("Activated for the worker; it needs numpy (and torch for models, the sirius package to open "
                                                            "cluster TIFF datasets). Empty: the python of the job's modules."));
                 }
+                note("Container and venv are alternatives: with an image set, the venv is not used.");
+                if (const std::string w = cluster::emptyBindWarning(profile_); !w.empty()) note("With no Bind, " + w + ".", kAmber);
                 drawSlurmRow(fo);
                 drawPartitionNotes(app, link, st, editable);
                 const cluster::Partition* part = info_ ? cluster::findPartition(*info_, profile_.partition) : nullptr;
@@ -284,6 +286,61 @@ namespace sirius::app::gui {
                     }
                 }
                 (void)link;
+                drawBind(app, st, fo);
+            }
+
+            // Under the image: the host paths bound into it (apptainer --bind)
+            // and, folded away, extra entries for the worker's PYTHONPATH.
+            void drawBind(App& app, const cluster::Status& st, widgets::FieldOpts fo) {
+                const bool inImage = !trimmed(profile_.container).empty();
+                const float gap = px(10);
+                const float browse = buttonWidth("Add folder\xE2\x80\xA6", widgets::ButtonKind::Secondary);
+                fo.enabled = fo.enabled && inImage;
+                fo.width = design(std::max(px(120), ImGui::GetContentRegionAvail().x - browse - gap));
+                {
+                    const Field f("Bind");
+                    fo.hint = inImage ? "host paths the worker may read, e.g. /clusterfs" : "used with a container image";
+                    widgets::inputText("##bind", &profile_.bind, fo);
+                    widgets::tooltip("apptainer --bind: comma separated, src[:dst[:ro]], e.g. /clusterfs:/clusterfs,/global/scratch. The "
+                                     "container sees only the image and your home folder without them; each path is checked before the job "
+                                     "is submitted.");
+                    fo.hint.clear();
+                }
+                ImGui::SameLine(0.0f, gap);
+                {
+                    const Field f(" ");
+                    const bool here = st.sshUp && st.host == trimmed(profile_.host);
+                    widgets::ButtonOpts b;
+                    b.enabled = fo.enabled && here;
+                    b.tooltip = here ? std::string("Pick a folder among the cluster's files and add it to Bind") : std::string("Log in first (below)");
+                    if (widgets::button("Add folder\xE2\x80\xA6##bind", b)) {
+                        const std::vector<std::string> binds = cluster::bindHostPaths(profile_.bind);
+                        const std::string start = binds.empty() ? std::string() : binds.back();
+                        auto self = alive_;
+                        app.defer([&app, start, self, this] {
+                            app.showDialog(makeClusterBrowser(app, start, true, [self, this](const std::string& chosen) {
+                                std::string h, path;
+                                if (!*self || !splitClusterPath(chosen, h, path) || path.empty()) return;
+                                for (const std::string& b : cluster::bindHostPaths(profile_.bind))
+                                    if (b == path) return;
+                                std::string bind = trimmed(profile_.bind);
+                                while (!bind.empty() && bind.back() == ',') bind.pop_back();
+                                profile_.bind = bind.empty() ? path : bind + "," + path;
+                            }));
+                        });
+                    }
+                }
+                // the Python path, folded away unless it has something
+                if (!trimmed(profile_.containerPythonPath).empty()) showPythonPath_ = true;
+                if (!showPythonPath_) {
+                    if (widgets::linkButton("Python path (optional)\xE2\x80\xA6##showPyPath", fo.enabled)) showPythonPath_ = true;
+                } else {
+                    fo.width = design(ImGui::GetContentRegionAvail().x);
+                    const Field f("Python path (optional)");
+                    fo.hint = "extra entries for PYTHONPATH inside the image, : separated";
+                    widgets::inputText("##containerPythonPath", &profile_.containerPythonPath, fo);
+                    widgets::tooltip("Appended after the worker's own code (SIRIUS_CONTAINER_PYTHONPATH); paths as the container sees them.");
+                }
             }
 
             // Partition, Account and QoS: lists once the cluster has said
@@ -471,6 +528,8 @@ namespace sirius::app::gui {
                 profile_.container = trimmed(profile_.container);
                 profile_.launcher = trimmed(profile_.launcher);
                 if (profile_.launcher.empty()) profile_.launcher = "apptainer";
+                profile_.bind = trimmed(profile_.bind);
+                profile_.containerPythonPath = trimmed(profile_.containerPythonPath);
                 profile_.partition = trimmed(profile_.partition);
                 profile_.account = trimmed(profile_.account);
                 profile_.qos = trimmed(profile_.qos);
@@ -576,6 +635,7 @@ namespace sirius::app::gui {
             std::vector<std::string> filled_;            // what the last pick filled in
             std::string lastHost_;
             bool openList_ = false;
+            bool showPythonPath_ = false;                // the Python path field unfolded
             std::shared_ptr<RefreshShared> refresh_ = std::make_shared<RefreshShared>();
             DialogThread refreshThread_;
             std::shared_ptr<bool> alive_ = std::make_shared<bool>(true);   // GUI thread: a browser's pick reaches the dialog only while it lives

@@ -55,9 +55,12 @@
 
 namespace sirius::app::cluster {
 
-    // The Slurm part of a profile as last chosen on one host.
+    // The Slurm part of a profile as last chosen on one host, and the
+    // container's binds (the cluster's own paths). The binds are optional: a
+    // choice saved before they were kept leaves the profile's as they are.
     struct SlurmChoice {
         std::string partition, account, qos, time;
+        std::optional<std::string> bind, containerPythonPath;
     };
 
     struct Profile {
@@ -70,6 +73,14 @@ namespace sirius::app::cluster {
         // "" = the venv, as before.
         std::string container;
         std::string launcher = "apptainer";        // singularity is tried when it is not found
+        // The host paths the container may see besides the image and $HOME,
+        // apptainer's --bind syntax: "/clusterfs:/clusterfs,/global/scratch"
+        // (src[:dst[:opts]], comma separated). The job gets it as
+        // SIRIUS_CONTAINER_BIND. "" = nothing more.
+        std::string bind;
+        // Entries appended to the worker's PYTHONPATH inside the image
+        // (SIRIUS_CONTAINER_PYTHONPATH); "" = none.
+        std::string containerPythonPath;
         std::string partition = "abc_a100";
         std::string account = "velatkilic";
         std::string qos = "abc_debug";
@@ -80,12 +91,12 @@ namespace sirius::app::cluster {
         int port = 7645;                           // unused: the worker takes a free port (kept for old profiles)
         std::string sshProgram;                    // "" = the system's ssh
         std::vector<std::string> sshProgramArgs;   // tests: a fake ssh run by an interpreter
-        std::map<std::string, SlurmChoice> perHost;   // partition, account, QoS and time last used on each host
+        std::map<std::string, SlurmChoice> perHost;   // partition, account, QoS, time and binds last used on each host
 
-        // perHost[host] = this profile's partition, account, QoS and time.
+        // perHost[host] = this profile's partition, account, QoS, time and binds.
         void remember();
-        // Takes the partition, account, QoS and time last used on `host`, if
-        // any were; false when there were none (the fields stay).
+        // Takes the partition, account, QoS, time and binds last used on
+        // `host`, if any were; false when there were none (the fields stay).
         bool recall(const std::string& host);
 
         nlohmann::json toJson() const;
@@ -106,6 +117,21 @@ namespace sirius::app::cluster {
     //
     // Only sinfo has to answer; the others may be refused (a site that hides
     // its accounting) and their part is then unknown, not empty.
+
+    // --- the container's binds --------------------------------------------------------
+
+    // The host side of each entry of a --bind list ("/clusterfs:/clusterfs,
+    // /global/scratch:/scratch:ro" -> "/clusterfs", "/global/scratch"), in
+    // order, blanks and empty entries left out.
+    std::vector<std::string> bindHostPaths(const std::string& bind);
+    // The warning for a container profile without binds; "" when it has
+    // some, or runs no container.
+    std::string emptyBindWarning(const Profile& p);
+    // Whether the worker in `p`'s container can see `remotePath` (absolute,
+    // on the cluster): inside $HOME (`home`; a "~" in the profile stands for
+    // it), the checkout, /tmp or a bind's host path. "" when it can (or there
+    // is no container, or `home` is unknown); otherwise what to tell the user.
+    std::string unboundPathMessage(const Profile& p, const std::string& home, const std::string& remotePath);
 
     struct Partition {
         std::string name;
@@ -199,6 +225,7 @@ namespace sirius::app::cluster {
         std::string reason;          // why it is disconnected or what failed, in plain words
         std::string remoteOutput;    // the remote side's own words for it (stderr, the job log)
         std::string fix;             // a command that fixes what the checks found missing
+        std::string home;            // the cluster's $HOME, once the checks have said it ("" unknown)
         std::string jobId, node, jobState;
         WorkerCapabilities caps;
         std::string host;

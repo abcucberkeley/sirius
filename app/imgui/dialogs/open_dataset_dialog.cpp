@@ -33,6 +33,7 @@
 #include <imgui_internal.h>
 
 #include "core/array_source.hpp"
+#include "core/cluster.hpp"
 #include "core/manifest.hpp"
 #include "core/remote_source.hpp"
 #include "imgui/cluster_link.hpp"
@@ -700,6 +701,19 @@ namespace sirius::app::gui {
                     }));
                 }
                 line.end();
+                unbound_ = unboundMessage(app);
+            }
+
+            // A path the worker's container cannot see, said before the
+            // worker's read fails on it; "" when it can (or no container).
+            std::string unboundMessage(App& app) const {
+                std::string host, remote;
+                if (!splitClusterPath(path(), host, remote)) return {};
+                ClusterLink& link = app.cluster();
+                if (!link.connected()) return {};
+                const cluster::Profile p = link.session().profile();
+                if (p.container.empty() || p.host != host) return {};
+                return cluster::unboundPathMessage(p, link.session().status().home, remote);
             }
 
             static std::string parentPathOf(const std::string& p) {
@@ -745,6 +759,11 @@ namespace sirius::app::gui {
 
             void drawFacts() {
                 gap(10);
+                if (location_ == 1 && !unbound_.empty()) {
+                    // what the worker's read would fail on, in words that say what to do
+                    widgets::textWrapped(unbound_, 11, theme::kAccentText);
+                    return;
+                }
                 if (!facts_.empty()) widgets::textWrapped(facts_, 12, theme::kNeutral600);
                 else if (error_.empty()) widgets::text(probing_ || probeAt_ ? "Reading…" : "", 12, theme::kNeutral600);
                 if (!error_.empty()) {
@@ -940,6 +959,7 @@ namespace sirius::app::gui {
             std::string path_;
             bool focusPath_ = true;
             int location_ = 0;              // 0 this computer, 1 the cluster
+            std::string unbound_;            // the cluster path is outside the container's binds: why it will not open
             bool locationTouched_ = false;
             bool popupAtStart_ = false;
             std::string facts_;

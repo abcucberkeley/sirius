@@ -963,6 +963,85 @@ TEST_CASE("cluster: the profile keeps the container image and its launcher", "[a
     CHECK(cluster::Profile::fromJson(nlohmann::json{{"launcher", ""}}).launcher == "apptainer");
 }
 
+TEST_CASE("cluster: the profile keeps the container's binds and Python path, per host too", "[app][cluster]") {
+    cluster::Profile p;
+    CHECK(p.bind.empty());
+    CHECK(p.containerPythonPath.empty());
+    p.host = "fiona";
+    p.container = "~/sirius-worker.sif";
+    p.bind = "/clusterfs:/clusterfs,/global/scratch";
+    p.containerPythonPath = "/opt/extra:/opt/more";
+    p.remember();
+    p.host = "other";
+    p.bind = "/data";
+    p.containerPythonPath.clear();
+    p.remember();
+    const cluster::Profile back = cluster::Profile::fromJson(p.toJson());
+    CHECK(back.bind == "/data");
+    CHECK(back.containerPythonPath.empty());
+    cluster::Profile q = back;
+    REQUIRE(q.recall("fiona"));
+    CHECK(q.bind == "/clusterfs:/clusterfs,/global/scratch");
+    CHECK(q.containerPythonPath == "/opt/extra:/opt/more");
+    REQUIRE(q.recall("other"));
+    CHECK(q.bind == "/data");
+    CHECK(q.containerPythonPath.empty());
+    // a host remembered before binds were kept leaves the profile's as they are
+    nlohmann::json old = q.toJson();
+    old["perHost"] = {{"fiona", {{"partition", "dgx"}, {"account", "a"}, {"qos", "q"}, {"time", "01:00:00"}}}};
+    cluster::Profile r = cluster::Profile::fromJson(old);
+    REQUIRE(r.recall("fiona"));
+    CHECK(r.partition == "dgx");
+    CHECK(r.bind == "/data");
+    // an old profile without the fields reads as empty
+    const cluster::Profile none = cluster::Profile::fromJson(nlohmann::json{{"host", "fiona"}});
+    CHECK(none.bind.empty());
+    CHECK(none.containerPythonPath.empty());
+}
+
+TEST_CASE("cluster: the bind list's host paths, the empty-bind warning and paths the container cannot see", "[app][cluster]") {
+    using V = std::vector<std::string>;
+    CHECK(cluster::bindHostPaths("") == V{});
+    CHECK(cluster::bindHostPaths("/clusterfs:/clusterfs, /global/scratch:/scratch:ro,,  ") == V{"/clusterfs", "/global/scratch"});
+    CHECK(cluster::bindHostPaths("~/data") == V{"~/data"});
+
+    cluster::Profile p;
+    p.checkout = "~/dev/sirius";
+    CHECK(cluster::emptyBindWarning(p).empty());   // no container: nothing to bind
+    p.container = "~/w.sif";
+    const std::string w = cluster::emptyBindWarning(p);
+    CHECK(w.find("only the image and your home folder") != std::string::npos);
+    CHECK(w.find("add them under Bind") != std::string::npos);
+    p.bind = "/clusterfs";
+    CHECK(cluster::emptyBindWarning(p).empty());
+
+    const std::string home = "/global/home/users/u";
+    // inside a bind, the home folder, the checkout or /tmp: seen
+    CHECK(cluster::unboundPathMessage(p, home, "/clusterfs/nvme/a.tif").empty());
+    CHECK(cluster::unboundPathMessage(p, home, "/clusterfs").empty());
+    CHECK(cluster::unboundPathMessage(p, home, home + "/data/a.tif").empty());
+    CHECK(cluster::unboundPathMessage(p, home, "~/data/a.tif").empty());
+    CHECK(cluster::unboundPathMessage(p, home, "/tmp/a.tif").empty());
+    // elsewhere: said, with the top folder to add
+    std::string m = cluster::unboundPathMessage(p, home, "/global/scratch/u/a.tif");
+    CHECK(m.find("not bound into the worker's container") != std::string::npos);
+    CHECK(m.find("add it under Bind") != std::string::npos);
+    CHECK(m.find("/global") != std::string::npos);
+    // a prefix of a name is not a parent folder
+    CHECK_FALSE(cluster::unboundPathMessage(p, home, "/clusterfs2/a.tif").empty());
+    // binds with a destination and options, and a "~/" bind
+    p.bind = "/global/scratch:/scratch:ro,~/elsewhere";
+    CHECK(cluster::unboundPathMessage(p, home, "/global/scratch/u/a.tif").empty());
+    CHECK_FALSE(cluster::unboundPathMessage(p, home, "/clusterfs/a.tif").empty());
+    // a checkout outside the home folder is bound by the job
+    p.checkout = "/opt/sirius";
+    CHECK(cluster::unboundPathMessage(p, home, "/opt/sirius/data/a.tif").empty());
+    // nothing to say without a container or before $HOME is known
+    CHECK(cluster::unboundPathMessage(p, "", "/clusterfs/a.tif").empty());
+    p.container.clear();
+    CHECK(cluster::unboundPathMessage(p, home, "/clusterfs/a.tif").empty());
+}
+
 TEST_CASE("cluster: the checks of a container image say what is wrong and never suggest pip", "[app][cluster]") {
     FakeCluster fc;
     if (!fc.usable()) SKIP("no Python or bash for the fake ssh");
@@ -1075,5 +1154,78 @@ TEST_CASE("cluster: connect runs the worker in the container image", "[app][clus
     CHECK(args.find("--nv") == std::string::npos);
     for (const auto& entry : fs::directory_iterator(fc.home / ".sirius" / "run")) CHECK(entry.path().filename().string().rfind("token.", 0) != 0);
     session.disconnect(true);
+    setEnv("FAKE_CONTAINER_SITE", "");
+}
+
+TEST_CASE("cluster: the checks fail on a bind path that is not there, before anything is submitted", "[app][cluster]") {
+    FakeCluster fc;
+    if (!fc.usable()) SKIP("no Python or bash for the fake ssh");
+    copyCheckout(fc.home / "sirius");
+    std::ofstream(fc.home / "w.sif") << "image\n";
+    fs::create_directories(fc.home / "data");
+    cluster::Session session;
+    session.setPollInterval(std::chrono::milliseconds(200), std::chrono::milliseconds(500));
+    cluster::Profile p = containerProfile(fc, "~/w.sif");
+    p.bind = "~/data:/data,~/missing:/m";
+    const cluster::Status st = connectUntilSettled(session, p);
+    INFO(st.reason);
+    CHECK(st.state == cluster::State::Disconnected);
+    CHECK(st.steps[static_cast<int>(cluster::Step::Checks)].status == cluster::StepStatus::Failed);
+    CHECK(st.reason.find("~/missing") != std::string::npos);
+    CHECK(st.reason.find("~/data") == std::string::npos);   // the one that is there is not named
+    CHECK(st.fix.find("Bind") != std::string::npos);
+    CHECK_FALSE(fs::exists(fc.slurm / "next"));   // nothing was submitted
+    session.disconnect(false);
+}
+
+TEST_CASE("cluster: no bind is a warning; the binds and the Python path reach the job", "[app][cluster]") {
+    FakeCluster fc;
+    if (!fc.usable()) SKIP("no Python or bash for the fake ssh");
+    if (!pythonHas(fc.python, "numpy")) SKIP("no numpy in " + fc.python + " for the image check");
+    copyCheckout(fc.home / "sirius");
+    std::ofstream(fc.home / "w.sif") << "image\n";
+    fs::create_directories(fc.home / "data");
+    setEnv("FAKE_CONTAINER_SITE", containerSite(fc).string());
+    // sbatch refuses every job once it has recorded its environment: no worker is started
+    std::ofstream(fc.slurm / "sbatch.fail") << "1\n";
+    cluster::Session session;
+    session.setPollInterval(std::chrono::milliseconds(200), std::chrono::milliseconds(500));
+    cluster::Profile p = containerProfile(fc, "~/w.sif");
+
+    // no bind: the checks pass with a warning, and the job is submitted all the same
+    cluster::Status st = connectUntilSettled(session, p);
+    INFO(st.reason << "\n"
+                   << st.remoteOutput);
+    const cluster::StepState checks = st.steps[static_cast<int>(cluster::Step::Checks)];
+    CHECK(checks.status == cluster::StepStatus::Warning);
+    CHECK(checks.detail.find("only the image and your home folder") != std::string::npos);
+    CHECK(checks.detail.find("add them under Bind") != std::string::npos);
+    CHECK(st.steps[static_cast<int>(cluster::Step::Submit)].status == cluster::StepStatus::Failed);
+    CHECK_FALSE(st.home.empty());   // the checks said where $HOME is
+    std::string env = readAll(fc.slurm / "4711.env");
+    CHECK(env.find("SIRIUS_CONTAINER=") != std::string::npos);
+    CHECK(env.find("SIRIUS_CONTAINER_BIND") == std::string::npos);
+    CHECK(env.find("SIRIUS_CONTAINER_PYTHONPATH") == std::string::npos);
+
+    // binds ("~/" made $HOME) and a Python path: checked, then in the job's environment
+    fs::remove(fc.slurm / "apptainer.args");
+    p.bind = "~/data:/data, /tmp";
+    p.containerPythonPath = "/opt/extra";
+    st = connectUntilSettled(session, p);
+    const cluster::StepState checks2 = st.steps[static_cast<int>(cluster::Step::Checks)];
+    INFO(checks2.detail);
+    CHECK(checks2.status == cluster::StepStatus::Done);
+    CHECK(checks2.detail.find("binds 2") != std::string::npos);
+    env = readAll(fc.slurm / "4712.env");
+    INFO(env);
+    CHECK(env.find("SIRIUS_CONTAINER_BIND=") != std::string::npos);
+    CHECK(env.find("/data:/data,/tmp\n") != std::string::npos);
+    CHECK(env.find("SIRIUS_CONTAINER_BIND=~") == std::string::npos);
+    CHECK(env.find("SIRIUS_CONTAINER_PYTHONPATH=/opt/extra\n") != std::string::npos);
+    CHECK(env.find("SIRIUS_TOKEN=") == std::string::npos);   // never the token itself
+    // the image was tried with the same binds
+    CHECK(readAll(fc.slurm / "apptainer.args").find("--bind ") != std::string::npos);
+    CHECK(readAll(fc.slurm / "apptainer.args").find("/data:/data,/tmp") != std::string::npos);
+    session.disconnect(false);
     setEnv("FAKE_CONTAINER_SITE", "");
 }

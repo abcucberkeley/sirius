@@ -18,7 +18,7 @@ namespace sirius::app::cluster {
     // --- the profile -------------------------------------------------------------------
 
     void Profile::remember() {
-        if (!host.empty()) perHost[host] = SlurmChoice{partition, account, qos, time};
+        if (!host.empty()) perHost[host] = SlurmChoice{partition, account, qos, time, bind, containerPythonPath};
     }
 
     bool Profile::recall(const std::string& h) {
@@ -28,13 +28,20 @@ namespace sirius::app::cluster {
         account = it->second.account;
         qos = it->second.qos;
         time = it->second.time;
+        if (it->second.bind) bind = *it->second.bind;
+        if (it->second.containerPythonPath) containerPythonPath = *it->second.containerPythonPath;
         return true;
     }
 
     json Profile::toJson() const {
-        json j = {{"host", host}, {"checkout", checkout}, {"venv", venv}, {"container", container}, {"launcher", launcher}, {"partition", partition}, {"account", account}, {"qos", qos}, {"time", time}, {"gpus", gpus}, {"cpus", cpus}, {"mem", mem}, {"port", port}, {"ssh", sshProgram}};
+        json j = {{"host", host}, {"checkout", checkout}, {"venv", venv}, {"container", container}, {"launcher", launcher}, {"bind", bind}, {"containerPythonPath", containerPythonPath}, {"partition", partition}, {"account", account}, {"qos", qos}, {"time", time}, {"gpus", gpus}, {"cpus", cpus}, {"mem", mem}, {"port", port}, {"ssh", sshProgram}};
         json hosts = json::object();
-        for (const auto& [h, c] : perHost) hosts[h] = {{"partition", c.partition}, {"account", c.account}, {"qos", c.qos}, {"time", c.time}};
+        for (const auto& [h, c] : perHost) {
+            json one = {{"partition", c.partition}, {"account", c.account}, {"qos", c.qos}, {"time", c.time}};
+            if (c.bind) one["bind"] = *c.bind;
+            if (c.containerPythonPath) one["containerPythonPath"] = *c.containerPythonPath;
+            hosts[h] = one;
+        }
         j["perHost"] = hosts;
         return j;
     }
@@ -54,6 +61,8 @@ namespace sirius::app::cluster {
         str("container", p.container);
         str("launcher", p.launcher);
         if (p.launcher.empty()) p.launcher = "apptainer";
+        str("bind", p.bind);
+        str("containerPythonPath", p.containerPythonPath);
         str("partition", p.partition);
         str("account", p.account);
         str("qos", p.qos);
@@ -74,6 +83,9 @@ namespace sirius::app::cluster {
                 field("account", s.account);
                 field("qos", s.qos);
                 field("time", s.time);
+                if (c.contains("bind") && c["bind"].is_string()) s.bind = c["bind"].get<std::string>();
+                if (c.contains("containerPythonPath") && c["containerPythonPath"].is_string())
+                    s.containerPythonPath = c["containerPythonPath"].get<std::string>();
                 p.perHost[h] = s;
             }
         return p;
@@ -279,6 +291,57 @@ namespace sirius::app::cluster {
             return l;
         }
     } // namespace
+
+    // --- the container's binds --------------------------------------------------------------
+
+    std::vector<std::string> bindHostPaths(const std::string& bind) {
+        std::vector<std::string> out;
+        for (const std::string& entry : splitOn(bind, ',')) {
+            const std::string e = stripped(entry);
+            const std::string host = stripped(e.substr(0, e.find(':')));
+            if (!host.empty()) out.push_back(host);
+        }
+        return out;
+    }
+
+    std::string emptyBindWarning(const Profile& p) {
+        if (stripped(p.container).empty() || !bindHostPaths(p.bind).empty()) return {};
+        return "the container sees only the image and your home folder: datasets elsewhere (e.g. /clusterfs) will not open "
+               "\xE2\x80\x94 add them under Bind";
+    }
+
+    namespace {
+        // "~" and "~/x" with `home` for it, without trailing slashes ("/" stays).
+        std::string expandedPath(const std::string& path, const std::string& home) {
+            std::string p = stripped(path);
+            if (p == "~") p = home;
+            else if (p.rfind("~/", 0) == 0) p = home + p.substr(1);
+            while (p.size() > 1 && p.back() == '/') p.pop_back();
+            return p;
+        }
+
+        bool isWithin(const std::string& path, const std::string& root) {
+            if (root.empty() || root.front() != '/') return false;
+            if (root == "/") return true;
+            return path == root || (path.size() > root.size() && path.compare(0, root.size(), root) == 0 && path[root.size()] == '/');
+        }
+    } // namespace
+
+    std::string unboundPathMessage(const Profile& p, const std::string& home, const std::string& remotePath) {
+        const std::string h = expandedPath(home, {});
+        if (stripped(p.container).empty() || h.empty() || h.front() != '/') return {};
+        const std::string path = expandedPath(remotePath, h);
+        if (path.empty() || path.front() != '/') return {};
+        // what apptainer shows by itself (the home folder, /tmp), what the
+        // job binds (the checkout, the run folder in the home), and the binds
+        std::vector<std::string> roots = {h, "/tmp", expandedPath(p.checkout, h)};
+        for (const std::string& b : bindHostPaths(p.bind)) roots.push_back(expandedPath(b, h));
+        for (const std::string& r : roots)
+            if (isWithin(path, r)) return {};
+        const std::size_t second = path.find('/', 1);
+        const std::string top = second == std::string::npos ? path : path.substr(0, second);
+        return "This path is not bound into the worker's container: add it under Bind (e.g. " + top + ") and reconnect.";
+    }
 
     std::string clusterInfoScript() {
         // Fixed text only: nothing of the profile is in it. $u is the
@@ -659,6 +722,18 @@ namespace sirius::app::cluster {
             return s.substr(i);
         }
 
+        // A --bind list as one shell word: each entry quoted, a leading "~/"
+        // made $HOME (apptainer does not expand it); "" when there is none.
+        std::string bindWord(const std::string& bind) {
+            std::string word;
+            for (const std::string& entry : splitOn(bind, ',')) {
+                const std::string e = stripped(entry);
+                if (e.empty()) continue;
+                word += (word.empty() ? "" : ",") + remotePathWord(e);
+            }
+            return word;
+        }
+
         std::string elapsed(std::chrono::steady_clock::duration d) {
             const long long s = std::chrono::duration_cast<std::chrono::seconds>(d).count();
             char buf[32];
@@ -858,13 +933,21 @@ namespace sirius::app::cluster {
             script += "command -v sbatch >/dev/null 2>&1 && echo sbatch=yes || echo sbatch=no\n";
             script += "[ -f " + co + "/app/python/sirius_worker/__main__.py ] && echo worker=yes || echo worker=no\n";
             script += "[ -f " + co + "/app/python/slurm/sirius_worker.sbatch ] && echo template=yes || echo template=no\n";
+            script += "echo \"home=$HOME\"\n";
             script += "C=" + remotePathWord(p.container) + "\n";
-            script += "[ -f \"$C\" ] && echo image=yes || echo image=no\n";
+            script += "if [ ! -f \"$C\" ]; then echo image=no; elif test -r \"$C\"; then echo image=yes; else echo image=unreadable; fi\n";
+            // each bind's host path: apptainer stops before the worker starts on one that is not there
+            const std::vector<std::string> binds = bindHostPaths(p.bind);
+            for (std::size_t i = 0; i < binds.size(); ++i)
+                script += "test -d " + remotePathWord(binds[i]) + " && echo bind" + std::to_string(i) + "=yes || echo bind" + std::to_string(i) + "=no\n";
             script += launcherScript(p);
             script += "echo \"launcher=$L\"\n";
-            script += "if [ -f \"$C\" ] && [ -n \"$L\" ]; then\n"
+            const std::string bw = bindWord(p.bind);
+            script += "if test -r \"$C\" && [ -n \"$L\" ]; then\n"
                       // a folder named sirius (a checkout in the working directory) imports as an empty namespace: not the package
-                      "    \"$L\" exec \"$C\" python -c 'import sys, importlib.util as u; import sirius, numpy; "
+                      "    \"$L\" exec " +
+                      (bw.empty() ? std::string() : "--bind " + bw + " ") +
+                      "\"$C\" python -c 'import sys, importlib.util as u; import sirius, numpy; "
                       "assert getattr(sirius, \"__file__\", None), \"sirius is only a folder named so, not the compiled package\"; print(\"c_pyver=%d.%d\" % "
                       "sys.version_info[:2]); print(\"c_torch=%s\" % (\"yes\" if u.find_spec(\"torch\") else \"no\"))' </dev/null\n"
                       "    echo \"c_rc=$?\"\n"
@@ -879,7 +962,15 @@ namespace sirius::app::cluster {
             if (kv["worker"] != "yes" || kv["template"] != "yes")
                 throw Failure{Step::Checks, "There is no SIRIUS checkout at " + p.checkout + " on " + p.host + " (it needs app/python/sirius_worker and app/python/slurm).",
                               r.err, "Clone or copy this SIRIUS repository there (same version as this application), or set the checkout path."};
+            if (!trim(kv["home"]).empty()) update([&](Status& x) { x.home = trim(kv["home"]); });
+            if (kv["image"] == "unreadable")
+                throw Failure{Step::Checks, "The container image " + p.container + " on " + p.host + " cannot be read (test -r failed).", r.err,
+                              "Make it readable to you (chmod a+r), or set the path of a copy you can read."};
             if (kv["image"] != "yes") throw Failure{Step::Checks, "There is no container image at " + p.container + " on " + p.host + ".", r.err, ask};
+            for (std::size_t i = 0; i < binds.size(); ++i)
+                if (kv["bind" + std::to_string(i)] != "yes")
+                    throw Failure{Step::Checks, "The bind path " + binds[i] + " is not a folder on " + p.host + ": apptainer would stop before the worker starts.", r.err,
+                                  "Correct it or remove it under Bind (host paths the worker may read, comma separated)."};
             if (kv["launcher"].empty())
                 throw Failure{Step::Checks, "Neither " + (p.launcher.empty() ? std::string("apptainer") : p.launcher) + " nor singularity can be run on " + p.host + " (module load was tried).",
                               r.err, "module load apptainer, or set the launcher to the full path of apptainer or singularity in the profile."};
@@ -888,6 +979,13 @@ namespace sirius::app::cluster {
                               ask};
             std::string detail = "sbatch \xC2\xB7 checkout \xC2\xB7 " + kv["launcher"] + " \xC2\xB7 image: python " + kv["c_pyver"] + ", sirius, numpy";
             detail += kv["c_torch"] == "yes" ? ", torch" : " \xC2\xB7 no torch (models will not run)";
+            if (!binds.empty()) detail += " \xC2\xB7 binds " + std::to_string(binds.size());
+            if (const std::string w = emptyBindWarning(p); !w.empty()) {
+                // not a failure: data in the home folder opens all the same
+                stepState(Step::Checks, StepStatus::Warning, detail + " \xC2\xB7 " + w);
+                say("Cluster: " + w);
+                return;
+            }
             stepState(Step::Checks, StepStatus::Done, detail);
         }
 
@@ -965,6 +1063,11 @@ namespace sirius::app::cluster {
                 // the job runs the worker in the image (sirius_worker.sbatch); no venv
                 script += "unset SIRIUS_VENV\nexport SIRIUS_CONTAINER=" + remotePathWord(p.container) + "\n";
                 script += "export SIRIUS_LAUNCHER=" + shellQuote(p.launcher.empty() ? std::string("apptainer") : p.launcher) + "\n";
+                // the binds and the extra PYTHONPATH, quoted (a "~/" bind made $HOME): never the token
+                if (const std::string bw = bindWord(p.bind); !bw.empty()) script += "export SIRIUS_CONTAINER_BIND=" + bw + "\n";
+                else script += "unset SIRIUS_CONTAINER_BIND\n";
+                if (const std::string pp = trim(p.containerPythonPath); !pp.empty()) script += "export SIRIUS_CONTAINER_PYTHONPATH=" + shellQuote(pp) + "\n";
+                else script += "unset SIRIUS_CONTAINER_PYTHONPATH\n";
             } else if (!p.venv.empty()) {
                 script += "export SIRIUS_VENV=" + remotePathWord(p.venv) + "\n";
             }

@@ -22,12 +22,14 @@ echo $((id + 1)) > "$dir/next"
 log="${out//%j/$id}"
 printf '%s\n' "$*" > "$dir/$id.args"
 # what reached the job's environment; the token only as "set", never its value
-env | grep -E '^SIRIUS_(PORT|VENV|DEVICE|MAX_CLIENTS|CONTAINER|LAUNCHER)=' | sort > "$dir/$id.env"
+env | grep -E '^SIRIUS_(PORT|VENV|DEVICE|MAX_CLIENTS|CONTAINER|CONTAINER_BIND|CONTAINER_PYTHONPATH|LAUNCHER)=' | sort > "$dir/$id.env"
 [ -n "${SIRIUS_TOKEN:-}" ] && echo "SIRIUS_TOKEN=<set>" >> "$dir/$id.env"
 [ -n "${SIRIUS_TOKEN_FILE:-}" ] && echo "SIRIUS_TOKEN_FILE=<set>" >> "$dir/$id.env"
 # the token file's mode and the umask the job inherits (POSIX meaning only)
 [ -n "${SIRIUS_TOKEN_FILE:-}" ] && stat -c %a "$SIRIUS_TOKEN_FILE" > "$dir/$id.tokenmode" 2>/dev/null
 umask > "$dir/$id.umask"
+# a file sbatch.fail in $FAKE_SLURM_DIR: refused, once the job's environment is recorded
+if [ -f "$dir/sbatch.fail" ]; then echo "sbatch: error: Batch job submission failed: refused by the test" >&2; exit 1; fi
 echo "${FAKE_SLURM_PENDING_POLLS:-0}" > "$dir/$id.pending"
 run=("${FAKE_PYTHON:?}")
 if [ -n "${SIRIUS_CONTAINER:-}" ]; then
@@ -35,6 +37,7 @@ if [ -n "${SIRIUS_CONTAINER:-}" ]; then
     command -v "$L" >/dev/null 2>&1 || L=singularity
     run=("$L" exec)
     [ "${SIRIUS_DEVICE:-cuda}" != cpu ] && run+=(--nv)
+    [ -n "${SIRIUS_CONTAINER_BIND:-}" ] && run+=(--bind "$SIRIUS_CONTAINER_BIND")
     run+=(--bind "$PWD" --bind "$HOME/.sirius/run" "$SIRIUS_CONTAINER" python)
 fi
 ( cd app/python && exec "${run[@]}" -m sirius_worker --host 127.0.0.1 --port "${SIRIUS_PORT:-0}" --device cpu \
