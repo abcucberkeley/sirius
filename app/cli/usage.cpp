@@ -195,6 +195,20 @@ namespace sirius::cli {
                  "0 at the end of input or on SIGTERM, 2 usage, 3 / 4 when the state options fail, 1 fatal",
                  {"claude mcp add --transport stdio --scope user sirius -- /opt/sirius/bin/sirius-cli mcp",
                   "npx @modelcontextprotocol/inspector sirius-cli mcp"}},
+                {"serve",
+                 "SIRIUS's C++ engine as the worker of the HPC backend (the cluster job runs it): the worker protocol on TCP, with the "
+                 "Python worker's handshake and replies, so the application connects to it as to that worker. It serves the cluster "
+                 "datasets itself (dataset_info, dataset_read, dataset_view, dataset_stats) with SIRIUS's TIFF reader, on the GPU with "
+                 "nvTIFF when the build has it, and relays every other request to a Python worker it starts beside it on 127.0.0.1 "
+                 "with a token of its own (--python and --worker-dir choose it; --no-python-worker refuses those requests instead). "
+                 "The token comes from --token-file or $SIRIUS_TOKEN_FILE (the file is deleted once read), else $SIRIUS_TOKEN; an "
+                 "address other than loopback needs one. Once it listens it prints one line, the announce the job log is read for, and "
+                 "nothing else on stdout; logs go to stderr. It ends on a client's shutdown, SIGTERM or Ctrl+C.",
+                 R"((one line on stdout) {"port":40123,"pid":4711,"host":"0.0.0.0","hostname":"n0042","device":"cuda:0","engine":{"api":1,
+ "build":"0.1.0+g7cc582c","commit":"7cc582c...","dirty":false,"ops_schema":"...","version":"0.1.0"}})",
+                 "0 after a shutdown, SIGTERM or Ctrl+C, 2 usage (a refused bind, a token file that cannot be read), 1 fatal",
+                 {"SIRIUS_TOKEN_FILE=~/.sirius/run/token.4711 sirius-cli serve --host 0.0.0.0 --port 0 --python python3",
+                  "sirius-cli serve --no-python-worker"}},
                 {"worker status",
                  "Which Python the worker would run and why (explicit, environment, managed, discovered, fallback), the state of "
                  "SIRIUS's own environment (absent, incomplete, ready, outdated, broken), uv, the Python interpreters found on this "
@@ -357,6 +371,7 @@ namespace sirius::cli {
             "  tools | schema          the tool list (MCP format) | commands, options and exit codes\n"
             "  session                 a live workbench: JSON lines on stdin / stdout\n"
             "  mcp                     a Model Context Protocol server on stdio\n"
+            "  serve                   SIRIUS's engine for the HPC backend: the worker protocol on TCP\n"
             "Python worker\n"
             "  worker status | check | setup | remove    SIRIUS's own Python environment for the worker\n"
             "Other\n"

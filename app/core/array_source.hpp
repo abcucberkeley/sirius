@@ -18,6 +18,10 @@
 #include "core/array.hpp"
 #include "core/dataset.hpp"
 
+namespace sirius {
+    struct TiffInfo;
+}
+
 namespace sirius::app {
 
     using ProgressFn = std::function<void(double fraction, const std::string& message)>;
@@ -197,6 +201,23 @@ namespace sirius::app {
         std::vector<ChannelInfo> channels;
     };
     ParsedTiffMetadata parseTiffDescription(const std::string& description);
+
+    // How openDataset shapes a TIFF, for a reader of its own (the engine's
+    // dataset service, core/dataset_service.hpp, which reads pages in the
+    // file's pixel type): the meta, the page order, the samples per page,
+    // the first page's parsed metadata and the voxel size the file itself
+    // states (0 where it says nothing; before defaults and overrides).
+    // Throws like openDataset.
+    struct TiffDatasetProbe {
+        DatasetMeta meta;
+        PageOrder order;                         // over pages: c counts page channels
+        Index samples = 1;                       // samples (channels) per page
+        bool dimsFromMetadata = false;
+        ParsedTiffMetadata parsed;
+        std::array<double, 3> fileVoxelUm{0, 0, 0};
+        std::string summary;
+    };
+    TiffDatasetProbe probeTiffDataset(const std::string& path, const TiffInfo& info, const OpenOptions* options);
 
 } // namespace sirius::app
 

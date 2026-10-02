@@ -379,6 +379,21 @@ namespace sirius::cli {
                              flag("allow-network-paths", "let tools open network (UNC) paths such as //server/share")};
                 c.push_back(std::move(s));
             }
+            {
+                CommandSpec s = command("serve",
+                                        "serve [--host H] [--port P] [--token-file F] [--max-clients N] [--device D] [--idle-timeout S] "
+                                        "[--no-python-worker] [--exit-with-parent]",
+                                        "SIRIUS's engine as the HPC backend's worker: cluster datasets in C++, the rest through a Python worker");
+                s.options = {opt("host", "H", "string", "127.0.0.1", "the interface to listen on (0.0.0.0 on a cluster node; then a token is required)"),
+                             opt("port", "P", "integer", "0", "the TCP port; 0 picks a free one"),
+                             opt("token-file", "F", "path", "", "read the token from this file and delete it (default $SIRIUS_TOKEN_FILE, then $SIRIUS_TOKEN)"),
+                             opt("max-clients", "N", "integer", "8", "connections served at once"),
+                             opt("device", "auto|cpu|cuda|cuda:N", "string", "auto", "where TIFF pages are decoded, and the Python worker's device"),
+                             opt("idle-timeout", "S", "number", "3600", "close a connection that sends nothing for S seconds (0 = never)"),
+                             flag("no-python-worker", "serve the datasets only; refuse what the Python worker would serve"),
+                             flag("exit-with-parent", "stop when stdin reaches its end (the launching process went away)")};
+                c.push_back(std::move(s));
+            }
             c.push_back(command("worker status", "worker status", "which Python the worker runs, and the state of SIRIUS's own environment"));
             c.push_back(command("worker check", "worker check", "start the Python worker (installs nothing) and say hello"));
             {

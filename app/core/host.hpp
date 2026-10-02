@@ -18,6 +18,9 @@ namespace sirius::app::host {
     std::string makeTempDirectory(const std::string& prefix);   // a new directory of this process's own; "" when none
     std::string executableDirectory();              // GetModuleFileNameW | /proc/self/exe | _NSGetExecutablePath
     int processId();
+    // This machine's name (gethostname / GetComputerNameExW): what the
+    // Python worker reports as its hostname. "" when the system will not say.
+    std::string hostName();
     // False for a pid no process has (or that only a zombie holds); true for
     // one that runs, also when it belongs to a user this process may not
     // signal or open.

@@ -4,7 +4,7 @@
 # OpenGL, nfd or curl, so it also builds on a cluster node without X11 /
 # Wayland (SIRIUS_ENABLE_CLI).
 
-add_executable(sirius-cli main.cpp args.cpp commands.cpp stdio.cpp usage.cpp)
+add_executable(sirius-cli main.cpp args.cpp commands.cpp serve.cpp stdio.cpp usage.cpp)
 # Beside sirius-app in <build>/app (<build>/app/<config> for a multi-config
 # generator): both find the help pages, the worker and the plugins there.
 set_target_properties(sirius-cli PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${PROJECT_BINARY_DIR}/app)

@@ -68,10 +68,12 @@ namespace sirius::app::rpc {
     // 16 bytes from the operating system's generator, as 32 hex digits.
     std::string randomNonce();
 
-    // The worker's half of the handshake, for a stand-in worker (the tests'):
+    // The worker's half of the handshake, as sirius_worker/server.py does it:
+    // the C++ server (core/rpc_server.hpp) and the tests' stand-in workers.
     // `answer` takes a "hello" or "auth" request's params and returns the
     // result to send, or nullopt with `error` set (and the connection should
-    // then be closed). `capabilities` is what "auth" answers with.
+    // then be closed). `capabilities` is what "auth" answers with. A second
+    // "hello", or an "auth" before any, is refused as the worker refuses it.
     struct HandshakeResponder {
         std::string token;
         int protocolVersion = kProtocolVersion;   // what this stand-in claims
@@ -140,6 +142,39 @@ namespace sirius::app::rpc {
     // In-memory pair for tests: what one end sends, the other receives.
     std::pair<std::unique_ptr<Transport>, std::unique_ptr<Transport>> loopbackPair();
 
+    // A listening TCP socket: the server side of connectTcp (core/rpc_server.hpp
+    // serves what it accepts). IPv4, as the Python worker binds; "" or
+    // "0.0.0.0" is every interface, port 0 a free port. On Windows the port is
+    // bound exclusively (SO_EXCLUSIVEADDRUSE), so no second socket can share
+    // it and receive a client's hello. Throws ProtocolError when the bind fails.
+    class Listener {
+    public:
+        Listener(const std::string& host, int port, int backlog = 16);
+        ~Listener();
+        Listener(const Listener&) = delete;
+        Listener& operator=(const Listener&) = delete;
+
+        int port() const noexcept { return port_; }
+        const std::string& host() const noexcept { return host_; }
+        // The next connection, or null when none came within `timeout` (or the
+        // listener is closed). `peer` gets "address:port".
+        std::unique_ptr<Transport> accept(std::chrono::milliseconds timeout, std::string* peer = nullptr);
+        // Stops accepting; any thread.
+        void close() noexcept;
+        bool isOpen() const noexcept;
+
+    private:
+        struct Impl;
+        std::unique_ptr<Impl> impl_;
+        std::string host_;
+        int port_ = 0;
+    };
+
+    // True for an address only this machine can reach ("127.0.0.1", "::1",
+    // "localhost"); "" and "0.0.0.0" are every interface, and any other name
+    // counts as public (server.py: is_loopback).
+    bool isLoopbackHost(const std::string& host);
+
 } // namespace sirius::app::rpc
 
 namespace sirius::app {
@@ -161,6 +196,11 @@ namespace sirius::app {
         // and whether it decodes them on the GPU (nvTIFF)
         std::string tiffReader;
         bool nvtiff = false;
+        // hello's "engine" block: present when the peer is SIRIUS's C++
+        // engine (sirius-cli serve, core/engine_server.hpp) rather than the
+        // Python worker -- its build (core/build_info.hpp), devices and the
+        // Python worker it runs beside it. Null for the Python worker.
+        nlohmann::json engine;
     };
 
     struct WorkerResult {

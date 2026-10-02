@@ -165,9 +165,58 @@ sirius_core_unit(remote_host       HEADERS remote_host.hpp   SOURCES remote_host
 sirius_core_unit(cluster           HEADERS cluster.hpp       SOURCES cluster.cpp
                                    DEPENDS remote_host rpc cancel errors
                                    PUBLIC_LINK nlohmann_json::nlohmann_json LINK Threads::Threads)
+
+# --- the engine: SIRIUS's C++ side of the worker protocol (`sirius-cli serve`) -------------
+#
+# Which build this is (git commit, operation schema hash, engine API), written
+# into a header by cmake/BuildInfo.cmake at every build: the engine reports it
+# in its hello, and the application refuses an engine whose operations differ.
+# SIRIUS_BUILD_COMMIT (+ SIRIUS_BUILD_DIRTY) name the commit of a tree without
+# .git, such as a container build from an archive.
+find_package(Git QUIET)
+set(SIRIUS_BUILD_COMMIT "" CACHE STRING "The git commit this tree is, when it has no .git (container builds)")
+set(SIRIUS_BUILD_DIRTY OFF CACHE BOOL "With SIRIUS_BUILD_COMMIT: the tree has changes over that commit")
+set(_sirius_build_info_dir ${CMAKE_CURRENT_BINARY_DIR}/generated)
+set(_sirius_build_info_header ${_sirius_build_info_dir}/sirius_build_info_generated.hpp)
+set(_sirius_build_info_command ${CMAKE_COMMAND}
+    -DSOURCE_DIR=${PROJECT_SOURCE_DIR} -DOUTPUT=${_sirius_build_info_header} -DVERSION=${PROJECT_VERSION}
+    -DSCHEMA_FILE=${PROJECT_SOURCE_DIR}/bindings/python/sirius/op_schema.json
+    -DGIT_EXECUTABLE=${GIT_EXECUTABLE} -DCOMMIT=${SIRIUS_BUILD_COMMIT} -DDIRTY=${SIRIUS_BUILD_DIRTY}
+    -P ${PROJECT_SOURCE_DIR}/cmake/BuildInfo.cmake)
+file(MAKE_DIRECTORY ${_sirius_build_info_dir})
+execute_process(COMMAND ${_sirius_build_info_command})   # so the header exists from the start
+add_custom_target(sirius_build_info_header
+    COMMAND ${_sirius_build_info_command}
+    BYPRODUCTS ${_sirius_build_info_header}
+    COMMENT "The build's identity (git commit, operation schema hash)"
+    VERBATIM)
+sirius_core_unit(build_info        HEADERS build_info.hpp    SOURCES build_info.cpp
+                                   PUBLIC_LINK nlohmann_json::nlohmann_json)
+target_include_directories(sirius_core_build_info PRIVATE ${_sirius_build_info_dir})
+add_dependencies(sirius_core_build_info sirius_build_info_header)
+# Arrays on the wire: zstd (the build's own, cmake/Dependencies.cmake) or zlib,
+# over shuffled bytes, as the client accepts.
+sirius_core_unit(array_codec       HEADERS array_codec.hpp   SOURCES array_codec.cpp
+                                   DEPENDS rpc errors PUBLIC_LINK nlohmann_json::nlohmann_json LINK ZLIB::ZLIB)
+if(TARGET ZSTD::ZSTD)
+    target_link_libraries(sirius_core_array_codec PRIVATE ZSTD::ZSTD)
+    target_compile_definitions(sirius_core_array_codec PRIVATE SIRIUS_APP_HAVE_ZSTD)
+endif()
+# The serving half of the protocol: handshake, slots, jobs, progress, cancel.
+sirius_core_unit(rpc_server        HEADERS rpc_server.hpp    SOURCES rpc_server.cpp
+                                   DEPENDS rpc cancel errors PUBLIC_LINK nlohmann_json::nlohmann_json LINK Threads::Threads)
+# dataset_info / _read / _view / _stats in C++ (sirius_worker/datasets.py's replies).
+sirius_core_unit(dataset_service   HEADERS dataset_service.hpp SOURCES dataset_service.cpp
+                                   DEPENDS rpc_server array_codec array_source build_info host lib/buffer lib/device lib/tiff_io
+                                   PUBLIC_LINK nlohmann_json::nlohmann_json LINK Threads::Threads)
+# The datasets that stay on the cluster, read by the worker or the engine there.
 sirius_core_unit(remote_source     HEADERS remote_source.hpp SOURCES remote_source.cpp
-                                   DEPENDS array_source dataset rpc errors lib/checked_math
-                                   PUBLIC_LINK nlohmann_json::nlohmann_json LINK ZLIB::ZLIB Threads::Threads)
+                                   DEPENDS array_source array_codec dataset rpc errors lib/checked_math
+                                   PUBLIC_LINK nlohmann_json::nlohmann_json LINK Threads::Threads)
+# `sirius-cli serve`: the datasets in C++, the rest relayed to a Python worker child.
+sirius_core_unit(engine_server     HEADERS engine_server.hpp SOURCES engine_server.cpp
+                                   DEPENDS dataset_service rpc_server rpc array_codec build_info local_worker host cancel errors lib/device
+                                   PUBLIC_LINK nlohmann_json::nlohmann_json LINK Threads::Threads)
 if(WIN32)
     target_link_libraries(sirius_core_remote_host PRIVATE ws2_32)
 endif()
@@ -192,6 +241,14 @@ sirius_core_unit(executor
     SOURCES executor.cpp
     DEPENDS operation pipeline array_source cancel
     LINK nlohmann_json::nlohmann_json)
+
+# A step's result besides its array, for the wire to the engine: meta, reports,
+# lineage, diagnostics (JSON + tensors).
+sirius_core_unit(serialize
+    HEADERS serialize.hpp
+    SOURCES serialize.cpp
+    DEPENDS dataset diagnostics executor label_frames rpc errors
+    PUBLIC_LINK nlohmann_json::nlohmann_json)
 
 # --- SIM reconstruction, as the workbench drives it -------------------------------------
 
@@ -334,6 +391,9 @@ target_include_directories(sirius_app_core PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
 target_link_libraries(sirius_app_core
     PUBLIC sirius nlohmann_json::nlohmann_json Threads::Threads
     PRIVATE OpenMP::OpenMP_CXX TIFF::TIFF tomlplusplus::tomlplusplus ZLIB::ZLIB)
+if(TARGET ZSTD::ZSTD)
+    target_link_libraries(sirius_app_core PRIVATE ZSTD::ZSTD)   # the arrays on the wire (array_codec)
+endif()
 if(WIN32)
     target_link_libraries(sirius_app_core PRIVATE ws2_32)
 endif()

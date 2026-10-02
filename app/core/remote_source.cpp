@@ -1,5 +1,6 @@
 #include "core/remote_source.hpp"
 
+#include "core/array_codec.hpp"
 #include "core/errors.hpp"
 
 #include <sirius/checked_math.hpp>
@@ -9,7 +10,6 @@
 #include <cstring>
 #include <limits>
 
-#include <zlib.h>
 
 namespace sirius::app {
 
@@ -38,34 +38,6 @@ namespace sirius::app {
                 std::memcpy(&v, p + i * sizeof(T), sizeof(T));
                 out[i] = static_cast<float>(v);
             }
-        }
-
-        std::vector<std::byte> inflateAll(const std::vector<std::byte>& in, std::size_t expected) {
-            std::vector<std::byte> out(expected);
-            z_stream zs{};
-            if (inflateInit(&zs) != Z_OK) throw ProtocolError("worker: zlib cannot start");
-            std::size_t inPos = 0, outPos = 0;
-            int rc = Z_OK;
-            constexpr std::size_t kChunk = std::size_t{1} << 30;   // zlib counts in uInt
-            while (rc != Z_STREAM_END) {
-                const std::size_t inLeft = in.size() - inPos, outLeft = out.size() - outPos;
-                zs.next_in = reinterpret_cast<Bytef*>(const_cast<std::byte*>(in.data() + inPos));
-                zs.avail_in = static_cast<uInt>(std::min(inLeft, kChunk));
-                zs.next_out = reinterpret_cast<Bytef*>(out.data() + outPos);
-                zs.avail_out = static_cast<uInt>(std::min(outLeft, kChunk));
-                const uInt availIn = zs.avail_in, availOut = zs.avail_out;
-                rc = inflate(&zs, Z_NO_FLUSH);
-                inPos += availIn - zs.avail_in;
-                outPos += availOut - zs.avail_out;
-                if (rc == Z_STREAM_END) break;
-                if (rc != Z_OK || (availIn == zs.avail_in && availOut == zs.avail_out)) {
-                    inflateEnd(&zs);
-                    throw ProtocolError("worker: a compressed array does not decompress");
-                }
-            }
-            inflateEnd(&zs);
-            if (outPos != expected) throw ProtocolError("worker: a compressed array has the wrong size");
-            return out;
         }
 
         std::string requestId(const ViewRequest& r) {
@@ -133,10 +105,11 @@ namespace sirius::app {
         const std::string encoding = desc.value("encoding", std::string("raw"));
         std::vector<std::byte> raw;
         const std::vector<std::byte>* bytes = &data.bytes;
-        if (encoding == "zlib") {
-            if (expected / 1100 > data.bytes.size() + 1)
+        if (encoding == "zlib" || encoding == "zstd") {
+            // zlib inflates at most ~1032:1; zstd's output is bounded by `expected` itself
+            if (encoding == "zlib" && expected / 1100 > data.bytes.size() + 1)
                 throw ProtocolError("worker: a compressed array of " + std::to_string(data.bytes.size()) + " bytes claims " + std::to_string(expected));
-            raw = inflateAll(data.bytes, expected);
+            raw = codec::decompress(encoding, data.bytes, expected);
             if (desc.value("shuffle", false) && item > 1) {
                 std::vector<std::byte> un(raw.size());
                 for (std::size_t b = 0; b < item; ++b)
@@ -177,8 +150,8 @@ namespace sirius::app {
     // --- the datasets of one session ---------------------------------------------------------
 
     RemoteDatasets::RemoteDatasets(std::string host, Connect connect) : host_(std::move(host)), connect_(std::move(connect)) {
-        // zstd needs a decoder this build does not have: zlib, which the worker always offers
-        accept_ = {"zlib"};
+        // what this build decodes, best first (zstd when it has the library; the worker always offers zlib)
+        accept_ = codec::availableEncodings();
     }
 
     RemoteDatasets::~RemoteDatasets() { uninstall(); }

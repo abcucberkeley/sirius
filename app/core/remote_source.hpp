@@ -13,8 +13,8 @@
 //     instead (inputReference(): the worker reads its input itself).
 //   * The viewer draws through the ViewProvider (core/array_source.hpp): the
 //     worker computes each pane's picture at the pane's resolution
-//     (dataset_view), compressed on the wire (zlib with shuffled bytes, when
-//     the worker offers it); views arrive on a thread of the source's own and
+//     (dataset_view), compressed on the wire (zstd or zlib with shuffled bytes,
+//     core/array_codec.hpp, when the worker offers it); views arrive on a thread of the source's own and
 //     are cached (bounded), with the neighbouring planes and time points
 //     prefetched behind the visible ones.
 //
@@ -48,7 +48,7 @@ namespace sirius::app {
     bool splitClusterPath(const std::string& path, std::string& host, std::string& remotePath);
 
     // A dataset_read / dataset_view reply's array as float32: the encoding
-    // ("raw", "zlib", shuffled bytes), the dtype, the shape. Throws
+    // ("raw", "zlib", "zstd", shuffled bytes), the dtype, the shape. Throws
     // ProtocolError on a reply that does not add up.
     std::vector<float> decodeWorkerArray(const nlohmann::json& desc, const rpc::Tensor& data, std::vector<Index>& shape);
 

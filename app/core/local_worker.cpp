@@ -101,6 +101,7 @@ namespace sirius::app {
             pyenv::Interpreter interpreter;
             std::string dir, device, hint;
             bool allowInstall = false;
+            int maxClients = 1;
         };
 
         const std::string token = newToken();   // fixed for the launcher's life
@@ -108,6 +109,7 @@ namespace sirius::app {
         mutable std::mutex mutex;   // the settings, the log and runningPython
         std::string python, scriptDir, device = "auto", setupHint;
         bool allowInstall = false;
+        int maxClients = 1;
         std::function<std::string()> configuredPython, configuredScriptDir;
         std::string log, runningPython;
 
@@ -215,6 +217,11 @@ namespace sirius::app {
         // Installing packages into the interpreter is the model hub's (the
         // GUI's); a worker nobody asked to install for does not accept it.
         if (cfg.allowInstall) o.arguments.emplace_back("--allow-install");
+        // the engine (core/engine_server.hpp) relays several calls at once
+        if (cfg.maxClients > 1) {
+            o.arguments.emplace_back("--max-clients");
+            o.arguments.emplace_back(std::to_string(cfg.maxClients));
+        }
         o.workingDirectory = cfg.dir;
         // The shared secret goes through the environment: a command line is
         // readable by every user of the machine (ps, /proc), the environment
@@ -226,6 +233,9 @@ namespace sirius::app {
         // hold: a step or a plugin runs arbitrary code in it. HF_TOKEN stays,
         // for the model downloads the user set it up for.
         o.unsetEnvironment = pyenv::secretEnvironmentNames();
+        // The worker reads a token file before $SIRIUS_TOKEN: one meant for the
+        // process that starts it (the engine's own, read and deleted) is not its.
+        o.unsetEnvironment.emplace_back("SIRIUS_TOKEN_FILE");
         // A PYTHONHOME meant for another Python would break SIRIUS's own
         // environment, and nobody set it for that one; CPython ignores an
         // empty value.
@@ -328,6 +338,11 @@ namespace sirius::app {
         impl_->allowInstall = allow;
     }
 
+    void LocalWorker::setMaxClients(int clients) {
+        const std::lock_guard<std::mutex> g(impl_->mutex);
+        impl_->maxClients = std::max(clients, 1);
+    }
+
     void LocalWorker::setConfiguredPython(std::function<std::string()> source) {
         const std::lock_guard<std::mutex> g(impl_->mutex);
         impl_->configuredPython = std::move(source);
@@ -406,6 +421,7 @@ namespace sirius::app {
             cfg.device = impl_->device;
             cfg.hint = impl_->setupHint;
             cfg.allowInstall = impl_->allowInstall;
+            cfg.maxClients = impl_->maxClients;
             return cfg;
         };
         if (impl_->process && !impl_->process->running()) {   // it died between runs

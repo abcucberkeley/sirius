@@ -33,6 +33,7 @@
 #include "core/agent_protocol.hpp"
 #include "core/app_paths.hpp"
 #include "core/array_source.hpp"
+#include "core/build_info.hpp"
 #include "core/cancel.hpp"
 #include "core/export.hpp"
 #include "core/headless.hpp"
@@ -997,6 +998,8 @@ namespace sirius::cli {
             }
             return {{"name", "sirius-cli"},
                     {"version", SIRIUS_VERSION},
+                    // which build: what an engine image's BUILD.json holds (core/build_info.hpp)
+                    {"build", app::toJson(app::buildInfo())},
                     {"schema", kOutputSchema},
                     {"protocols", {{"session", kSessionProtocol}, {"mcp", mcpVersions()}}},
                     {"features",
@@ -1795,6 +1798,8 @@ namespace sirius::cli {
             command_ = args_.command.empty() ? std::string("version") : args_.command;
             const std::string& command = command_;
             warnings_ = args_.warnings;
+            // The engine: its stdout is the announce line, then nothing.
+            if (command == "serve") return serveEngine(args_);
             const bool server = command == "session" || command == "mcp";
 
             if (server) {
@@ -1887,7 +1892,7 @@ namespace sirius::cli {
             }
             // No envelope for the servers: their stdout is the protocol, and a
             // client would read a line that is not one of its messages.
-            const bool server = command == "session" || command == "mcp";
+            const bool server = command == "session" || command == "mcp" || command == "serve";
             if (!server && claimDocument()) writeLine(dump(failureEnvelope(command, error, code, {}), stdoutIsTerminal()));
             writeError("sirius-cli: usage: " + std::string(e.what()) + "\n");
             return code;

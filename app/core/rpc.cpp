@@ -11,6 +11,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <cctype>
 #include <chrono>
 #include <condition_variable>
 #include <cstdlib>
@@ -96,6 +97,10 @@ namespace sirius::app::rpc {
     std::optional<nlohmann::json> HandshakeResponder::answer(const std::string& method, const nlohmann::json& params,
                                                              const nlohmann::json& capabilities, std::string& error) {
         if (method == "hello") {
+            if (!clientNonce.empty() || authenticated) {
+                error = "hello was sent already";
+                return std::nullopt;
+            }
             const int theirs = params.contains("protocol_version") && params["protocol_version"].is_number_integer()
                                    ? params["protocol_version"].get<int>()
                                    : 0;
@@ -118,9 +123,13 @@ namespace sirius::app::rpc {
             return r;
         }
         if (method == "auth") {
+            if (serverNonce.empty()) {
+                error = "not authenticated: send 'hello' first";
+                return std::nullopt;
+            }
             const std::string proof =
                 params.contains("client_proof") && params["client_proof"].is_string() ? params["client_proof"].get<std::string>() : std::string();
-            if (serverNonce.empty() || !crypto::constantTimeEqual(proof, handshakeProof(token, "client", clientNonce, serverNonce))) {
+            if (!crypto::constantTimeEqual(proof, handshakeProof(token, "client", clientNonce, serverNonce))) {
                 error = "authentication failed: the client's proof does not match this worker's token";
                 return std::nullopt;
             }
@@ -584,6 +593,124 @@ namespace sirius::app::rpc {
         return {std::make_unique<LoopbackTransport>(a, b), std::make_unique<LoopbackTransport>(b, a)};
     }
 
+    // --- the listening side -------------------------------------------------------------
+
+    struct Listener::Impl {
+        std::mutex m;
+        socket_t sock = SIRIUS_INVALID_SOCKET;
+        // close() from another thread only raises this: the accepting thread
+        // waits in short slices and closes the socket itself, so no thread
+        // ever waits on a descriptor another one has closed (and reused).
+        std::atomic<bool> closing{false};
+
+        void closeNow() {
+            const std::lock_guard<std::mutex> g(m);
+            if (sock != SIRIUS_INVALID_SOCKET) {
+                closeSocket(sock);
+                sock = SIRIUS_INVALID_SOCKET;
+            }
+        }
+    };
+
+    Listener::Listener(const std::string& host, int port, int backlog) : impl_(std::make_unique<Impl>()), host_(host) {
+        ensureWinsock();
+        if (port < 0 || port > 65535) throw ProtocolError("rpc: port " + std::to_string(port) + " is not a TCP port");
+        sockaddr_in addr{};
+        addr.sin_family = AF_INET;
+        addr.sin_port = htons(static_cast<std::uint16_t>(port));
+        const std::string h = host == "localhost" ? std::string("127.0.0.1") : host;
+        if (h.empty() || h == "0.0.0.0") {
+            addr.sin_addr.s_addr = htonl(INADDR_ANY);
+        } else if (inet_pton(AF_INET, h.c_str(), &addr.sin_addr) != 1) {
+            addrinfo hints{};
+            hints.ai_family = AF_INET;
+            hints.ai_socktype = SOCK_STREAM;
+            addrinfo* res = nullptr;
+            if (getaddrinfo(h.c_str(), nullptr, &hints, &res) != 0 || !res) throw ProtocolError("rpc: cannot resolve " + host + " to listen on");
+            addr.sin_addr = reinterpret_cast<sockaddr_in*>(res->ai_addr)->sin_addr;
+            freeaddrinfo(res);
+        }
+        const socket_t s = ::socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+        if (s == SIRIUS_INVALID_SOCKET) throw ProtocolError("rpc: cannot create a socket to listen on");
+        int one = 1;
+#ifdef _WIN32
+        // SO_REUSEADDR on Winsock would let a second socket bind this port and
+        // receive a client's hello; the exclusive option is what POSIX's means.
+        setsockopt(s, SOL_SOCKET, SO_EXCLUSIVEADDRUSE, reinterpret_cast<const char*>(&one), sizeof one);
+#else
+        setsockopt(s, SOL_SOCKET, SO_REUSEADDR, reinterpret_cast<const char*>(&one), sizeof one);
+#endif
+        if (::bind(s, reinterpret_cast<const sockaddr*>(&addr), sizeof addr) != 0 || ::listen(s, backlog) != 0) {
+            const int e = lastError();
+            closeSocket(s);
+            throw ProtocolError("rpc: cannot listen on " + (host.empty() ? std::string("0.0.0.0") : host) + ":" + std::to_string(port) +
+                                " (error " + std::to_string(e) + ")");
+        }
+        sockaddr_in bound{};
+        socklen_t len = sizeof bound;
+        getsockname(s, reinterpret_cast<sockaddr*>(&bound), &len);
+        port_ = ntohs(bound.sin_port);
+        impl_->sock = s;
+    }
+
+    Listener::~Listener() { impl_->closeNow(); }
+
+    void Listener::close() noexcept { impl_->closing.store(true); }
+
+    bool Listener::isOpen() const noexcept { return !impl_->closing.load() && impl_->sock != SIRIUS_INVALID_SOCKET; }
+
+    std::unique_ptr<Transport> Listener::accept(std::chrono::milliseconds timeout, std::string* peer) {
+        const auto deadline = std::chrono::steady_clock::now() + timeout;
+        for (;;) {
+            if (impl_->closing.load()) {
+                impl_->closeNow();
+                return nullptr;
+            }
+            socket_t ls;
+            {
+                const std::lock_guard<std::mutex> g(impl_->m);
+                ls = impl_->sock;
+            }
+            if (ls == SIRIUS_INVALID_SOCKET) return nullptr;
+            const auto left = std::chrono::duration_cast<std::chrono::milliseconds>(deadline - std::chrono::steady_clock::now());
+            if (!waitFor(ls, false, (std::max)(std::chrono::milliseconds(0), (std::min)(left, std::chrono::milliseconds(200))))) {
+                if (left.count() <= 200) return nullptr;
+                continue;
+            }
+            sockaddr_in from{};
+            socklen_t len = sizeof from;
+            const socket_t s = ::accept(ls, reinterpret_cast<sockaddr*>(&from), &len);
+            if (s == SIRIUS_INVALID_SOCKET) {
+                if (std::chrono::steady_clock::now() >= deadline) return nullptr;
+                continue;   // the peer left between the wait and the accept
+            }
+            setBlocking(s, false);
+            int one = 1;
+            setsockopt(s, IPPROTO_TCP, TCP_NODELAY, reinterpret_cast<const char*>(&one), sizeof one);
+#ifdef SO_NOSIGPIPE
+            setsockopt(s, SOL_SOCKET, SO_NOSIGPIPE, reinterpret_cast<const char*>(&one), sizeof one);
+#endif
+            if (peer) {
+                char text[INET_ADDRSTRLEN] = {0};
+                inet_ntop(AF_INET, &from.sin_addr, text, sizeof text);
+                *peer = std::string(text) + ":" + std::to_string(ntohs(from.sin_port));
+            }
+            return std::make_unique<TcpTransport>(s);
+        }
+    }
+
+    bool isLoopbackHost(const std::string& hostIn) {
+        std::string h = hostIn;
+        std::transform(h.begin(), h.end(), h.begin(), [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+        while (!h.empty() && (h.front() == ' ' || h.front() == '\t')) h.erase(h.begin());
+        while (!h.empty() && (h.back() == ' ' || h.back() == '\t')) h.pop_back();
+        if (h.empty()) return false;
+        if (h == "localhost" || h == "localhost.localdomain" || h == "::1" || h == "[::1]") return true;
+        in_addr a{};
+        if (inet_pton(AF_INET, h.c_str(), &a) == 1) return (ntohl(a.s_addr) >> 24) == 127;
+        return false;
+    }
+
 } // namespace sirius::app::rpc
 
 namespace sirius::app {
@@ -697,6 +824,7 @@ namespace sirius::app {
             for (const json& e : r["encodings"])
                 if (e.is_string()) caps_.encodings.push_back(e.get<std::string>());
         if (r.contains("max_clients") && r["max_clients"].is_number_integer()) caps_.maxClients = r["max_clients"].get<int>();
+        if (r.contains("engine") && r["engine"].is_object()) caps_.engine = r["engine"];
         if (r.contains("tiff_reader") && r["tiff_reader"].is_object()) {
             const json& tr = r["tiff_reader"];
             if (tr.contains("sirius") && tr["sirius"].is_string()) caps_.tiffReader = tr["sirius"].get<std::string>();

@@ -315,6 +315,19 @@ namespace sirius::app::host {
 #endif
     }
 
+    std::string hostName() {
+#ifdef _WIN32
+        wchar_t buffer[256];
+        DWORD n = static_cast<DWORD>(sizeof buffer / sizeof buffer[0]);
+        if (!::GetComputerNameExW(ComputerNameDnsHostname, buffer, &n)) return environment("COMPUTERNAME");
+        return narrow(std::wstring(buffer, n));
+#else
+        char buffer[256] = {0};
+        if (::gethostname(buffer, sizeof buffer - 1) != 0) return environment("HOSTNAME");
+        return buffer;
+#endif
+    }
+
     bool processAlive(int pid) {
         if (pid <= 0) return false;
 #ifdef _WIN32

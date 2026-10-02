@@ -387,16 +387,7 @@ namespace sirius::app {
             return out;
         }
 
-        struct TiffProbe {
-            DatasetMeta meta;
-            PageOrder order;      // over pages: c counts page channels
-            Index samples = 1;    // samples (channels) per page
-            std::string summary;
-            bool dimsFromMetadata = false;
-        };
-
-        TiffProbe probeTiff(const std::string& path, const OpenOptions* options) {
-            const TiffInfo info = inspectTiff(path);
+        TiffDatasetProbe probeTiffInfo(const std::string& path, const TiffInfo& info, const OpenOptions* options) {
             if (!info.uniformPages())
                 throw std::runtime_error("TIFF pages differ in size, pixel type or samples per pixel: " + path);
             const TiffImageInfo& p0 = info.page(0);
@@ -405,7 +396,7 @@ namespace sirius::app {
             // Samples per pixel are channels: an RGB page is three planes.
             const Index spp = std::max<Index>(p0.samplesPerPixel, 1);
 
-            TiffProbe r;
+            TiffDatasetProbe r;
             DatasetMeta& m = r.meta;
             m.name = fs::path(path).stem().string();
             if (fs::path(m.name).extension() == ".ome") m.name = fs::path(m.name).stem().string();
@@ -416,7 +407,8 @@ namespace sirius::app {
             m.dims.y = static_cast<Index>(p0.height);
             m.dims.x = static_cast<Index>(p0.width);
 
-            const ParsedTiffMetadata md = parseTiffDescription(p0.description);
+            r.parsed = parseTiffDescription(p0.description);
+            const ParsedTiffMetadata& md = r.parsed;
             m.format = md.ome ? "ome-tiff" : "tiff";
             std::ostringstream summary;
             summary << (md.ome ? "OME-TIFF" : md.imagej ? "ImageJ TIFF"
@@ -483,6 +475,7 @@ namespace sirius::app {
                 if (xy[1] > 0.0) voxel[1] = xy[1];
             }
             if (voxel[2] <= 0.0 && md.imagej) voxel[2] = md.voxelUm[2];
+            for (std::size_t k = 0; k < 3; ++k) r.fileVoxelUm[k] = std::max(voxel[k], 0.0);
             if (options && options->voxelUm)
                 for (int k = 0; k < 3; ++k)
                     if ((*options->voxelUm)[k] > 0.0) voxel[k] = (*options->voxelUm)[k];   // 0 = the file's
@@ -516,6 +509,8 @@ namespace sirius::app {
             r.summary = summary.str();
             return r;
         }
+
+        TiffDatasetProbe probeTiff(const std::string& path, const OpenOptions* options) { return probeTiffInfo(path, inspectTiff(path), options); }
 
         // --- zarr source ------------------------------------------------------------
 
@@ -927,6 +922,10 @@ namespace sirius::app {
 
     } // namespace
 
+    TiffDatasetProbe probeTiffDataset(const std::string& path, const TiffInfo& info, const OpenOptions* options) {
+        return probeTiffInfo(path, info, options);
+    }
+
     // --- public entry points -------------------------------------------------------------
 
     bool zarrSupported() noexcept { return sirius::zarrSupported(); }
@@ -1021,7 +1020,7 @@ namespace sirius::app {
             if (!looksLikeTiff(path)) {
                 // let libtiff decide: many microscopy files carry odd extensions
             }
-            TiffProbe p = probeTiff(path, &options);
+            TiffDatasetProbe p = probeTiff(path, &options);
             r.source = std::make_shared<TiffArraySource>(path, p.meta, p.order, p.samples);
             r.metadataSummary = p.summary;
             r.dimsFromMetadata = p.dimsFromMetadata;

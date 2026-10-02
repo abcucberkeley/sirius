@@ -200,7 +200,7 @@ the executor's cache lives in the process: iterative work belongs in
 
 | command | does | `result` |
 | --- | --- | --- |
-| `version` | nothing | `{name, version, schema, protocols:{session, mcp:[…]}, features:{cuda, cuda_devices, zarr, export_formats, readable_extensions}, paths:{executable_dir, help, worker, python_env}}` |
+| `version` | nothing | `{name, version, build:{build, version, commit, dirty, ops_schema, api}, schema, protocols:{session, mcp:[…]}, features:{cuda, cuda_devices, zarr, export_formats, readable_extensions}, paths:{executable_dir, help, worker, python_env}}` |
 | `devices` | the `list_devices` tool | `{backend, cuda_available, cuda_device, devices:[{index, name, memory_gb, compute}]}` |
 | `info <dataset> [open options] [--open]` | `dataset_info`: probes the file; `--open` opens it (lazily), which also fills `metadata_summary` and `dims_from_metadata` (null without it) | DatasetInfo |
 | `ops [kind…] [--group G] [--detail] [--plugins]` | `list_operations`; with one kind and `--detail`, `describe_operation` | `{operations:[…]}`, or the description |
@@ -218,6 +218,7 @@ the executor's cache lives in the process: iterative work belongs in
 | `schema` | nothing | `{commands:[{name, synopsis, options:[{name, type, default, help}]}], exit_codes, error_codes, envelope}` |
 | `session [--allow-worker-setup] [--allow-network-paths] [state options]` | the session protocol | (protocol) |
 | `mcp [--allow-worker-setup] [--read-only] [--allow-network-paths] [state options]` | the MCP server | (protocol) |
+| `serve [--host H] [--port P] [--token-file F] [--max-clients N] [--device D] [--no-python-worker]` | SIRIUS's engine for the HPC backend | (the worker protocol on TCP; one announce line on stdout) |
 | `worker status` | where the worker's Python comes from, and the state of SIRIUS's environment | see "The Python worker" |
 | `worker check` | starts the worker (never installs) and says hello | `{interpreter:{path, source}, capabilities, seconds}` |
 | `worker setup [options]` | plans, asks, and sets up SIRIUS's environment | `{env_dir, python, base_python, python_version, installer, mode, packages, extras, seconds}` |
@@ -870,6 +871,33 @@ A handshake by hand (`>` stdin, `<` stdout, shortened):
 < {"id":2,"jsonrpc":"2.0","result":{"content":[{"text":"{\"dims\":{…},…}","type":"text"}],"isError":false,"structuredContent":{"dims":{…},…}}}
 ```
 
+## The engine (`sirius-cli serve`)
+
+`sirius-cli serve` is SIRIUS's C++ engine as the worker of the HPC backend:
+the cluster job runs it on the node. It speaks the Python worker's protocol
+(`app/core/rpc.hpp`: the frames, the HMAC handshake, progress and cancel), so
+the application connects to it as to that worker, and its hello carries an
+`engine` block more: the build (`version`'s `build`: the git commit, the
+operation schema's hash and the engine API), the GPUs, and the state of its
+Python worker.
+
+- It serves the cluster datasets itself -- `dataset_info`, `dataset_read`,
+  `dataset_view`, `dataset_stats`, with the replies of the Python worker's
+  `datasets.py` -- reading TIFF with SIRIUS's own reader (nvTIFF on a CUDA
+  device when the build has it and a request's `device` asks for one) and
+  `.npy`.
+- Every other request is relayed to a Python worker it starts beside it, on
+  127.0.0.1 with a token of its own (`--python`, `--worker-dir` choose it);
+  `--no-python-worker` refuses those requests instead, saying so.
+- The token comes from `--token-file` or `$SIRIUS_TOKEN_FILE` (read, then
+  deleted; on POSIX it must be a file of this user's that nobody else can
+  read), else `$SIRIUS_TOKEN`. Listening on an address other than loopback
+  without one is refused (exit 2).
+- Once it listens it prints one line, `{"port": N, "pid", "host", "hostname",
+  "device", "engine": {...}}`, the line the cluster session waits for in the
+  job's log, and nothing else on stdout. It ends on a client's `shutdown`,
+  SIGTERM, Ctrl+C, or (with `--exit-with-parent`) the end of its stdin.
+
 ## The Python worker
 
 Steps that live in Python (segmentation models, btrack tracking, user
@@ -958,6 +986,8 @@ worker setup [--yes] [--extras] [--package P]… [--base-python P] [--update|--r
 | `SIRIUS_PYTHON_ENV` | both | where SIRIUS's own Python environment lives |
 | `SIRIUS_UV` | both | the uv executable to set it up with |
 | `SIRIUS_HPC_TOKEN` | `sirius-cli` | the token for `--hpc` (never on the command line, which other users can see) |
+| `SIRIUS_TOKEN_FILE`, `SIRIUS_TOKEN` | `sirius-cli serve`, the worker | the server's token: a file read and then deleted, else the value itself |
+| `SIRIUS_WORKER_VIEW_CACHE_MB` | `sirius-cli serve`, the worker | how much of the cluster datasets' volumes is kept for re-slicing (default 4096) |
 | `HF_TOKEN` | `sirius-cli`, the worker | a Hugging Face token for gated models |
 | `SIRIUS_HELP_DIR` | both | a directory of help pages to use first |
 | `SIRIUS_WORKER_DIR` | both | a directory holding `sirius_worker/`, used when there is no installed or built copy (see `--worker-dir`) |

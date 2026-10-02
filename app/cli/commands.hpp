@@ -28,6 +28,11 @@ namespace sirius::cli {
     // ending the process to the caller (exitProcess).
     int run(const std::vector<std::string>& argv);
 
+    struct Args;
+    // `sirius-cli serve` (serve.cpp): listens, prints the announce line,
+    // serves until shutdown; the exit code.
+    int serveEngine(const Args& args);
+
     // The MCP protocol versions the server speaks, newest first.
     const std::vector<std::string>& mcpVersions();
 

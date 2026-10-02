@@ -80,3 +80,14 @@ target_compile_definitions(test_app_cluster_objects PRIVATE
     SIRIUS_TEST_FAKE_SLURM_DIR="${PROJECT_SOURCE_DIR}/tests/tools/fake_slurm"
     SIRIUS_TEST_SOURCE_DIR="${PROJECT_SOURCE_DIR}")
 add_dependencies(test_app_cluster sirius_test_askpass)
+
+# SIRIUS's C++ engine (`sirius-cli serve`): the build identity, the
+# serializer, the server half of the worker protocol, the cluster datasets in
+# C++ -- through the application's RemoteSource, in-process and as a real
+# sirius-cli process on 127.0.0.1 -- and their parity with the Python worker's.
+app_test(engine test_app_engine.cpp UNITS engine_server dataset_service rpc_server array_codec build_info serialize remote_source
+                                           array_source rpc local_worker process host ops_schema ops_registry tracks)
+target_compile_definitions(test_app_engine_objects PRIVATE
+    SIRIUS_TEST_CLI="$<TARGET_FILE:sirius-cli>"
+    SIRIUS_TEST_WORKER_DIR="${PROJECT_SOURCE_DIR}/app/python")
+add_dependencies(test_app_engine sirius-cli)

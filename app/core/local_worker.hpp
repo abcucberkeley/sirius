@@ -26,6 +26,7 @@ namespace sirius::app {
         void setScriptDir(const std::string& dir);
         void setDevice(const std::string& device);              // auto | cpu | cuda | cuda:N
         void setAllowInstall(bool allow);                        // --allow-install; default false
+        void setMaxClients(int clients);                         // --max-clients; default 1 (one connection at a time)
         void setConfiguredPython(std::function<std::string()> source);
         void setConfiguredScriptDir(std::function<std::string()> source);
         void setSetupHint(std::string hint);
