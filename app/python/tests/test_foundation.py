@@ -603,6 +603,7 @@ class WithScriptedHeatmap(unittest.TestCase):
 
 
 
+@unittest.skipUnless(HAVE, f"latents not importable: {WHY}")
 class DistanceHead(unittest.TestCase):
     """A coat student: the head outputs foreground and distance to the wall, and the instances come
     from a watershed seeded on the h-maxima of that distance.
@@ -646,6 +647,7 @@ class DistanceHead(unittest.TestCase):
                 foundation.run(self.v, {"model": self.path, "task": task}, "cpu")
 
 
+@unittest.skipUnless(HAVE, f"latents not importable: {WHY}")
 class PromptTask(unittest.TestCase):
     """A promptable (SamHead) bundle: the person points at an object and gets that object.
 

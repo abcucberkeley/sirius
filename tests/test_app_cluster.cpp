@@ -90,6 +90,14 @@ namespace {
         return p.waitForExit(60000) && p.exitCode() == 0;
     }
 
+    // A script the fake cluster runs by name from PATH: written, then made
+    // executable (a no-op on Windows, where Git Bash goes by the #! line).
+    void writeScript(const fs::path& path, const std::string& text) {
+        std::ofstream(path, std::ios::binary) << text;
+        std::error_code ec;
+        fs::permissions(path, fs::perms::owner_exec | fs::perms::group_exec | fs::perms::others_exec, fs::perm_options::add, ec);
+    }
+
     // A temporary "cluster home" with the fake Slurm tools and a python3 shim
     // on its PATH, and the variables fake_ssh.py reads set for the children.
     struct FakeCluster {
@@ -107,15 +115,17 @@ namespace {
             fs::create_directories(home);
             fs::create_directories(bin);
             fs::create_directories(slurm);
-            // the tools as LF scripts, whatever the checkout's line endings
+            // the tools as LF scripts, whatever the checkout's line endings, and
+            // executable: a file written here is 0644 on POSIX, and bash finds a
+            // non-executable one on PATH all the same, then fails "Permission denied"
             for (const char* tool : {"sbatch", "squeue", "sacct", "scancel", "sinfo", "sacctmgr", "scontrol", "apptainer"}) {
                 std::string text = readAll(fs::path(SIRIUS_TEST_FAKE_SLURM_DIR) / tool);
                 std::string lf;
                 for (char c : text)
                     if (c != '\r') lf.push_back(c);
-                std::ofstream(bin / tool, std::ios::binary) << lf;
+                writeScript(bin / tool, lf);
             }
-            std::ofstream(bin / "python3", std::ios::binary) << "#!/bin/bash\nexec \"$FAKE_PYTHON\" \"$@\"\n";
+            writeScript(bin / "python3", "#!/bin/bash\nexec \"$FAKE_PYTHON\" \"$@\"\n");
             setEnv("FAKE_SSH_LOG", log.generic_string());
             setEnv("FAKE_SSH_HOME", home.generic_string());
             setEnv("FAKE_SSH_PATH", bin.string());
@@ -882,13 +892,16 @@ TEST_CASE("cluster: log in lists the partitions and submits nothing", "[app][clu
     for (int i = 1; i < cluster::kStepCount; ++i) CHECK(st.steps[static_cast<std::size_t>(i)].status == cluster::StepStatus::Pending);
     std::optional<cluster::ClusterInfo> info = session.clusterInfo();
     REQUIRE(info);
+    INFO(info->error);
     CHECK(info->host == "fakecluster");
     CHECK(info->user == "tester");
     CHECK(info->error.empty());
-    CHECK(info->partitions.size() == 4);
+    REQUIRE(info->partitions.size() == 4);
     CHECK(info->associationsKnown);
     CHECK(info->exclusiveKnown);
-    CHECK(cluster::findPartition(*info, "dgx")->exclusive);
+    const cluster::Partition* dgx = cluster::findPartition(*info, "dgx");
+    REQUIRE(dgx);
+    CHECK(dgx->exclusive);
     CHECK_FALSE(cluster::hasAssociation(*info, "lab_h100"));
     // the user's name was the cluster's own
     CHECK(readAll(fc.slurm / "sacctmgr.args").find("user=tester ") != std::string::npos);
@@ -1069,8 +1082,14 @@ TEST_CASE("cluster: the checks of a container image say what is wrong and never 
     CHECK(st.remoteOutput.find("squashfs") != std::string::npos);
     CHECK(st.fix.find("pip") == std::string::npos);
 
-    // an image without the sirius package (the checkout's folder named sirius does not count)
+    // an image without the sirius package (the checkout's folder named sirius does not count),
+    // with numpy, so that it is sirius that is missing whatever the interpreter behind the fake has
+    const fs::path numpyOnly = fc.root / "numpy-only-site";
+    fs::create_directories(numpyOnly / "numpy");
+    std::ofstream(numpyOnly / "numpy" / "__init__.py") << "__version__ = '0-test'\n";
+    setEnv("FAKE_CONTAINER_SITE", numpyOnly.string());
     st = connectUntilSettled(session, containerProfile(fc, "~/empty.sif"));
+    setEnv("FAKE_CONTAINER_SITE", "");
     CHECK(checksFailed(st));
     CHECK(st.reason.find("sirius and numpy do not import") != std::string::npos);
     CHECK(st.remoteOutput.find("not the compiled package") != std::string::npos);

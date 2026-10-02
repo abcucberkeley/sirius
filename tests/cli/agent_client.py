@@ -296,7 +296,8 @@ def check_tools(tools: dict[str, dict[str, Any]]) -> None:
     check(tools["render"]["annotations"]["readOnlyHint"] is True, "render is not read-only")
     # D27: an agent picks a backend, never an endpoint or a token, whatever the argument is called
     backend_args = set(tools["set_backend"]["inputSchema"]["properties"])
-    check(backend_args <= {"backend", "cuda_device", "hpc_device", "workspace"}, f"set_backend takes more: {sorted(backend_args)}")
+    check(backend_args <= {"backend", "cuda_device", "hpc_device", "workspace"},
+          f"set_backend takes more: {sorted(backend_args)}")
     setup = tools["setup_worker_env"]
     check(setup["annotations"]["destructiveHint"] is True, "setup_worker_env is not flagged destructive")
     check(

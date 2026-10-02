@@ -43,13 +43,18 @@ def _cases(scale: float):
         return out
 
     pages = max(int(128 * s), 2)
-    yield ("uint16 stack, uncompressed, 128 x 1024^2", smooth((pages, 1024, 1024), np.uint16),
-           {"photometric": "minisblack"})
-    yield ("uint16 stack, Deflate + predictor, 64 x 1024^2", smooth((max(int(64 * s), 2), 1024, 1024), np.uint16),
-           {"photometric": "minisblack", "compression": "zlib", "predictor": True})
-    edge = max(int(8192 * s ** 0.5) // 256 * 256, 512)
-    yield (f"uint16 single page {edge}^2, Deflate + predictor, 256^2 tiles", smooth((edge, edge), np.uint16),
-           {"photometric": "minisblack", "compression": "zlib", "predictor": True, "tile": (256, 256)})
+    yield ("uint16 stack, uncompressed, 128 x 1024^2", smooth((pages, 1024, 1024), np.uint16), {"photometric": "minisblack"})
+    yield (
+        "uint16 stack, Deflate + predictor, 64 x 1024^2",
+        smooth((max(int(64 * s), 2), 1024, 1024), np.uint16),
+        {"photometric": "minisblack", "compression": "zlib", "predictor": True},
+    )
+    edge = max(int(8192 * s**0.5) // 256 * 256, 512)
+    yield (
+        f"uint16 single page {edge}^2, Deflate + predictor, 256^2 tiles",
+        smooth((edge, edge), np.uint16),
+        {"photometric": "minisblack", "compression": "zlib", "predictor": True, "tile": (256, 256)},
+    )
     rgb = smooth((max(int(16 * s), 2), 3, 2048, 2048), np.uint16)
     rgb = np.moveaxis((rgb >> 2).astype(np.uint8), 1, -1).copy()
     yield ("RGB uint8, LZW, 16 x 2048^2", rgb, {"photometric": "rgb", "compression": "lzw"})
@@ -57,7 +62,7 @@ def _cases(scale: float):
 
 
 def _best(fn, repeats: int):
-    fn()   # warm-up: page cache, thread pools
+    fn()  # warm-up: page cache, thread pools
     times = []
     for _ in range(repeats):
         t0 = time.perf_counter()
@@ -86,7 +91,7 @@ def main() -> None:
             ref = tifffile.imread(path)
             got = np.asarray(sirius.read_tiff(path))
             if ref.ndim == got.ndim and got.ndim >= 3 and ref.shape[-1] == got.shape[1] and ref.shape != got.shape:
-                got_cmp = np.moveaxis(got, 1, -1)   # RGB: (pages, s, y, x) -> (pages, y, x, s)
+                got_cmp = np.moveaxis(got, 1, -1)  # RGB: (pages, s, y, x) -> (pages, y, x, s)
             else:
                 got_cmp = got
             if not np.array_equal(got_cmp.reshape(ref.shape), ref):

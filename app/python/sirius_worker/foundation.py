@@ -543,12 +543,13 @@ def run(volume: np.ndarray, params: Dict[str, Any], device: str = "auto",
             # channels into a one-channel buffer, and watershedding the foreground as if it were
             # centroids merges every touching cell. The decode rule comes from the bundle, because
             # it is what the model was SCORED with and is not recoverable from the weights.
-            from scipy.special import expit
             from latents.downstream.seg import instances_from_dist
+            from scipy.special import expit
 
             m._check_channels(n_c)
             logits = np.asarray(m._class_logits(frame, channels=multi), np.float32)
-            fg = expit(logits[0]); dist = expit(logits[1])
+            fg = expit(logits[0])
+            dist = expit(logits[1])
             conf[t] = fg
             given = float(params.get("threshold", 0) or 0)
             fg_thr = given if given > 0 else float(getattr(man, "fg_threshold", 0.5))

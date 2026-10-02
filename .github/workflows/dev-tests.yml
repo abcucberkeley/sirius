@@ -24,9 +24,10 @@ on:
   workflow_dispatch:
 
 # The jobs only read the repository (upload-artifact needs no token scope):
-# the GITHUB_TOKEN of every job gets nothing more than that. The third-party
-# actions are pinned by tag, not by commit; pin them by SHA before this
-# workflow is given secrets or write scopes.
+# the GITHUB_TOKEN of every job gets nothing more than that. The actions are
+# pinned by an exact release tag (a major-only tag such as setup-uv@v10 need
+# not exist, and then the job cannot even start), not by commit; pin them by
+# SHA before this workflow is given secrets or write scopes.
 permissions:
   contents: read
 
@@ -46,13 +47,13 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v4.4.0
         with:
           # The whole history: the formatting steps diff against the PR base
           # or the previous head of the branch.
           fetch-depth: 0
 
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@v5.6.0
         with:
           python-version: "3.11"
 
@@ -111,7 +112,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 45
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v4.4.0
 
       - name: Install build dependencies
         run: |
@@ -123,7 +124,7 @@ jobs:
             gcc \
             g++
 
-      - uses: hendrikmuhs/ccache-action@v1
+      - uses: hendrikmuhs/ccache-action@v1.2.24
         with:
           key: cpp-tests-linux-gcc
 
@@ -160,7 +161,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 45
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v4.4.0
 
       # GLFW builds for X11 and Wayland (their headers and wayland-scanner),
       # the file dialogs go through the desktop portal (D-Bus), the assistant
@@ -176,7 +177,7 @@ jobs:
             libdbus-1-dev libcurl4-openssl-dev \
             xvfb xauth desktop-file-utils
 
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@v5.6.0
         id: python
         with:
           python-version: "3.11"
@@ -193,7 +194,7 @@ jobs:
           python -m pip install --upgrade pip
           pip install numpy scipy
 
-      - uses: hendrikmuhs/ccache-action@v1
+      - uses: hendrikmuhs/ccache-action@v1.2.24
         with:
           key: app-tests-linux
 
@@ -231,7 +232,7 @@ jobs:
             --pipeline examples/sim_bundled.sirius.toml --render cli-mip.png --plane mip --stats | tee cli-run.json
           test -s cli-mip.png
 
-      - uses: astral-sh/setup-uv@v10
+      - uses: astral-sh/setup-uv@v10.2.0
 
       # SIRIUS's own Python environment for the worker, set up from nothing
       # with uv into a scratch directory, then started: the only automated
@@ -261,7 +262,7 @@ jobs:
           # moved past a window) instead of crashing; any report fails the run.
           if grep -q "imgui-error" smoke.log; then grep "imgui-error" smoke.log | sort | uniq -c; exit 1; fi
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v4.6.2
         if: always()
         with:
           name: workbench-smoke
@@ -276,7 +277,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 45
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v4.4.0
 
       - name: Install build dependencies
         run: |
@@ -288,7 +289,7 @@ jobs:
             gcc \
             g++
 
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@v5.6.0
         id: python
         with:
           python-version: "3.11"
@@ -322,7 +323,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 45
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v4.4.0
 
       - name: Install build dependencies
         run: |
@@ -333,7 +334,7 @@ jobs:
           sudo apt-get install -y --no-install-recommends \
             build-essential cmake ninja-build clang llvm libomp-dev
 
-      - uses: hendrikmuhs/ccache-action@v1
+      - uses: hendrikmuhs/ccache-action@v1.2.24
         with:
           key: sanitizers-linux-clang
 
@@ -377,9 +378,9 @@ jobs:
       run:
         shell: bash
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v4.4.0
 
-      - uses: ilammy/msvc-dev-cmd@v1
+      - uses: ilammy/msvc-dev-cmd@v1.13.0
 
       # No preset, so the cache variables the dev preset would set are spelled
       # out. TensorStore is off (nasm, ~15 min); the Python bindings are off
@@ -432,7 +433,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 45
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v4.4.0
 
       - name: Install build dependencies
         run: |
@@ -442,7 +443,7 @@ jobs:
             cmake \
             ninja-build
 
-      - uses: hendrikmuhs/ccache-action@v1
+      - uses: hendrikmuhs/ccache-action@v1.2.24
         with:
           key: cli-headless-linux
 
@@ -484,7 +485,7 @@ jobs:
           apt-get install -y --no-install-recommends ca-certificates git
           rm -rf /var/lib/apt/lists/*
 
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v4.4.0
 
       - name: Provision toolchain (same script as the containers)
         run: bash containers/install-deps.sh
