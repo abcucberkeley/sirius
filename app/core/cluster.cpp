@@ -1253,9 +1253,10 @@ namespace sirius::app::cluster {
                 }
                 listPartitions(p, !submitting);
                 if (!submitting) {
-                    // logged in, the partitions listed: nothing is submitted
-                    setState(State::Idle);
+                    // logged in, the partitions listed: nothing is submitted. The
+                    // flag is cleared before the state is published (see below).
                     connecting.store(false);
+                    setState(State::Idle);
                     return;
                 }
                 checks(p);
@@ -1268,6 +1269,7 @@ namespace sirius::app::cluster {
                 const std::string node = waitInQueue(p, id);
                 waitForWorker(p, id, node);
                 hello(p, node);
+                connecting.store(false);
                 setState(State::Connected);
                 Status st;
                 {
@@ -1277,6 +1279,10 @@ namespace sirius::app::cluster {
                 say("HPC: connected to the worker on " + st.node + " (job " + st.jobId + ", " + st.caps.device + ")");
                 startKeeper();
             } catch (const Failure& f) {
+                // Cleared before the state is published: whoever sees the attempt
+                // settle (Connect again, a test) must be able to start the next one,
+                // which start() refuses while this flag is set.
+                connecting.store(false);
                 update([&](Status& x) {
                     x.steps[static_cast<std::size_t>(f.step)] = StepState{StepStatus::Failed, f.reason};
                     x.state = State::Disconnected;
@@ -1289,6 +1295,7 @@ namespace sirius::app::cluster {
                 });
                 say("HPC: " + f.reason + (f.remote.empty() ? std::string() : " \xE2\x80\x94 " + f.remote.substr(0, 300)));
             } catch (const std::exception& e) {
+                connecting.store(false);
                 update([&](Status& x) {
                     x.state = State::Disconnected;
                     x.since = std::chrono::steady_clock::now();
@@ -1422,8 +1429,10 @@ namespace sirius::app::cluster {
 
     void Session::start(const Profile& profile, bool submit) {
         if (impl_->connecting.exchange(true)) return;
-        impl_->stopKeeperThread();
+        // The previous attempt's thread first: it clears `connecting` before it
+        // publishes its state, and may still start the keeper after that.
         if (impl_->worker.joinable()) impl_->worker.join();
+        impl_->stopKeeperThread();
         {
             const std::lock_guard<std::mutex> g(impl_->controlMutex);
             impl_->control.reset();
