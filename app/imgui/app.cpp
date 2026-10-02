@@ -1975,18 +1975,30 @@ namespace sirius::app::gui {
         // in there (it opens there), the work area of its monitor once it has
         // a window of its own, so another monitor neither caps it nor shrinks
         // it with the main window.
-        ImVec2 room(vp->WorkSize.x, vp->WorkSize.y);
+        ImVec2 room(vp->WorkSize.x, vp->WorkSize.y), roomPos(vp->WorkPos.x, vp->WorkPos.y);
         if (d->appeared_ && (ImGui::GetIO().ConfigFlags & ImGuiConfigFlags_ViewportsEnable)) {
             const ImGuiPlatformIO& pio = ImGui::GetPlatformIO();
             if (ImGuiWindow* w = ImGui::FindWindowByName(id.c_str());
-                w && w->Viewport && w->Viewport != vp && w->Viewport->PlatformMonitor >= 0 && w->Viewport->PlatformMonitor < pio.Monitors.Size)
+                w && w->Viewport && w->Viewport != vp && w->Viewport->PlatformMonitor >= 0 && w->Viewport->PlatformMonitor < pio.Monitors.Size) {
                 room = pio.Monitors[w->Viewport->PlatformMonitor].WorkSize;
+                roomPos = pio.Monitors[w->Viewport->PlatformMonitor].WorkPos;
+            }
         }
         const float maxH = std::max(room.y - px(40), px(120));
         if (!d->appeared_) {
             ImGui::SetNextWindowPos(ImVec2(vp->WorkPos.x + vp->WorkSize.x * 0.5f, vp->WorkPos.y + vp->WorkSize.y * 0.5f), ImGuiCond_Appearing,
                                     ImVec2(0.5f, 0.5f));
             if (size.y > 0.0f) ImGui::SetNextWindowSize(ImVec2(px(size.x), std::min(px(size.y), maxH)), ImGuiCond_Appearing);
+        } else if (ImGuiWindow* w = ImGui::FindWindowByName(id.c_str())) {
+            // A dialog placed when it appeared grows downwards as its content
+            // fills in (an auto-sized one, or one whose rows come later): kept
+            // inside its room, or its buttons end up below the screen with the
+            // dialog holding the input of the window behind it.
+            const ImVec2 lo = roomPos, hi(roomPos.x + room.x, roomPos.y + room.y);
+            ImVec2 pos = w->Pos;
+            pos.x = std::max(lo.x, std::min(pos.x, hi.x - w->Size.x));
+            pos.y = std::max(lo.y, std::min(pos.y, hi.y - w->Size.y));
+            if (std::abs(pos.x - w->Pos.x) > 0.5f || std::abs(pos.y - w->Pos.y) > 0.5f) ImGui::SetNextWindowPos(pos, ImGuiCond_Always);
         }
         if (size.y <= 0.0f) {
             ImGui::SetNextWindowSizeConstraints(ImVec2(px(size.x), 0.0f), ImVec2(px(size.x), maxH));
