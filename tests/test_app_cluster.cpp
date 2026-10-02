@@ -166,6 +166,20 @@ namespace {
             return o;
         }
         std::string sshLog() const { return readAll(log); }
+        // An nvidia-smi on the cluster's PATH that lists `lines` (its
+        // --query-gpu=index,name,memory.total,uuid CSV): the job's GPU
+        // hardware, whatever CUDA the worker's Python has.
+        void fakeNvidiaSmi(const std::vector<std::string>& lines) const {
+            std::string sh = "#!/bin/sh\n", bat = "@echo off\r\n";
+            for (const std::string& l : lines) {
+                sh += "echo '" + l + "'\n";
+                bat += "echo " + l + "\r\n";
+            }
+            writeScript(bin / "nvidia-smi", sh);
+            std::ofstream(bin / "nvidia-smi.bat", std::ios::binary) << bat;   // what a Windows Python finds
+            // a test run inside a Slurm job: the fake GPU is the job's own
+            if (!host::environment("SLURM_JOB_ID").empty()) setEnv("SLURM_JOB_GPUS", "0");
+        }
     };
 
     // A .npy file of uint16 (c, t, z, y, x) = values i % 997.
@@ -480,6 +494,100 @@ TEST_CASE("cluster: SOCKS through the ssh proxy says when nothing listens", "[ap
     CHECK_THROWS_AS(rpc::connectSocks5("127.0.0.1", s.socksPort(), "node42", 1, std::chrono::seconds(2)), ProtocolError);
 }
 
+TEST_CASE("cluster: the node's GPU and CPU are named, and a GPU the worker cannot use says why", "[app][cluster]") {
+    const std::string noLibrary = "no CUDA library in the worker's environment: install torch or build the sirius package with CUDA";
+    // the user's job: an A100 on g0003, a venv with neither torch nor the sirius package
+    WorkerCapabilities caps;
+    caps.device = "cpu \xC2\xB7 16 threads";
+    parseWorkerHardware({{"cuda", false},
+                         {"gpus", nlohmann::json::array({{{"name", "NVIDIA A100-SXM4-80GB"}, {"memory_mb", 81920}}})},
+                         {"cuda_usable", false},
+                         {"cuda_reason", noLibrary},
+                         {"cpu_threads", 16}},
+                        caps);
+    REQUIRE(caps.gpus.size() == 1);
+    CHECK(caps.gpus[0].name == "NVIDIA A100-SXM4-80GB");
+    CHECK(caps.gpus[0].memoryMb == 81920);
+    CHECK_FALSE(caps.cudaUsable);
+    CHECK(caps.cudaReason == noLibrary);
+    CHECK(caps.cpuThreads == 16);
+    CHECK_FALSE(cluster::gpuUsable(caps));
+    CHECK(cluster::gpuSummary(caps.gpus) == "1\xC3\x97 A100 80 GB");
+    CHECK(cluster::gpuUnusableReason("g0003.abc0", caps) == "g0003.abc0 has 1\xC3\x97 A100 80 GB, but the worker cannot compute on it: " + noLibrary);
+    CHECK(cluster::unusableGpuNote(caps) == "1\xC3\x97 A100 80 GB not usable: " + noLibrary);
+    std::vector<cluster::NodeDevice> d = cluster::nodeDevices("g0003.abc0", caps);
+    REQUIRE(d.size() == 2);
+    CHECK(d[0].gpu);
+    CHECK(d[0].label == "g0003 \xC2\xB7 1\xC3\x97 A100 80 GB");
+    CHECK_FALSE(d[0].usable);
+    CHECK(d[0].why == noLibrary);
+    CHECK_FALSE(d[1].gpu);
+    CHECK(d[1].label == "g0003 \xC2\xB7 CPU \xC2\xB7 16 threads");
+    CHECK(d[1].usable);
+
+    // the same GPU with CUDA in the worker: usable, nothing to say
+    WorkerCapabilities gpu;
+    gpu.cuda = true;
+    gpu.device = "cuda:0 \xC2\xB7 NVIDIA A100-SXM4-80GB \xC2\xB7 80 GB";
+    parseWorkerHardware({{"gpus", nlohmann::json::array({{{"name", "NVIDIA A100-SXM4-80GB"}, {"memory_mb", 81920}}})}, {"cuda_usable", true}, {"cuda_reason", ""}}, gpu);
+    CHECK(cluster::gpuUsable(gpu));
+    CHECK(cluster::gpuUnusableReason("g0003", gpu).empty());
+    CHECK(cluster::unusableGpuNote(gpu).empty());
+    CHECK(cluster::nodeDevices("g0003", gpu)[0].usable);
+
+    // a worker of protocol 2 without the new fields: usable as its "cuda" says
+    WorkerCapabilities old;
+    old.cuda = true;
+    old.device = "cuda:0 \xC2\xB7 RTX 4000 \xC2\xB7 20 GB";
+    parseWorkerHardware({{"cuda", true}, {"device", old.device}}, old);
+    CHECK(old.cudaUsable);
+    CHECK(old.gpus.empty());
+    CHECK(old.cpuThreads == 0);
+    d = cluster::nodeDevices("n0042", old);
+    CHECK(d[0].label == "n0042 \xC2\xB7 cuda:0 \xC2\xB7 RTX 4000 \xC2\xB7 20 GB");
+    CHECK(d[0].usable);
+    CHECK(d[1].label == "n0042 \xC2\xB7 CPU");
+
+    // a job without a GPU
+    WorkerCapabilities none;
+    none.device = "cpu \xC2\xB7 8 threads";
+    parseWorkerHardware({{"gpus", nlohmann::json::array()}, {"cuda_usable", false}, {"cuda_reason", "this worker job has no GPU"}, {"cpu_threads", 8}}, none);
+    CHECK(cluster::gpuUnusableReason("n0042", none) ==
+          "The worker job on n0042 has no GPU (it reports cpu \xC2\xB7 8 threads): reconnect with GPUs \xE2\x89\xA5 1 to use one");
+    CHECK(cluster::unusableGpuNote(none).empty());
+    d = cluster::nodeDevices("n0042", none);
+    CHECK(d[0].label == "n0042 \xC2\xB7 no GPU");
+    CHECK_FALSE(d[0].usable);
+    CHECK(d[0].why == "this worker job has no GPU");
+    CHECK(d[1].label == "n0042 \xC2\xB7 CPU \xC2\xB7 8 threads");
+
+    // names and counts
+    CHECK(cluster::shortGpuName("NVIDIA A100-SXM4-80GB") == "A100");
+    CHECK(cluster::shortGpuName("NVIDIA A100 80GB PCIe") == "A100");
+    CHECK(cluster::shortGpuName("NVIDIA H100 80GB HBM3") == "H100");
+    CHECK(cluster::shortGpuName("Tesla V100-SXM2-32GB") == "V100");
+    CHECK(cluster::shortGpuName("NVIDIA GeForce RTX 4090") == "GeForce RTX 4090");
+    CHECK(cluster::shortGpuName("NVIDIA RTX 4000 Ada Generation") == "RTX 4000 Ada Generation");
+    CHECK(cluster::gpuSummary({{"NVIDIA A100-SXM4-80GB", 81920}, {"NVIDIA A100-SXM4-80GB", 81920}, {"Tesla V100-SXM2-32GB", 32768}}) ==
+          "2\xC3\x97 A100 80 GB + 1\xC3\x97 V100 32 GB");
+    CHECK(cluster::gpuSummary({{"NVIDIA A100-PCIE-40GB", 40960}}) == "1\xC3\x97 A100 40 GB");
+    CHECK(cluster::gpuSummary({}).empty());
+    CHECK(cluster::shortNodeName("g0003.abc0") == "g0003");
+    CHECK(cluster::shortNodeName("n0042") == "n0042");
+    CHECK(cluster::shortNodeName("10.0.0.5") == "10.0.0.5");
+
+    // what is not of the expected form is left out, never thrown on
+    WorkerCapabilities odd;
+    parseWorkerHardware({{"gpus", nlohmann::json::array({nlohmann::json("A100"), nlohmann::json{{"name", 7}, {"memory_mb", "80 GB"}}})}, {"cuda_usable", "yes"}, {"cpu_threads", -3}}, odd);
+    REQUIRE(odd.gpus.size() == 1);
+    CHECK(odd.gpus[0].name.empty());
+    CHECK(odd.gpus[0].memoryMb == 0);
+    CHECK_FALSE(odd.cudaUsable);
+    CHECK(odd.cpuThreads == 0);
+    parseWorkerHardware({{"gpus", "A100"}}, odd);
+    CHECK(odd.gpus.size() == 1);
+}
+
 TEST_CASE("cluster: connect submits the worker, waits, says hello and serves a dataset", "[app][cluster]") {
     FakeCluster fc;
     if (!fc.usable()) SKIP("no Python or bash for the fake ssh");
@@ -492,6 +600,8 @@ TEST_CASE("cluster: connect submits the worker, waits, says hello and serves a d
                  fs::copy_options::recursive | fs::copy_options::skip_existing);
     writeNpy(fc.home / "stack.npy", 1, 2, 4, 64, 80);
     fc.prompts(R"(["Password: "])", R"(["pw"])");
+    // the job's GPU, which the test's Python has no CUDA for (or has)
+    fc.fakeNvidiaSmi({"0, NVIDIA A100-SXM4-80GB, 81920, GPU-fake-0001"});
 
     cluster::Session session;
     session.setAskpassProgram(SIRIUS_TEST_ASKPASS);
@@ -526,6 +636,22 @@ TEST_CASE("cluster: connect submits the worker, waits, says hello and serves a d
     CHECK(st.jobId == "4711");
     CHECK(st.caps.protocolVersion == rpc::kProtocolVersion);
     CHECK_FALSE(st.caps.version.empty());
+    // hello names the GPU from nvidia-smi; a worker without CUDA says why
+    // it cannot compute there, and the Hello step and the log say so too
+    REQUIRE(st.caps.gpus.size() == 1);
+    CHECK(st.caps.gpus[0].name == "NVIDIA A100-SXM4-80GB");
+    CHECK(st.caps.gpus[0].memoryMb == 81920);
+    CHECK(st.caps.cpuThreads >= 1);
+    if (!st.caps.cudaUsable) {
+        CHECK_FALSE(st.caps.cudaReason.empty());
+        const cluster::StepState& hello = st.steps[static_cast<int>(cluster::Step::Hello)];
+        CHECK(hello.status == cluster::StepStatus::Warning);
+        CHECK(hello.detail.find("1\xC3\x97 A100 80 GB not usable: " + st.caps.cudaReason) != std::string::npos);
+        const std::lock_guard<std::mutex> g(logMutex);
+        bool said = false;
+        for (const std::string& l : logLines) said = said || (l.find("HPC: connected") != std::string::npos && l.find("A100 80 GB not usable") != std::string::npos);
+        CHECK(said);
+    }
     for (const auto& step : st.steps) CHECK((step.status == cluster::StepStatus::Done || step.status == cluster::StepStatus::Warning));
     // The token reached the job as a file the worker read and deleted: never
     // its command line, never its environment (Slurm's accounting may keep

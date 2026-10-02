@@ -568,6 +568,88 @@ namespace sirius::app::cluster {
         return s;
     }
 
+    std::string shortGpuName(const std::string& name) {
+        std::string s = name;
+        s.erase(0, std::min(s.size(), s.find_first_not_of(" \t")));
+        for (const char* vendor : {"NVIDIA ", "Tesla "})
+            if (s.rfind(vendor, 0) == 0) s = s.substr(std::char_traits<char>::length(vendor));
+        // "A100-SXM4-80GB": the model before the form factor
+        if (const std::size_t dash = s.find('-'); dash != std::string::npos && dash > 0) s = s.substr(0, dash);
+        // "A100 80GB PCIe": the memory is said from memory_mb, the bus is not of interest
+        std::istringstream words(s);
+        std::string out, w;
+        while (words >> w) {
+            const std::string l = lowerCase(w);
+            const bool memory = l.size() > 2 && l.compare(l.size() - 2, 2, "gb") == 0 &&
+                                std::all_of(l.begin(), l.end() - 2, [](char c) { return std::isdigit(static_cast<unsigned char>(c)) != 0; });
+            if (memory || l == "pcie" || l == "nvl" || l.rfind("sxm", 0) == 0 || l.rfind("hbm", 0) == 0) continue;
+            out += (out.empty() ? "" : " ") + w;
+        }
+        return out.empty() ? name : out;
+    }
+
+    std::string gpuSummary(const std::vector<GpuInfo>& gpus) {
+        // identical GPUs counted together, in the order they come
+        std::vector<std::pair<std::string, int>> kinds;
+        for (const GpuInfo& g : gpus) {
+            std::string kind = shortGpuName(g.name);
+            if (kind.empty()) kind = "GPU";
+            if (g.memoryMb > 0) kind += " " + std::to_string((g.memoryMb + 512) / 1024) + " GB";
+            auto it = std::find_if(kinds.begin(), kinds.end(), [&](const auto& k) { return k.first == kind; });
+            if (it == kinds.end()) kinds.emplace_back(kind, 1);
+            else ++it->second;
+        }
+        std::string s;
+        for (const auto& [kind, n] : kinds) s += (s.empty() ? "" : " + ") + std::to_string(n) + "\xC3\x97 " + kind;
+        return s;
+    }
+
+    std::string shortNodeName(const std::string& node) {
+        const std::size_t dot = node.find('.');
+        if (dot == std::string::npos || dot == 0) return node;
+        const std::string first = node.substr(0, dot);
+        // an address keeps its dots
+        if (std::all_of(first.begin(), first.end(), [](char c) { return std::isdigit(static_cast<unsigned char>(c)) != 0; })) return node;
+        return first;
+    }
+
+    bool gpuUsable(const WorkerCapabilities& caps) { return caps.cuda || caps.cudaUsable; }
+
+    std::string gpuUnusableReason(const std::string& node, const WorkerCapabilities& caps) {
+        if (gpuUsable(caps)) return {};
+        if (!caps.gpus.empty())
+            return node + " has " + gpuSummary(caps.gpus) + ", but the worker cannot compute on it: " +
+                   (caps.cudaReason.empty() ? std::string("it reports no CUDA") : caps.cudaReason);
+        return "The worker job on " + node + " has no GPU (it reports " + caps.device + "): reconnect with GPUs \xE2\x89\xA5 1 to use one";
+    }
+
+    std::string unusableGpuNote(const WorkerCapabilities& caps) {
+        if (gpuUsable(caps) || caps.gpus.empty()) return {};
+        return gpuSummary(caps.gpus) + " not usable: " + (caps.cudaReason.empty() ? std::string("the worker reports no CUDA") : caps.cudaReason);
+    }
+
+    std::vector<NodeDevice> nodeDevices(const std::string& node, const WorkerCapabilities& caps) {
+        const std::string dot = " \xC2\xB7 ";
+        const std::string name = shortNodeName(node.empty() ? caps.hostname : node);
+        const std::string at = name.empty() ? std::string() : name + dot;
+        NodeDevice gpu;
+        gpu.gpu = true;
+        gpu.usable = gpuUsable(caps);
+        if (!caps.gpus.empty()) gpu.label = at + gpuSummary(caps.gpus);
+        else if (caps.device.rfind("cuda", 0) == 0) gpu.label = at + caps.device;   // a worker older than "gpus"
+        else gpu.label = at + (gpu.usable ? "GPU" : "no GPU");
+        if (!gpu.usable)
+            gpu.why = !caps.cudaReason.empty() ? caps.cudaReason
+                      : caps.gpus.empty()      ? std::string("the job has no GPU: reconnect with GPUs \xE2\x89\xA5 1")
+                                               : std::string("the worker reports no CUDA");
+        int threads = caps.cpuThreads;
+        if (threads <= 0 && caps.engine.is_object() && caps.engine.contains("cpu_threads") && caps.engine["cpu_threads"].is_number_integer())
+            threads = caps.engine["cpu_threads"].get<int>();
+        NodeDevice cpu;
+        cpu.label = at + "CPU" + (threads > 0 ? dot + std::to_string(threads) + (threads == 1 ? " thread" : " threads") : std::string());
+        return {gpu, cpu};
+    }
+
     std::string partitionWarning(const Partition& p) {
         // Read from scontrol (OverSubscribe=EXCLUSIVE); the DGX note is by
         // name, since no Slurm setting says that a node's GPUs are not
@@ -1262,20 +1344,26 @@ namespace sirius::app::cluster {
                 control = std::move(w);
             }
             update([&](Status& x) { x.caps = caps; });
+            StepStatus helloStatus = StepStatus::Done;
+            std::string detail;
             if (caps.engine.is_object()) {
                 const json python = caps.engine.value("python", json::object());
-                stepState(Step::Hello, StepStatus::Done,
-                          "SIRIUS engine " + caps.engine.value("build", caps.version) + " \xC2\xB7 " + caps.device + " \xC2\xB7 Python worker " +
-                              python.value("state", std::string("disabled")) + " \xC2\xB7 session " + caps.engine.value("session", std::string()));
+                detail = "SIRIUS engine " + caps.engine.value("build", caps.version) + " \xC2\xB7 " + caps.device + " \xC2\xB7 Python worker " +
+                         python.value("state", std::string("disabled")) + " \xC2\xB7 session " + caps.engine.value("session", std::string());
             } else if (p.engine) {
                 // asked for the engine, got the Python worker (an old image): built-in steps will be refused
-                stepState(Step::Hello, StepStatus::Warning,
-                          "sirius_worker " + caps.version + " \xC2\xB7 " + caps.device +
-                              " \xC2\xB7 no SIRIUS engine in this job: only the Python steps run there");
+                helloStatus = StepStatus::Warning;
+                detail = "sirius_worker " + caps.version + " \xC2\xB7 " + caps.device +
+                         " \xC2\xB7 no SIRIUS engine in this job: only the Python steps run there";
             } else {
-                stepState(Step::Hello, StepStatus::Done,
-                          "sirius_worker " + caps.version + " \xC2\xB7 " + caps.device + " \xC2\xB7 " + std::to_string(kinds) + " step kinds");
+                detail = "sirius_worker " + caps.version + " \xC2\xB7 " + caps.device + " \xC2\xB7 " + std::to_string(kinds) + " step kinds";
             }
+            // the job's GPU that the worker cannot compute on: named, with why
+            if (const std::string note = unusableGpuNote(caps); !note.empty()) {
+                helloStatus = StepStatus::Warning;
+                detail += " \xC2\xB7 " + note;
+            }
+            stepState(Step::Hello, helloStatus, detail);
         }
 
         void run() {
@@ -1335,7 +1423,9 @@ namespace sirius::app::cluster {
                     const std::lock_guard<std::mutex> g(m);
                     st = status;
                 }
-                say("HPC: connected to the worker on " + st.node + " (job " + st.jobId + ", " + st.caps.device + ")");
+                const std::string note = unusableGpuNote(st.caps);
+                say("HPC: connected to the worker on " + st.node + " (job " + st.jobId + ", " + st.caps.device +
+                    (note.empty() ? std::string() : "; " + note) + ")");
                 startKeeper();
             } catch (const Failure& f) {
                 // Cleared before the state is published: whoever sees the attempt

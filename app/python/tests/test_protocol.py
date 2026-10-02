@@ -1196,3 +1196,118 @@ class TestTokenSources(unittest.TestCase):
             if os.path.exists(path):
                 os.remove(path)
 
+
+
+def _fake_nvidia_smi(directory: str, lines) -> None:
+    """An nvidia-smi on `directory` that prints `lines` (its --query-gpu CSV)."""
+    if os.name == "nt":
+        with open(os.path.join(directory, "nvidia-smi.bat"), "w", encoding="ascii") as f:
+            f.write("@echo off\r\n" + "".join(f"echo {line}\r\n" for line in lines))
+    else:
+        path = os.path.join(directory, "nvidia-smi")
+        with open(path, "w", encoding="ascii") as f:
+            f.write("#!/bin/sh\n" + "".join(f"echo '{line}'\n" for line in lines))
+        os.chmod(path, 0o755)
+
+
+class TestGpuHardware(unittest.TestCase):
+    """A job holds a GPU its environment cannot compute on (a venv without
+    torch or the sirius package): hello still names the GPU, from nvidia-smi,
+    and says why it is not usable -- rather than reporting a CPU-only job."""
+
+    A100 = "0, NVIDIA A100-SXM4-80GB, 81920, GPU-aaaa-1111"
+    V100 = "1, Tesla V100-SXM2-32GB, 32768, GPU-bbbb-2222"
+
+    def setUp(self):
+        self.dir = tempfile.mkdtemp()
+
+    def tearDown(self):
+        import shutil  # noqa: PLC0415
+
+        shutil.rmtree(self.dir, ignore_errors=True)
+
+    def env(self, **extra):
+        env = {k: v for k, v in os.environ.items() if k not in ("CUDA_VISIBLE_DEVICES", "SLURM_JOB_GPUS", "SLURM_STEP_GPUS", "SLURM_JOB_ID")}
+        env["PATH"] = self.dir   # nothing but the fake: the machine's own nvidia-smi stays out
+        env.update(extra)
+        return env
+
+    def caps(self, **extra):
+        from sirius_worker import server as server_module  # noqa: PLC0415
+
+        server = WorkerServer("127.0.0.1", 0, "t", "auto")
+        with unittest.mock.patch.dict(os.environ, self.env(**extra), clear=True), \
+                unittest.mock.patch.object(server_module, "_cuda_device", return_value=None):
+            return server.capabilities()
+
+    def test_nvidia_smi_names_the_gpu_a_worker_without_cuda_cannot_use(self):
+        from sirius_worker import server as server_module  # noqa: PLC0415
+
+        _fake_nvidia_smi(self.dir, [self.A100])
+        with unittest.mock.patch.dict(sys.modules, {"torch": None, "sirius": None}):
+            caps = self.caps(SLURM_JOB_ID="4238488", CUDA_VISIBLE_DEVICES="0")
+        self.assertEqual(caps["gpus"], [{"name": "NVIDIA A100-SXM4-80GB", "memory_mb": 81920}])
+        self.assertIs(caps["cuda_usable"], False)
+        self.assertIs(caps["cuda"], False)
+        self.assertEqual(caps["cuda_reason"], server_module.NO_CUDA_LIBRARY)
+        self.assertIn("no CUDA library in the worker's environment", caps["cuda_reason"])
+        self.assertEqual(caps["cpu_threads"], os.cpu_count() or 1)
+        self.assertTrue(caps["device"].startswith("cpu"), caps["device"])
+
+    def test_without_nvidia_smi_there_is_no_gpu_and_the_reason_says_so(self):
+        caps = self.caps(SLURM_JOB_ID="4238488")
+        self.assertEqual(caps["gpus"], [])
+        self.assertIs(caps["cuda_usable"], False)
+        self.assertIn("this worker job has no GPU", caps["cuda_reason"])
+        caps = self.caps()
+        self.assertIn("no NVIDIA GPU on this machine", caps["cuda_reason"])
+
+    def test_a_worker_that_computes_on_the_gpu_gives_no_reason(self):
+        from sirius_worker import server as server_module  # noqa: PLC0415
+
+        _fake_nvidia_smi(self.dir, [self.A100])
+        server = WorkerServer("127.0.0.1", 0, "t", "auto")
+        with unittest.mock.patch.dict(os.environ, self.env(), clear=True), \
+                unittest.mock.patch.object(server_module, "_cuda_device", return_value="cuda:0 · A100 · 80 GB"):
+            caps = server.capabilities()
+        self.assertIs(caps["cuda_usable"], True)
+        self.assertEqual(caps["cuda_reason"], "")
+        self.assertEqual(len(caps["gpus"]), 1)
+
+    def test_the_jobs_own_gpus_from_cuda_visible_devices_or_slurm(self):
+        from sirius_worker.server import detect_gpus  # noqa: PLC0415
+
+        _fake_nvidia_smi(self.dir, [self.A100, self.V100])
+        names = lambda env: [g["name"] for g in detect_gpus(env)]  # noqa: E731
+        self.assertEqual(names(self.env()), ["NVIDIA A100-SXM4-80GB", "Tesla V100-SXM2-32GB"])
+        self.assertEqual(names(self.env(CUDA_VISIBLE_DEVICES="1")), ["Tesla V100-SXM2-32GB"])
+        self.assertEqual(names(self.env(CUDA_VISIBLE_DEVICES="GPU-aaaa")), ["NVIDIA A100-SXM4-80GB"])
+        self.assertEqual(names(self.env(SLURM_JOB_GPUS="1")), ["Tesla V100-SXM2-32GB"])
+        self.assertEqual(names(self.env(CUDA_VISIBLE_DEVICES="")), [])
+        # a node confining the job's devices lists its one GPU as index 0 while
+        # Slurm names the physical one: both are the same GPU
+        _fake_nvidia_smi(self.dir, [self.A100])
+        self.assertEqual(names(self.env(SLURM_JOB_GPUS="3")), ["NVIDIA A100-SXM4-80GB"])
+        # a Slurm job given no GPU on a node that does not confine devices:
+        # the GPUs nvidia-smi lists are other jobs'
+        self.assertEqual(names(self.env(SLURM_JOB_ID="7")), [])
+
+    def test_hello_carries_the_new_fields_over_the_socket(self):
+        _fake_nvidia_smi(self.dir, [self.A100])
+        server = WorkerServer("127.0.0.1", 0, "t", "cpu")
+        with unittest.mock.patch.dict(os.environ, self.env(), clear=True):
+            server.gpus()   # asked once, here, with the fake on PATH
+        port = server.bind()
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        try:
+            c = _Client(port, "t")
+            caps = c.hello()["result"]
+            c.close()
+        finally:
+            server.stop()
+            thread.join(timeout=5)
+        self.assertEqual(caps["gpus"], [{"name": "NVIDIA A100-SXM4-80GB", "memory_mb": 81920}])
+        self.assertIsInstance(caps["cuda_usable"], bool)
+        self.assertIsInstance(caps["cuda_reason"], str)
+        self.assertGreaterEqual(caps["cpu_threads"], 1)

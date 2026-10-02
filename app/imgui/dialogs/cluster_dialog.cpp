@@ -590,6 +590,9 @@ namespace sirius::app::gui {
                                              "opened (" +
                                                  st.fix + ").",
                                              11, kAmber);
+                    // the job's GPU that the worker cannot compute on, and why
+                    if (const std::string why = cluster::gpuUnusableReason(st.node, c); !why.empty() && !c.gpus.empty())
+                        widgets::textWrapped(why + ". Until it can, the steps run on the CPU of the job.", 11, kAmber);
                     widgets::textWrapped("The HPC backend runs there now; File \xE2\x96\xB8 Open dataset\xE2\x80\xA6 \xE2\x96\xB8 Cluster opens "
                                          "datasets that stay on the cluster.",
                                          11, theme::kNeutral600);

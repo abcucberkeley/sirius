@@ -191,6 +191,8 @@ namespace sirius::app::gui {
         // per form: the field buffers and which "More parameters" are open
         std::map<std::string, FieldBuf> bufs;
         std::map<std::string, bool> moreOpen;
+        // a path field's Browse, chosen by hand: this computer (0) or the cluster (1)
+        std::map<std::pair<StepId, std::string>, int> pathWhere;
         // derived once per form
         bool haveUpstream = false;
         double dataMin = 0.0, dataMax = 1.0;   // contrast: the input's intensity range
@@ -414,6 +416,40 @@ namespace sirius::app::gui {
             a->showDialog(makeOpenDatasetDialog(*a, path, [a](const std::string& p, const OpenOptions& o) { a->openWith(p, o); }));
         }
 
+        // Where a path field's Browse looks while a cluster session is up:
+        // 0 this computer, 1 the cluster. Chosen by hand it stays (per step
+        // and field); else a cluster value, or the HPC backend on a
+        // connected cluster, says the cluster.
+        int browseWhere(const std::string& key, const std::string& value) {
+            const auto it = pathWhere.find({selectedId(), key});
+            if (it != pathWhere.end()) return it->second;
+            if (isRemoteDatasetPath(value)) return 1;
+            if (value.empty() && wb().backend() == Backend::Hpc && app.cluster().connected()) return 1;
+            return 0;
+        }
+
+        // The cluster's files (the browser of File ▸ Open from cluster); the
+        // choice is the field's value as "cluster://<host>/<path>", which the
+        // engine on the node reads where it is. The Load step's Source with
+        // no dataset open opens it, as File ▸ Open from cluster does.
+        void browseCluster(const std::string& key, const std::string& current, bool dir, bool opensDataset) {
+            App* a = &app;
+            const StepId forStep = selectedId();
+            std::string start, host, remote;
+            if (splitClusterPath(current, host, remote)) {
+                const std::size_t slash = remote.find_last_of('/');
+                start = slash == std::string::npos || slash == 0 ? std::string("/") : remote.substr(0, slash);
+            }
+            a->defer([this, a, key, dir, start, forStep, opensDataset] {
+                a->showDialog(makeClusterBrowser(*a, start, dir, [this, a, key, forStep, opensDataset](const std::string& chosen) {
+                    if (chosen.empty() || selectedId() != forStep) return;
+                    bufs.erase(key);
+                    if (opensDataset && !wb().hasDataset()) a->openDatasetPath(chosen);
+                    else wb().setStepParam(index(), key, chosen);
+                }));
+            });
+        }
+
         void pathEditor(const ParamSpec& s, const ParamSet& params, float width, const char* extraLabel = nullptr,
                         const std::string& extraTip = {}, std::function<void()> extra = {}, bool opensDataset = false) {
             const std::string key = s.key;
@@ -424,7 +460,20 @@ namespace sirius::app::gui {
             const float editW = std::max(px(40), width - browseW - spacing - (extraLabel ? extraW + spacing : 0.0f));
             FieldBuf& b = buf(key);
             if (!b.active) b.s = params.getString(key);
-            const ImVec2 at = ImGui::GetCursorScreenPos();
+            ImVec2 at = ImGui::GetCursorScreenPos();
+            // Logged in to a cluster: Browse looks on this computer or on the
+            // cluster, as the Open dataset dialog's switch does
+            const bool clusterUp = app.cluster().sshUp();
+            int where = clusterUp ? browseWhere(key, b.s) : 0;
+            if (clusterUp) {
+                widgets::SegmentedOpts so;
+                so.enabled = !s.readOnly && formEnabled;
+                so.tooltips = {"Browse this computer's files",
+                               "Browse the cluster's files (" + app.cluster().status().host + "): the step reads the file there"};
+                if (widgets::segmented("##where", {"This computer", "Cluster"}, &where, so)) pathWhere[{selectedId(), key}] = where;
+                at.y += theme::snap(px(26)) + px(6);
+                place(at.x, at.y);
+            }
             widgets::FieldOpts fo;
             fo.width = dp(editW);
             fo.enabled = formEnabled;
@@ -447,7 +496,11 @@ namespace sirius::app::gui {
             widgets::ButtonOpts bo;
             bo.small = true;
             bo.enabled = !s.readOnly && formEnabled;
-            if (widgets::button("Browse##browse", bo)) {
+            if (where == 1) bo.tooltip = "The cluster's files, through the SSH session";
+            const bool browse = widgets::button("Browse##browse", bo);
+            if (browse && where == 1) {
+                browseCluster(key, b.s, s.directory, opensDataset);
+            } else if (browse) {
                 App* a = &app;
                 const bool dir = s.directory;
                 const std::string filter = s.fileFilter;

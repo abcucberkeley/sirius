@@ -80,6 +80,9 @@ namespace sirius::app::gui {
         // stops it: the connected worker reports no CUDA, or the profile
         // asks for no GPU. Without a session the stored profile decides.
         bool hpcGpuUsable(std::string* why = nullptr) const;
+        // What the connected node computes on, its GPU then its CPU
+        // (cluster::nodeDevices); empty while no worker is connected.
+        std::vector<cluster::NodeDevice> nodeDevices() const;
 
         // The cluster's folders opened last, newest first.
         std::vector<std::string> recentFolders() const;

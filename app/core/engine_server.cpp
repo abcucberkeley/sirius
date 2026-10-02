@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <atomic>
 #include <cctype>
+#include <cstdint>
 #include <mutex>
 #include <thread>
 #include <utility>
@@ -239,12 +240,14 @@ namespace sirius::app {
             const std::string device = resolvedDevice();
             const int gpus = cudaDeviceCount();
             json devices = json::array();
+            json hardware = json::array();   // hello's "gpus", as the Python worker reports them
             std::string deviceText = "cpu \xC2\xB7 " + std::to_string(std::max(1u, std::thread::hardware_concurrency())) + " threads";
             for (int i = 0; i < gpus; ++i) {
                 try {
                     const DeviceProperties p = deviceProperties(Device::cuda(i));
                     const double gb = static_cast<double>(p.totalMemoryBytes) / (1024.0 * 1024.0 * 1024.0);
                     devices.push_back({{"index", i}, {"name", p.name}, {"memory_gb", gb}});
+                    hardware.push_back({{"name", p.name}, {"memory_mb", static_cast<std::int64_t>(p.totalMemoryBytes / (1024u * 1024u))}});
                     if (device == "cuda:" + std::to_string(i))
                         deviceText = device + " \xC2\xB7 " + p.name + " \xC2\xB7 " + std::to_string(static_cast<int>(gb + 0.5)) + " GB";
                 } catch (const std::exception&) {
@@ -264,11 +267,21 @@ namespace sirius::app {
                 const std::lock_guard<std::mutex> g(pythonMutex);
                 if (pythonCaps.contains("python") && pythonCaps["python"].is_string()) python = pythonCaps["python"].get<std::string>();
             }
+            // why this engine computes on no GPU, in the Python worker's words
+            const std::string cudaReason = gpus > 0           ? std::string()
+                                           : !builtWithCuda() ? std::string("this SIRIUS engine was built without CUDA: use an image or a sirius-cli "
+                                                                            "built with CUDA")
+                                                              : std::string("the CUDA runtime finds no GPU in this job (submitted with GPUs 0, or no "
+                                                                            "NVIDIA driver on the node)");
             return {{"version", buildInfo().version},
                     {"protocol_version", rpc::kProtocolVersion},
                     {"methods", methods},
                     {"cuda", gpus > 0 && device.rfind("cuda", 0) == 0},
                     {"device", deviceText},
+                    {"gpus", hardware},
+                    {"cuda_usable", gpus > 0},
+                    {"cuda_reason", cudaReason},
+                    {"cpu_threads", std::max(1u, std::thread::hardware_concurrency())},
                     {"hostname", host::hostName()},
                     {"python", python},
                     {"sirius", buildInfo().version},

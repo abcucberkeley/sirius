@@ -179,12 +179,28 @@ namespace sirius::app::rpc {
 
 namespace sirius::app {
 
+    // One GPU of a worker's node, as its hello names it ("gpus"): the
+    // hardware, whether or not the worker can compute on it.
+    struct GpuInfo {
+        std::string name;              // "NVIDIA A100-SXM4-80GB"
+        std::int64_t memoryMb = 0;     // MiB, as nvidia-smi reports it
+    };
+
     struct WorkerCapabilities {
         std::string version;                   // the worker package's version, e.g. "0.1.0"
         int protocolVersion = 0;               // rpc::kProtocolVersion the worker answered with
         std::vector<std::string> methods;      // "run:torch_segment", "model_info", ...
         bool cuda = false;
         std::string device;                    // "cuda:0 · RTX 4000 · 20 GB"
+        // The node's GPU hardware (the Python worker asks nvidia-smi, the
+        // engine its CUDA runtime), whether this worker can compute on a GPU
+        // at all, and why not ("no CUDA library in the worker's
+        // environment: ..."). A worker older than these fields: no GPUs
+        // listed, `cudaUsable` = `cuda`, no reason.
+        std::vector<GpuInfo> gpus;
+        bool cudaUsable = false;
+        std::string cudaReason;
+        int cpuThreads = 0;                    // 0 = not said
         std::string hostname;
         std::string python;
         // What dataset_read / dataset_view replies may be compressed with,
@@ -202,6 +218,11 @@ namespace sirius::app {
         // Python worker it runs beside it. Null for the Python worker.
         nlohmann::json engine;
     };
+
+    // The hardware fields of a hello's capabilities ("gpus", "cuda_usable",
+    // "cuda_reason", "cpu_threads") into `caps`, whose `cuda` is already
+    // read; a field that is missing or of another type is left as it is.
+    void parseWorkerHardware(const nlohmann::json& hello, WorkerCapabilities& caps);
 
     struct WorkerResult {
         nlohmann::json result;

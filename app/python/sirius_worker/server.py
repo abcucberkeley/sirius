@@ -5,7 +5,10 @@ Requests (see protocol.py for the framing):
 
     hello       {protocol_version, client_nonce}
                                             -> {protocol_version, server_nonce, server_proof}
-    auth        {client_proof}              -> capabilities (incl. protocol_version)
+    auth        {client_proof}              -> capabilities (incl. protocol_version); among them "gpus"
+                                               [{name, memory_mb}]: the job's GPU hardware as nvidia-smi
+                                               lists it, CUDA library or not; "cuda_usable" (this
+                                               process computes on one) and "cuda_reason" (why not)
     ping        {}                          -> {}
     list_plugins   {}                       -> {plugins: [spec + file (+ error)], dirs}
     reload_plugins {}                       -> the same, after re-importing every plugin file
@@ -86,14 +89,17 @@ import json
 import logging
 import os
 import platform
+import re
 import secrets
 import select
+import shutil
 import socket
+import subprocess
 import sys
 import threading
 import time
 import traceback
-from typing import Any, Dict, Optional, Tuple
+from typing import Any, Dict, List, Mapping, Optional, Tuple
 
 import numpy as np
 
@@ -133,6 +139,114 @@ def _cuda_present() -> bool:
         return bool(sirius.cuda_available())
     except Exception:  # noqa: BLE001
         return False
+
+
+def _cuda_device() -> Optional[str]:
+    """The GPU this process computes on, described ("cuda:0 · A100 · 80 GB"):
+    torch's, else the sirius package's; None when neither has CUDA here."""
+    try:
+        import torch  # type: ignore  # noqa: PLC0415
+
+        if torch.cuda.is_available():
+            idx = torch.cuda.current_device()
+            props = torch.cuda.get_device_properties(idx)
+            return f"cuda:{idx} · {props.name} · {props.total_memory / 2**30:.0f} GB"
+    except Exception:  # noqa: BLE001 - torch is optional
+        pass
+    try:
+        import sirius  # type: ignore  # noqa: PLC0415
+
+        if sirius.cuda_available():
+            p = sirius.device_properties(sirius.Device.cuda(0))
+            return f"cuda:0 · {p.name} · {p.total_memory_bytes / 2**30:.0f} GB"
+    except Exception:  # noqa: BLE001
+        pass
+    return None
+
+
+# The job has GPUs the worker cannot compute on: what is missing (hello's "cuda_reason").
+NO_CUDA_LIBRARY = "no CUDA library in the worker's environment: install torch or build the sirius package with CUDA"
+
+
+def _id_list(text: str) -> List[str]:
+    return [e.strip() for e in text.split(",") if e.strip()]
+
+
+def detect_gpus(env: Optional[Mapping[str, str]] = None, timeout: float = 10.0) -> List[Dict[str, Any]]:
+    """The GPU hardware of this worker's job, as nvidia-smi lists it: found
+    whether or not a CUDA library here can compute on it, so that a job whose
+    environment lacks one still says which GPUs it holds. [{name, memory_mb,
+    index, uuid}]; [] without nvidia-smi (no NVIDIA driver) or GPUs.
+
+    A node that does not confine the job's devices lists all of its GPUs;
+    CUDA_VISIBLE_DEVICES (indices or GPU-/MIG- UUIDs), else SLURM_JOB_GPUS,
+    then names the job's own; a Slurm job with neither holds none. An empty
+    CUDA_VISIBLE_DEVICES hides them all."""
+    env = os.environ if env is None else env
+    exe = shutil.which("nvidia-smi", path=env.get("PATH"))
+    if not exe:
+        return []
+    try:
+        out = subprocess.run([exe, "--query-gpu=index,name,memory.total,uuid", "--format=csv,noheader,nounits"],
+                             capture_output=True, text=True, timeout=timeout, env=dict(env), stdin=subprocess.DEVNULL,
+                             check=False)
+    except (OSError, subprocess.SubprocessError) as e:
+        log.info("nvidia-smi did not answer: %s", e)
+        return []
+    if out.returncode != 0:
+        log.info("nvidia-smi failed (%d): %s", out.returncode, (out.stderr or out.stdout).strip()[:200])
+        return []
+    gpus: List[Dict[str, Any]] = []
+    for line in out.stdout.splitlines():
+        parts = [p.strip() for p in line.split(",")]
+        if len(parts) < 4 or not parts[0].isdigit():
+            continue
+        mem = re.match(r"\d+", parts[-2])
+        gpus.append({"name": ", ".join(parts[1:-2]), "memory_mb": int(mem.group(0)) if mem else 0,
+                     "index": parts[0], "uuid": parts[-1]})
+    visible = env.get("CUDA_VISIBLE_DEVICES")
+    if visible is not None:
+        ids = _id_list(visible)
+        if not ids or ids[0] in ("-1", "NoDevFiles"):
+            return []
+        if any(i.startswith(("GPU-", "MIG-")) for i in ids):
+            return [g for g in gpus if any(g["uuid"].startswith(i) for i in ids)]
+    else:
+        ids = _id_list(env.get("SLURM_JOB_GPUS", "") or env.get("SLURM_STEP_GPUS", ""))
+        if not ids and env.get("SLURM_JOB_ID"):
+            return []   # a Slurm job given no GPU: what nvidia-smi lists is other jobs'
+    # more GPUs listed than the job holds: nvidia-smi's indices are the node's
+    if ids and len(gpus) > len(ids):
+        gpus = [g for g in gpus if g["index"] in ids]
+    return gpus
+
+
+def cuda_unusable_reason(gpus: List[Dict[str, Any]], env: Optional[Mapping[str, str]] = None) -> str:
+    """Why this process cannot compute on the job's GPUs (hello's
+    "cuda_reason"), for a worker that found no CUDA it can use."""
+    env = os.environ if env is None else env
+    if not gpus:
+        return ("this worker job has no GPU (submitted with GPUs 0, or CUDA_VISIBLE_DEVICES hides them)"
+                if env.get("SLURM_JOB_ID") else "no NVIDIA GPU on this machine (nvidia-smi lists none)")
+    found = []
+    try:
+        import torch  # type: ignore  # noqa: PLC0415
+
+        cuda = getattr(getattr(torch, "version", None), "cuda", None)
+        found.append(f"torch {torch.__version__} is a CPU-only build" if not cuda else
+                     f"torch {torch.__version__} (CUDA {cuda}) finds no usable GPU: is the NVIDIA driver older than CUDA {cuda}?")
+    except Exception:  # noqa: BLE001 - torch is optional
+        pass
+    try:
+        import sirius  # type: ignore  # noqa: PLC0415
+
+        found.append("the sirius package finds no usable GPU" if sirius.built_with_cuda() else
+                     "the sirius package was built without CUDA")
+    except Exception:  # noqa: BLE001
+        pass
+    if not found:
+        return NO_CUDA_LIBRARY
+    return "; ".join(found) + ": install a CUDA build of torch or build the sirius package with CUDA"
 
 
 # kinds served through run_step plus the two with their own tensor contracts
@@ -310,6 +424,14 @@ class WorkerServer:
             self._cuda = _cuda_present()
         return self._cuda
 
+    # The job's GPU hardware (detect_gpus), asked once.
+    _gpus: Optional[List[Dict[str, Any]]] = None
+
+    def gpus(self) -> List[Dict[str, Any]]:
+        if self._gpus is None:
+            self._gpus = detect_gpus()
+        return self._gpus
+
     def request_device(self, requested: Any = None) -> str:
         """Where one request runs: the device it names ("cpu", "cuda",
         "cuda:1"), or this worker's own (--device, resolved) for "auto" or
@@ -340,36 +462,24 @@ class WorkerServer:
                    "model_prepare", "list_bundles", "dataset_info", "dataset_read", "dataset_view", "dataset_stats"]
         kinds = list(_SPECIAL_KINDS) + [k for k in wb.step_kinds() if k not in _SPECIAL_KINDS] + ["plugin"]
         methods += [f"run:{k}" for k in kinds]
-        cuda = False
-        device = "cpu"
-        try:
-            import torch  # type: ignore
-
-            if torch.cuda.is_available():
-                cuda = True
-                idx = torch.cuda.current_device()
-                props = torch.cuda.get_device_properties(idx)
-                device = f"cuda:{idx} · {props.name} · {props.total_memory / 2**30:.0f} GB"
-        except Exception:  # noqa: BLE001 - torch is optional
-            pass
-        if not cuda:
-            try:
-                import sirius  # type: ignore
-
-                if sirius.cuda_available():
-                    cuda = True
-                    p = sirius.device_properties(sirius.Device.cuda(0))
-                    device = f"cuda:0 · {p.name} · {p.total_memory_bytes / 2**30:.0f} GB"
-            except Exception:  # noqa: BLE001
-                pass
+        gpu = _cuda_device()
+        cuda = gpu is not None
+        device = gpu or "cpu"
         if self.resolved_device() == "cpu" or not cuda:
             device = f"cpu · {os.cpu_count() or 1} threads"
+        # The GPU hardware whether or not CUDA computes on it here, and why
+        # not: a job with a GPU but no CUDA library says so in words.
+        gpus = self.gpus()
         return {
             "version": __version__,
             "protocol_version": PROTOCOL_VERSION,
             "methods": methods,
             "cuda": cuda and self.resolved_device().startswith("cuda"),
             "device": device,
+            "gpus": [{"name": g["name"], "memory_mb": g["memory_mb"]} for g in gpus],
+            "cuda_usable": cuda,
+            "cuda_reason": "" if cuda else cuda_unusable_reason(gpus),
+            "cpu_threads": os.cpu_count() or 1,
             "hostname": platform.node(),
             "python": sys.version.split()[0],
             "torch": _module_version("torch"),

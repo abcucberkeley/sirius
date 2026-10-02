@@ -198,7 +198,7 @@ namespace sirius::app::gui {
         datasets_->install();
         Workbench& wb = app_.wb();
         // a job without a GPU computes on its CPU; with one, the session's choice stands
-        if (!st.caps.cuda) wb.setHpcDevice(HpcDevice::Cpu);
+        if (!cluster::gpuUsable(st.caps)) wb.setHpcDevice(HpcDevice::Cpu);
         datasets_->setDevice(wb.hpcDevice() == HpcDevice::Cpu ? "cpu" : "cuda");
         // Another engine than the one the results here came from (a new job):
         // those are gone; the same one (a reattached job) still holds them.
@@ -239,16 +239,20 @@ namespace sirius::app::gui {
     bool ClusterLink::hpcGpuUsable(std::string* why) const {
         const cluster::Status st = status();
         if (st.state == cluster::State::Connected) {
-            if (st.caps.cuda) return true;
-            if (why)
-                *why = "The worker job on " + st.node + " has no GPU (it reports " + st.caps.device +
-                       "): reconnect with GPUs \xE2\x89\xA5 1 to use one";
+            if (cluster::gpuUsable(st.caps)) return true;
+            if (why) *why = cluster::gpuUnusableReason(st.node, st.caps);
             return false;
         }
         const cluster::Profile p = st.state == cluster::State::Idle ? storedProfile() : session_.profile();
         if (p.gpus > 0) return true;
         if (why) *why = "The cluster profile asks for no GPU (GPUs 0): set GPUs \xE2\x89\xA5 1 in Connect to cluster to use one";
         return false;
+    }
+
+    std::vector<cluster::NodeDevice> ClusterLink::nodeDevices() const {
+        const cluster::Status st = status();
+        if (st.state != cluster::State::Connected) return {};
+        return cluster::nodeDevices(st.node, st.caps);
     }
 
     std::vector<std::string> ClusterLink::recentFolders() const { return settings().getStringList("cluster/recentFolders"); }

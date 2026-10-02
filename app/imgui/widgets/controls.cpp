@@ -1118,6 +1118,66 @@ namespace sirius::app::gui::widgets {
         return changed;
     }
 
+    bool detailCombo(const char* id, int* current, const std::vector<ComboItem>& items, const FieldOpts& o, float popupWidth) {
+        bool changed = false;
+        const int n = static_cast<int>(items.size());
+        const std::string preview = current && *current >= 0 && *current < n ? items[static_cast<std::size_t>(*current)].value : std::string();
+        ImVec2 min, max;
+        {
+            const FieldFrame frame(o);
+            {
+                const PopupLook look(false);
+                ImGui::PushStyleVar(ImGuiStyleVar_FrameBorderSize, 0.0f);
+                const float fieldW = ImGui::CalcItemWidth();
+                const float w = std::max(fieldW, popupWidth > 0.0f ? px(popupWidth) : 0.0f);
+                ImGui::SetNextWindowSizeConstraints(ImVec2(w, 0.0f), ImVec2(w, px(360)));
+                if (ImGui::BeginCombo(id, "", ImGuiComboFlags_NoArrowButton)) {
+                    ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, px(0, 0));
+                    for (int i = 0; i < n; ++i) {
+                        const ComboItem& item = items[static_cast<std::size_t>(i)];
+                        const bool selected = current && *current == i;
+                        ImGui::PushID(i);
+                        const ImVec2 p = ImGui::GetCursorScreenPos();
+                        const float h = theme::snap(px(item.detail.empty() ? 26.0f : 40.0f));
+                        const ImGuiSelectableFlags flags = item.dimmed ? ImGuiSelectableFlags_Disabled : ImGuiSelectableFlags_None;
+                        const bool clicked = ImGui::Selectable("##row", selected, flags, ImVec2(0, h));
+                        const float rw = ImGui::GetItemRectSize().x;
+                        ImDrawList* dl = ImGui::GetWindowDrawList();
+                        const float top = item.detail.empty() ? p.y : p.y + px(3);
+                        const float nameH = item.detail.empty() ? h : px(19);
+                        drawTextIn(dl, ImVec2(p.x + px(8), top), ImVec2(p.x + rw - px(8), top + nameH), elideText(item.value, rw - px(16), 12), 12,
+                                   item.dimmed ? theme::kNeutral500 : theme::kText, selected ? Weight::SemiBold : Weight::Regular, 0.0f, 0.5f);
+                        if (!item.detail.empty()) {
+                            drawTextIn(dl, ImVec2(p.x + px(8), top + nameH), ImVec2(p.x + rw - px(8), p.y + h - px(3)),
+                                       elideText(item.detail, rw - px(16), 11), 11, item.dimmed ? theme::kAccentText : theme::kNeutral600,
+                                       Weight::Regular, 0.0f, 0.5f);
+                            tooltip(item.detail);
+                        }
+                        if (selected) ImGui::SetItemDefaultFocus();
+                        if (clicked && !item.dimmed && current && *current != i) {
+                            *current = i;
+                            changed = true;
+                        }
+                        ImGui::PopID();
+                    }
+                    ImGui::PopStyleVar();
+                    ImGui::EndCombo();
+                }
+                ImGui::PopStyleVar();
+            }
+            min = ImGui::GetItemRectMin();
+            max = ImGui::GetItemRectMax();
+            ImGui::RenderFrameBorder(min, max, 0.0f);
+        }
+        ImDrawList* dl = ImGui::GetWindowDrawList();
+        const float room = (max.x - min.x) - px(8) - px(24);
+        drawTextIn(dl, ImVec2(min.x + px(8), min.y), ImVec2(max.x - px(24), max.y), elideText(preview, room, 13), 13,
+                   dim(theme::kText, o.enabled), Weight::Regular, 0.0f, 0.5f);
+        chevron(min, max, o.enabled);
+        if (ImGui::IsItemHovered() && o.enabled) ImGui::SetMouseCursor(ImGuiMouseCursor_Hand);
+        return changed;
+    }
+
     bool editableCombo(const char* id, std::string* value, const std::vector<std::string>& items, const FieldOpts& o) {
         std::vector<ComboItem> rows;
         rows.reserve(items.size());

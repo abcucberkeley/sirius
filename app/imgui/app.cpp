@@ -1310,8 +1310,18 @@ namespace sirius::app::gui {
                 gpuItems.push_back("CPU only");
                 gpuIds.push_back(0);
             }
+            // HPC with a worker connected: the node's GPU and CPU instead,
+            // which are the step panel's Cluster device (Workbench::hpcDevice,
+            // the one switch both show); a GPU the worker cannot use is
+            // listed, greyed, with why
+            const std::vector<cluster::NodeDevice> node =
+                w.backend() == Backend::Hpc ? self.cluster().nodeDevices() : std::vector<cluster::NodeDevice>{};
+            std::vector<widgets::ComboItem> nodeItems;
+            for (const cluster::NodeDevice& d : node) nodeItems.push_back({d.label, d.usable ? std::string() : "not usable: " + d.why, !d.usable});
             float comboW = px(150);
-            for (const std::string& item : gpuItems) comboW = std::max(comboW, theme::textSize(item, 13).x + px(44));
+            for (const std::string& item : gpuItems)
+                if (node.empty()) comboW = std::max(comboW, theme::textSize(item, 13).x + px(44));
+            for (const cluster::NodeDevice& d : node) comboW = std::max(comboW, theme::textSize(d.label, 13).x + px(44));
             comboW = std::min(comboW, px(300));
             const float buttonW = theme::textSize("Assistant", 12, Weight::ExtraBold).x + px(40);
             const float nameRoom = std::max(px(40), width - ImGui::GetCursorPosX() - comboW - buttonW - px(14) - 3 * px(18));
@@ -1331,7 +1341,18 @@ namespace sirius::app::gui {
                 f.width = comboW / std::max(theme::scale(), 0.01f);
                 f.height = 26;
                 f.enabled = n > 0;
-                if (widgets::combo("##gpu", &current, gpuItems, f) && cudaAvailable()) {
+                if (!node.empty()) {
+                    int pick = w.hpcDevice() == HpcDevice::Cpu ? 1 : 0;
+                    f.enabled = true;
+                    if (widgets::detailCombo("##node", &pick, nodeItems, f, 420) && pick >= 0 && pick < static_cast<int>(node.size())) {
+                        const HpcDevice d = node[static_cast<std::size_t>(pick)].gpu ? HpcDevice::Gpu : HpcDevice::Cpu;
+                        self.defer([this, d] { wb().setHpcDevice(d); });
+                    }
+                    std::string why;
+                    const bool gpuOk = self.cluster().hpcGpuUsable(&why);
+                    widgets::tooltip("Where the cluster's steps compute (the step panel's Cluster device)" +
+                                     (gpuOk ? std::string() : "\n\nGPU: " + why));
+                } else if (widgets::combo("##gpu", &current, gpuItems, f) && cudaAvailable()) {
                     // choosing a GPU is choosing to run on it; say so when that
                     // changes the backend
                     if (wb().backend() != Backend::Cuda)

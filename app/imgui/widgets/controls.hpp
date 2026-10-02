@@ -206,6 +206,11 @@ namespace sirius::app::gui::widgets {
     };
     bool editableCombo(const char* id, std::string* value, const std::vector<ComboItem>& items, const FieldOpts& opts,
                        bool* picked, float popupWidth = 0.0f);
+    // A dropdown of fixed entries like combo(), each with its line of detail
+    // under it; a `dimmed` entry is drawn greyed and cannot be picked (its
+    // detail says why; the whole of it is the entry's tooltip).
+    bool detailCombo(const char* id, int* current, const std::vector<ComboItem>& items, const FieldOpts& opts = {},
+                     float popupWidth = 0.0f);
 
     // --- rows -----------------------------------------------------------------
     // A row that answers a click anywhere on it and paints its own hover /

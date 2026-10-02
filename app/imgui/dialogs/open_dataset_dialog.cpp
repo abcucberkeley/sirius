@@ -599,6 +599,13 @@ namespace sirius::app::gui {
             // "cluster://<host>/<path>", opened through the connected worker.
             void drawLocationRow(App& app) {
                 if (isRemoteDatasetPath(path()) && location_ == 0 && !locationTouched_) location_ = 1;
+                // opened empty while the HPC backend has a worker: the data is
+                // most likely on the cluster, where the steps compute (once:
+                // what is typed or chosen afterwards decides)
+                if (!locationDefaulted_) {
+                    locationDefaulted_ = true;
+                    if (path().empty() && !locationTouched_ && app.cluster().connected() && app.wb().backend() == Backend::Hpc) location_ = 1;
+                }
                 if (widgets::segmented("##where", {"This computer", "Cluster"}, &location_)) locationTouched_ = true;
                 ImGui::SameLine(0.0f, px(10));
                 if (location_ == 1) {
@@ -961,6 +968,7 @@ namespace sirius::app::gui {
             int location_ = 0;              // 0 this computer, 1 the cluster
             std::string unbound_;            // the cluster path is outside the container's binds: why it will not open
             bool locationTouched_ = false;
+            bool locationDefaulted_ = false;
             bool popupAtStart_ = false;
             std::string facts_;
             std::string error_;

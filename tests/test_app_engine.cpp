@@ -39,6 +39,7 @@
 
 #include <nlohmann/json.hpp>
 
+#include <sirius/device.hpp>
 #include <sirius/tiff_io.hpp>
 
 #include "core/array_codec.hpp"
@@ -955,6 +956,11 @@ TEST_CASE("engine: sirius-cli serve announces, takes its token from a file and s
     auto w = RemoteWorker::connect("127.0.0.1", port, "file-token-123");
     CHECK(w->capabilities().engine["build"] == buildInfo().build);
     CHECK(w->capabilities().maxClients == 8);
+    // the hardware fields of the Python worker's hello, from the engine's own CUDA query
+    CHECK(w->capabilities().gpus.size() == static_cast<std::size_t>(cudaDeviceCount()));
+    CHECK(w->capabilities().cudaUsable == (cudaDeviceCount() > 0));
+    CHECK(w->capabilities().cudaReason.empty() == (cudaDeviceCount() > 0));
+    CHECK(w->capabilities().cpuThreads >= 1);
 
     auto datasets = std::make_shared<RemoteDatasets>("localengine", [&] { return RemoteWorker::connect("127.0.0.1", port, "file-token-123"); });
     datasets->install();

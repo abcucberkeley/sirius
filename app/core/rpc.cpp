@@ -717,6 +717,21 @@ namespace sirius::app {
 
     using json = nlohmann::json;
 
+    void parseWorkerHardware(const json& r, WorkerCapabilities& caps) {
+        caps.cudaUsable = caps.cuda;
+        if (r.contains("cuda_usable") && r["cuda_usable"].is_boolean()) caps.cudaUsable = r["cuda_usable"].get<bool>();
+        if (r.contains("cuda_reason") && r["cuda_reason"].is_string()) caps.cudaReason = r["cuda_reason"].get<std::string>();
+        if (r.contains("cpu_threads") && r["cpu_threads"].is_number_integer()) caps.cpuThreads = (std::max)(0, r["cpu_threads"].get<int>());
+        if (r.contains("gpus") && r["gpus"].is_array())
+            for (const json& g : r["gpus"]) {
+                if (!g.is_object()) continue;
+                GpuInfo info;
+                if (g.contains("name") && g["name"].is_string()) info.name = g["name"].get<std::string>();
+                if (g.contains("memory_mb") && g["memory_mb"].is_number_integer()) info.memoryMb = (std::max<std::int64_t>)(0, g["memory_mb"].get<std::int64_t>());
+                caps.gpus.push_back(std::move(info));
+            }
+    }
+
     RemoteWorker::RemoteWorker(std::unique_ptr<rpc::Transport> transport, std::string token, const std::function<bool()>& cancelled,
                                std::chrono::milliseconds helloTimeout)
         : transport_(std::move(transport)) {
@@ -815,6 +830,7 @@ namespace sirius::app {
         caps_.version = r.value("version", "");
         caps_.cuda = r.value("cuda", false);
         caps_.device = r.value("device", "");
+        parseWorkerHardware(r, caps_);
         caps_.hostname = r.value("hostname", "");
         caps_.python = r.value("python", "");
         if (r.contains("methods") && r["methods"].is_array())

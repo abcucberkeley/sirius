@@ -207,6 +207,37 @@ namespace sirius::app::cluster {
     // its nodes and the QoS allow. Returns what changed, in words.
     std::vector<std::string> choosePartition(Profile& p, const ClusterInfo& info, const std::string& partition);
 
+    // --- the node's devices, as the application names them -------------------------
+    // A GPU's name without its vendor and form factor: "NVIDIA A100-SXM4-80GB"
+    // -> "A100", "NVIDIA GeForce RTX 4090" -> "GeForce RTX 4090".
+    std::string shortGpuName(const std::string& name);
+    // "1× A100 80 GB", "2× A100 80 GB + 1× V100 32 GB"; "" for none.
+    std::string gpuSummary(const std::vector<GpuInfo>& gpus);
+    // "g0003.abc0" -> "g0003"; an address ("10.0.0.5") stays whole.
+    std::string shortNodeName(const std::string& node);
+    // Whether the session's GPU can compute on `caps`'s worker (its CUDA,
+    // not only its hardware).
+    bool gpuUsable(const WorkerCapabilities& caps);
+    // Why the GPU of the worker on `node` cannot be chosen, a sentence; ""
+    // when it can. A GPU the node has but the worker cannot use is named,
+    // with the worker's reason ("no CUDA library in the worker's environment: ...").
+    std::string gpuUnusableReason(const std::string& node, const WorkerCapabilities& caps);
+    // The hardware the worker cannot use, for the log and the Hello step:
+    // "1× A100 80 GB not usable: no CUDA library ..."; "" when there is none,
+    // or it is usable.
+    std::string unusableGpuNote(const WorkerCapabilities& caps);
+
+    // What a connected node computes on, one entry each for its GPU and its
+    // CPU (the HPC device: Workbench::hpcDevice), in that order: the title
+    // bar's device list while the backend is HPC.
+    struct NodeDevice {
+        bool gpu = false;
+        std::string label;     // "g0003 · 1× A100 80 GB", "g0003 · CPU · 16 threads"
+        bool usable = true;
+        std::string why;       // !usable: the worker's reason, short ("no CUDA library in ...")
+    };
+    std::vector<NodeDevice> nodeDevices(const std::string& node, const WorkerCapabilities& caps);
+
     enum class Step { Login,
                       Checks,
                       Submit,
