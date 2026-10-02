@@ -1164,6 +1164,10 @@ namespace sirius::app::gui {
         ImGui::PushStyleColor(ImGuiCol_Text, theme::kText);
         ImGui::PushStyleColor(ImGuiCol_HeaderHovered, theme::kNeutral200);
         ImGui::PushStyleColor(ImGuiCol_HeaderActive, theme::kNeutral300);
+        // The ink fill is drawn here, from the same test as the text's colour:
+        // Dear ImGui's own hover rectangle is narrower than this one, and paper
+        // text over its missing fill left the title blank at the edges.
+        if (open || hot) barList->AddRectFilled(hitMin, hitMax, theme::kText);
         barList->AddText(ImVec2(pos.x + spacing, pos.y + style.FramePadding.y), open || hot ? theme::kBg : theme::kText, name.c_str());
         if (open) {
             ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, ImVec2(0, 0));
