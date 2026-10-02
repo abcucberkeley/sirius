@@ -258,7 +258,7 @@ namespace sirius::app::gui {
                     widgets::inputText("##token", &token_, secret);
                 }
                 note("By hand instead: launch the worker with app/python/slurm/sirius_worker.sbatch and forward its port "
-                     "(ssh -L); see app/python/slurm/README.md. The same worker runs Torch models locally.");
+                     "(ssh -L); see app/python/slurm/README.md. The token is kept for this session only, never saved.");
                 widgets::rule(theme::kRule);
                 {
                     const Field f("Python for the local worker");
@@ -606,7 +606,9 @@ namespace sirius::app::gui {
                 // still worked got lost, and a key that came from the environment
                 // is not the user's to store.
                 std::vector<std::string> notStored;
-                if (token_ != openedToken_ && !secrets::write("hpc/token", token_)) notStored.emplace_back("the HPC token");
+                // The HPC worker's token is not stored: it belongs to one worker job
+                // (Connect to cluster makes a new one per session), and a stored
+                // copy would only outlive the job while still opening it.
                 // These two only when changed here (followSettings).
                 if (python_ != pythonTaken_) {
                     if (const std::string python = trimmed(python_); python.empty()) s.remove("worker/python");
@@ -695,7 +697,9 @@ namespace sirius::app::gui {
         RemoteConfig rc;
         rc.host = s.getString("hpc/host", "localhost");
         rc.port = s.getInt("hpc/port", 7645);
-        rc.token = secrets::read("hpc/token");
+        // Earlier versions stored the token typed in Preferences; a token is
+        // one worker job's, so a stored one is removed rather than reused.
+        secrets::remove("hpc/token");
         wb.setRemoteConfig(rc);
     }
 
