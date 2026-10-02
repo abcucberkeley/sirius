@@ -641,7 +641,7 @@ class PromptTask(unittest.TestCase):
         labels, info, _ = foundation.run(self.v, {"model": self.path, "task": "prompt",
                                                   "boxes": [[8, 8, 2, 28, 28, 6]]}, "cpu")
         self.assertEqual(info["prompts"], 1)
-        self.assertEqual(info["prompt_kinds"], {"points": 0, "boxes": 1, "scribbles": 0})
+        self.assertEqual(info["prompt_kinds"], {"points": 0, "boxes": 1, "scribbles": 0, "objects": 0})
         labels, info, _ = foundation.run(self.v, {"model": self.path, "task": "prompt",
                                                   "scribbles": [{"points": [[16, 16, 4], [18, 18, 4]],
                                                                  "label": 1}]}, "cpu")
@@ -654,7 +654,7 @@ class PromptTask(unittest.TestCase):
                                                   "boxes": [[8, 8, 2, 28, 28, 6]],
                                                   "scribbles": [{"points": [[20, 44, 4]], "label": 1}]}, "cpu")
         self.assertEqual(info["prompts"], 3)
-        self.assertEqual(info["prompt_kinds"], {"points": 1, "boxes": 1, "scribbles": 1})
+        self.assertEqual(info["prompt_kinds"], {"points": 1, "boxes": 1, "scribbles": 1, "objects": 0})
         self.assertEqual(len(info["mask_scores"]), 3)
 
     def test_a_box_outside_the_image_is_refused(self):
@@ -663,7 +663,7 @@ class PromptTask(unittest.TestCase):
                                     "boxes": [[8, 8, 2, 999, 28, 6]]}, "cpu")
 
     def test_errors_are_specific(self):
-        with self.assertRaisesRegex(ValueError, "at least one point, box or scribble"):
+        with self.assertRaisesRegex(ValueError, "at least one point, box, scribble or object"):
             foundation.run(self.v, {"model": self.path, "task": "prompt", "points": []}, "cpu")
         with self.assertRaisesRegex(ValueError, "outside the image"):
             foundation.run(self.v, {"model": self.path, "task": "prompt", "points": [[999, 1, 1]]}, "cpu")
@@ -673,6 +673,53 @@ class PromptTask(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "one frame"):
             foundation.run(blobs(t=2), {"model": self.path, "task": "prompt",
                                         "points": [[16, 16, 4]]}, "cpu")
+
+
+    def test_an_object_is_one_mask_holding_all_of_its_prompts(self):
+        """The joint form: a box plus a corrective background click is ONE object and ONE mask, which
+        is what makes a correction refine a mask instead of adding another one."""
+        labels, info, _ = foundation.run(self.v, {"model": self.path, "task": "prompt", "objects": [
+            {"box": [8, 8, 2, 28, 28, 6], "points": [[24, 24, 4]], "point_labels": [0]},
+            {"points": [[20, 44, 4]]},
+        ]}, "cpu")
+        self.assertEqual(info["prompts"], 2)                        # two objects, not four prompts
+        self.assertEqual(info["prompt_kinds"], {"points": 0, "boxes": 0, "scribbles": 0, "objects": 2})
+        self.assertEqual(len(info["mask_scores"]), 2)
+        self.assertLessEqual(int(labels.max()), 2)
+
+    def test_a_correction_changes_the_mask(self):
+        box = [8, 8, 2, 28, 28, 6]
+        a, _, _ = foundation.run(self.v, {"model": self.path, "task": "prompt",
+                                          "objects": [{"box": box}]}, "cpu")
+        b, _, _ = foundation.run(self.v, {"model": self.path, "task": "prompt", "objects": [
+            {"box": box, "points": [[24, 24, 4]], "point_labels": [0]}]}, "cpu")
+        self.assertFalse(np.array_equal(a, b))
+
+    def test_one_objects_prompts_do_not_change_another_objects_mask(self):
+        """The pad token attends, so decoding every slot in one padded tensor made a mask depend on
+        how many prompts the OTHER objects carried. An interactive tool cannot have that: a click on
+        cell A must leave cell B alone. deploy.Bundle.prompt groups equal-width slots for this."""
+        lone = {"points": [[20, 44, 4]]}
+        _, alone, _ = foundation.run(self.v, {"model": self.path, "task": "prompt",
+                                              "objects": [lone]}, "cpu")
+        _, with_other, _ = foundation.run(self.v, {"model": self.path, "task": "prompt", "objects": [
+            lone, {"box": [8, 8, 2, 28, 28, 6], "points": [[16, 16, 4]], "point_labels": [1]}]}, "cpu")
+        # the decoder's own score for object 0, which the label volume does not preserve: a later
+        # mask paints over an earlier one where they overlap
+        self.assertEqual(alone["mask_scores"][0], with_other["mask_scores"][0])
+
+    def test_object_errors_name_the_object(self):
+        with self.assertRaisesRegex(ValueError, "object 0 has no prompts"):
+            foundation.run(self.v, {"model": self.path, "task": "prompt", "objects": [{}]}, "cpu")
+        with self.assertRaisesRegex(ValueError, "object 1: 1 points but 2 point labels"):
+            foundation.run(self.v, {"model": self.path, "task": "prompt", "objects": [
+                {"points": [[16, 16, 4]]}, {"points": [[16, 16, 4]], "point_labels": [1, 0]}]}, "cpu")
+        with self.assertRaisesRegex(ValueError, "point of object 0 falls outside"):
+            foundation.run(self.v, {"model": self.path, "task": "prompt",
+                                    "objects": [{"points": [[999, 1, 1]]}]}, "cpu")
+        with self.assertRaisesRegex(ValueError, "box of object 0 falls outside"):
+            foundation.run(self.v, {"model": self.path, "task": "prompt",
+                                    "objects": [{"box": [8, 8, 2, 999, 28, 6]}]}, "cpu")
 
     def test_a_non_promptable_bundle_says_so(self):
         other = os.path.join(self.dir, "plain.ltb")

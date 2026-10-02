@@ -511,6 +511,59 @@ class Promptable(unittest.TestCase):
         with self.assertRaises(models.ModelError):
             models.run_family_prompt("/tmp/x.ltb", np.zeros((4, 8, 8), np.float32), [[1, 4, 4]], None, {})
 
+
+class AppPromptConversion(unittest.TestCase):
+    """app_prompts_to_zyx: the ONE conversion between the GUI's (x, y, z) voxels and latents'
+    (z, y, x), shared by our bundle and micro-SAM so that one interaction serves both. Pure
+    numpy -- no model package needed, which is why it can be tested at all."""
+
+    SHAPE = (8, 64, 64)                                   # (z, y, x)
+
+    def conv(self, params):
+        return models.app_prompts_to_zyx(params, self.SHAPE)
+
+    def test_points_and_boxes_flip_axis_order(self):
+        pr = self.conv({"points": [[16, 32, 4]], "boxes": [[8, 10, 2, 30, 40, 6]]})
+        self.assertEqual(list(pr["points"][0]), [4, 32, 16])
+        self.assertEqual(list(pr["boxes"][0]), [2, 10, 8, 6, 40, 30])     # both corners, same flip
+        self.assertEqual(pr["count"], 2)
+
+    def test_an_object_keeps_its_prompts_together(self):
+        pr = self.conv({"objects": [{"box": [8, 10, 2, 30, 40, 6],
+                                     "points": [[16, 32, 4]], "point_labels": [0],
+                                     "scribbles": [{"points": [[17, 33, 4]], "label": 1}]}]})
+        self.assertEqual(pr["count"], 1)                                  # one object is one mask
+        ob = pr["objects"][0]
+        self.assertEqual(list(ob["points"][0]), [4, 32, 16])
+        self.assertEqual(list(ob["point_labels"]), [0])
+        self.assertEqual(list(ob["box"]), [2, 10, 8, 6, 40, 30])
+        self.assertEqual(list(ob["scribbles"][0]["points"][0]), [4, 33, 17])
+
+    def test_nothing_at_all_is_refused(self):
+        with self.assertRaisesRegex(ValueError, "at least one point, box, scribble or object"):
+            self.conv({})
+
+    def test_out_of_image_coordinates_are_refused_by_name(self):
+        with self.assertRaisesRegex(ValueError, "a point falls outside"):
+            self.conv({"points": [[999, 1, 1]]})
+        with self.assertRaisesRegex(ValueError, "a box falls outside"):
+            self.conv({"boxes": [[8, 10, 2, 999, 40, 6]]})
+        with self.assertRaisesRegex(ValueError, "point of object 0 falls outside"):
+            self.conv({"objects": [{"points": [[1, 1, 999]]}]})
+        with self.assertRaisesRegex(ValueError, "box of object 0 falls outside"):
+            self.conv({"objects": [{"box": [8, 10, 2, 30, 40, 999]}]})
+
+    def test_a_label_count_mismatch_names_the_object(self):
+        with self.assertRaisesRegex(ValueError, "object 0: 1 points but 2 point labels"):
+            self.conv({"objects": [{"points": [[16, 32, 4]], "point_labels": [1, 0]}]})
+
+    def test_an_empty_object_is_refused(self):
+        with self.assertRaisesRegex(ValueError, "object 0 has no prompts"):
+            self.conv({"objects": [{}]})
+        with self.assertRaisesRegex(ValueError, "not an object"):
+            self.conv({"objects": [[16, 32, 4]]})
+
+
 if __name__ == "__main__":
     unittest.main()
 

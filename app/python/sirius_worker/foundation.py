@@ -364,8 +364,17 @@ def run(volume: np.ndarray, params: Dict[str, Any], device: str = "auto",
                          plane: .49 -> .60 median IoU, 48% -> 68% of cells past .5
         scribbles        Prompt only: [{"points": [[x, y, z], ...], "label": 1|0}]
                          -- one stroke is ONE mask, all of its points in the same
-                         decoder call. Masks come back points, then boxes, then
-                         scribbles
+                         decoder call
+        objects          Prompt only: [{"box": [...], "points": [...],
+                         "point_labels": [...], "scribbles": [...]}, ...] -- one
+                         entry is ONE object and ONE mask, holding ALL of its
+                         prompts together, so a second click REFINES that
+                         object's mask instead of adding another mask. This is
+                         the form an interactive tool wants: keep an object's
+                         prompt list, append each correction, re-send the object.
+                         Masks come back points, then boxes, then scribbles, then
+                         objects, and the label id in the returned volume is that
+                         position
         threshold        peak probability; <= 0 means use the bundle's
         min_separation   microns between two objects; <= 0 means the bundle's
         min_voxels       Segment only: drop smaller objects. Detect marks one
@@ -437,37 +446,16 @@ def run(volume: np.ndarray, params: Dict[str, Any], device: str = "auto",
         # The person points at an object and gets that object back. The one task that does not
         # come from the heatmap, and the one path on which a model that cannot segment
         # unattended is still useful.
-        pts = np.asarray(params.get("points") or [], np.float32).reshape(-1, 3)
-        bxs = np.asarray(params.get("boxes") or [], np.float32).reshape(-1, 6)
-        scr = list(params.get("scribbles") or [])
-        if not (len(pts) or len(bxs) or len(scr)):
-            raise ValueError("the Prompt task needs at least one point, box or scribble")
-        plab = params.get("point_labels")
-        plab = None if plab is None else np.asarray(plab, np.int64).reshape(-1)
-        if plab is not None and len(plab) != len(pts):
-            raise ValueError(f"{len(pts)} points but {len(plab)} point labels")
         if n_t != 1:
             raise ValueError(f"the Prompt task takes one frame, this image has {n_t}; "
                              "prompt a single timepoint")
-        # the application gives (x, y, z); latents takes (z, y, x). A box is two corners, so both
-        # halves flip the same way; a scribble flips every point of its stroke.
-        lim = np.array([n_z, n_y, n_x], np.float32)
-        zyx = pts[:, ::-1] if len(pts) else pts
-        if len(zyx) and ((zyx < 0) | (zyx >= lim)).any():
-            raise ValueError("a point falls outside the image")
-        bz = np.concatenate([bxs[:, 2::-1], bxs[:, 5:2:-1]], 1) if len(bxs) else bxs
-        if len(bz) and ((bz[:, :3] < 0) | (bz[:, :3] >= lim) | (bz[:, 3:] <= 0) | (bz[:, 3:] > lim)).any():
-            raise ValueError("a box falls outside the image")
-        sz = []
-        for sc in scr:
-            q = np.asarray(sc.get("points") or [], np.float32).reshape(-1, 3)
-            if not len(q):
-                raise ValueError("a scribble has no points")
-            q = q[:, ::-1]
-            if ((q < 0) | (q >= lim)).any():
-                raise ValueError("a scribble point falls outside the image")
-            sz.append({"points": q, "label": int(sc.get("label", 1))})
-        n_prompt = len(zyx) + len(bz) + len(sz)
+        # The application gives (x, y, z); latents takes (z, y, x). models.app_prompts_to_zyx does
+        # that one conversion for every backend, so our bundle and micro-SAM answer the same click.
+        from . import models as model_hub
+        pr = model_hub.app_prompts_to_zyx(params, (n_z, n_y, n_x))
+        zyx, plab, bz, sz, oz = (pr["points"], pr["point_labels"], pr["boxes"],
+                                 pr["scribbles"], pr["objects"])
+        n_prompt = pr["count"]
         report(0.1, f"{n_prompt} prompt(s)")
         vol = a[:, 0] if multi else a[0, 0]
         # snap_z on by default for the interactive path: a person centres a click in plane easily and
@@ -475,7 +463,7 @@ def run(volume: np.ndarray, params: Dict[str, Any], device: str = "auto",
         # own distance channel puts it right for one dense pass and no extra click. snap_z: false opts out.
         snap = bool(params.get("snap_z", True))
         masks, scores = m.prompt(vol, zyx if len(zyx) else None, plab, boxes=bz if len(bz) else None,
-                                 scribbles=sz or None, channels=multi, snap_z=snap)
+                                 scribbles=sz or None, objects=oz or None, channels=multi, snap_z=snap)
         info["snap_z"] = snap
         check()
         # Later prompts win where two masks overlap, which is what a person adding a point expects.
@@ -486,7 +474,8 @@ def run(volume: np.ndarray, params: Dict[str, Any], device: str = "auto",
             labels[0][mk] = i + 1
             conf[0][mk] = float(scores[i])
         info["prompts"] = int(n_prompt)
-        info["prompt_kinds"] = {"points": int(len(zyx)), "boxes": int(len(bz)), "scribbles": int(len(sz))}
+        info["prompt_kinds"] = {"points": int(len(zyx)), "boxes": int(len(bz)),
+                                "scribbles": int(len(sz)), "objects": int(len(oz))}
         info["mask_scores"] = [round(float(v), 4) for v in scores]
         info["objects"] = int(labels.max())
         extras["confidence"] = conf

@@ -906,6 +906,84 @@ def run_microsam(volume: np.ndarray, model_type: str, params: Dict[str, Any], de
     return np.ascontiguousarray(labels), None
 
 
+def app_prompts_to_zyx(params: Dict[str, Any], shape) -> Dict[str, Any]:
+    """The application's prompt parameters -> latents' axis order, validated against `shape` (z, y, x).
+
+    The GUI holds every coordinate as (x, y, z) in voxels and latents takes (z, y, x), so exactly one
+    conversion stands between one GUI interaction and every backend. Doing it in one place is what
+    keeps our bundle and micro-SAM answering the same click; it was duplicated once and the two copies
+    disagreed about whether a box's second corner is inclusive.
+
+    Returns {"points", "point_labels", "boxes", "scribbles", "objects", "count"}, where `objects` is
+    the JOINT form: one entry holds all of one object's prompts, so a correction refines its mask.
+    Raises ValueError, with the message the application shows the person.
+    """
+    lim = np.asarray(shape, np.float32).reshape(3)
+    pts = np.asarray(params.get("points") or [], np.float32).reshape(-1, 3)
+    bxs = np.asarray(params.get("boxes") or [], np.float32).reshape(-1, 6)
+    scr = list(params.get("scribbles") or [])
+    objs = list(params.get("objects") or [])
+    if not (len(pts) or len(bxs) or len(scr) or len(objs)):
+        raise ValueError("the Prompt task needs at least one point, box, scribble or object")
+    plab = params.get("point_labels")
+    plab = None if plab is None else np.asarray(plab, np.int64).reshape(-1)
+    if plab is not None and len(plab) != len(pts):
+        raise ValueError(f"{len(pts)} points but {len(plab)} point labels")
+
+    def _pts(v, what):
+        q = np.asarray(v if v is not None else [], np.float32).reshape(-1, 3)
+        if not len(q):
+            return q
+        q = q[:, ::-1]                                       # (x, y, z) -> (z, y, x)
+        if ((q < 0) | (q >= lim)).any():
+            raise ValueError(f"{what} falls outside the image")
+        return q
+
+    def _box(v, what):
+        b = np.asarray(v, np.float32).reshape(6)
+        b = np.concatenate([b[2::-1], b[5:2:-1]])            # both corners flip the same way
+        if ((b[:3] < 0) | (b[:3] >= lim) | (b[3:] <= 0) | (b[3:] > lim)).any():
+            raise ValueError(f"{what} falls outside the image")
+        return b
+
+    def _scribble(sc, what):
+        q = _pts(sc.get("points") if isinstance(sc, dict) else None, f"{what} point")
+        if not len(q):
+            raise ValueError(f"{what} has no points")
+        return {"points": q, "label": int(sc.get("label", 1))}
+
+    out: Dict[str, Any] = {
+        "points": _pts(pts, "a point"),
+        "point_labels": plab,
+        "boxes": np.stack([_box(b, "a box") for b in bxs]) if len(bxs) else bxs,
+        "scribbles": [_scribble(sc, "a scribble") for sc in scr],
+        "objects": [],
+    }
+    for k, ob in enumerate(objs):
+        if not isinstance(ob, dict):
+            raise ValueError(f"object {k} is not an object with box/points/scribbles")
+        o: Dict[str, Any] = {}
+        q = _pts(ob.get("points"), f"a point of object {k}")
+        if len(q):
+            o["points"] = q
+            ol = ob.get("point_labels")
+            if ol is not None:
+                ol = np.asarray(ol, np.int64).reshape(-1)
+                if len(ol) != len(q):
+                    raise ValueError(f"object {k}: {len(q)} points but {len(ol)} point labels")
+                o["point_labels"] = ol
+        if ob.get("box") is not None:
+            o["box"] = _box(ob["box"], f"the box of object {k}")
+        oss = [_scribble(sc, f"a scribble of object {k}") for sc in list(ob.get("scribbles") or [])]
+        if oss:
+            o["scribbles"] = oss
+        if not o:
+            raise ValueError(f"object {k} has no prompts")
+        out["objects"].append(o)
+    out["count"] = len(out["points"]) + len(out["boxes"]) + len(out["scribbles"]) + len(out["objects"])
+    return out
+
+
 def family_promptable(family: str) -> bool:
     """Can this family answer a POINT PROMPT -- "the object here", rather than "every object"?
 
@@ -919,16 +997,22 @@ def family_promptable(family: str) -> bool:
 
 def run_microsam_prompt(volume: np.ndarray, model_type: str, points: np.ndarray, point_labels: np.ndarray,
                         params: Dict[str, Any], device: str = "auto",
-                        progress: ProgressFn = None, cancelled: CancelFn = None):
+                        progress: ProgressFn = None, cancelled: CancelFn = None, objects=None):
     """One mask per prompt from micro-SAM's predictor -> (labels uint32 (z, y, x), score per prompt).
 
     micro-SAM is a 2-D model, so a prompt names an object IN ITS PLANE. The mask is written into
     that plane of the returned volume and nowhere else; a 3-D object needs a prompt per plane, or
     our own bundle, whose decoder is 3-D. Saying so in the result rather than silently returning a
-    one-plane object is the point of `plane_only` below.
+    one-plane object is the point of `plane_only` in the reply.
 
-    `points` is (P, 3) in (z, y, x) VOXELS of this volume, `point_labels` (P,) 1 object / 0 background.
-    Prompts sharing a plane are answered in one predictor pass, which is where the time goes.
+    `points` is (P, 3) in (z, y, x) VOXELS of this volume, `point_labels` (P,) 1 object / 0 background,
+    one mask each. `objects` is the JOINT form: a list of {"points", "point_labels", "box",
+    "scribbles"} in the same order, where one entry is ONE object and all of its prompts go into the
+    SAME predictor call -- which is how a correction refines that object's mask instead of asking for
+    another mask. SAM has no stroke input, so a scribble enters as its points at the stroke's label.
+    All of one object's prompts must share a plane, because the model cannot see across z.
+
+    Prompts sharing a plane are answered after one `set_image`, which is where the time goes.
     """
     try:
         from micro_sam.util import get_sam_model  # type: ignore
@@ -940,35 +1024,81 @@ def run_microsam_prompt(volume: np.ndarray, model_type: str, points: np.ndarray,
     dev = device
     if device in ("auto", "", None):
         dev = "cuda" if torch.cuda.is_available() else "cpu"
-    pts = np.asarray(points, np.float32).reshape(-1, 3)
+    z, y, x = volume.shape
+    lim = np.array([z, y, x], np.float32)
+    pts = np.asarray(points if points is not None else [], np.float32).reshape(-1, 3)
     labs = (np.ones(len(pts), np.int64) if point_labels is None
             else np.asarray(point_labels, np.int64).reshape(-1))
     if len(labs) != len(pts):
         raise ModelError(f"{len(pts)} points but {len(labs)} point labels")
-    z, y, x = volume.shape
-    if ((pts < 0) | (pts >= np.array([z, y, x], np.float32))).any():
+    if len(pts) and ((pts < 0) | (pts >= lim)).any():
         raise ModelError("a point falls outside the volume")
+
+    # One predictor call per MASK: (plane, in-plane points as (x, y), their labels, an optional box).
+    rows: List[Dict[str, Any]] = []
+    for i in range(len(pts)):
+        rows.append({"plane": int(round(float(pts[i, 0]))),
+                     "pts": np.array([[pts[i, 2], pts[i, 1]]], np.float32),
+                     "labs": np.array([int(labs[i])], np.int64), "box": None})
+    for k, ob in enumerate(list(objects or [])):
+        op = np.asarray(ob.get("points") if ob.get("points") is not None else [], np.float32).reshape(-1, 3)
+        ol = (np.ones(len(op), np.int64) if ob.get("point_labels") is None
+              else np.asarray(ob["point_labels"], np.int64).reshape(-1))
+        if len(ol) != len(op):
+            raise ModelError(f"object {k}: {len(op)} points but {len(ol)} point labels")
+        for sc in list(ob.get("scribbles") or []):             # a stroke is K points at one label
+            sp = np.asarray(sc.get("points"), np.float32).reshape(-1, 3)
+            op = np.concatenate([op, sp]) if len(op) else sp
+            ol = np.concatenate([ol, np.full(len(sp), int(sc.get("label", 1)), np.int64)])
+        box = ob.get("box")
+        if len(op) and ((op < 0) | (op >= lim)).any():
+            raise ModelError(f"a point of object {k} falls outside the volume")
+        planes = {int(round(float(v))) for v in op[:, 0]} if len(op) else set()
+        if box is not None:
+            b = np.asarray(box, np.float32).reshape(6)
+            if not planes:                                     # no point: take the box's middle plane
+                planes = {int(round((float(b[0]) + float(b[3]) - 1) / 2.0))}
+        if len(planes) > 1:
+            raise ModelError(f"object {k} has prompts on planes {sorted(planes)}; microsam:{model_type} is a "
+                             "2-D model and cannot refine across z. Put the object's corrective prompts in "
+                             "the plane it was opened in, or prompt a .ltb bundle, whose decoder is 3-D.")
+        if not planes:
+            raise ModelError(f"object {k} has no prompts")
+        plane = int(np.clip(planes.pop(), 0, z - 1))
+        row: Dict[str, Any] = {"plane": plane, "box": None,
+                               "pts": (np.stack([op[:, 2], op[:, 1]], 1).astype(np.float32)
+                                       if len(op) else np.zeros((0, 2), np.float32)),
+                               "labs": ol.astype(np.int64)}
+        if box is not None:
+            b = np.asarray(box, np.float32).reshape(6)         # (z0,y0,x0,z1,y1,x1) -> SAM's (x0,y0,x1,y1)
+            row["box"] = np.array([b[2], b[1], b[5] - 1, b[4] - 1], np.float32)
+        rows.append(row)
+    if not rows:
+        raise ModelError("no prompts given")
+
     predictor = get_sam_model(model_type=model_type, device=dev)
     labels = np.zeros(volume.shape, np.uint32)
-    scores = np.zeros(len(pts), np.float32)
-    order = np.argsort(pts[:, 0].astype(int), kind="stable")
+    scores = np.zeros(len(rows), np.float32)
     done = 0
-    for plane in sorted({int(v) for v in pts[:, 0]}):
+    for plane in sorted({r["plane"] for r in rows}):
         _check(cancelled)
         pl = volume[plane]
         lo, hi = np.percentile(pl, (0.5, 99.8))
         img = (np.clip((pl - lo) / max(float(hi - lo), 1e-6), 0, 1) * 255).astype(np.uint8)
         predictor.set_image(np.stack([img] * 3, -1))
-        here = [int(i) for i in order if int(pts[i, 0]) == plane]
-        for i in here:
-            m, sc, _ = predictor.predict(point_coords=np.array([[pts[i, 2], pts[i, 1]]], np.float32),
-                                         point_labels=np.array([labs[i]], np.int64), multimask_output=False)
-            mask = np.asarray(m[0], bool)
-            labels[plane][mask] = i + 1
+        for i, r in enumerate(rows):
+            if r["plane"] != plane:
+                continue
+            m, sc, _ = predictor.predict(
+                point_coords=r["pts"] if len(r["pts"]) else None,
+                point_labels=r["labs"] if len(r["pts"]) else None,
+                box=r["box"][None] if r["box"] is not None else None,
+                multimask_output=False)
+            labels[plane][np.asarray(m[0], bool)] = i + 1
             scores[i] = float(sc[0])
             done += 1
             if progress:
-                progress(min(1.0, done / max(len(pts), 1)), f"prompt {done}/{len(pts)}")
+                progress(min(1.0, done / max(len(rows), 1)), f"prompt {done}/{len(rows)}")
     return labels, scores
 
 
@@ -991,8 +1121,12 @@ def run_family(spec: str, volume: np.ndarray, params: Dict[str, Any], device: st
 
 
 def run_family_prompt(spec: str, volume: np.ndarray, points, point_labels, params: Dict[str, Any],
-                      device: str = "auto", progress: ProgressFn = None, cancelled: CancelFn = None):
-    """Dispatch a POINT PROMPT to a family model -> (labels uint32 (z, y, x), score per prompt)."""
+                      device: str = "auto", progress: ProgressFn = None, cancelled: CancelFn = None,
+                      objects=None):
+    """Dispatch a PROMPT to a family model -> (labels uint32 (z, y, x), score per prompt).
+
+    `objects` is the joint per-object form (see run_microsam_prompt): all of one object's prompts in
+    one call, so a corrective click refines its mask."""
     ms = parse_spec(spec)
     volume = np.asarray(volume, dtype=np.float32)
     while volume.ndim > 3 and volume.shape[0] == 1:
@@ -1005,4 +1139,5 @@ def run_family_prompt(spec: str, volume: np.ndarray, points, point_labels, param
         raise ModelError(f"'{spec}' cannot be prompted: {ms.family} segments a whole image and has no "
                          "prompt interface. Use the Segment step for it, or a promptable model "
                          "(microsam:, or a .ltb bundle with a prompt decoder).")
-    return run_microsam_prompt(volume, ms.name, points, point_labels, params, device, progress, cancelled)
+    return run_microsam_prompt(volume, ms.name, points, point_labels, params, device, progress, cancelled,
+                               objects=objects)

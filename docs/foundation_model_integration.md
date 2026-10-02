@@ -173,3 +173,75 @@ Send them back and they will be answered against the code, not from memory:
   another. The run prints its resolution limit beside the object size.
 - Which fields of the manifest are safe to expose as user-editable.
 - Whether a given bundle was validated on data like the user's.
+
+---
+
+## 7. The Prompt task (added 2026-10-01, model side)
+
+"The object here", not "every object". This is the path a model that cannot yet
+segment unattended is still useful on, and it is the one the Prompt GUI drives.
+Measured on the human-labelled coat windows with the deep SAM student
+(`latents scripts/prompt_metric.py`), median IoU for one interaction:
+
+| prompt | manual | completed |
+|---|---|---|
+| box around the cell | 0.74 | 0.60 |
+| one click at the centre | 0.67 | 0.44 |
+| a 3-point stroke | 0.52 | 0.44 |
+| one off-centre click | 0.44 | 0.29 |
+
+So default to the box, and expect one corrective click to be needed often: from
+an off-centre click, the first correction moves the median from 0.44 to 0.59 and
+36 of 40 cells reach IoU 0.5 within a median of one click.
+
+### Parameters
+
+`run` with `task: "prompt"`, one frame only. Every coordinate is `[x, y, z]` in
+VOXELS of the image on screen, the application's axis order; the worker converts
+once, in `models.app_prompts_to_zyx`, so our bundle and micro-SAM answer the
+same click.
+
+    points        [[x, y, z], ...]            one mask each
+    point_labels  [1 | 0, ...]                1 object, 0 background
+    boxes         [[x0, y0, z0, x1, y1, z1]]  one mask each, second corner exclusive
+    scribbles     [{"points": [...], "label": 1|0}]   one stroke is ONE mask
+    objects       [{"box": ..., "points": ..., "point_labels": ...,
+                    "scribbles": [...]}, ...]         one entry is ONE object
+    snap_z        default true
+
+### Use `objects`, not the flat lists
+
+`objects` is the joint form: every prompt of one object goes into the same
+decoder slot, so **a corrective click refines that object's mask instead of
+asking for another mask**. The flat lists can only ever add masks, which is the
+wrong semantics for an interactive tool. Keep the prompt list per object in the
+GUI, append each correction to it, and re-send the whole object.
+
+Masks come back in the order points, boxes, scribbles, objects, and the label id
+in the returned volume is that position. `info.mask_scores` is the model's own
+opinion of each mask, `info.prompt_kinds` counts what it was given, and
+`extras.confidence` carries the score per voxel.
+
+Two properties the GUI can rely on:
+
+- **Objects are independent.** Adding a prompt to one object does not change any
+  other object's mask. (The pad token is a real token and attends, so a naive
+  single padded batch did not have this property; `Bundle.prompt` decodes
+  equal-width slots in groups to get it.)
+- **z is handled.** `snap_z` walks a lone object click along its own z column to
+  the peak of the model's wall-distance channel without crossing a wall. A click
+  on a cell's first or last plane scores 0.46 against 0.63 in the interior, and
+  snapping recovers most of that for no extra click. Corrections are never
+  moved: they were aimed at a specific mistake.
+
+### micro-SAM
+
+`microsam:` specs answer prompts too, through the same parameters, with one
+limit that must reach the user: **micro-SAM is 2-D**, so a prompt names an
+object in its plane and the mask is written into that plane only
+(`info.plane_only` is true). All of one object's prompts must therefore share a
+plane; the worker refuses a cross-plane object with a message that says to use a
+`.ltb` bundle, whose decoder is 3-D. A bare box or scribble is not accepted for
+micro-SAM — put it inside an `objects` entry. Cellpose is not promptable at all
+(`family_promptable` is false; cellpose-SAM borrows the architecture, not the
+prompt interface), so do not offer it a Prompt step.

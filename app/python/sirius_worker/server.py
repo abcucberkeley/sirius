@@ -634,19 +634,24 @@ class WorkerServer:
                 if str(p.get("task", "")).lower() == "prompt":
                     # "the object here", not "every object". Only micro-SAM among the families can
                     # answer it; model_hub.run_family_prompt refuses the others with a reason. The
-                    # same point convention as the foundation step: [[x, y, z], ...] in voxels, the
-                    # application's axis order, so one GUI interaction serves every backend.
-                    pts = np.asarray(p.get("points") or [], np.float32).reshape(-1, 3)
-                    if not len(pts):
-                        raise ValueError("the Prompt task needs at least one point")
-                    plab = p.get("point_labels")
-                    plab = None if plab is None else np.asarray(plab, np.int64).reshape(-1)
+                    # same conversion as the foundation step (app_prompts_to_zyx), so one GUI
+                    # interaction serves every backend -- including the joint 'objects' form, where
+                    # one entry holds all of an object's prompts and a correction refines its mask.
+                    pr = model_hub.app_prompts_to_zyx(p, volume.shape[-3:])
+                    if len(pr["boxes"]) or len(pr["scribbles"]):
+                        raise ValueError("a bare box or scribble is only a prompt for a .ltb bundle; for "
+                                         f"{spec}, put them inside an 'objects' entry, which is one object "
+                                         "and one mask")
                     labels, scores = model_hub.run_family_prompt(
-                        spec, volume, pts[:, ::-1], plab, p, device, progress=progress, cancelled=cancelled)
+                        spec, volume, pr["points"], pr["point_labels"], p, device,
+                        progress=progress, cancelled=cancelled, objects=pr["objects"] or None)
                     check()
                     return ({"labels": int(labels.max()) if labels.size else 0, "model": spec,
                              "format": model_hub.parse_spec(spec).family, "task": "prompt",
-                             "prompts": int(len(pts)), "mask_scores": [round(float(v), 4) for v in scores],
+                             "prompts": int(pr["count"]),
+                             "prompt_kinds": {"points": int(len(pr["points"])), "boxes": 0,
+                                              "scribbles": 0, "objects": int(len(pr["objects"]))},
+                             "mask_scores": [round(float(v), 4) for v in scores],
                              "plane_only": True, "device": device},
                             {"labels": np.ascontiguousarray(labels, dtype=np.uint32)})
                 # cellpose / micro-SAM produce instance labels themselves; the
