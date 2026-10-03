@@ -19,6 +19,10 @@ Requests (see protocol.py for the framing):
     hub_files   {repo}                      -> {repo, files: [{name, size, model}]}
     hub_download {repo, file}               -> "progress"* then {path, bytes, spec} (cancellable like a run)
                                                (hub_* take an optional `token` for gated / private repositories)
+    list_bundles {dirs: [folder, ...]}      -> {models: [{path, name, version, tasks, promptable, description,
+                                               voxel_um, channels, size_bytes, error}], errors}: the model
+                                               folders under each folder (foundation.list_models); `dir`
+                                               (one folder) is read too
     models_list {}                          -> {cache, models: [{spec, path, bytes}]}
     models_delete {path}                    -> {path, bytes, removed_directories}  (cache only)
     install     {family, dry_run?}          -> "progress"* (one frame per output line) then
@@ -42,8 +46,9 @@ Requests (see protocol.py for the framing):
                   pages are decoded (nvTIFF on a CUDA device when the sirius package can, else the
                   CPU); hello's "tiff_reader" {sirius: version | null, nvtiff} says what this worker has
 
-Model specs (params.model of torch_segment, model_info): a local .pt / .pts /
-.pth / .onnx path; ``hf:<repo>[:<file>]`` (downloaded into $SIRIUS_MODEL_CACHE
+Model specs (params.model of torch_segment, model_info): a model folder
+(model.json "latents-model/1", foundation.py: model_info answers from model.json
+without loading it); a local .pt / .pts / .pth / .onnx path; ``hf:<repo>[:<file>]`` (downloaded into $SIRIUS_MODEL_CACHE
 or ~/.sirius/models); ``cellpose:<model>``; ``microsam:<model_type>`` -- see
 models.py.
 
@@ -680,14 +685,18 @@ class WorkerServer:
                 elif method == "model_info":
                     reply(rid, self.model_info(str(params.get("spec") or params.get("path") or params.get("model") or "")))
                 elif method == "list_bundles":
-                    # The registry the application offers as a list of models.
-                    # Served from the worker rather than read by the
-                    # application because on a cluster the worker is the
-                    # process that can see the filesystem the bundles are on.
+                    # The model folders the application offers as a list (Models…).
+                    # Served from the worker rather than read by the application
+                    # because on a cluster the worker is the process that can see
+                    # the filesystem the models are on. The method keeps its name:
+                    # the engine on a node relays it to this worker by that name.
                     from . import foundation as foundation_model
 
-                    directory = str(params.get("dir") or params.get("directory") or "")
-                    reply(rid, {"dir": directory, "bundles": foundation_model.list_bundles(directory)})
+                    dirs = [str(d) for d in (params.get("dirs") or []) if str(d or "").strip()]
+                    one = str(params.get("dir") or params.get("directory") or "")
+                    if one and one not in dirs:
+                        dirs.append(one)
+                    reply(rid, {"dirs": dirs, **foundation_model.list_models(dirs)})
                 elif method == "hub_search":
                     model_hub.set_hub_token(str(params.get("token", "") or ""))
                     reply(rid, {"models": model_hub.hub_search(str(params.get("query", "")),
@@ -879,12 +888,16 @@ class WorkerServer:
         """Facts about a model spec. Family specs report availability; an hf:
         file not in the cache yet is described without downloading it (the
         first run, or hub_download, fetches it)."""
-        if spec.lower().endswith(".ltb"):
-            # A latents bundle describes itself: the application reads the
-            # thresholds and the voxel size it was calibrated at out of this
-            # and uses them as the step's defaults.
-            from . import foundation as foundation_model
+        from . import foundation as foundation_model
 
+        model_file = os.path.splitext(spec)[1].lower() in (".pt", ".pts", ".pth", ".ts", ".onnx", ".torchscript")
+        if (foundation_model.is_old_bundle(spec) or os.path.isdir(spec) or os.path.basename(spec) == "model.json"
+                or (model_hub.is_file_spec(spec) and not model_file and not os.path.isfile(spec))):
+            # A model folder describes itself from model.json, without being
+            # loaded: its tasks (the step's Task choice), its input contract and
+            # its decode. An old .ltb bundle is refused with what to do instead,
+            # and a path that is neither a model file nor there is a model
+            # folder not found.
             return foundation_model.model_info(spec)
         ms = model_hub.parse_spec(spec)
         if ms.family in ("cellpose", "microsam"):
@@ -1007,7 +1020,7 @@ class WorkerServer:
                     # one entry holds all of an object's prompts and a correction refines its mask.
                     pr = model_hub.app_prompts_to_zyx(p, volume.shape[-3:])
                     if len(pr["boxes"]) or len(pr["scribbles"]):
-                        raise ValueError("a bare box or scribble is only a prompt for a .ltb bundle; for "
+                        raise ValueError("a bare box or scribble is only a prompt for a model folder; for "
                                          f"{spec}, put them inside an 'objects' entry, which is one object "
                                          "and one mask")
                     labels, scores = model_hub.run_family_prompt(
@@ -1043,10 +1056,8 @@ class WorkerServer:
             return {"channels": int(prob.shape[0]), "device": device}, {"prob": prob}
 
         if kind == "foundation":
-            # The latents foundation model. Unlike every other kind here it
-            # takes the whole (c, t, z, y, x) array in one call, because the
-            # colour and time axes are what the model is for; splitting them
-            # off would leave it doing the same job as torch_segment.
+            # A trained model folder (foundation.py). It takes the whole
+            # (c, t, z, y, x) array in one call and answers per time point.
             from . import foundation as foundation_model
 
             arr = tensors.get("input")

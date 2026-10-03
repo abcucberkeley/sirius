@@ -717,6 +717,33 @@ namespace sirius::app {
 
     using json = nlohmann::json;
 
+    WorkerCapabilities parseWorkerCapabilities(const json& r) {
+        WorkerCapabilities caps;
+        if (!r.is_object()) return caps;
+        caps.version = r.value("version", "");
+        caps.cuda = r.value("cuda", false);
+        caps.device = r.value("device", "");
+        parseWorkerHardware(r, caps);
+        caps.hostname = r.value("hostname", "");
+        caps.python = r.value("python", "");
+        if (r.contains("torch") && r["torch"].is_string()) caps.torch = r["torch"].get<std::string>();
+        if (r.contains("methods") && r["methods"].is_array())
+            for (const json& m : r["methods"])
+                if (m.is_string()) caps.methods.push_back(m.get<std::string>());
+        if (r.contains("encodings") && r["encodings"].is_array())
+            for (const json& e : r["encodings"])
+                if (e.is_string()) caps.encodings.push_back(e.get<std::string>());
+        if (r.contains("max_clients") && r["max_clients"].is_number_integer()) caps.maxClients = r["max_clients"].get<int>();
+        if (r.contains("protocol_version") && r["protocol_version"].is_number_integer()) caps.protocolVersion = r["protocol_version"].get<int>();
+        if (r.contains("engine") && r["engine"].is_object()) caps.engine = r["engine"];
+        if (r.contains("tiff_reader") && r["tiff_reader"].is_object()) {
+            const json& tr = r["tiff_reader"];
+            if (tr.contains("sirius") && tr["sirius"].is_string()) caps.tiffReader = tr["sirius"].get<std::string>();
+            if (tr.contains("nvtiff") && tr["nvtiff"].is_boolean()) caps.nvtiff = tr["nvtiff"].get<bool>();
+        }
+        return caps;
+    }
+
     void parseWorkerHardware(const json& r, WorkerCapabilities& caps) {
         caps.cudaUsable = caps.cuda;
         if (r.contains("cuda_usable") && r["cuda_usable"].is_boolean()) caps.cudaUsable = r["cuda_usable"].get<bool>();
@@ -826,27 +853,9 @@ namespace sirius::app {
             throw timedOut();
         }
         cancelGrace_ = grace;
-        const json& r = auth.result;
-        caps_.version = r.value("version", "");
-        caps_.cuda = r.value("cuda", false);
-        caps_.device = r.value("device", "");
-        parseWorkerHardware(r, caps_);
-        caps_.hostname = r.value("hostname", "");
-        caps_.python = r.value("python", "");
-        if (r.contains("torch") && r["torch"].is_string()) caps_.torch = r["torch"].get<std::string>();
-        if (r.contains("methods") && r["methods"].is_array())
-            for (const json& m : r["methods"])
-                if (m.is_string()) caps_.methods.push_back(m.get<std::string>());
-        if (r.contains("encodings") && r["encodings"].is_array())
-            for (const json& e : r["encodings"])
-                if (e.is_string()) caps_.encodings.push_back(e.get<std::string>());
-        if (r.contains("max_clients") && r["max_clients"].is_number_integer()) caps_.maxClients = r["max_clients"].get<int>();
-        if (r.contains("engine") && r["engine"].is_object()) caps_.engine = r["engine"];
-        if (r.contains("tiff_reader") && r["tiff_reader"].is_object()) {
-            const json& tr = r["tiff_reader"];
-            if (tr.contains("sirius") && tr["sirius"].is_string()) caps_.tiffReader = tr["sirius"].get<std::string>();
-            if (tr.contains("nvtiff") && tr["nvtiff"].is_boolean()) caps_.nvtiff = tr["nvtiff"].get<bool>();
-        }
+        const int protocol = caps_.protocolVersion;
+        caps_ = parseWorkerCapabilities(auth.result);
+        caps_.protocolVersion = protocol;
     }
 
     RemoteWorker::~RemoteWorker() { close(); }

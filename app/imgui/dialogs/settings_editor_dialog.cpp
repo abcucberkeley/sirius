@@ -101,7 +101,7 @@ namespace sirius::app::gui {
                 }
                 ImGui::EndChild();
                 widgets::vspace(4);
-                if (!saveError_.empty()) widgets::textWrapped(saveError_, 11, theme::kAccentText);
+                if (!saveError_.empty()) widgets::copyableText("##saveError", saveError_, 11, theme::kAccentText);
                 const bool errors = std::any_of(problems_.begin(), problems_.end(), [](const cluster::SettingsProblem& p) { return p.error; });
                 const Action a = actionRow("Save", modified_ && !errors);
                 if (a == Action::Cancel) {

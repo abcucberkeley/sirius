@@ -2756,15 +2756,22 @@ namespace sirius::app::gui {
         bo.kind = widgets::ButtonKind::Ghost;
         bo.small = true;
         const float buttonH = std::max(px(14), theme::textSize("Ag", 12, theme::Weight::SemiBold).y) + 2 * px(4) + 2 * px(theme::kBorder);
+        // A previewed Contrast step's input on the cluster is measured there:
+        // the buttons wait for the node's answer, which is applied by itself.
+        const std::optional<Workbench::ContrastRequest> asked = previewing ? wb.contrastRequest(wb.viewedIndex()) : std::nullopt;
         at(buttonH);
-        bo.tooltip = "Auto contrast (display): window on the 0.1\xE2\x80\x93"
-                     "99.9 percentiles" +
-                     shortcutSuffix(ImGuiMod_Shift | ImGuiKey_A);
-        if (widgets::button("Auto##contrast", bo)) app.viewer().autoContrast();
+        bo.enabled = !asked;
+        bo.tooltip = asked ? std::string("Measuring the input on the cluster node\xE2\x80\xA6 the window is applied when it answers")
+                           : "Auto contrast (display): window on the 0.1\xE2\x80\x93"
+                             "99.9 percentiles" +
+                                 shortcutSuffix(ImGuiMod_Shift | ImGuiKey_A);
+        if (widgets::button(asked && asked->action == Workbench::ContrastAction::Auto ? "Auto\xE2\x80\xA6###autoContrast" : "Auto###autoContrast", bo))
+            app.viewer().autoContrast();
         next(spacing);
         at(buttonH);
-        bo.tooltip = "Reset the display window to the full data range" + shortcutSuffix(ImGuiMod_Shift | ImGuiKey_R);
-        if (widgets::button("Reset##contrast", bo)) app.viewer().resetContrast();
+        bo.tooltip = asked ? bo.tooltip : "Reset the display window to the full data range" + shortcutSuffix(ImGuiMod_Shift | ImGuiKey_R);
+        if (widgets::button(asked && asked->action == Workbench::ContrastAction::Reset ? "Reset\xE2\x80\xA6###resetContrast" : "Reset###resetContrast", bo))
+            app.viewer().resetContrast();
         const float groupW = ImGui::GetItemRectMax().x - rightStart;
         if (std::abs(groupW - rightGroupW) > 0.5f) {
             rightGroupW = groupW;
@@ -3084,16 +3091,9 @@ namespace sirius::app::gui {
     void Viewer::autoContrast() {
         Impl& d = *impl_;
         if (d.previewing) {   // the previewed step's own Auto
-            const int i = d.wb.viewedIndex();
-            // the window samples planes of the input, which a lazy source can fail to read
-            try {
-                if (const std::optional<ParamSet> p = d.wb.contrastAutoOf(i, d.wb.pipeline().at(i).params))
-                    d.wb.setStepParams(i, *p, "Auto contrast");
-                else if (d.wb.upstreamOutput(i))
-                    d.wb.logLine("Auto contrast: the cluster node is measuring the input; press Auto again in a moment.");
-            } catch (const std::exception& e) {
-                d.wb.logLine(std::string("Auto contrast: ") + e.what());
-            }
+            // applied at once, or when the cluster node has measured the input
+            // (a failure is logged and shown under the step's Auto button)
+            d.wb.requestContrast(d.wb.viewedIndex(), Workbench::ContrastAction::Auto);
             return;
         }
         d.model.setWindowMode(DisplayModel::WindowMode::Auto);
@@ -3105,16 +3105,7 @@ namespace sirius::app::gui {
     void Viewer::resetContrast() {
         Impl& d = *impl_;
         if (d.previewing) {
-            const int i = d.wb.viewedIndex();
-            // the range reads planes of the input, which a lazy source can fail to read
-            try {
-                if (const std::optional<ParamSet> p = d.wb.contrastResetOf(i, d.wb.pipeline().at(i).params))
-                    d.wb.setStepParams(i, *p, "Reset contrast");
-                else if (d.wb.upstreamOutput(i))
-                    d.wb.logLine("Reset contrast: the cluster node is measuring the input; press Reset again in a moment.");
-            } catch (const std::exception& e) {
-                d.wb.logLine(std::string("Reset contrast: ") + e.what());
-            }
+            d.wb.requestContrast(d.wb.viewedIndex(), Workbench::ContrastAction::Reset);
             return;
         }
         d.model.setWindowMode(DisplayModel::WindowMode::Full);

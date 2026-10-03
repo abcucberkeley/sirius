@@ -62,6 +62,7 @@ namespace sirius::app::gui {
         alive_->store(false);
         session_.cancelConnect();
         if (disconnecting_.joinable()) disconnecting_.join();
+        if (jobsThread_.joinable()) jobsThread_.join();
         if (datasets_) datasets_->uninstall();
     }
 
@@ -89,6 +90,43 @@ namespace sirius::app::gui {
     void ClusterLink::connectJob(const cluster::Profile& profile) {
         lastState_ = cluster::State::Connecting;
         session_.connectJob(prepared(profile));
+    }
+
+    void ClusterLink::adoptJob(const cluster::Profile& profile, const std::string& jobId) {
+        lastState_ = cluster::State::Connecting;
+        session_.adoptJob(prepared(profile), jobId);
+    }
+
+    ClusterLink::UserJobs ClusterLink::userJobs() const {
+        const std::lock_guard<std::mutex> g(jobsMutex_);
+        return jobs_;
+    }
+
+    void ClusterLink::refreshJobs() {
+        const std::string host = session_.status().host;
+        {
+            const std::lock_guard<std::mutex> g(jobsMutex_);
+            if (jobs_.loading) return;
+            jobs_.loading = true;
+            if (jobs_.host != host) jobs_ = UserJobs{host, {}, true, false, {}};
+        }
+        if (jobsThread_.joinable()) jobsThread_.join();
+        auto alive = alive_;
+        jobsThread_ = std::thread([this, alive, host] {
+            UserJobs got;
+            got.host = host;
+            got.known = true;
+            try {
+                got.jobs = session_.listJobs();
+            } catch (const std::exception& e) {
+                got.error = e.what();
+            }
+            {
+                const std::lock_guard<std::mutex> g(jobsMutex_);
+                jobs_ = std::move(got);
+            }
+            if (alive->load()) app_.bridge().post([] {});
+        });
     }
 
     void ClusterLink::startWorker(const cluster::Profile& profile) {
@@ -132,6 +170,13 @@ namespace sirius::app::gui {
         const cluster::Status st = status();
         if (st.jobId.empty()) return;
         const bool worker = st.state == cluster::State::Connected;
+        if (st.adopted) {
+            // the user's own job: let go of, never cancelled
+            app_.ask("Another job", "Job " + st.jobId + " was yours before SIRIUS: it is not cancelled, it keeps running." + (worker ? " SIRIUS's worker in it stops, and what it holds is lost." : std::string()) + " Let go of it to take up or start another job? You stay logged in.", {"Keep using it", "Let go of it"}, [this](int answer) {
+                         if (answer != 1) return;
+                         offThread([this] { session_.cancelJob(); }); }, 0);
+            return;
+        }
         app_.ask("Change the job", "Cancel job " + st.jobId + " on " + st.host + " to ask for one with other settings?" + (worker ? " The worker in it stops, and what it holds is lost." : std::string()) + " You stay logged in.", {"Keep the job", "Cancel the job"}, [this](int answer) {
                      if (answer != 1) return;
                      offThread([this] { session_.cancelJob(); }); }, 0);
@@ -172,6 +217,12 @@ namespace sirius::app::gui {
     void ClusterLink::disconnectAsking() {
         const cluster::Status st = status();
         if (st.jobId.empty()) {
+            disconnect(false);
+            return;
+        }
+        if (st.adopted) {
+            // never a question of cancelling a job SIRIUS did not start (the
+            // session's log says it keeps running)
             disconnect(false);
             return;
         }
@@ -250,9 +301,13 @@ namespace sirius::app::gui {
         // (nvTIFF on the job's GPU), switched with the HPC device
         if (datasets_) datasets_->setDevice(app_.wb().hpcDevice() == HpcDevice::Cpu ? "cpu" : "cuda");
         // the HPC backend's engine (or why there is none), as the session is now
-        if (const std::string why = cluster::wizard::hpcNoEngineReason(session_.status()); !synced_ || why != syncedWhy_) {
+        // and again when its capabilities change (the engine's Python child
+        // up: torch, model steps, plugins; the session logs it)
+        const cluster::Status current = session_.status();
+        if (const std::string why = cluster::wizard::hpcNoEngineReason(current); !synced_ || why != syncedWhy_ || current.capsSerial != syncedCaps_) {
             synced_ = true;
             syncedWhy_ = why;
+            syncedCaps_ = current.capsSerial;
             app_.wb().setRemoteConfig(remoteConfig());
         }
         const cluster::State now = session_.status().state;
@@ -368,6 +423,13 @@ namespace sirius::app::gui {
         const cluster::Status st = status();
         if (st.jobId.empty() || !st.sshUp) {
             session_.cancelConnect();
+            done();
+            return;
+        }
+        if (st.adopted) {
+            // the user's own job: it keeps running, nothing to ask
+            if (disconnecting_.joinable()) disconnecting_.join();
+            session_.disconnect(false);
             done();
             return;
         }

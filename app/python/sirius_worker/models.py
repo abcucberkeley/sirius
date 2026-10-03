@@ -907,11 +907,11 @@ def run_microsam(volume: np.ndarray, model_type: str, params: Dict[str, Any], de
 
 
 def app_prompts_to_zyx(params: Dict[str, Any], shape) -> Dict[str, Any]:
-    """The application's prompt parameters -> latents' axis order, validated against `shape` (z, y, x).
+    """The application's prompt parameters -> the models' (z, y, x) order, validated against `shape` (z, y, x).
 
-    The GUI holds every coordinate as (x, y, z) in voxels and latents takes (z, y, x), so exactly one
-    conversion stands between one GUI interaction and every backend. Doing it in one place is what
-    keeps our bundle and micro-SAM answering the same click; it was duplicated once and the two copies
+    The GUI holds every coordinate as (x, y, z) in voxels and a model folder's prompt() takes (z, y, x),
+    so exactly one conversion stands between one GUI interaction and every backend. Doing it in one
+    place is what keeps a model folder and micro-SAM answering the same click; it was duplicated once and the two copies
     disagreed about whether a box's second corner is inclusive.
 
     Returns {"points", "point_labels", "boxes", "scribbles", "objects", "count"}, where `objects` is
@@ -1061,7 +1061,7 @@ def run_microsam_prompt(volume: np.ndarray, model_type: str, points: np.ndarray,
         if len(planes) > 1:
             raise ModelError(f"object {k} has prompts on planes {sorted(planes)}; microsam:{model_type} is a "
                              "2-D model and cannot refine across z. Put the object's corrective prompts in "
-                             "the plane it was opened in, or prompt a .ltb bundle, whose decoder is 3-D.")
+                             "the plane it was opened in, or prompt a model folder on the Foundation step, whose decoder is 3-D.")
         if not planes:
             raise ModelError(f"object {k} has no prompts")
         plane = int(np.clip(planes.pop(), 0, z - 1))
@@ -1138,6 +1138,6 @@ def run_family_prompt(spec: str, volume: np.ndarray, points, point_labels, param
     if not family_promptable(ms.family):
         raise ModelError(f"'{spec}' cannot be prompted: {ms.family} segments a whole image and has no "
                          "prompt interface. Use the Segment step for it, or a promptable model "
-                         "(microsam:, or a .ltb bundle with a prompt decoder).")
+                         "(microsam:, or a model folder whose tasks include prompt, on the Foundation step).")
     return run_microsam_prompt(volume, ms.name, points, point_labels, params, device, progress, cancelled,
                                objects=objects)

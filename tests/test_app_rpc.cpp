@@ -119,9 +119,8 @@ namespace {
                         }
                         if (kind == "foundation") {
                             // the foundation model's reply: (t, z, y, x) uint32
-                            // labels holding two one-voxel objects per frame,
-                            // which is what a Detect run returns, a confidence
-                            // map, and the facts the step reports
+                            // labels holding two one-voxel objects per frame, a
+                            // confidence map, and the facts the step reports
                             {
                                 std::lock_guard<std::mutex> lock(sentMutex);
                                 foundationParams = h["params"].value("params", json::object());
@@ -139,7 +138,7 @@ namespace {
                             rpc::TensorRef c{"confidence", "float32", shape, confidence.data(), confidence.size() * sizeof(float)};
                             send({{"id", id},
                                   {"type", "result"},
-                                  {"result", {{"model", "stub"}, {"threshold", 0.5}, {"min_separation_um", 1.0}, {"objects", 2 * s[1]}, {"tracks", 2}, {"divisions", 1}}}},
+                                  {"result", {{"model", "stub v1"}, {"threshold", 0.5}, {"min_voxels", 5}, {"objects", 2 * s[1]}, {"warnings", {"a stub warning"}}}}},
                                  {l, c});
                             continue;
                         }
@@ -506,8 +505,18 @@ TEST_CASE("the foundation step keeps the labels the worker returns and reports i
     auto [client, server] = rpc::loopbackPair();
     ScriptedWorker worker(std::move(server));
     RemoteWorker rw(std::move(client));
-    test::TempFile bundle("foundation", ".ltb");
-    { std::ofstream(bundle.path) << "stub"; }
+    // a model folder: model.json is what the step reads of it here
+    const std::filesystem::path folder = test::uniqueTempPath("foundation", "");
+    std::filesystem::create_directories(folder);
+    struct Remove {
+        std::filesystem::path p;
+        ~Remove() {
+            std::error_code ec;
+            std::filesystem::remove_all(p, ec);
+        }
+    } removeFolder{folder};
+    std::ofstream(folder / "model.json") << json{{"format", "latents-model/1"}, {"name", "stub"}, {"version", "v1"}, {"tasks", {"segment", "prompt"}}, {"input", {{"channels", 1}, {"voxel_um", {0.75, 0.15, 0.15}}}}}
+                                                .dump();
 
     const Dims5 dims{1, 2, 4, 8, 8};
     auto array = std::make_shared<Array5>(Array5::zeros(dims));
@@ -517,7 +526,7 @@ TEST_CASE("the foundation step keeps the labels the worker returns and reports i
     meta.normalizeChannels();
     const Operation& op = requireOperation("foundation");
     ParamSet p = op.defaults();
-    p.set("model", bundle.str);
+    p.set("model", folder.string());
     StepContext ctx;
     ctx.remote = &rw;
     const auto sent = [&worker] {
@@ -525,40 +534,25 @@ TEST_CASE("the foundation step keeps the labels the worker returns and reports i
         return worker.foundationParams;
     };
 
-    SECTION("Detect with a Min. voxels keeps its one-voxel objects") {
-        // the step used to run its own size filter after the worker's, on
-        // every task but Track: a detection is one voxel, so all were removed
-        p.set("task", std::string("Detect centroids"));
+    SECTION("Segment keeps small objects as the worker sent them") {
         p.set("min_voxels", std::int64_t{5});
         const StepOutput out = op.run(StepInput{meta, array, nullptr, nullptr}, p, ctx);
         REQUIRE(out.labels);
         CHECK(out.labels->at(0, 1, 1, 1) == 1u);
         CHECK(out.labels->at(1, 3, 7, 7) == 2u);
-        CHECK(out.labels->stats().size() >= 2);
         // the note carries the summary: it was read after the diagnostics were moved from
-        CHECK_THAT(out.note, Catch::Matchers::ContainsSubstring("detect · 2 labels"));
-        CHECK_THAT(out.diagnostics.summary, Catch::Matchers::ContainsSubstring("2 labels"));
+        CHECK_THAT(out.note, Catch::Matchers::ContainsSubstring("segment · 2 labels"));
+        CHECK_THAT(out.diagnostics.summary, Catch::Matchers::ContainsSubstring("stub v1"));
         const json params = sent();
-        CHECK(params.value("task", "") == "detect");
-        // (x, y, z), the application's order; the worker turns it into latents' (z, y, x)
+        CHECK(params.value("task", "") == "segment");
+        CHECK(params.value("model", "") == folder.string());
+        CHECK(params.value("min_voxels", 0) == 5);   // the worker applies it
+        // (x, y, z), the application's order; the worker compares it with model.json's
         CHECK(params["voxel_um"] == json::array({0.15, 0.15, 0.75}));
-        CHECK_FALSE(params.contains("tile"));   // all zero: the bundle's own
-    }
-    SECTION("Segment keeps small objects as the worker sent them") {
-        p.set("min_voxels", std::int64_t{5});
-        const StepOutput out = op.run(StepInput{meta, array, nullptr, nullptr}, p, ctx);
-        REQUIRE(out.labels);
-        CHECK(out.labels->at(1, 1, 1, 1) == 1u);
-        CHECK(sent().value("min_voxels", 0) == 5);   // the worker applies it
-    }
-    SECTION("a tracking run is tracked and its division count says it is approximate") {
-        p.set("task", std::string("Track over time"));
-        const StepOutput out = op.run(StepInput{meta, array, nullptr, nullptr}, p, ctx);
-        REQUIRE(out.labels);
-        CHECK(out.labels->tracked());
-        CHECK_THAT(out.note, Catch::Matchers::ContainsSubstring("2 tracks"));
-        CHECK(std::any_of(out.diagnostics.facts.begin(), out.diagnostics.facts.end(),
-                          [](const DiagnosticFact& f) { return f.key == "Divisions (approx.)" && f.value == "1"; }));
+        CHECK_FALSE(params.contains("tile"));
+        CHECK_FALSE(params.contains("min_separation"));
+        // what the worker warns about reaches the parameters dock
+        CHECK(std::find(out.diagnostics.warnings.begin(), out.diagnostics.warnings.end(), "a stub warning") != out.diagnostics.warnings.end());
     }
     SECTION("the request names the device the run was given, not the worker's own") {
         // "auto" was the device the worker process started on, kept for the session
@@ -579,16 +573,10 @@ TEST_CASE("the foundation step keeps the labels the worker returns and reports i
         (void)op.run(StepInput{meta, array, nullptr, nullptr}, p, ctx);
         CHECK(sent().value("device", "") == "cpu");
     }
-    SECTION("a tile with some extents given is sent, zero meaning the bundle's on that axis") {
-        p.set("tile", std::vector<double>{0, 32, 32});
-        (void)op.run(StepInput{meta, array, nullptr, nullptr}, p, ctx);
-        CHECK(sent()["tile"] == json::array({0, 32, 32}));
-    }
-    SECTION("a bundle this machine cannot see is left to the worker") {
-        // A bundle picked from a registry on a cluster lives on the worker's
-        // filesystem. Refusing it here, because it is not on this machine,
-        // made the HPC backend unable to run any registry bundle.
-        const std::string remote = "/cluster/only/registry/track-nih-ls-2d-pretrained.ltb";
+    SECTION("a model folder this machine cannot see is left to the worker") {
+        // A model picked from the cluster's models folder lives on the worker's
+        // filesystem: refusing it here would leave the HPC backend unable to run it.
+        const std::string remote = "/cluster/only/models/coat-sam-s2/v1";
         REQUIRE_FALSE(std::filesystem::exists(remote));
         p.set("model", remote);
         const Validation v = op.validate(p, meta);
@@ -601,15 +589,15 @@ TEST_CASE("the foundation step keeps the labels the worker returns and reports i
         p.set("model", std::string());
         CHECK_FALSE(op.validate(p, meta).ok());        // no model at all is still an error
     }
-    SECTION("Min. voxels is shown for Segment only") {
-        const auto spec = std::find_if(op.info().params.begin(), op.info().params.end(),
-                                       [](const ParamSpec& s) { return s.key == "min_voxels"; });
-        REQUIRE(spec != op.info().params.end());
-        CHECK(spec->visibleFor(p));
-        p.set("task", std::string("Detect centroids"));
-        CHECK_FALSE(spec->visibleFor(p));
-        p.set("task", std::string("Track over time"));
-        CHECK_FALSE(spec->visibleFor(p));
+    SECTION("Threshold is shown for Segment only, Min. voxels for both") {
+        const auto spec = [&op](const char* key) {
+            return *std::find_if(op.info().params.begin(), op.info().params.end(), [key](const ParamSpec& s) { return s.key == key; });
+        };
+        CHECK(spec("threshold").visibleFor(p));
+        CHECK(spec("min_voxels").visibleFor(p));
+        p.set("task", std::string(kPromptTask));
+        CHECK_FALSE(spec("threshold").visibleFor(p));
+        CHECK(spec("min_voxels").visibleFor(p));
     }
 }
 

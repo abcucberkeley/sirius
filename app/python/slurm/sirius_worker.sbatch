@@ -46,19 +46,49 @@
 # and point the app at localhost:7645 with the same token (Preferences ▸
 # Compute, HPC worker; or sirius-cli --hpc localhost:7645 with the token in
 # SIRIUS_HPC_TOKEN). See README.md next to this file.
+#
+# --check runs the checks instead, where the worker would run and as it would
+# run (the same image, binds, library path and environment), and starts
+# nothing: the launcher, the image, sirius and numpy (and torch) importing in
+# it, the worker's code visible inside it, `<engine> version` (SIRIUS's
+# engine runs there, and which build it is), the GPUs the step was given, the
+# data folders readable inside the image and the node cache folder writable.
+# One line each, `check <name> <ok|warn|fail> <words>`, and `@@version <json>`
+# for the engine's own answer; exit 0 unless one failed. The application runs
+# it in the job, as a step of its own, before every worker start:
+#
+#     srun --jobid=<job> --overlap --ntasks=1 [--gres=gpu:N] bash sirius_worker-<build>.sbatch --check [<host path> <path in the image>]...
+#
+# with the data folders as pairs after --check. Nothing is tried on the login
+# node: its scratch may be mounted noexec, the nodes' is not.
 
 set -euo pipefail
 # whatever the job writes is its owner's alone
 umask 077
+
+CHECK=0
+if [[ "${1:-}" == --check ]]; then
+    CHECK=1
+    shift
+fi
+CHECK_DATA=("$@")
+
+# A reason to stop, on stderr; with --check also as that check's line.
+stop() {   # stop <check> <exit code> <words>
+    local name="$1" rc="$2"
+    shift 2
+    if [[ "${CHECK}" == 1 ]]; then printf 'check %s fail %s\n' "${name}" "$*"; fi
+    echo "$*" >&2
+    exit "${rc}"
+}
 
 # --- the image -----------------------------------------------------------------
 # The worker always runs in a container image (SIRIUS_CONTAINER, below): the
 # node needs nothing installed but apptainer (or singularity), and the worker
 # runs against exactly the libraries the image was built with.
 if [[ -z "${SIRIUS_CONTAINER:-}" ]]; then
-    echo "SIRIUS_CONTAINER is not set: the worker runs in a container image (an Apptainer/Singularity .sif holding the" \
-         "compiled sirius package, numpy and torch); see app/python/slurm/README.md" >&2
-    exit 1
+    stop image 1 "SIRIUS_CONTAINER is not set: the worker runs in a container image (an Apptainer/Singularity .sif holding the" \
+         "compiled sirius package, numpy and torch); see app/python/slurm/README.md"
 fi
 
 # --- worker ------------------------------------------------------------------
@@ -66,7 +96,7 @@ fi
 # fixed port is one another user of the node could take first.
 SIRIUS_PORT="${SIRIUS_PORT:-0}"
 SIRIUS_DEVICE="${SIRIUS_DEVICE:-cuda}"
-if [[ -z "${SIRIUS_TOKEN_FILE:-}" && -z "${SIRIUS_TOKEN:-}" ]]; then
+if [[ "${CHECK}" == 0 && -z "${SIRIUS_TOKEN_FILE:-}" && -z "${SIRIUS_TOKEN:-}" ]]; then
     echo "neither SIRIUS_TOKEN_FILE nor SIRIUS_TOKEN is set; refusing to start an unauthenticated worker on a shared node" >&2
     exit 1
 fi
@@ -86,13 +116,50 @@ if [[ -z "${WORKER_DIR}" ]]; then
     done
 fi
 if [[ -z "${WORKER_DIR}" || ! -f "${WORKER_DIR}/sirius_worker/__main__.py" ]]; then
-    echo "cannot find sirius_worker${WORKER_DIR:+ in ${WORKER_DIR}}: submit from the sirius checkout, or set SIRIUS_WORKER_DIR=<checkout>/app/python" >&2
-    exit 1
+    stop worker 1 "cannot find sirius_worker${WORKER_DIR:+ in ${WORKER_DIR}} on $(hostname): submit from the sirius checkout, or set SIRIUS_WORKER_DIR=<checkout>/app/python"
 fi
 export PYTHONPATH="${WORKER_DIR}${PYTHONPATH:+:$PYTHONPATH}"
 
-echo "sirius worker on $(hostname) (device ${SIRIUS_DEVICE}), job ${SLURM_JOB_ID:-?}; its port is in the {\"port\": ...} line below"
-echo "tunnel:  ssh -N -L 7645:$(hostname):<port> <login-node>"
+if [[ "${CHECK}" == 0 ]]; then
+    echo "sirius worker on $(hostname) (device ${SIRIUS_DEVICE}), job ${SLURM_JOB_ID:-?}; its port is in the {\"port\": ...} line below"
+    echo "tunnel:  ssh -N -L 7645:$(hostname):<port> <login-node>"
+fi
+
+# --- the job's GPUs ----------------------------------------------------------
+# srun --gres=gpu:N gives the step the job's GPUs, and Slurm names them in
+# CUDA_VISIBLE_DEVICES (SLURM_STEP_GPUS or SLURM_JOB_GPUS where it sets none).
+# The image is entered with --cleanenv, which would leave that behind, and
+# CUDA in the image would then see every GPU of a node that does not confine
+# a job's devices: it goes in with the environment file below. A step given
+# more GPUs than the job asked for (SIRIUS_GPUS, which the application sets)
+# is held to the first of them, and says so.
+GPU_IDS=""
+GPU_SET=0
+GPU_NOTE=""
+WANT_GPUS=0
+if [[ "${SIRIUS_DEVICE}" != cpu ]]; then
+    WANT_GPUS="${SIRIUS_GPUS:-}"
+    if [[ -n "${CUDA_VISIBLE_DEVICES+x}" ]]; then
+        GPU_IDS="${CUDA_VISIBLE_DEVICES}"
+        GPU_SET=1
+    elif [[ -n "${SLURM_STEP_GPUS:-${SLURM_JOB_GPUS:-}}" ]]; then
+        GPU_IDS="${SLURM_STEP_GPUS:-${SLURM_JOB_GPUS:-}}"
+        GPU_SET=1
+    fi
+    if [[ "${GPU_SET}" == 1 && "${WANT_GPUS}" =~ ^[1-9][0-9]*$ ]]; then
+        IFS=, read -r -a GIDS <<< "${GPU_IDS}"
+        if (( ${#GIDS[@]} > WANT_GPUS )); then
+            GPU_NOTE="the step was given ${#GIDS[@]} GPUs (${GPU_IDS}), the job asked for ${WANT_GPUS}: held to "
+            GPU_IDS="$(IFS=,; echo "${GIDS[*]:0:WANT_GPUS}")"
+            GPU_NOTE+="${GPU_IDS}"
+        fi
+    fi
+    if [[ "${GPU_SET}" == 1 ]]; then export CUDA_VISIBLE_DEVICES="${GPU_IDS}"; fi
+    if [[ "${CHECK}" == 0 ]]; then
+        if [[ "${GPU_SET}" == 1 ]]; then echo "GPUs: CUDA_VISIBLE_DEVICES=${GPU_IDS}${GPU_NOTE:+ (${GPU_NOTE})}"
+        else echo "GPUs: Slurm named none for this step (no CUDA_VISIBLE_DEVICES): CUDA sees every GPU the node shows it"; fi
+    fi
+fi
 
 # No --allow-install: on a shared node the worker must not run pip or conda
 # on a client's request (see ../SECURITY.md). Install the model packages into
@@ -139,17 +206,88 @@ if [[ "${SIRIUS_ENGINE:-0}" == 1 ]]; then
         CMD=(/bin/sh -c 'd=$1; shift; LD_LIBRARY_PATH="$d/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"; export LD_LIBRARY_PATH; exec "$@"' \
              sirius-engine "${ENGINE_HOME}" "${CMD[@]}")
     fi
-    echo "SIRIUS engine: ${ENGINE_BIN} serve (the Python worker beside it, from ${WORKER_DIR})"
+    if [[ "${CHECK}" == 0 ]]; then echo "SIRIUS engine: ${ENGINE_BIN} serve (the Python worker beside it, from ${WORKER_DIR})"; fi
 fi
 
 # The engine was asked for and is not there: said on stdout in the form the
-# application reads ({"error": ...}) and on stderr, and nothing is started.
+# application reads ({"error": ...}; with --check its check line) and on
+# stderr, and nothing is started.
 engine_missing() {
     local msg="SIRIUS's C++ engine is not at $1 ($2): set Engine builds folder (Job > More options) to the folder holding per-commit builds, or Engine executable to one"
-    printf '{"error": "engine_missing", "path": "%s"}\n' "$1"
+    if [[ "${CHECK}" == 1 ]]; then printf 'check engine-missing fail %s (%s)\n' "$1" "$2"
+    else printf '{"error": "engine_missing", "path": "%s"}\n' "$1"; fi
     echo "${msg}" >&2
     exit 3
 }
+
+# --- what --check runs inside the image ------------------------------------------
+# /bin/sh -c "$CHECK_BODY" sirius-check <worker dir> <engine> <engine build>
+#     <node cache> <GPUs asked for> <GPU note> [<n> <data folder in the image>]...
+# Each line `check <name> <ok|warn|fail> <words>`; exit 1 when one failed.
+read -r -d '' CHECK_BODY <<'SH' || true
+W=$1 E=$2 H=$3 S=$4 G=$5 N=$6
+shift 6
+bad=0
+echo "check image ok starts on $(uname -n)"
+# the engine's own libraries in front, as the engine (and its Python child) get them
+if [ -n "$H" ] && [ -d "$H/lib" ]; then
+    LD_LIBRARY_PATH="$H/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+    export LD_LIBRARY_PATH
+fi
+# a folder named sirius (a checkout in the working directory) imports as an empty namespace: not the package
+if out=$(python -c 'import sys, importlib.util as u
+import sirius, numpy
+assert getattr(sirius, "__file__", None), "sirius is only a folder named so, not the compiled package"
+print("check python ok python %d.%d, sirius, numpy" % sys.version_info[:2])
+print("check torch ok in the image" if u.find_spec("torch") else "check torch warn not in the image: models will not run")' 2>&1); then
+    printf '%s\n' "$out"
+else
+    printf '%s\n' "$out"
+    echo "check python fail sirius and numpy do not import in the image"
+    bad=1
+fi
+if [ -f "$W/sirius_worker/__main__.py" ]; then echo "check worker ok $W"
+else echo "check worker fail $W/sirius_worker is not there inside the image"; bad=1; fi
+if [ -n "$E" ] && [ ! -f "$E" ]; then
+    echo "check engine-missing fail $E is not there inside the image"
+    bad=1
+elif [ -n "$E" ]; then
+    out=$("$E" version 2>&1)
+    rc=$?
+    if [ "$rc" = 0 ]; then
+        printf '@@version %s\n' "$(printf '%s' "$out" | tr -d '\r\n')"
+        echo "check engine ok $E"
+    else
+        printf '%s\n' "$out"
+        echo "check engine fail $(basename "$E") version exited with $rc"
+        bad=1
+    fi
+fi
+if [ "$G" != 0 ]; then
+    k=$(nvidia-smi -L 2>/dev/null | grep -c '^GPU ')
+    if [ -z "${CUDA_VISIBLE_DEVICES+x}" ]; then
+        if [ "$k" -gt 0 ]; then echo "check gpu warn Slurm named no GPU for this step (no CUDA_VISIBLE_DEVICES): CUDA sees all $k GPUs of the node"
+        else echo "check gpu warn no GPU is visible in the image (nvidia-smi lists none)"; fi
+    else
+        n=$(printf '%s' "$CUDA_VISIBLE_DEVICES" | tr ',' '\n' | grep -c .)
+        if [ "$n" = 0 ]; then echo "check gpu warn CUDA_VISIBLE_DEVICES is empty: no GPU is visible"
+        elif [ "$k" = 0 ]; then echo "check gpu warn CUDA_VISIBLE_DEVICES=$CUDA_VISIBLE_DEVICES, but nvidia-smi sees no GPU in the image"
+        elif [ -n "$G" ] && [ "$n" != "$G" ]; then echo "check gpu warn $n visible (CUDA_VISIBLE_DEVICES=$CUDA_VISIBLE_DEVICES), the job asked for $G${N:+; $N}"
+        else echo "check gpu ok $n visible (CUDA_VISIBLE_DEVICES=$CUDA_VISIBLE_DEVICES)${N:+; $N}"; fi
+    fi
+fi
+while [ $# -ge 2 ]; do
+    if [ -d "$2" ] && ls "$2" >/dev/null 2>&1; then echo "check data:$1 ok $2"
+    else echo "check data:$1 fail $2 cannot be read inside the image"; bad=1; fi
+    shift 2
+done
+if [ -n "$S" ]; then
+    t="$S/.sirius-check.$$"
+    if mkdir -p "$S" 2>/dev/null && touch "$t" 2>/dev/null; then rm -f "$t"; echo "check cache ok $S"
+    else echo "check cache fail cannot write to $S"; bad=1; fi
+fi
+exit $bad
+SH
 
 # --- the container -------------------------------------------------------------
 # SIRIUS_CONTAINER=<image.sif> runs the worker inside that image. This is the
@@ -181,35 +319,41 @@ engine_missing() {
     fi
     RUNTIME="$(command -v "${RUNTIME}" || command -v apptainer || command -v singularity || true)"
     if [[ -z "${RUNTIME}" ]]; then
-        echo "neither ${SIRIUS_LAUNCHER:-apptainer} nor singularity can be run here (module load was tried)" >&2; exit 1
+        stop launcher 1 "neither ${SIRIUS_LAUNCHER:-apptainer} nor singularity can be run on $(hostname) (module load was tried)"
     fi
+    if [[ "${CHECK}" == 1 ]]; then printf 'check launcher ok %s\n' "$(basename "${RUNTIME}")"; fi
     if [[ ! -r "${SIRIUS_CONTAINER}" ]]; then
-        echo "SIRIUS_CONTAINER=${SIRIUS_CONTAINER} is not readable" >&2; exit 1
+        stop image 1 "SIRIUS_CONTAINER=${SIRIUS_CONTAINER} is not readable on $(hostname)"
     fi
     # the engine, when asked for, is there before anything starts: on this file
     # system (a build folder, bound into the image) or inside the image itself
+    # (--check tries the image's own when it runs `<engine> version` there)
     if [[ "${SIRIUS_ENGINE:-0}" == 1 && ! -x "${ENGINE_BIN}" ]]; then
-        [[ -n "${ENGINE_HOME}" ]] && engine_missing "${ENGINE_BIN}" "no executable file there"
-        "${RUNTIME}" exec --cleanenv "${SIRIUS_CONTAINER}" test -x "${ENGINE_BIN}" </dev/null >/dev/null 2>&1 ||
-            engine_missing "${ENGINE_BIN}" "not in the image ${SIRIUS_CONTAINER}"
+        if [[ -n "${ENGINE_HOME}" ]]; then engine_missing "${ENGINE_BIN}" "no executable file there on $(hostname)"; fi
+        if [[ "${CHECK}" == 0 ]]; then
+            "${RUNTIME}" exec --cleanenv "${SIRIUS_CONTAINER}" test -x "${ENGINE_BIN}" </dev/null >/dev/null 2>&1 ||
+                engine_missing "${ENGINE_BIN}" "not in the image ${SIRIUS_CONTAINER}"
+        fi
     fi
     RUNDIR="${SIRIUS_RUNDIR:-$HOME/.sirius/run}"; mkdir -p "${RUNDIR}"
     TOKEN_FILE="${SIRIUS_TOKEN_FILE:-}"
-    if [[ -z "${TOKEN_FILE}" ]]; then                 # only $SIRIUS_TOKEN was given
+    if [[ "${CHECK}" == 0 && -z "${TOKEN_FILE}" ]]; then   # only $SIRIUS_TOKEN was given
         TOKEN_FILE="$(mktemp "${RUNDIR}/token.XXXXXX")"; chmod 600 "${TOKEN_FILE}"
         printf '%s' "${SIRIUS_TOKEN}" > "${TOKEN_FILE}"
     fi
     ENV_FILE="$(mktemp "${RUNDIR}/env.XXXXXX")"; chmod 600 "${ENV_FILE}"
     {
         printf 'PYTHONPATH=%s\n' "${WORKER_DIR}${SIRIUS_CONTAINER_PYTHONPATH:+:${SIRIUS_CONTAINER_PYTHONPATH}}"
-        printf 'SIRIUS_TOKEN_FILE=%s\n' "${TOKEN_FILE}"
+        if [[ -n "${TOKEN_FILE}" ]]; then printf 'SIRIUS_TOKEN_FILE=%s\n' "${TOKEN_FILE}"; fi
         # The application reads the worker's port from the {"port": N} line, and a container's
         # stdout is a pipe, so python block-buffers it and the line never arrives: the worker looks
         # dead while it is serving. Cost one silent start on 2026-10-02.
         printf 'PYTHONUNBUFFERED=1\n'
+        # the step's GPUs (above): --cleanenv leaves Slurm's own word for them behind
+        if [[ "${GPU_SET}" == 1 ]]; then printf 'CUDA_VISIBLE_DEVICES=%s\n' "${GPU_IDS}"; fi
         for v in SIRIUS_LATENTS_PATH SIRIUS_MODEL_DIR HF_HOME MPLCONFIGDIR TORCH_HOME \
                  CELLPOSE_LOCAL_MODELS_PATH MICROSAM_CACHEDIR; do
-            [[ -n "${!v:-}" ]] && printf '%s=%s\n' "$v" "${!v}"
+            if [[ -n "${!v:-}" ]]; then printf '%s=%s\n' "$v" "${!v}"; fi
         done
     } > "${ENV_FILE}"
     GPU=(); [[ "${SIRIUS_DEVICE}" == cpu ]] || GPU=(--nv)
@@ -222,7 +366,7 @@ engine_missing() {
     # and the per-commit engine build it runs (SIRIUS_ENGINE_DIR)
     SCRATCH=()
     if [[ "${SIRIUS_ENGINE:-0}" == 1 && -n "${SIRIUS_ENGINE_SCRATCH:-}" ]]; then
-        mkdir -p "${SIRIUS_ENGINE_SCRATCH}" || { echo "cannot make the node cache folder ${SIRIUS_ENGINE_SCRATCH}" >&2; exit 1; }
+        mkdir -p "${SIRIUS_ENGINE_SCRATCH}" || stop cache 1 "cannot make the node cache folder ${SIRIUS_ENGINE_SCRATCH} on $(hostname)"
         SCRATCH=("${SIRIUS_ENGINE_SCRATCH}")
     fi
     [[ "${SIRIUS_ENGINE:-0}" == 1 && -n "${ENGINE_HOME}" ]] && SCRATCH+=("${ENGINE_HOME}")
@@ -230,6 +374,34 @@ engine_missing() {
         case "$(cd "$d" && pwd -P)/" in "$(cd "$HOME" && pwd -P)/"*) ;; *) BIND+=(--bind "$d") ;; esac
     done
     EXTRA=(); [[ -n "${SIRIUS_CONTAINER_ARGS:-}" ]] && read -r -a EXTRA <<< "${SIRIUS_CONTAINER_ARGS}"
+
+    if [[ "${CHECK}" == 1 ]]; then
+        # The data folders (pairs after --check): there on this node first --
+        # apptainer stops on a bind whose host path is not -- then readable
+        # inside the image.
+        DATA=()
+        missing=0
+        i=0
+        while (( i + 1 < ${#CHECK_DATA[@]} )); do
+            if [[ -e "${CHECK_DATA[i]}" ]]; then DATA+=("$((i / 2))" "${CHECK_DATA[i + 1]}")
+            else
+                printf 'check data:%d fail %s is not on %s\n' "$((i / 2))" "${CHECK_DATA[i]}" "$(hostname)"
+                missing=1
+            fi
+            i=$((i + 2))
+        done
+        if [[ "${missing}" == 1 ]]; then rm -f "${ENV_FILE}"; exit 1; fi
+        ENGINE_ARG=""
+        if [[ "${SIRIUS_ENGINE:-0}" == 1 ]]; then ENGINE_ARG="${ENGINE_BIN}"; fi
+        rc=0
+        "${RUNTIME}" exec "${GPU[@]}" --cleanenv "${BIND[@]}" "${EXTRA[@]}" \
+            --env-file "${ENV_FILE}" --pwd "${WORKER_DIR}" \
+            "${SIRIUS_CONTAINER}" /bin/sh -c "${CHECK_BODY}" sirius-check "${WORKER_DIR}" "${ENGINE_ARG}" "${ENGINE_HOME}" \
+            "${SIRIUS_ENGINE_SCRATCH:-}" "${WANT_GPUS}" "${GPU_NOTE}" ${DATA[@]+"${DATA[@]}"} < /dev/null 2>&1 || rc=$?
+        rm -f "${ENV_FILE}"
+        exit "${rc}"
+    fi
+
     echo "container: ${SIRIUS_CONTAINER} via $(basename "${RUNTIME}")${SIRIUS_CONTAINER_BIND:+, binds ${SIRIUS_CONTAINER_BIND}}"
     # The env file holds no secret (the token lives in its own 0600 file, which
     # the worker deletes), so handing the process over with exec is safe.

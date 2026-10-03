@@ -726,7 +726,12 @@ namespace sirius::app::gui {
                 ImGui::SameLine(0.0f, px(8));
                 ImGui::BeginGroup();
                 const ImU32 ink = o.kind == K::Ok ? kGreen : (o.kind == K::Failed ? theme::kAccentText : theme::kText);
-                widgets::textWrapped(o.text, 13, ink, theme::Weight::SemiBold, ImGui::GetContentRegionAvail().x);
+                // a failure is copied into a report: with its details, when there are some
+                if (o.kind == K::Failed)
+                    widgets::copyableText("##loginFailure", o.text, 13, ink, theme::Weight::SemiBold, ImGui::GetContentRegionAvail().x,
+                                          o.details.empty() || o.details == o.text ? std::string() : o.text + "\n\n" + o.details);
+                else
+                    widgets::textWrapped(o.text, 13, ink, theme::Weight::SemiBold, ImGui::GetContentRegionAvail().x);
                 if (o.kind == K::Ok) {
                     if (info_) {
                         const std::string what = info_->error.empty() ? std::to_string(info_->partitions.size()) + " partitions found" + (info_->home.empty() ? std::string() : " \xC2\xB7 home " + info_->home)
@@ -880,6 +885,8 @@ namespace sirius::app::gui {
                 const bool editable = !held && !busy;
                 const float gap = px(10);
                 if (!cluster::wizard::loggedIn(st, host()) && !held) describe("Not logged in: Connect on page 1 first. The lists below fill from the cluster then.", kAmber);
+                // a job of the user's own, in place of a new one
+                drawYourJobs(link, st);
                 widgets::FieldOpts fo;
                 fo.enabled = editable;
                 // the node type
@@ -985,6 +992,58 @@ namespace sirius::app::gui {
                 // the rest, folded
                 widgets::vspace(2);
                 if (disclosure("##more", "More options\xE2\x80\xA6", &moreOpen_)) drawMoreOptions(app, link, st);
+            }
+
+            // The user's jobs that run or wait on the cluster (any of them),
+            // each with "Use this job": SIRIUS's worker then runs in it as a
+            // step, and SIRIUS never cancels it. A job taken up so says so.
+            void drawYourJobs(ClusterLink& link, const cluster::Status& st) {
+                const bool held = cluster::wizard::jobHeld(st);
+                if (held && st.adopted) {
+                    describe("Job " + st.jobId + " was yours before SIRIUS: SIRIUS's worker runs in it as a step, and SIRIUS never cancels it "
+                                                 "(Disconnect leaves it running).");
+                    return;
+                }
+                if (held || !cluster::wizard::loggedIn(st, host())) return;
+                ClusterLink::UserJobs jobs = link.userJobs();
+                if ((!jobs.known && !jobs.loading) || jobs.host != st.host) {
+                    link.refreshJobs();
+                    jobs = link.userJobs();
+                }
+                if (!disclosure("##yourJobs", "Your jobs on " + st.host + (jobs.known ? " (" + std::to_string(jobs.jobs.size()) + ")" : std::string()), &yourJobsOpen_))
+                    return;
+                const bool busy = cluster::wizard::busy(st);
+                {
+                    widgets::ButtonOpts r;
+                    r.small = true;
+                    r.kind = widgets::ButtonKind::Ghost;
+                    r.enabled = !jobs.loading;
+                    r.tooltip = "Ask the cluster again (squeue)";
+                    if (widgets::button(jobs.loading ? "Asking\xE2\x80\xA6##jobsRefresh" : "Refresh##jobsRefresh", r)) link.refreshJobs();
+                }
+                if (!jobs.error.empty()) describe("Your jobs could not be listed: " + jobs.error, theme::kAccentText);
+                else if (jobs.known && jobs.jobs.empty())
+                    describe("None runs or waits: Start job below asks for one.");
+                for (const cluster::ClusterJob& j : jobs.jobs) {
+                    ImGui::PushID(j.id.c_str());
+                    widgets::ButtonOpts b;
+                    b.small = true;
+                    b.enabled = !busy;
+                    b.tooltip = "Take up job " + j.id + " as it is, in place of a new job: SIRIUS's worker runs in it as a step (srun --overlap) "
+                                                        "with its " +
+                                (j.gpus > 0 ? std::to_string(j.gpus) + (j.gpus == 1 ? " GPU" : " GPUs") : std::string("CPUs")) +
+                                ", after the checks on its node. SIRIUS never cancels it.";
+                    if (widgets::button("Use this job", b)) {
+                        profileToUse();
+                        saveSaying(link);
+                        link.adoptJob(profileToUse(), j.id);
+                    }
+                    ImGui::SameLine(0.0f, px(8));
+                    widgets::textWrapped(j.id + " \xC2\xB7 " + j.name + " \xC2\xB7 " + j.partition + " \xC2\xB7 " + cluster::jobSummary(j), 12,
+                                         j.running() ? theme::kText : theme::kNeutral700, theme::Weight::Regular, ImGui::GetContentRegionAvail().x);
+                    ImGui::PopID();
+                }
+                widgets::vspace(4);
             }
 
             // Under the node type: what it has, and what to know before submitting there.
@@ -1105,6 +1164,10 @@ namespace sirius::app::gui {
                     label = "Stop##job";
                     b.kind = widgets::ButtonKind::Secondary;
                     b.tooltip = "Stop waiting (a job already submitted is taken up again by Start job)";
+                } else if (held && st.adopted) {
+                    label = "Let go of this job\xE2\x80\xA6##job";
+                    b.kind = widgets::ButtonKind::Secondary;
+                    b.tooltip = "Job " + st.jobId + " was yours before SIRIUS: it is never cancelled. Let go of it (it keeps running) to use another; you stay logged in";
                 } else if (held) {
                     label = "Change job\xE2\x80\xA6##job";
                     b.kind = widgets::ButtonKind::Secondary;
@@ -1147,8 +1210,13 @@ namespace sirius::app::gui {
                 ImGui::SameLine(0.0f, px(6));
                 const float y = ImGui::GetCursorPosY();
                 ImGui::SetCursorPosY(y + std::max(0.0f, (lineH - ImGui::GetTextLineHeight()) * 0.5f));
-                widgets::textWrapped(line.text, 12, color, line.kind == cluster::wizard::JobLine::Kind::None ? theme::Weight::Regular : theme::Weight::SemiBold,
-                                     ImGui::GetContentRegionAvail().x);
+                if (line.kind == cluster::wizard::JobLine::Kind::Failed)
+                    widgets::copyableText("##jobFailure", line.text, 12, color, theme::Weight::SemiBold, ImGui::GetContentRegionAvail().x,
+                                          line.text + (st.fix.empty() ? std::string() : "\n" + st.fix) +
+                                              (st.remoteOutput.empty() ? std::string() : "\n\n" + st.remoteOutput));
+                else
+                    widgets::textWrapped(line.text, 12, color, line.kind == cluster::wizard::JobLine::Kind::None ? theme::Weight::Regular : theme::Weight::SemiBold,
+                                         ImGui::GetContentRegionAvail().x);
                 ImGui::EndGroup();
                 if (line.kind == cluster::wizard::JobLine::Kind::Failed) {
                     if (!st.fix.empty()) describe(st.fix, theme::kText);
@@ -1377,7 +1445,16 @@ namespace sirius::app::gui {
                     }
                     mark(ink, 18, lineH);
                     ImGui::SameLine(0.0f, px(8));
-                    widgets::textWrapped(r.headline, 14, color, theme::Weight::Bold, ImGui::GetContentRegionAvail().x);
+                    if (r.verdict == V::Failed) {
+                        // the whole report goes to the clipboard: headline, what to do, the rows, the details
+                        std::string report = r.headline;
+                        if (!r.fix.empty()) report += "\n" + r.fix;
+                        for (const cluster::wizard::HealthRow& row : r.rows) report += "\n" + row.label + ": " + row.value;
+                        if (!r.details.empty()) report += "\n\n" + r.details;
+                        widgets::copyableText("##healthFailure", r.headline, 14, color, theme::Weight::Bold, ImGui::GetContentRegionAvail().x, report);
+                    } else {
+                        widgets::textWrapped(r.headline, 14, color, theme::Weight::Bold, ImGui::GetContentRegionAvail().x);
+                    }
                 }
                 if (r.verdict == V::Failed && !r.fix.empty()) {
                     widgets::text("What to do", 11, theme::kText, theme::Weight::SemiBold);
@@ -1412,6 +1489,9 @@ namespace sirius::app::gui {
                         const ImU32 color = row.mark == cluster::wizard::Mark::Fail ? theme::kAccentText
                                                                                     : (row.mark == cluster::wizard::Mark::Warn ? kAmber : theme::kNeutral800);
                         widgets::textWrapped(row.value, 12, color, theme::Weight::Regular, ImGui::GetContentRegionAvail().x);
+                        ImGui::PushID(static_cast<int>(i));
+                        widgets::copyOnRightClick("##rowCopy", row.label + ": " + row.value);
+                        ImGui::PopID();
                     }
                     ImGui::EndTable();
                 }
@@ -1526,6 +1606,7 @@ namespace sirius::app::gui {
             std::optional<Page> forcePage_;              // screenshots
             bool openList_ = false;
             bool moreOpen_ = false;
+            bool yourJobsOpen_ = true;   // the user's own jobs on the Job page
             bool buildOpen_ = false;
             bool detailsOpen_ = false;
             bool querying_ = false;                      // the partitions being listed

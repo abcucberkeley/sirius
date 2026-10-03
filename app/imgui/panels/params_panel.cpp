@@ -21,6 +21,7 @@
 #include <sirius/device.hpp>
 
 #include "core/labels.hpp"
+#include "core/model_folder.hpp"
 #include "core/ops/common.hpp"
 #include "core/ops/contrast.hpp"
 #include "core/ops/load.hpp"
@@ -29,6 +30,7 @@
 #include "imgui/cluster_link.hpp"
 #include "imgui/dialogs/dialogs.hpp"
 #include "imgui/platform.hpp"
+#include "imgui/settings.hpp"
 #include "imgui/strings.hpp"
 #include "imgui/theme.hpp"
 #include "imgui/viewer/viewer.hpp"
@@ -110,6 +112,36 @@ namespace sirius::app::gui {
             }
             ImGui::PopStyleVar(2);
             ImGui::PopStyleColor();
+        }
+
+        // The header of a section that folds (Backend, Cache output): a
+        // chevron and the caption, `right` at the end while it is open, and
+        // folded the `summary` line in place of the section. The whole row
+        // toggles it: true on the click.
+        bool sectionHeader(const char* id, const char* caption, const std::string& summary, const std::string& right, bool open, float x,
+                           float y, float width, float h) {
+            place(x, y);
+            const bool clicked = ImGui::InvisibleButton(id, ImVec2(std::max(1.0f, width), h));
+            const bool hovered = ImGui::IsItemHovered();
+            if (hovered) ImGui::SetMouseCursor(ImGuiMouseCursor_Hand);
+            tip(open ? std::string("Fold to one line") : summary + "\nClick to unfold");
+            ImDrawList* dl = ImGui::GetWindowDrawList();
+            const ImU32 ink = hovered ? theme::kAccentText : theme::kNeutral600;
+            const float chevron = px(10);
+            drawIcon(dl, ImVec2(x + chevron * 0.5f, y + h * 0.5f), chevron, open ? Icon::ChevronDown : Icon::ChevronRight, ink, px(1.25f));
+            const float tx = x + chevron + px(6);
+            const float rightW = open && !right.empty() ? theme::textSize(right, 11).x : 0.0f;
+            if (open || summary.empty()) {
+                const std::string shown = fitCaption(caption, std::max(px(10), x + width - tx - (rightW > 0.0f ? rightW + px(8) : 0.0f)));
+                place(tx, y + (h - captionHeight()) * 0.5f);
+                widgets::caption(shown, ink);
+                if (rightW > 0.0f) widgets::drawTextIn(dl, ImVec2(x + width - rightW, y), ImVec2(x + width, y + h), right, 11, theme::kNeutral700,
+                                                       Weight::Regular, 1.0f, 0.5f);
+            } else {
+                widgets::drawTextIn(dl, ImVec2(tx, y), ImVec2(x + width, y + h), widgets::elideText(summary, std::max(px(10), x + width - tx), 11), 11,
+                                    hovered ? theme::kAccentText : theme::kNeutral700, Weight::Regular, 0.0f, 0.5f);
+            }
+            return clicked;
         }
 
         // The heights and natural widths widgets::button gives its buttons.
@@ -409,7 +441,7 @@ namespace sirius::app::gui {
 
         // --- generic editors -----------------------------------------------------------
         // A file / directory field with Browse, and optionally one more button
-        // after it (Hub…, Bundles…). `opensDataset`: the Load step's Source,
+        // after it (Hub…, Models…). `opensDataset`: the Load step's Source,
         // where a path chosen while no dataset is open opens it -- nothing
         // else would, and the form says to choose a file there. It goes
         // through the Open dataset dialog, as File ▸ Open dataset… does, so a
@@ -445,9 +477,17 @@ namespace sirius::app::gui {
                 start = slash == std::string::npos || slash == 0 ? std::string("/") : remote.substr(0, slash);
             }
             a->defer([this, a, key, dir, start, forStep, opensDataset] {
-                a->showDialog(makeClusterBrowser(*a, start, dir, [this, a, key, forStep, opensDataset](const std::string& chosen) {
+                a->showDialog(makeClusterBrowser(*a, start, dir, [this, a, key, forStep, opensDataset, dir](const std::string& chosen) {
                     if (chosen.empty() || selectedId() != forStep) return;
                     bufs.erase(key);
+                    // a folder of stacks on the cluster: the folder dialog of File ▸ Open folder as
+                    // dataset describes it (pattern, preview), keeps its manifest on the cluster and
+                    // opens it; a store or a manifest is the Source as it is
+                    if (opensDataset && dir && !endsWithNoCase(chosen, ".zarr") && !endsWithNoCase(chosen, ".n5") &&
+                        !endsWithNoCase(chosen, ".toml")) {
+                        a->showDialog(makeFolderDatasetDialog(*a, chosen));
+                        return;
+                    }
                     if (opensDataset && !wb().hasDataset()) a->openDatasetPath(chosen);
                     else wb().setStepParam(index(), key, chosen);
                 }));
@@ -1027,17 +1067,20 @@ namespace sirius::app::gui {
             if (!diagnostics.warnings.empty()) {
                 gap();
                 widgets::rule(theme::kRule);
-                for (const std::string& w : diagnostics.warnings) {
+                for (std::size_t k = 0; k < diagnostics.warnings.size(); ++k) {
                     gap();
-                    widgets::textWrapped(w, 11, theme::kNeutral600, Weight::Regular, formW);
+                    ImGui::PushID(static_cast<int>(k));
+                    widgets::copyableText("##warning", diagnostics.warnings[k], 11, theme::kNeutral600, Weight::Regular, formW);
+                    ImGui::PopID();
                 }
             }
         }
 
-        // The foundation step's model is a bundle, and a bundle is picked from
-        // the registry rather than found on disk: what distinguishes two .ltb
-        // files is inside them (task, voxel size, the thresholds they were
-        // validated at), and a file dialog shows none of it.
+        // The Foundation step's model is a folder (model.py, model.json, the
+        // weights): Browse picks one, on this computer or on the cluster, and
+        // Models… lists those of the models folders with what each is for.
+        // Under the field, what model.json says; the Task choice offers only
+        // the tasks it lists (Prompt only for a model with a prompt decoder).
         void buildFoundation(const ParamSet& params, const OpInfo& info, const DatasetMeta& input) {
             std::vector<std::string> done;
             for (const ParamSpec& s : info.params) {
@@ -1046,14 +1089,41 @@ namespace sirius::app::gui {
                 gap();
                 fieldLabel(s.label, formW);
                 ImGui::PushID(key.c_str());
-                pathEditor(s, params, formW, "Bundles…",
-                           "Choose from the bundles in the registry, with what each was trained for and calibrated at",
+                pathEditor(s, params, formW, "Modelsâ¦",
+                           "Choose from the models in your models folders (sirius-app.toml [models], and the cluster's while "
+                           "connected), with their tasks and what each is for",
                            [this, key] { openHub(key, true); });
                 ImGui::PopID();
                 done.push_back(key);
                 break;
             }
-            generic(info.params, params, input, false, done);
+            const std::string model = params.getString("model");
+            std::optional<ModelFolderFacts> facts;
+            std::string about;
+            if (!model.empty()) {
+                std::string why;
+                if (startsWith(model, "cluster://")) {
+                    if (const std::optional<nlohmann::json> j = wb().clusterModelInfo(model, &why)) facts = modelFactsFromJson(*j, &why);
+                    else if (why.empty()) why = "Reading model.json on the clusterâ¦";
+                } else if (pathExists(model)) {
+                    facts = readModelFolder(model, &why);
+                }
+                if (facts) about = facts->title() + (facts->description.empty() ? std::string() : " â " + facts->description);
+                else about = why;   // a folder not on this machine: the step's own warning says so
+            }
+            if (!about.empty()) {
+                gap();
+                widgets::textWrapped(about, 11, theme::kNeutral600, Weight::Regular, formW);
+            }
+            std::vector<ParamSpec> specs = info.params;
+            for (ParamSpec& s : specs) {
+                if (s.key != "task") continue;
+                s.choices = modelTaskChoices(facts);
+                // a task the model does not offer stays shown while chosen: the step's error names it
+                const std::string current = params.getString("task");
+                if (!current.empty() && std::find(s.choices.begin(), s.choices.end(), current) == s.choices.end()) s.choices.push_back(current);
+            }
+            generic(specs, params, input, false, done);
         }
 
         // A Prompt step's prompts: what the viewer's Prompt tool places (Box,
@@ -1224,12 +1294,12 @@ namespace sirius::app::gui {
         }
 
         // Hugging Face, the model cache and the model families (or the
-        // foundation bundles) in one dialog; its choice becomes the step's model.
-        void openHub(const std::string& key, bool bundles) {
+        // Foundation step's model folders) in one dialog; its choice becomes the step's model.
+        void openHub(const std::string& key, bool models) {
             App* a = &app;
             const StepId forStep = selectedId();
-            a->defer([this, a, key, bundles, forStep] {
-                a->showDialog(makeModelHubDialog(*a, bundles, [this, key, forStep](const std::string& chosen) {
+            a->defer([this, a, key, models, forStep] {
+                a->showDialog(makeModelHubDialog(*a, models, [this, key, forStep](const std::string& chosen) {
                     if (chosen.empty() || selectedId() != forStep) return;
                     bufs.erase(key);
                     wb().setStepParam(index(), key, chosen);
@@ -1510,35 +1580,43 @@ namespace sirius::app::gui {
                 placeEnd(at.x, at.y + px(theme::kInputH));
             }
 
-            // Auto / Reset
+            // Auto / Reset: one press; an input on the cluster is measured
+            // there and the answer applied when it arrives (Workbench::requestContrast)
             gap();
             {
                 const ImVec2 at = ImGui::GetCursorScreenPos();
+                const std::optional<Workbench::ContrastRequest> asked = wb().contrastRequest(index());
                 widgets::ButtonOpts ao;
                 ao.small = true;
-                ao.enabled = formEnabled;
+                ao.enabled = formEnabled && !asked;
                 ao.tooltip = "Min / max on the input's percentiles (see More parameters)";
                 if (widgets::button("Auto##auto", ao))
-                    onStep([this](int i) {
-                        if (const std::optional<ParamSet> p = wb().contrastAutoOf(i, wb().pipeline().at(i).params))
-                            wb().setStepParams(i, *p, "Auto contrast");
-                        else if (wb().upstreamOutput(i))
-                            wb().logLine("Auto contrast: the cluster node is measuring the input; press Auto again in a moment.");
-                    });
-                place(at.x + buttonWidth("Auto", true, 10) + px(8), at.y);
+                    onStep([this](int i) { wb().requestContrast(i, Workbench::ContrastAction::Auto); });
+                float x = at.x + buttonWidth("Auto", true, 10) + px(8);
+                place(x, at.y);
                 widgets::ButtonOpts ro;
                 ro.kind = widgets::ButtonKind::Ghost;
                 ro.small = true;
-                ro.enabled = formEnabled;
+                ro.enabled = formEnabled && !asked;
                 ro.tooltip = "Min / max over the input's full range, gamma 1";
                 if (widgets::button("Reset##reset", ro))
-                    onStep([this](int i) {
-                        if (const std::optional<ParamSet> p = wb().contrastResetOf(i, wb().pipeline().at(i).params))
-                            wb().setStepParams(i, *p, "Reset contrast");
-                        else if (wb().upstreamOutput(i))
-                            wb().logLine("Reset contrast: the cluster node is measuring the input; press Reset again in a moment.");
-                    });
+                    onStep([this](int i) { wb().requestContrast(i, Workbench::ContrastAction::Reset); });
+                x += buttonWidth("Reset", true, 10) + px(10);
+                // the node at work: said beside the buttons, until its answer is applied
+                if (asked || wb().contrastMeasuring(index())) {
+                    std::string note = "Measuring on the node\xE2\x80\xA6";
+                    if (asked && asked->seconds >= 2.0) note += " " + std::to_string(static_cast<int>(asked->seconds)) + " s";
+                    const float lh = lineHeight(11);
+                    place(x, at.y + (buttonHeight(true) - lh) * 0.5f);
+                    widgets::text(widgets::elideText(note, std::max(px(20), at.x + formW - x), 11), 11, theme::kNeutral600);
+                    tip("The cluster node is measuring the step's input; the window is applied when it answers (Edit \xE2\x96\xB8 Undo takes it back).");
+                }
                 placeEnd(at.x, at.y + buttonHeight(true));
+                const std::string why = wb().contrastError(index());
+                if (!why.empty()) {
+                    gap();
+                    widgets::copyableText("##contrastError", why, 11, theme::kAccentText, Weight::Regular, formW);
+                }
             }
 
             generic(info.params, params, input, false, done);
@@ -1639,7 +1717,7 @@ namespace sirius::app::gui {
             for (const std::string& w : v.warnings) text += (text.empty() ? "" : "\n") + w;
             if (!text.empty()) {
                 gap();
-                widgets::textWrapped(text, 11, v.ok() ? theme::kNeutral600 : theme::kAccentText, Weight::Regular, formW);
+                widgets::copyableText("##validation", text, 11, v.ok() ? theme::kNeutral600 : theme::kAccentText, Weight::Regular, formW);
             }
             drawColourPopup();
         }
@@ -1666,7 +1744,7 @@ namespace sirius::app::gui {
             const float x = origin.x + px(18);
             const float width = std::max(px(40), avail.x - px(36));
             const float rule = theme::crispPen(theme::kRule);
-            const float h10 = captionHeight(), h11 = lineHeight(11), h12 = lineHeight(12);
+            const float h10 = captionHeight(), h11 = lineHeight(11);
 
             // --- header ---
             float headerH = 0.0f;
@@ -1747,12 +1825,26 @@ namespace sirius::app::gui {
                 "Survives restarts; written to the zarr scratch directory. Best for slow steps like reconstruction.",
                 "Nothing stored; recomputed from the previous step on demand. Good for cheap steps."};
             const std::string cacheNote = st ? kCacheNotes[static_cast<int>(st->cache)] : std::string();
-            const float tileH = theme::snap(px(36));
-            // HPC: the "Cluster device: GPU | CPU" row under the tiles
+            // Backend and Cache output: one compact row each under a header
+            // that folds the section to a line of summary (remembered).
             const bool hpc = w.backend() == Backend::Hpc;
-            const float deviceRowH = hpc ? px(8) + theme::snap(px(26)) : 0.0f;
-            const float backendH = px(16) + h10 + px(8) + tileH + deviceRowH + (backendNote.empty() ? 0.0f : px(8) + wrappedHeight(backendNote, 12, width)) + px(16);
-            const float cacheH = px(16) + std::max(h10, h12) + px(8) + tileH + (cacheNote.empty() ? 0.0f : px(8) + wrappedHeight(cacheNote, 12, width)) + px(16);
+            const bool backendOpen = settings().getBool("params/backendOpen", true);
+            const bool cacheOpen = settings().getBool("params/cacheOpen", true);
+            const float sectionHeadH = theme::snap(px(30));
+            const float rowH = theme::snap(px(26));
+            const float noteGap = px(6), sectionEnd = px(12);
+            std::string backendSummary = std::string("Backend: ") + toString(w.backend());
+            if (hpc) {
+                std::string where = w.remoteConfig().where;
+                if (const std::size_t job = where.find(" \xC2\xB7 job "); job != std::string::npos) where.erase(job);
+                if (!where.empty()) backendSummary += " \xC2\xB7 " + where;
+                backendSummary += std::string(" \xC2\xB7 ") + toString(w.hpcDevice());
+            }
+            static const char* const kCacheNames[] = {"Memory", "Disk", "Recompute"};
+            const std::string cacheSize = st ? "\xE2\x89\x88 " + bytesOrDash(derivedBytes) : std::string();
+            const std::string cacheSummary = st ? std::string("Cache: ") + kCacheNames[static_cast<int>(st->cache)] + " \xC2\xB7 " + cacheSize : std::string("Cache output");
+            const float backendH = sectionHeadH + (backendOpen ? rowH + (backendNote.empty() ? 0.0f : noteGap + widgets::copyableTextHeight(backendNote, 11, width)) + sectionEnd : 0.0f);
+            const float cacheH = sectionHeadH + (cacheOpen ? rowH + (cacheNote.empty() ? 0.0f : noteGap + wrappedHeight(cacheNote, 11, width)) + sectionEnd : 0.0f);
             const float btnH = buttonHeight();
             const float footerH = rule + px(14) + btnH + px(14);
             const float sectionsH = rule + backendH + rule + cacheH;
@@ -1777,75 +1869,63 @@ namespace sirius::app::gui {
             // --- backend ---
             float y = origin.y + headerH + bodyH;
             dl->AddRectFilled(ImVec2(x, theme::snap(y)), ImVec2(x + width, theme::snap(y) + rule), theme::kDivider);
-            y = theme::snap(y) + rule + px(16);
-            place(x, y);
-            widgets::caption("Backend");
-            y += h10 + px(8);
-            place(x, y);
-            {
-                int backend = static_cast<int>(w.backend());
+            y = theme::snap(y) + rule;
+            if (sectionHeader("##backendHead", "Backend", backendSummary, {}, backendOpen, x, y, width, sectionHeadH))
+                settings().set("params/backendOpen", !backendOpen);
+            y += sectionHeadH;
+            if (backendOpen) {
+                // CPU | CUDA | HPC; the cluster's device beside it when HPC
+                static const Backend kOrder[] = {Backend::Cpu, Backend::Cuda, Backend::Hpc};
+                int shown = 0;
+                for (int k = 0; k < 3; ++k)
+                    if (kOrder[k] == w.backend()) shown = k;
+                place(x, y);
                 widgets::SegmentedOpts so;
-                so.tiles = true;
-                so.width = dp(width);
                 const bool cuda = cudaAvailable();
-                so.optionEnabled = {cuda, true, true};
-                so.tooltips = {cuda ? "Run on the selected CUDA device" : "No CUDA device is available in this build / machine", "",
-                               "Run on the remote worker (Preferences ▸ HPC)"};
-                if (widgets::segmented("##backend", {"CUDA", "CPU", "HPC"}, &backend, so)) {
-                    const Backend b = static_cast<Backend>(backend);
+                so.optionEnabled = {true, cuda, true};
+                so.tooltips = {"Run on this computer's CPU", cuda ? "Run on the selected CUDA device" : "No CUDA device is available in this build / machine",
+                               "Run on the cluster (Cluster \xE2\x96\xB8 Connect)"};
+                if (widgets::segmented("##backend", {"CPU", "CUDA", "HPC"}, &shown, so) && shown >= 0 && shown < 3) {
+                    const Backend b = kOrder[shown];
                     later([this, b] { wb().setBackend(b); });
                 }
-            }
-            y += tileH;
-            if (hpc) {
-                // Where the HPC worker computes, sent with each step: a
-                // switch needs no new job. The GPU only when the job has one.
-                const float rowH = theme::snap(px(26));
-                y += px(8);
-                place(x, y + (rowH - theme::textSize("Cluster device", 12).y) * 0.5f);
-                widgets::text("Cluster device", 12, theme::kNeutral700);
-                const std::vector<std::string> devices = {"GPU", "CPU"};
-                place(x + width - widgets::segmentedWidth(devices), y);
-                std::string why;
-                const bool gpu = app.cluster().hpcGpuUsable(&why);
-                int device = static_cast<int>(w.hpcDevice());
-                widgets::SegmentedOpts so;
-                so.optionEnabled = {gpu, true};
-                so.tooltips = {gpu ? "Run the worker's steps on the job's GPU" : why,
-                               "Run the worker's steps on the job's CPU (the GPU stays allocated)"};
-                if (widgets::segmented("##hpcDevice", devices, &device, so)) {
-                    const HpcDevice d = static_cast<HpcDevice>(device);
-                    later([this, d] { wb().setHpcDevice(d); });
+                if (hpc) {
+                    // Where the node computes, sent with each step: a switch
+                    // needs no new job. The GPU only when the job has one.
+                    const std::vector<std::string> devices = {"GPU", "CPU"};
+                    place(x + width - widgets::segmentedWidth(devices), y);
+                    std::string why;
+                    const bool gpu = app.cluster().hpcGpuUsable(&why);
+                    int device = static_cast<int>(w.hpcDevice());
+                    widgets::SegmentedOpts dso;
+                    dso.optionEnabled = {gpu, true};
+                    dso.tooltips = {gpu ? "Cluster device: run the steps on the job's GPU" : why,
+                                    "Cluster device: run the steps on the job's CPU (the GPU stays allocated)"};
+                    if (widgets::segmented("##hpcDevice", devices, &device, dso)) {
+                        const HpcDevice d = static_cast<HpcDevice>(device);
+                        later([this, d] { wb().setHpcDevice(d); });
+                    }
                 }
                 y += rowH;
+                if (!backendNote.empty()) {
+                    place(x, y + noteGap);
+                    widgets::copyableText("##backendNote", backendNote, 11, gate.enabled ? theme::kNeutral600 : theme::kAccentText, Weight::Regular,
+                                          width);
+                    y += noteGap + widgets::copyableTextHeight(backendNote, 11, width);
+                }
+                y += sectionEnd;
             }
-            if (!backendNote.empty()) {
-                place(x, y + px(8));
-                widgets::textWrapped(backendNote, 12, gate.enabled ? theme::kNeutral600 : theme::kAccentText, Weight::Regular, width);
-                y += px(8) + wrappedHeight(backendNote, 12, width);
-            }
-            y += px(16);
 
             // --- cache output ---
             dl->AddRectFilled(ImVec2(x, theme::snap(y)), ImVec2(x + width, theme::snap(y) + rule), theme::kDivider);
-            y = theme::snap(y) + rule + px(16);
-            {
-                const float headH = std::max(h10, h12);
-                place(x, y + (headH - h10) * 0.5f);
-                widgets::caption("Cache output");
-                if (st) {
-                    const std::string size = "≈ " + bytesOrDash(derivedBytes);
-                    place(x + width - theme::textSize(size, 12).x, y + (headH - h12) * 0.5f);
-                    widgets::text(size, 12, theme::kNeutral700);
-                }
-                y += headH + px(8);
-            }
-            place(x, y);
-            {
+            y = theme::snap(y) + rule;
+            if (sectionHeader("##cacheHead", "Cache output", cacheSummary, cacheSize, cacheOpen, x, y, width, sectionHeadH))
+                settings().set("params/cacheOpen", !cacheOpen);
+            y += sectionHeadH;
+            if (cacheOpen) {
+                place(x, y);
                 int cache = st ? static_cast<int>(st->cache) : -1;
                 widgets::SegmentedOpts so;
-                so.tiles = true;
-                so.width = dp(width);
                 so.enabled = editable && st;
                 if (editable) so.tooltips = {"Cached in GPU/RAM", "Cached on disk (zarr scratch)", "Recomputed on demand"};
                 if (widgets::segmented("##cache", {"Memory", "Disk", "Recompute"}, &cache, so) && cache >= 0) {
@@ -1853,11 +1933,11 @@ namespace sirius::app::gui {
                     onStep([this, c](int now) { wb().setStepCache(now, c); });
                 }
                 if (!editable) tip(kFrozen);
-            }
-            y += tileH;
-            if (!cacheNote.empty()) {
-                place(x, y + px(8));
-                widgets::textWrapped(cacheNote, 12, theme::kNeutral600, Weight::Regular, width);
+                y += rowH;
+                if (!cacheNote.empty()) {
+                    place(x, y + noteGap);
+                    widgets::textWrapped(cacheNote, 11, theme::kNeutral600, Weight::Regular, width);
+                }
             }
 
             // --- footer: Run step / View / Remove ---

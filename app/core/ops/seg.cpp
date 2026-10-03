@@ -173,7 +173,7 @@ namespace sirius::app {
                         v.errors.push_back("Cellpose cannot be prompted: it segments a whole image and has no prompt interface. "
                                            "Use Task: Segment all objects, or a micro-SAM model (microsam:vit_b_lm, ...).");
                     else if (!model.empty() && !isMicroSamSpec(model))
-                        v.errors.push_back("Only micro-SAM models (microsam:<type>) can be prompted in this step; a .ltb bundle with a "
+                        v.errors.push_back("Only micro-SAM models (microsam:<type>) can be prompted in this step; a model folder with a "
                                            "prompt decoder is prompted in the Foundation model step.");
                     const std::vector<Prompt> prompts = promptsOf(p);
                     validatePrompts(prompts, in, v);
@@ -188,7 +188,7 @@ namespace sirius::app {
                             v.errors.push_back("Object " + std::to_string(o.id) + (in.dims.t > 1 ? " on time point " + std::to_string(t) : std::string()) +
                                                " has prompts on planes z " + list + ": micro-SAM is a 2-D model and cannot correct across z. "
                                                                                     "Keep an object's corrections on the plane it was started in (a new plane is a new object), "
-                                                                                    "or prompt a .ltb bundle in the Foundation model step, whose decoder is 3-D.");
+                                                                                    "or prompt a model folder in the Foundation model step, whose decoder is 3-D.");
                             break;
                         }
                 }
@@ -427,7 +427,7 @@ namespace sirius::app {
                     diag.facts.push_back({"Masks", "per plane: each covers its object's z plane only"});
                     diag.warnings.push_back(modelLabel(model) +
                                             " is a 2-D model: each mask lies in the plane of its object's prompts. A cell in 3-D needs "
-                                            "an object on every plane, or the Foundation model step with a 3-D promptable bundle.");
+                                            "an object on every plane, or the Foundation model step with a promptable model folder, whose decoder is 3-D.");
                 }
                 diag.summary = summary(p, meta) + " · " + std::to_string(total) + " labels";
                 char note[240];

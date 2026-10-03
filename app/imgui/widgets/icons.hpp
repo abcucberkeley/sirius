@@ -56,6 +56,7 @@ namespace sirius::app::gui {
         More,
         Help,
         Server,   // a rack of two: the cluster
+        Copy,     // two sheets: copy to the clipboard
     };
 
     // Draws `icon` centred in the box (min, max), scaled from the 24 x 24

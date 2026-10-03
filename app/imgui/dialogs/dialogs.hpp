@@ -35,7 +35,10 @@ namespace sirius::app::gui {
 
     // "Open folder as dataset": a folder of TIFF stacks described by a
     // filename pattern with named groups, previewed live, then opened (the
-    // dialog opens the dataset itself through App::openWith).
+    // dialog opens the dataset itself through App::openWith). `folder` is one
+    // of this computer, one of the cluster ("cluster://<host>/<path>": listed
+    // over the SSH session, its manifest kept in ~/.sirius/manifests there,
+    // read on the node), or "" to choose one in the dialog.
     std::shared_ptr<Dialog> makeFolderDatasetDialog(App& app, const std::string& folder);
 
     // File ▸ Export result…: format list, source step, range, pixel type,
@@ -124,10 +127,11 @@ namespace sirius::app::gui {
     void finishDialogThreads();
 
     // Models for the steps that need one: the local cache, Hugging Face,
-    // model families, foundation bundles. `chosen` receives the model spec
-    // ("/path/model.pt", "hf:repo/name:file.onnx", "cellpose:cyto3", ...).
-    // `bundles`: open on the registry of foundation bundles.
-    std::shared_ptr<Dialog> makeModelHubDialog(App& app, bool bundles, std::function<void(const std::string& model)> chosen);
+    // model families, the Foundation step's model folders. `chosen` receives
+    // the model spec ("/path/model.pt", "hf:repo/name:file.onnx",
+    // "cellpose:cyto3", a model folder, "cluster://host/models/name/v1", ...).
+    // `models`: open on the model folders (Models).
+    std::shared_ptr<Dialog> makeModelHubDialog(App& app, bool models, std::function<void(const std::string& model)> chosen);
 
     // Window ▸ User operations…: the plugin folders and files, their load
     // status and a code editor. Not modal; one instance, which the

@@ -1,7 +1,8 @@
 // Models for the steps that need one: the local model cache, Hugging Face
 // (search, the files of a repository, download into the cache) and the
-// registry of foundation bundles (.ltb). The chosen model spec is what the
-// step's "model" parameter accepts.
+// Foundation step's model folders (core/model_folder.hpp) under the models
+// folders of this computer and of the cluster. The chosen model spec is what
+// the step's "model" parameter accepts.
 //
 // The dialog asks the Python worker only for what the worker alone can
 // answer:
@@ -10,11 +11,12 @@
 //   * Hugging Face is reached over http::Fetch, one Fetch per kind of request
 //     (search, file list, download), with the access token as a bearer that
 //     never follows a redirect to another host;
-//   * the bundles of a registry are listed by the worker, since on a cluster
-//     the worker is what sees the filesystem they are on, and so is what a
+//   * this computer's model folders are read here (model.json is plain
+//     JSON); the cluster's are listed by the worker beside the engine on the
+//     node, the process that sees that filesystem, and so is what a
 //     downloaded file holds (the one-line summary of model_info).
-// So the dialog works, short of the bundles, on a machine whose worker does
-// not start.
+// So the dialog works, short of the cluster's models, on a machine whose
+// worker does not start.
 #include "imgui/dialogs/dialogs.hpp"
 
 #include <algorithm>
@@ -36,9 +38,12 @@
 #include <imgui.h>
 #include <nlohmann/json.hpp>
 
+#include "core/model_folder.hpp"
 #include "core/ops/torch_model.hpp"
+#include "core/remote_source.hpp"
 #include "core/rpc.hpp"
 #include "core/workbench.hpp"
+#include "imgui/cluster_link.hpp"
 #include "imgui/dialogs/model_hub_cache.hpp"
 #include "imgui/http.hpp"
 #include "imgui/platform.hpp"
@@ -90,13 +95,13 @@ namespace sirius::app::gui {
 
             // `remote` with a host: the configured HPC worker instead of the
             // local one, for the calls where "which machine" is the whole
-            // question (a bundle registry is a directory on the cluster).
+            // question (a models folder on the cluster).
             void call(const std::string& method, nlohmann::json params, const RemoteConfig* remote, Done done) {
                 Job job;
                 job.method = method;
                 job.params = std::move(params);
                 if (remote) {
-                    job.useRemote = !remote->host.empty();
+                    job.useRemote = !remote->host.empty() || static_cast<bool>(remote->connect);
                     job.remote = *remote;
                 }
                 job.done = std::move(done);
@@ -141,9 +146,9 @@ namespace sirius::app::gui {
                         // A worker that is only busy or slow is therefore never taken for an unreachable one.
                         std::unique_ptr<RemoteWorker> worker;
                         try {
-                            worker = job.useRemote ? RemoteWorker::connect(job.remote.host, job.remote.port, job.remote.token,
-                                                                           std::chrono::seconds(5), cancelled)
-                                                   : launcher_.connect(cancelled);
+                            // the configured endpoint as it connects: through the cluster
+                            // session (its SOCKS proxy, a reconnect) when it has one
+                            worker = job.useRemote ? job.remote.open(cancelled) : launcher_.connect(cancelled);
                         } catch (const std::exception&) {
                             unreachable = true;
                             throw;
@@ -476,28 +481,29 @@ namespace sirius::app::gui {
             long long size = -1;
             bool model = false;
         };
-        struct Bundle {
-            std::string name, path, task, voxel, threshold, size;
-            nlohmann::json facts;   // what the worker said about it
+        struct ModelRow {
+            ModelFolderFacts facts;
+            bool onCluster = false;
+            std::string spec;   // what the step's Model becomes: the folder, or cluster://host/folder
         };
 
         enum Tab { kLocal = 0,
                    kHuggingFace = 1,
-                   kBundles = 2 };
+                   kModels = 2 };
 
         class ModelHubDialog final : public Dialog {
         public:
-            ModelHubDialog(App& app, bool bundles, std::function<void(const std::string&)> chosen)
+            ModelHubDialog(App& app, bool models, std::function<void(const std::string&)> chosen)
                 : app_(app), accept_(std::move(chosen)), worker_(app.bridge(), app.launcher()) {
                 tokenStored_ = !hubToken().empty();
-                registryDir_ = storedRegistry();
+                foldersText_ = join(storedFolders(), "; ");
                 // the Local tab is up first
                 listCache();
-                if (bundles) {
-                    tab_ = kBundles;
-                    // Listing spawns a worker, so it waits for the tab that needs it
-                    // rather than happening when any tab is opened.
-                    if (!trimmed(registryDir_).empty()) listBundles();
+                if (models) {
+                    tab_ = kModels;
+                    // Listing the cluster's asks a worker, so it waits for the tab
+                    // that needs it rather than happening when any tab is opened.
+                    listModels();
                 }
             }
 
@@ -516,7 +522,7 @@ namespace sirius::app::gui {
                 widgets::textWrapped("Models for the step that runs them. Segmentation takes a TorchScript / ONNX file from Hugging "
                                      "Face, one already in the cache, or a file on this machine; a package family the worker provides "
                                      "(cellpose:cpsam, microsam:vit_b_lm) can be typed straight into the step's Model field. The "
-                                     "foundation model takes a bundle from the registry, under Bundles.",
+                                     "Foundation step takes a model folder, under Models.",
                                      11, theme::kNeutral600);
                 widgets::vspace(2);
                 {
@@ -526,7 +532,7 @@ namespace sirius::app::gui {
                     const float h = theme::snap(px(26));
                     ImGui::GetWindowDrawList()->AddRectFilled(ImVec2(at.x, at.y + h - theme::crispPen(1)), ImVec2(at.x + w, at.y + h),
                                                               theme::kDivider);
-                    widgets::tabRow("##tabs", {"Local", "Hugging Face", "Bundles"}, &tab_);
+                    if (widgets::tabRow("##tabs", {"Local", "Hugging Face", "Models"}, &tab_) && tab_ == kModels && models_.empty()) listModels();
                 }
 
                 // what stays under the tabs: the status, the rule, the chosen model and the buttons
@@ -544,7 +550,7 @@ namespace sirius::app::gui {
                     widgets::vspace(4);   // with the item spacing, the 12 px above a page
                     if (tab_ == kLocal) drawLocal(app);
                     else if (tab_ == kHuggingFace) drawHuggingFace(app);
-                    else drawBundles(app);
+                    else drawModels(app);
                 }
                 ImGui::EndChild();
                 const float footerTop = ImGui::GetCursorPosY();
@@ -1091,125 +1097,120 @@ namespace sirius::app::gui {
                 widgets::textWrapped(fileNote_, 11, theme::kNeutral600);
             }
 
-            // --- the foundation-bundle registry ------------------------------------------
+            // --- the models: folders of model folders -----------------------------------
 
-            // Where the bundles are. Remembered, and seeded from the environment so
-            // that a cluster deployment can point every user at one directory
-            // instead of each of them having to find it.
-            static std::string storedRegistry() {
-                const std::string saved = settings().getString("foundation/registry");
-                if (!saved.empty()) return saved;
-                return platform::environment("SIRIUS_BUNDLE_REGISTRY");
+            // The models folders of this computer: sirius-app.toml's [models]
+            // folders = [...] (a single string is read too).
+            static std::vector<std::string> storedFolders() {
+                std::vector<std::string> out = settings().getStringList("models/folders");
+                if (out.empty()) {
+                    const std::string one = settings().getString("models/folders");
+                    if (!trimmed(one).empty()) out.push_back(one);
+                }
+                return out;
             }
 
-            // Listed by the worker, not by this process: on a cluster the worker is
-            // what can see the filesystem the bundles are on, and it is also what
-            // reads a manifest out of one.
-            void listBundles() {
-                const std::string dir = trimmed(registryDir_);
-                bundles_.clear();
-                bundleRow_ = -1;
-                if (dir.empty()) {
-                    bundleNote_ = "Give the directory the .ltb bundles are in. On a cluster that is a directory the worker can read, "
-                                  "which need not be one this machine can.";
+            // The cluster's models folder: the current cluster profile's `models`.
+            std::string clusterFolder() const { return trimmed(app_.cluster().storedProfile().models); }
+
+            // This computer's folders are read here (model.json is plain JSON);
+            // the cluster's by the worker beside the engine on the node, the
+            // process that sees that filesystem.
+            void listModels() {
+                models_.clear();
+                modelRow_ = -1;
+                modelNote_.clear();
+                std::vector<std::string> dirs;
+                for (const std::string& d : split(foldersText_, ';', true))
+                    if (!trimmed(d).empty()) dirs.push_back(trimmed(d));
+                if (dirs != storedFolders()) settings().set("models/folders", dirs);
+                const ModelListing here = listModelFolders(dirs);
+                for (const ModelFolderFacts& f : here.models) models_.push_back({f, false, f.path});
+                std::vector<std::string> notes = here.errors;
+                const std::string remote = clusterFolder();
+                const int generation = ++listGeneration_;
+                if (!remote.empty()) {
+                    if (app_.wb().remoteConfig().hasEngine()) {
+                        const std::string host = app_.cluster().status().host;
+                        callWorker(
+                            "Listing the models in " + remote + " on the cluster", {{"dirs", {remote}}}, "list_bundles",
+                            [this, host, generation](const nlohmann::json& r) {
+                                if (generation != listGeneration_) return;   // a later listing replaced this one
+                                const ModelListing there = modelListingFromJson(r);
+                                for (const ModelFolderFacts& f : there.models) models_.push_back({f, true, makeClusterPath(host, f.path)});
+                                for (const std::string& e : there.errors) modelNote_ += (modelNote_.empty() ? "" : "\n") + ("cluster: " + e);
+                                if (models_.empty() && modelNote_.empty()) modelNote_ = "No models in these folders.";
+                            },
+                            true);
+                    } else {
+                        notes.push_back("The cluster's models folder (" + remote + ") is listed once you are connected to the cluster with "
+                                                                                   "SIRIUS's engine.");
+                    }
+                }
+                if (dirs.empty() && remote.empty())
+                    notes.push_back("Give the folder your models are in (<models>/<name>/<version>/ with model.py and model.json), or set "
+                                    "[models] folders = [...] in sirius-app.toml, and models = \"...\" in a cluster profile for the cluster's.");
+                else if (models_.empty() && notes.empty() && remote.empty())
+                    notes.push_back("No models in these folders.");
+                modelNote_ = join(notes, "\n");
+            }
+
+            // What model.json says about the model now selected, under the table.
+            void modelSelected() {
+                if (modelRow_ < 0 || modelRow_ >= static_cast<int>(models_.size())) return;
+                const ModelRow& row = models_[static_cast<std::size_t>(modelRow_)];
+                const ModelFolderFacts& m = row.facts;
+                if (!m.error.empty()) {
+                    modelNote_ = m.error;
                     return;
                 }
-                settings().set("foundation/registry", dir);
-                bundleNote_.clear();
-                const bool onHpc = app_.wb().backend() == Backend::Hpc;
-                callWorker(
-                    "Listing bundles in " + dir, {{"dir", dir}}, "list_bundles", [this, dir](const nlohmann::json& r) { fillBundles(dir, r); },
-                    onHpc);
-            }
-
-            void fillBundles(const std::string& dir, const nlohmann::json& r) {
-                bundles_.clear();
-                bundleRow_ = -1;
-                const auto list = r.find("bundles");
-                if (list == r.end() || !list->is_array() || list->empty()) {
-                    bundleNote_ = "No .ltb bundles in " + dir + ".";
-                    return;
-                }
-                for (const nlohmann::json& b : *list) {
-                    if (!b.is_object()) continue;
-                    Bundle bundle;
-                    bundle.facts = b;
-                    bundle.path = stringOf(b, "path");
-                    bundle.name = stringOf(b, "name");
-                    bundle.task = stringOf(b, "task");
-                    if (bundle.task.empty()) bundle.task = "?";
-                    for (double v : numbersOf(b, "voxel_um")) bundle.voxel += (bundle.voxel.empty() ? "" : " x ") + format("%.3g", v);
-                    // The unit goes in the cells: a caption-case header would turn the micro sign into a capital mu.
-                    bundle.voxel = bundle.voxel.empty() ? std::string("?") : bundle.voxel + " µm";
-                    const auto threshold = b.find("peak_threshold");
-                    bundle.threshold = threshold != b.end() && threshold->is_number() ? format("%.3g", threshold->get<double>()) : std::string("?");
-                    bundle.size = sizeText(integerOf(b, "size_bytes", 0));
-                    bundles_.push_back(std::move(bundle));
-                }
-                bundleNote_ = std::to_string(bundles_.size()) + " bundle(s) in " + dir +
-                              ". A '?' is a bundle whose manifest could not be read: it can still be chosen, but the step cannot "
-                              "default to the thresholds it was validated at.";
-            }
-
-            // What the manifest says about the bundle now selected, under the table.
-            void bundleSelected() {
-                if (bundleRow_ < 0 || bundleRow_ >= static_cast<int>(bundles_.size())) return;
-                const Bundle& bundle = bundles_[static_cast<std::size_t>(bundleRow_)];
-                const nlohmann::json& b = bundle.facts;
                 std::vector<std::string> facts;
-                const auto separation = b.find("min_separation_um");
-                if (separation != b.end() && separation->is_number()) facts.push_back("min. separation " + format("%.3g", separation->get<double>()) + " um");
-                const std::vector<double> patch = numbersOf(b, "patch");
-                if (patch.size() == 3) facts.push_back(format("patch %.3g x %.3g x %.3g", patch[0], patch[1], patch[2]));
-                const auto channels = b.find("channels");
-                if (channels != b.end() && channels->is_array() && !channels->empty()) {
-                    std::vector<std::string> names;
-                    for (const nlohmann::json& c : *channels) names.push_back(c.is_string() ? c.get<std::string>() : c.dump());
-                    facts.push_back("channels " + join(names, ", "));
-                }
-                std::string text = join(facts, " · ");
-                const std::string notes = stringOf(b, "notes");
-                if (!notes.empty()) text += (text.empty() ? "" : "\n") + notes;
-                const auto manifest = b.find("manifest");
-                if (manifest == b.end() || !manifest->is_boolean() || !manifest->get<bool>()) text = "The manifest could not be read. " + text;
-                bundleNote_ = text.empty() ? bundle.path : text;
+                if (m.voxelUm.size() == 3) facts.push_back(format("trained at %.3g x %.3g x %.3g um (z, y, x)", m.voxelUm[2], m.voxelUm[1], m.voxelUm[0]));
+                facts.push_back(m.channels > 1 ? std::to_string(m.channels) + " channels" + (m.channelMerge.empty() ? std::string() : " (" + m.channelMerge + ")")
+                                               : std::string("one channel"));
+                facts.push_back(m.promptable ? "promptable" : "automatic only");
+                std::string text = join(facts, " \xC2\xB7 ");
+                if (!m.description.empty()) text += "\n" + m.description;
+                text += "\n" + row.spec;
+                modelNote_ = text;
             }
 
-            void chooseSelectedBundle() {
-                if (bundleRow_ < 0 || bundleRow_ >= static_cast<int>(bundles_.size())) return;
-                choose(bundles_[static_cast<std::size_t>(bundleRow_)].path);
+            void chooseSelectedModel() {
+                if (modelRow_ < 0 || modelRow_ >= static_cast<int>(models_.size())) return;
+                const ModelRow& row = models_[static_cast<std::size_t>(modelRow_)];
+                if (row.facts.error.empty()) choose(row.spec);
             }
 
-            void drawBundles(App& app) {
+            void drawModels(App& app) {
                 const float spacing = ImGui::GetStyle().ItemSpacing.y;
                 const float fieldH = theme::snap(px(theme::kInputH));
                 const float buttonH = smallButtonHeight();
                 const float gap = px(6);
 
-                // --- the registry row
+                // --- the folders row
                 const float rowTop = ImGui::GetCursorPosY();
                 const float browseW = px(84), refreshW = px(76);
                 centreInRow(fieldH, theme::textSize("X", theme::kCaptionPx).y);
-                widgets::caption("Registry");
+                widgets::caption("Folders");
                 ImGui::SameLine(0.0f, gap);
                 ImGui::SetCursorPosY(rowTop);
                 widgets::FieldOpts field;
                 field.width = (ImGui::GetContentRegionAvail().x - browseW - refreshW - 2 * gap) / scaleOrOne();
-                field.hint = "directory of .ltb bundles, as the worker sees it";
+                field.hint = "models folders on this computer, separated by ;";
                 field.enterReturnsTrue = true;
-                bool refresh = widgets::inputText("##registry", &registryDir_, field);
-                tip("Where the bundles are. Read by the worker, so on a cluster this is a path on the cluster. "
-                    "SIRIUS_BUNDLE_REGISTRY sets the default.");
+                bool refresh = widgets::inputText("##folders", &foldersText_, field);
+                tip("This computer's models folders (sirius-app.toml: [models] folders = [...]). Each holds <name>/<version>/ model "
+                    "folders, as latents scripts/export_model.py writes them. The cluster's is the cluster profile's models = \"...\".");
                 if (refresh) enterUsed_ = true;
                 ImGui::SameLine(0.0f, gap);
                 ImGui::SetCursorPosY(rowTop);
                 centreInRow(fieldH, buttonH);
-                if (smallButton("Browse…##registry", ButtonKind::Secondary, 84, true, "Only useful when the worker runs on this machine")) {
+                if (smallButton("Browse…##folders", ButtonKind::Secondary, 84, true, "Add a models folder of this computer")) {
                     app.defer(guarded([this] {
-                        const std::string d = platform::pickFolderDialog("Bundle registry", registryDir_);
+                        const std::string d = platform::pickFolderDialog("Models folder", app_.lastDir());
                         if (d.empty()) return;
-                        registryDir_ = d;
-                        listBundles();
+                        foldersText_ = trimmed(foldersText_).empty() ? d : foldersText_ + "; " + d;
+                        listModels();
                     }));
                 }
                 ImGui::SameLine(0.0f, gap);
@@ -1217,42 +1218,50 @@ namespace sirius::app::gui {
                 centreInRow(fieldH, buttonH);
                 if (smallButton("Refresh", ButtonKind::Secondary, 76)) refresh = true;
                 ImGui::SetCursorPosY(rowTop + fieldH + spacing);
-                if (refresh) listBundles();
+                if (refresh) listModels();
+                if (const std::string remote = clusterFolder(); !remote.empty()) {
+                    widgets::textWrapped("Cluster: " + remote + (app_.wb().remoteConfig().hasEngine() ? "" : " (listed once connected)"), 11,
+                                         theme::kNeutral600);
+                }
 
-                // --- the bundles, what the selected one says, Use
+                // --- the models, what the selected one says, Use
                 const float width = ImGui::GetContentRegionAvail().x;
-                // no note, no line for it (a failed listing leaves none)
-                const float noteH = bundleNote_.empty() ? 0.0f : wrappedHeight(bundleNote_, 11, width) + spacing;
+                const float noteH = modelNote_.empty() ? 0.0f : wrappedHeight(modelNote_, 11, width) + spacing;
                 const float tableH = ImGui::GetContentRegionAvail().y - noteH - buttonH - spacing;
                 const Picked picked =
-                    table("##bundles", {{"Bundle", 1.0f}, {"Task", 0.0f}, {"Voxel", 0.0f}, {"Threshold", 0.0f}, {"Size", 0.0f}},
-                          static_cast<int>(bundles_.size()), bundleRow_, tableH, [this](int row, int column) {
-                              const Bundle& b = bundles_[static_cast<std::size_t>(row)];
+                    table("##models", {{"Model", 0.0f}, {"Version", 0.0f}, {"Tasks", 0.0f}, {"Where", 0.0f}, {"What it is", 1.0f}},
+                          static_cast<int>(models_.size()), modelRow_, tableH, [this](int row, int column) {
+                              const ModelRow& r = models_[static_cast<std::size_t>(row)];
+                              const ModelFolderFacts& m = r.facts;
                               Cell c;
                               switch (column) {
                                   case 0:
-                                      c.text = b.name;
-                                      c.tip = b.path;
+                                      c.text = m.name;
+                                      c.tip = r.spec;
                                       break;
-                                  case 1: c.text = b.task; break;
-                                  case 2: c.text = b.voxel; break;
-                                  case 3: c.text = b.threshold; break;
-                                  default: c.text = b.size; break;
+                                  case 1: c.text = m.version; break;
+                                  case 2: c.text = m.error.empty() ? join(m.tasks, ", ") : std::string("?"); break;
+                                  case 3: c.text = r.onCluster ? "cluster" : "this computer"; break;
+                                  default:
+                                      c.text = m.error.empty() ? firstLine(m.description) : m.error;
+                                      c.tip = m.error.empty() ? m.description : m.error;
+                                      break;
                               }
                               return c;
                           });
-                if (picked.clicked >= 0 && picked.clicked != bundleRow_) {
-                    bundleRow_ = picked.clicked;
-                    bundleSelected();
+                if (picked.clicked >= 0 && picked.clicked != modelRow_) {
+                    modelRow_ = picked.clicked;
+                    modelSelected();
                 }
-                if (!bundleNote_.empty()) widgets::textWrapped(bundleNote_, 11, theme::kNeutral600);
+                if (!modelNote_.empty()) widgets::textWrapped(modelNote_, 11, theme::kNeutral600);
 
-                const bool any = bundleRow_ >= 0 && bundleRow_ < static_cast<int>(bundles_.size());
+                const bool any = modelRow_ >= 0 && modelRow_ < static_cast<int>(models_.size()) &&
+                                 models_[static_cast<std::size_t>(modelRow_)].facts.error.empty();
                 const float useW = px(64);
                 ImGui::SetCursorPosX(ImGui::GetCursorPosX() + std::max(0.0f, ImGui::GetContentRegionAvail().x - useW));
-                if (smallButton("Use##bundle", ButtonKind::Primary, 64, any)) chooseSelectedBundle();
-                if (picked.doubleClicked >= 0 && picked.doubleClicked == bundleRow_ && any) {
-                    chooseSelectedBundle();
+                if (smallButton("Use##model", ButtonKind::Primary, 64, any)) chooseSelectedModel();
+                if (picked.doubleClicked >= 0 && picked.doubleClicked == modelRow_ && any) {
+                    chooseSelectedModel();
                     accept();
                 }
             }
@@ -1287,11 +1296,12 @@ namespace sirius::app::gui {
             float progress_ = 0.0f;
             std::string fileNote_ = "Downloads land in $SIRIUS_MODEL_CACHE or ~/.sirius/models.";
 
-            // the foundation-bundle registry
-            std::string registryDir_;
-            std::vector<Bundle> bundles_;
-            int bundleRow_ = -1;
-            std::string bundleNote_;
+            // the Foundation step's model folders
+            std::string foldersText_;   // this computer's models folders, "; " between them
+            std::vector<ModelRow> models_;
+            int modelRow_ = -1;
+            std::string modelNote_;
+            int listGeneration_ = 0;
 
             // Last, so that they go first: their callbacks use what is above.
             bool workerFailed_ = false;
@@ -1301,8 +1311,8 @@ namespace sirius::app::gui {
 
     } // namespace
 
-    std::shared_ptr<Dialog> makeModelHubDialog(App& app, bool bundles, std::function<void(const std::string&)> chosen) {
-        return std::make_shared<ModelHubDialog>(app, bundles, std::move(chosen));
+    std::shared_ptr<Dialog> makeModelHubDialog(App& app, bool models, std::function<void(const std::string&)> chosen) {
+        return std::make_shared<ModelHubDialog>(app, models, std::move(chosen));
     }
 
 } // namespace sirius::app::gui

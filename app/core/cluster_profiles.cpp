@@ -126,6 +126,7 @@ namespace sirius::app::cluster {
                   {"job", {{"partition", partition}, {"account", account}, {"qos", qos}, {"time", time}, {"gpus", gpus}, {"cpus", cpus}, {"mem", mem}}},
                   {"partitions", parts}};
         if (!sshProgram.empty()) j["ssh"] = sshProgram;
+        if (!models.empty()) j["models"] = models;
         if (!perHost.empty()) {
             json hosts = json::object();
             for (const auto& [h, c] : perHost) {
@@ -178,6 +179,7 @@ namespace sirius::app::cluster {
         str(j, "scratch", p.scratch);
         str(j, "cache", p.scratch);
         str(j, "def_file", p.defFile);
+        str(j, "models", p.models);
         if (j.contains("partitions") && j["partitions"].is_array())
             for (const json& c : j["partitions"]) {
                 PartitionChoice pc = partitionChoiceFromJson(c);
@@ -481,7 +483,8 @@ namespace sirius::app::cluster {
 
         const std::set<std::string>& profileKeys() {
             static const std::set<std::string> keys = {"host", "image", "images", "binds", "bind_sets", "checkout", "launcher", "python_path", "engine",
-                                                       "engine_builds", "engine_bin", "cache", "def_file", "job", "partitions", "ssh", "last_used"};
+                                                       "engine_builds", "engine_bin", "cache", "def_file", "job", "partitions", "ssh", "last_used",
+                                                       "models"};
             return keys;
         }
 
@@ -602,7 +605,7 @@ namespace sirius::app::cluster {
                     error(base, "[cluster." + name + "] needs image = \"<the worker image (.sif) on the cluster>\" (write image = \"\" while you have none).");
                 else if (p.contains("image") && p["image"].is_string() && trim(p["image"].get<std::string>()).empty())
                     warn(at(base, "image"), "No worker image yet: the worker cannot start until image names one (Connect to cluster can build it).");
-                for (const char* k : {"host", "image", "checkout", "launcher", "python_path", "engine_builds", "engine_bin", "cache", "def_file", "ssh"})
+                for (const char* k : {"host", "image", "checkout", "launcher", "python_path", "engine_builds", "engine_bin", "cache", "def_file", "ssh", "models"})
                     string(p, base, k, "a name or a path");
                 strings(p, base, "images", "worker images used before");
                 strings(p, base, "binds", "folders on the cluster the image sees");

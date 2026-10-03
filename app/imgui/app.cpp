@@ -27,6 +27,7 @@
 #include "core/app_paths.hpp"
 #include "core/array_source.hpp"
 #include "core/export.hpp"
+#include "core/model_folder.hpp"
 #include "core/remote_source.hpp"
 #include "core/training_export.hpp"
 #include "imgui/cluster_link.hpp"
@@ -278,7 +279,8 @@ namespace sirius::app::gui {
             ImVec2 size() const override { return ImVec2(460, 0); }
 
             void draw(App&) override {
-                widgets::textWrapped(text_, 13, theme::kText);
+                // the message is often an error to paste somewhere: Copy beside it, and on a right-click
+                widgets::copyableText("##message", text_, 13, theme::kText);
                 widgets::vspace(10);
                 // buttons flush right, the default (last) one primary
                 float total = 0.0f;
@@ -1530,7 +1532,8 @@ namespace sirius::app::gui {
                 ImGui::SetCursorScreenPos(ImVec2(x0, top));
                 if (ImGui::InvisibleButton("##hpcStatus", ImVec2(std::max(wd, 1.0f), max.y - top))) self.clusterDialog();
                 if (ImGui::IsItemHovered()) ImGui::SetMouseCursor(ImGuiMouseCursor_Hand);
-                widgets::tooltip(hpc + "\n\nClick for the cluster connection");
+                widgets::tooltip(hpc + "\n\nClick for the cluster connection; right-click to copy");
+                widgets::copyOnRightClick("##hpcStatusCopy", hpc);
                 const float dot = theme::snap(px(6));
                 const float cy = theme::snap((top + max.y) * 0.5f);
                 dl->AddCircleFilled(ImVec2(x0 - px(8), cy), dot * 0.5f, hpcColor);
@@ -1580,14 +1583,16 @@ namespace sirius::app::gui {
 
             // The last log line, for four seconds; the whole history is one
             // click (or the Window > Log shortcut) away.
-            if (!logLine.empty() && secondsSince(logLineAt) < 4.0 && x < limit - px(60)) {
+            // (and while its Copy menu is open)
+            if (!logLine.empty() && (secondsSince(logLineAt) < 4.0 || ImGui::IsPopupOpen("##loglineCopy")) && x < limit - px(60)) {
                 const std::string shown = widgets::elideText(simplified(logLine), std::min(px(640), limit - x), 11);
                 const float wd = theme::textSize(shown, 11).x;
                 ImGui::SetCursorScreenPos(ImVec2(x, top));
                 if (ImGui::InvisibleButton("##logline", ImVec2(std::max(wd, 1.0f), max.y - top))) self.showLog();
                 const bool hovered = ImGui::IsItemHovered();
                 if (hovered) ImGui::SetMouseCursor(ImGuiMouseCursor_Hand);
-                widgets::tooltip(simplified(logLine) + "\n\nClick to open the log (" + shortcutText(keys::logDock) + ")");
+                widgets::tooltip(simplified(logLine) + "\n\nClick to open the log (" + shortcutText(keys::logDock) + "); right-click to copy");
+                widgets::copyOnRightClick("##loglineCopy", logLine);
                 widgets::drawTextIn(dl, ImVec2(x, top), ImVec2(x + wd, max.y), shown, 11, hovered ? theme::kAccentText : theme::kNeutral600,
                                     Weight::Regular, 0.0f, 0.5f);
                 self.requestRedraw(2);   // so the line leaves when its time is up
@@ -2936,6 +2941,12 @@ namespace sirius::app::gui {
     // A folder with a manifest opens directly; otherwise the pattern dialog
     // builds one first.
     void App::openFolderDataset() {
+        // logged in to a cluster: the folder dialog itself asks where the
+        // folder is (This computer | Cluster) and browses there
+        if (cluster().sshUp()) {
+            showDialog(makeFolderDatasetDialog(*this, std::string()));
+            return;
+        }
         std::string start = impl_->lastDir;
         if (!start.empty() && isDirectory(start)) start = parentPath(start);
         const std::string folder = platform::pickFolderDialog("Open folder as dataset", start);
@@ -3335,13 +3346,15 @@ namespace sirius::app::gui {
 
     void App::modelHub() {
         // On the tab that matches the step in hand: with a foundation step
-        // selected the menu means "which bundle".
+        // selected the menu means "which model folder".
         const int selected = wb().selectedIndex();
-        const bool bundles = selected >= 0 && selected < wb().pipeline().size() && wb().pipeline().at(selected).kind == "foundation";
-        showDialog(makeModelHubDialog(*this, bundles, [this](const std::string& chosen) {
+        const bool models = selected >= 0 && selected < wb().pipeline().size() && wb().pipeline().at(selected).kind == "foundation";
+        showDialog(makeModelHubDialog(*this, models, [this](const std::string& chosen) {
             if (chosen.empty()) return;
-            // A bundle is the foundation step's model, not the segmentation step's.
-            const int i = endsWithNoCase(chosen, ".ltb") ? stepOrNew("foundation") : segmentationStepOrNew();
+            // A model folder (Models: one of this computer's, or the cluster's)
+            // is the Foundation step's model, not the segmentation step's.
+            const bool folder = isRemoteDatasetPath(chosen) || readModelFolder(chosen).has_value();
+            const int i = folder ? stepOrNew("foundation") : segmentationStepOrNew();
             if (i < 0) return;
             wb().setStepParam(i, "model", chosen);
             wb().select(i);

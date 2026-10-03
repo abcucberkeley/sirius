@@ -26,6 +26,10 @@ it does what OpenSSH would, as far as the application can tell:
     $FAKE_SSH_HOME (HOME as well), with $FAKE_SSH_PATH in front of PATH
     (the fake Slurm tools of tests/tools/fake_slurm).
 
+With $FAKE_SSH_NOEXEC the login shell plays a login node that mounts the
+paths containing it noexec: `[ -x ]` says no there (noexec_login), while
+the fake jobs' steps, on the "compute node", see them as they are.
+
 $FAKE_SSH_LOG, when set, receives one line per event (argv, asking,
 answered, response, socks, exit) for the tests to read. $FAKE_SSH_BASH names
 the bash to run. With $FAKE_SLURM_DIR and $FAKE_SLURM_KILL_ON_EXIT=1 the fake
@@ -44,6 +48,7 @@ import socketserver
 import struct
 import subprocess
 import sys
+import tempfile
 import threading
 
 
@@ -172,6 +177,44 @@ def find_bash() -> str:
     return shutil.which("bash") or "/bin/bash"
 
 
+_NOEXEC_TEST = r'''#!/bin/bash
+# fake_ssh.py's login node mounts every path containing $FAKE_SSH_NOEXEC
+# noexec: `test -x` / `[ -x ]` (access(X_OK)) says no for it, as Linux does
+# there, whatever the file's mode. Anything else is /usr/bin/test's.
+args=("$@")
+if [ "$(basename "$0")" = "[" ]; then unset 'args[${#args[@]}-1]'; fi
+neg=0
+if [ "${args[0]:-}" = "!" ]; then neg=1; args=("${args[@]:1}"); fi
+if [ "${args[0]:-}" = -x ] && [[ "${args[1]:-}" == *"$FAKE_SSH_NOEXEC"* ]]; then exit $((1 - neg)); fi
+if [ "$neg" = 1 ]; then exec /usr/bin/test ! "${args[@]}"; fi
+exec /usr/bin/test "${args[@]}"
+'''
+
+
+def noexec_login(env) -> str:
+    """With $FAKE_SSH_NOEXEC: a folder of `test` and `[` that answer -x
+    "no" for the paths it names, and a $BASH_ENV that makes the login shell
+    use them in place of its builtins. Only the login shell: the file unsets
+    $BASH_ENV, so the jobs' steps (fake srun, the launch script: a bash of
+    their own, builtins and all) run there as on a compute node, which
+    mounts the same paths executable. "" without it."""
+    if not env.get("FAKE_SSH_NOEXEC"):
+        return ""
+    d = os.path.join(env.get("FAKE_SLURM_DIR") or tempfile.gettempdir(), "noexec-login")
+    os.makedirs(d, exist_ok=True)
+    for name in ("test", "["):
+        path = os.path.join(d, name)
+        with open(path, "w", encoding="utf-8", newline="\n") as f:
+            f.write(_NOEXEC_TEST)
+        os.chmod(path, 0o755)
+    with open(os.path.join(d, "login.bash"), "w", encoding="utf-8", newline="\n") as f:
+        # first on PATH (Git for Windows' bash puts /usr/bin in front as it starts)
+        f.write('__d="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"\nPATH="$__d:$PATH"\nunset __d\n'
+                'enable -n test "["\nunset BASH_ENV\n')
+    log("noexec " + env["FAKE_SSH_NOEXEC"])
+    return d
+
+
 def stop_fake_jobs() -> None:
     d = os.environ.get("FAKE_SLURM_DIR")
     if not d or os.environ.get("FAKE_SLURM_KILL_ON_EXIT") != "1":
@@ -230,6 +273,10 @@ def main(argv) -> int:
     extra = os.environ.get("FAKE_SSH_PATH")
     if extra:
         env["PATH"] = extra + os.pathsep + env.get("PATH", "")
+    noexec_dir = noexec_login(env)
+    if noexec_dir:
+        env["PATH"] = noexec_dir + os.pathsep + env.get("PATH", "")
+        env["BASH_ENV"] = os.path.join(noexec_dir, "login.bash").replace("\\", "/")
     for k in ("SSH_ASKPASS", "SSH_ASKPASS_REQUIRE", "SIRIUS_ASKPASS_PORT", "SIRIUS_ASKPASS_SECRET"):
         env.pop(k, None)
     try:

@@ -17,14 +17,25 @@
 //            job runs on a node.
 //
 // The worker (startWorker), inside that job:
-//   Checks   the worker's code (the engine build's python/ folder, else the
-//            checkout's app/python), the container image (there, readable,
-//            sirius and numpy import in it), the launcher, the data folders,
-//            SIRIUS's engine when the profile runs it -- the engine build
-//            that fits this application (Profile::engineBuilds), the named
-//            executable, or the image's own, each made sure of: never a
-//            silent fall back to the Python worker alone -- and the node
-//            cache folder: what is missing comes back with what to do about it
+//   Checks   in two parts. On the login node, over the command channel, only
+//            what a file's existence and mode say, never whether something
+//            runs there (its scratch may be mounted noexec, the compute
+//            nodes' is not, and nothing of SIRIUS runs on it): srun, the
+//            image file, the worker's code (the engine build's python/
+//            folder, else the checkout's app/python), and the engine builds
+//            (Profile::engineBuilds: BUILD.json, bin/sirius-cli a file with
+//            an execute bit in its mode, lib/, python/), to list them and
+//            pick the one that fits this application. Then in the job, on
+//            its node, as one step through the same route and with the same
+//            image, binds, library path and environment as the worker's
+//            start (the launch script's --check): the launcher, the image
+//            starting, sirius and numpy importing in it, `<engine> version`
+//            (SIRIUS's engine runs there, and is the build BUILD.json says:
+//            never a silent fall back to the Python worker alone), the GPUs
+//            the step was given, the data folders readable inside the image
+//            and the node cache folder writable (NodeCheck, one each). What
+//            fails comes back with what to do about it, and nothing starts
+
 //   Start    the application's own launch script (sirius_worker.sbatch as
 //            compiled into it, workerLaunchScript) is written over the
 //            command channel to ~/.sirius/run/<workerLaunchScriptName()>
@@ -80,6 +91,7 @@
 #include <optional>
 #include <string>
 #include <thread>
+#include <utility>
 #include <vector>
 
 #include <nlohmann/json.hpp>
@@ -173,6 +185,9 @@ namespace sirius::app::cluster {
         // SIRIUS_ENGINE_SCRATCH; bound into the image). "" = the node's
         // temporary folder. The user's to choose: the checks test it.
         std::string scratch;
+        // The cluster's models folder (<models>/<name>/<version>/model.json):
+        // what Models… lists while connected. "" = none.
+        std::string models;
         // What the dropdowns offer (clusters.toml); empty until written or
         // added from what the cluster reports.
         std::vector<PartitionChoice> choices;
@@ -368,6 +383,37 @@ namespace sirius::app::cluster {
         std::string detail;    // one line: "job 4711 · PENDING (Resources) · 0:42"
     };
 
+    // One of the checks run in the job before the worker starts (the launch
+    // script's --check, on the job's node, in the image): the Worker page's
+    // checklist.
+    struct NodeCheck {
+        std::string name;        // "launcher", "image", "python", "torch", "worker", "engine", "cuda", "gpu", "data:<n>", "cache"
+        std::string label;       // "Launcher", "Image", "Python", ...
+        StepStatus status = StepStatus::Done;   // Done, Warning or Failed
+        std::string detail;      // what was found; Failed: why, a sentence
+        std::string fix;         // Failed or Warning: what to do ("" nothing)
+    };
+    struct NodeCheckReport {
+        std::vector<NodeCheck> checks;
+        std::string output;      // the node's own words beside the check lines (Details)
+        bool noEngine = false;   // a check found no SIRIUS engine that runs there
+        int exitCode = -1;       // the check step's ("@@check-exit"); -1 not said
+        // The first Failed check, or nullptr.
+        const NodeCheck* failure() const;
+    };
+    // The check step's output read: each `check <name> <ok|warn|fail>
+    // <words>` line in the application's words with its fix; `@@version
+    // <json>` (the engine's `version`) compared with `buildJson` (the picked
+    // build's BUILD.json; nullopt for the image's own engine or one named
+    // outright) and with `app`. An image that did not start (no "image ok")
+    // fails "image". `node` names where it ran; `buildsHint` is a builds
+    // folder the login checks found (for the fix). Exposed for tests.
+    NodeCheckReport readNodeChecks(const std::string& output, const Profile& p, const std::optional<BuildInfo>& buildJson,
+                                   const std::string& buildDir, const BuildInfo& app, const std::string& node, const std::string& buildsHint = {});
+    // The data folders as `<host path> <path in the image>` pairs, in the
+    // order of the --bind list (the arguments after --check).
+    std::vector<std::pair<std::string, std::string>> bindPairs(const std::string& bind);
+
     // A worker image built in the job (Session::buildImage).
     struct BuildStatus {
         enum class Phase { None,
@@ -404,10 +450,22 @@ namespace sirius::app::cluster {
         // Disconnected because the job ended (it was cancelled, timed out,
         // failed): what its engine held went with it.
         bool jobEnded = false;
+        // The job was the user's before SIRIUS took it up (Session::adoptJob):
+        // SIRIUS never cancels it; a disconnect or another job lets it go,
+        // running.
+        bool adopted = false;
         // Disconnected without being asked to: the SSH connection or the job
         // went away while it was held.
         bool dropped = false;
         WorkerCapabilities caps;
+        // Counts the changes of `caps` after the hello: SIRIUS's engine
+        // answers before its Python child is up (torch takes a while to
+        // import), and the keep-alive asks again until that child is ready
+        // or has failed. What hangs on the child (torch, model steps,
+        // plugins) is read again when it changes.
+        int capsSerial = 0;
+        // The checks run in the job before the worker's start (the last ones).
+        std::vector<NodeCheck> nodeChecks;
         std::string host;
         std::chrono::steady_clock::time_point since{};   // when `state` began
         // The job's time limit in seconds (-1 unlimited, -2 unknown, as
@@ -460,6 +518,32 @@ namespace sirius::app::cluster {
     // The bash script that lists `path` (exposed for tests).
     std::string listingScript(const std::string& path, int maxEntries);
 
+    // --- the user's own jobs -----------------------------------------------------------
+    //
+    // Every job of the user's that runs or waits on the cluster, SIRIUS's or
+    // not, as squeue lists them: one of them may hold the allocation instead
+    // of a new job (Session::adoptJob).
+    struct ClusterJob {
+        std::string id;            // "4238722"
+        std::string name;          // the job's name ("sirius" for SIRIUS's own)
+        std::string partition;
+        std::string state;         // RUNNING, PENDING, ...
+        std::string used, limit;   // as Slurm says them: "1:02:03", "2-00:00:00"
+        std::string where;         // RUNNING: its node(s); else why it waits ("(Resources)")
+        int nodes = 0;
+        int gpus = 0;              // per node, from its gres ("gres/gpu:a100:2" -> 2); 0 none or not said
+        int cpus = 0;
+        std::string mem;           // "64G"; "" not said
+        bool running() const { return state == "RUNNING"; }
+    };
+    // squeue -h -u $USER -t RUNNING,PENDING with the fields above (exposed for tests).
+    std::string userJobsScript();
+    std::vector<ClusterJob> parseUserJobs(const std::string& output);
+    // The GPUs of a gres/TRES text: "gpu:2", "gres:gpu:a100:2", "gres/gpu=2", "gres/gpu" (1); 0 for none, "N/A", "(null)".
+    int gresGpus(const std::string& gres);
+    // "g0003 · 1 GPU · 8 CPUs · 64G · 0:42 of 1:00:00"; a waiting job says why.
+    std::string jobSummary(const ClusterJob& job);
+
     // --- the worker's launch script -------------------------------------------------
     //
     // app/python/slurm/sirius_worker.sbatch as this application was built
@@ -477,11 +561,19 @@ namespace sirius::app::cluster {
     // checks list them (the newest first), and the one that serves this
     // application: the build of its own commit, else one with the same
     // operations and engine API (engineMismatch). Exposed for tests.
+    //
+    // A build is a plain self-contained folder (bin/sirius-cli, lib/,
+    // python/, help/, BUILD.json) and may live on a scratch file system the
+    // login node mounts noexec: these are file checks only (`ls -lL`, never
+    // `[ -x ]`, which asks access(X_OK) and says no there). Whether it runs
+    // is found out in the job (readNodeChecks).
     struct EngineBuild {
         std::string dir;          // the folder's name (a commit)
-        bool runnable = false;    // bin/sirius-cli is there and executable
+        bool runnable = false;    // bin/sirius-cli is a file (or a link to one) with an execute bit in its mode
+        bool binThere = false;    // bin/sirius-cli is a file at all (runnable or not)
         bool readable = false;    // BUILD.json parses
         bool python = false;      // python/sirius_worker is there: the worker's code of that commit
+        bool lib = true;          // lib/ is there (a listing of before does not say: true)
         BuildInfo info;
     };
     std::string engineBuildsScript(const std::string& folder);
@@ -526,6 +618,16 @@ namespace sirius::app::cluster {
         // still answers. JobReady (or Connected) afterwards. Ignored while
         // connecting.
         void connectJob(const Profile& profile);
+        // Step 1 with a job of the user's own (listJobs) in place of a new
+        // one: logged in (kept when it is up for this host), the job taken
+        // up as it is -- its node, its GPUs (the worker's step asks for as
+        // many) -- and waited for while it is pending. JobReady afterwards.
+        // SIRIUS never cancels it (Status::adopted). Ignored while connecting
+        // or while a job is held.
+        void adoptJob(const Profile& profile, const std::string& jobId);
+        // The user's jobs that run or wait (squeue); blocks for as long as
+        // that takes. Throws ssh::SshError when not logged in. Any thread.
+        std::vector<ClusterJob> listJobs();
         // Step 2: the worker in the held job: the checks, the srun step, the
         // hello. A worker already running is stopped first (a new image, new
         // data folders). Ignored without a job, or while connecting.
@@ -541,12 +643,14 @@ namespace sirius::app::cluster {
         void stopWorker();
         // Cancels the held job (scancel; its worker goes with it) and keeps
         // the login: Idle, logged in, for a job with other settings. Blocks
-        // for as long as scancel takes.
+        // for as long as scancel takes. A job of the user's own (adopted) is
+        // not cancelled: its worker step ends and it is let go, running.
         void cancelJob();
         // Stops a connect in progress (the prompt included).
         void cancelConnect();
         // Closes the worker connection and ssh; with `cancelJob` scancels the
-        // job first. Blocks for as long as scancel takes (seconds).
+        // job first (never an adopted one: it is left running). Blocks for as
+        // long as scancel takes (seconds).
         void disconnect(bool cancelJob);
 
         // Builds a worker image in the held job: first whether the cluster
@@ -596,6 +700,7 @@ namespace sirius::app::cluster {
     private:
         enum class Mode { Login,
                           Job,
+                          Adopt,
                           Worker,
                           Both };
         void start(const Profile& profile, Mode mode);

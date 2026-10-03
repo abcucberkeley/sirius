@@ -332,14 +332,36 @@ namespace sirius::app {
     void DatasetManifest::save(const fs::path& path) const {
         std::error_code ec;
         const fs::path target = fs::is_directory(path, ec) ? path / kFileName : path;
+        std::ofstream out(target);
+        if (!out) throw std::runtime_error("cannot write " + target.string());
+        out << toText();
+        if (!out) throw std::runtime_error("cannot write " + target.string());
+    }
+
+    std::string DatasetManifest::toText() const {
         toml::table t = jsonToToml(toJson());
         t.insert("format", "sirius-dataset");
         t.insert("version", std::int64_t{1});
-        std::ofstream out(target);
-        if (!out) throw std::runtime_error("cannot write " + target.string());
+        std::ostringstream out;
         out << "# SIRIUS multi-file dataset: one TIFF stack per channel, time point and tile.\n"
             << t << "\n";
-        if (!out) throw std::runtime_error("cannot write " + target.string());
+        return out.str();
+    }
+
+    DatasetManifest DatasetManifest::fromText(const std::string& text, const std::string& source) {
+        toml::table t;
+        try {
+            t = toml::parse(text, source);
+        } catch (const toml::parse_error& e) {
+            std::ostringstream ss;
+            ss << source << ": " << e.description() << " (line " << e.source().begin.line << ")";
+            throw std::runtime_error(ss.str());
+        }
+        try {
+            return fromJson(tomlToJson(t));
+        } catch (const std::exception& e) {
+            throw std::runtime_error(source + ": " + e.what());
+        }
     }
 
     DatasetManifest DatasetManifest::load(const fs::path& path) {
@@ -593,6 +615,14 @@ namespace sirius::app {
         return names;
     }
 
+    std::vector<std::string> tiffNamesOf(std::vector<std::string> names) {
+        names.erase(std::remove_if(names.begin(), names.end(),
+                                   [](const std::string& n) { return n.empty() || n.front() == '.' || !isTiffName(fs::u8path(n)); }),
+                    names.end());
+        std::sort(names.begin(), names.end(), naturalLess);
+        return names;
+    }
+
     DatasetManifest manifestOfOneStack(const fs::path& folder) {
         DatasetManifest m;
         m.name = folderName(folder);
@@ -613,8 +643,19 @@ namespace sirius::app {
     DatasetManifest manifestFromFolder(const fs::path& folder, const FilenameRule& rule, std::vector<std::string>* unmatched) {
         std::error_code ec;
         if (!fs::is_directory(folder, ec)) throw std::runtime_error("not a folder: " + folder.string());
-        std::vector<std::string> names = tiffNamesInOrder(folder);
+        const StackShapeProbe probe = [&folder](const std::string& name) {
+            const TiffStackShape info = inspectTiffShape((folder / name).string());
+            StackShape s;
+            s.width = info.width;
+            s.height = info.height;
+            s.pages = info.pages;
+            return s;
+        };
+        return manifestFromNames(folderName(folder), tiffNamesInOrder(folder), rule, probe, unmatched);
+    }
 
+    DatasetManifest manifestFromNames(const std::string& datasetName, const std::vector<std::string>& names, const FilenameRule& rule,
+                                      const StackShapeProbe& probe, std::vector<std::string>* unmatched) {
         if (unmatched) unmatched->clear();
         std::vector<MatchedFile> matched;
         for (const FilenameMatch& m : matchFilenames(names, rule.pattern)) {
@@ -643,7 +684,7 @@ namespace sirius::app {
         }
 
         DatasetManifest manifest;
-        manifest.name = folderName(folder);
+        manifest.name = datasetName;
         manifest.voxelUm = rule.voxelUm;
         manifest.frameIntervalS = rule.frameIntervalS;
         manifest.sim = rule.sim;
@@ -696,7 +737,7 @@ namespace sirius::app {
         std::size_t pages = 0;
         std::string firstFile;
         auto probeShape = [&](const MatchedFile& f) {
-            const TiffStackShape info = inspectTiffShape((folder / f.name).string());
+            const StackShape info = probe(f.name);
             if (info.pages == 0) throw std::runtime_error(f.name + ": the TIFF has no pages");
             if (firstFile.empty()) {
                 width = info.width;

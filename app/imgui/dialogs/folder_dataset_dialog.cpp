@@ -10,6 +10,14 @@
 // matched and the manifest built (one TIFF header per tile) on the dialog's
 // own thread. Matching waits 150 ms after the last key, and a result is
 // taken only when the pattern is still the one it was matched for.
+//
+// The same dialog serves a folder on the cluster (File ▸ Open folder as
+// dataset with a cluster session, the Load step's Source in Folder mode on
+// the cluster): the names come over the session's command channel, the
+// pattern and preview are the same, the stacks' shapes are asked of the
+// engine on the node, and the manifest is kept in ~/.sirius/manifests on the
+// cluster -- never in the data folder (core/cluster_folder.hpp). The Load
+// step's Source is then that manifest's cluster:// path.
 #include "imgui/dialogs/dialogs.hpp"
 
 #include <algorithm>
@@ -37,7 +45,12 @@
 #include <nlohmann/json.hpp>
 
 #include "core/array_source.hpp"
+#include "core/cluster_folder.hpp"
+#include "core/host.hpp"
 #include "core/manifest.hpp"
+#include "core/remote_host.hpp"
+#include "core/remote_source.hpp"
+#include "imgui/cluster_link.hpp"
 #include "imgui/dialogs/open_dataset_common.hpp"
 #include "imgui/platform.hpp"
 #include "imgui/settings.hpp"
@@ -240,9 +253,12 @@ namespace sirius::app::gui {
         using Names = std::shared_ptr<const std::vector<std::string>>;
 
         struct Listing {
+            std::uint64_t generation = 0;               // of the folder it lists (the folder can change)
             Names names;                                // the folder's TIFF files, sorted
             std::optional<DatasetManifest> existing;    // a manifest already in the folder
             std::string canonicalFolder;
+            std::shared_ptr<const ClusterFolder> cluster;   // a folder on the cluster: as it was listed
+            std::string error;                          // the cluster's folder could not be listed
         };
 
         struct MatchResult {
@@ -269,6 +285,7 @@ namespace sirius::app::gui {
         };
 
         struct BuildResult {
+            std::string openPath;        // a folder on the cluster: its manifest's cluster:// path, written
             fs::path dest;
             bool openAsIs = false;       // the loaded manifest is valid: nothing to write
             DatasetManifest manifest;
@@ -362,36 +379,25 @@ namespace sirius::app::gui {
 
         class FolderDatasetDialog final : public Dialog {
         public:
+            // `folder`: a folder on this computer, a cluster folder
+            // ("cluster://<host>/<path>"), or "" to choose one here (on the
+            // cluster when a session is up and the HPC backend computes there).
             FolderDatasetDialog(App& app, const std::string& folder, std::function<void()> opened, bool readAll)
-                : app_(app), bridge_(app.bridge()), opened_(std::move(opened)), readAll_(readAll), folder_(absolutePath(folder)),
-                  worker_(app.bridge()) {
-                manifestPath_ = folder_ + "/" + DatasetManifest::kFileName;
-                status_ = "Matching files…";
-                worker_.run([this, alive = alive_, dir = folder_](const Worker::Post& post) {
-                    Listing l;
-                    std::vector<std::string> names;
-                    try {
-                        const fs::path path = toPath(dir);
-                        l.canonicalFolder = fromPath(canonicalPath(path));
-                        names = tiffNamesInOrder(path);
-                        std::error_code ec;
-                        const fs::path manifest = path / DatasetManifest::kFileName;
-                        if (fs::exists(manifest, ec)) {
-                            try {
-                                l.existing = DatasetManifest::load(manifest);
-                            } catch (const std::exception&) {
-                                l.existing.reset();
-                            }
-                        }
-                    } catch (const std::exception&) {
-                        // an unreadable folder holds no files, which the status line says
-                    }
-                    if (l.canonicalFolder.empty()) l.canonicalFolder = dir;
-                    l.names = std::make_shared<const std::vector<std::string>>(std::move(names));
-                    post([this, alive, l = std::move(l)] {
-                        if (alive->load() && isOpen()) listed(l);
-                    });
-                });
+                : app_(app), bridge_(app.bridge()), opened_(std::move(opened)), readAll_(readAll), worker_(app.bridge()) {
+                std::string host, remotePath;
+                // screenshots only: the folder File ▸ Open folder as dataset would have been given
+                const std::string given = folder.empty() ? host::environment("SIRIUS_TEST_FOLDER_DATASET") : folder;
+                if (splitClusterPath(given, host, remotePath)) {
+                    remote_ = true;
+                    host_ = host;
+                    folder_ = remotePath;
+                } else if (!given.empty()) {
+                    folder_ = absolutePath(given);
+                } else {
+                    remote_ = app.cluster().sshUp() && (app.cluster().connected() || app.wb().backend() == Backend::Hpc);
+                    if (remote_) host_ = app.cluster().status().host;
+                }
+                startListing();
             }
 
             ~FolderDatasetDialog() override { alive_->store(false); }
@@ -471,7 +477,136 @@ namespace sirius::app::gui {
             // The folder is listed: preload, then match. In-folder manifest, else
             // the regex remembered for this folder, else the last pattern that
             // opened any folder, else AOLLS when the names look like it.
+            // The folder (again): on this computer read here, on the cluster
+            // over the session's command channel. What the last folder showed
+            // goes; the pattern and the metadata typed stay.
+            void startListing() {
+                const std::uint64_t generation = ++listGeneration_;
+                names_.reset();
+                cluster_.reset();
+                existing_.reset();
+                loadedManifestPath_.clear();
+                matches_.clear();
+                matchedCount_ = 0;
+                canOpen_ = false;
+                statusBad_ = false;
+                ++generation_;   // a match under way is for the last folder
+                matching_ = false;
+                manifestPath_ = remote_ || folder_.empty() ? std::string() : folder_ + "/" + DatasetManifest::kFileName;
+                if (folder_.empty()) {
+                    status_ = remote_ ? "Choose a folder on the cluster: Browse." : "Choose a folder: Browse.";
+                    return;
+                }
+                if (remote_) {
+                    if (!app_.cluster().sshUp()) {
+                        status_ = "Not logged in to the cluster: connect first (Cluster button).";
+                        statusBad_ = true;
+                        return;
+                    }
+                    status_ = "Listing the folder on " + host_ + "…";
+                    cluster::Session* session = &app_.cluster().session();
+                    worker_.run([this, alive = alive_, session, host = host_, dir = folder_, generation](const Worker::Post& post) {
+                        Listing l;
+                        l.generation = generation;
+                        try {
+                            auto f = std::make_shared<ClusterFolder>(listClusterFolder(*session, host, dir));
+                            l.canonicalFolder = f->clusterPath();
+                            l.names = std::make_shared<const std::vector<std::string>>(f->tiffs);
+                            l.existing = f->existing;
+                            l.cluster = std::move(f);
+                        } catch (const std::exception& e) {
+                            l.error = e.what();
+                            l.names = std::make_shared<const std::vector<std::string>>();
+                            l.canonicalFolder = makeClusterPath(host, dir);
+                        }
+                        post([this, alive, l = std::move(l)] {
+                            if (alive->load() && isOpen()) listed(l);
+                        });
+                    });
+                    return;
+                }
+                status_ = "Matching files…";
+                worker_.run([this, alive = alive_, dir = folder_, generation](const Worker::Post& post) {
+                    Listing l;
+                    l.generation = generation;
+                    std::vector<std::string> names;
+                    try {
+                        const fs::path path = toPath(dir);
+                        l.canonicalFolder = fromPath(canonicalPath(path));
+                        names = tiffNamesInOrder(path);
+                        std::error_code ec;
+                        const fs::path manifest = path / DatasetManifest::kFileName;
+                        if (fs::exists(manifest, ec)) {
+                            try {
+                                l.existing = DatasetManifest::load(manifest);
+                            } catch (const std::exception&) {
+                                l.existing.reset();
+                            }
+                        }
+                    } catch (const std::exception&) {
+                        // an unreadable folder holds no files, which the status line says
+                    }
+                    if (l.canonicalFolder.empty()) l.canonicalFolder = dir;
+                    l.names = std::make_shared<const std::vector<std::string>>(std::move(names));
+                    post([this, alive, l = std::move(l)] {
+                        if (alive->load() && isOpen()) listed(l);
+                    });
+                });
+            }
+
+            // A folder chosen here: "cluster://<host>/<path>" or one of this computer.
+            void setFolder(const std::string& folder) {
+                std::string host, remotePath;
+                if (splitClusterPath(folder, host, remotePath)) {
+                    remote_ = true;
+                    host_ = host;
+                    folder_ = remotePath;
+                } else {
+                    remote_ = false;
+                    folder_ = folder.empty() ? std::string() : absolutePath(folder);
+                }
+                startListing();
+            }
+
+            // This computer | Cluster switched: the folder of the other side is chosen anew.
+            void setWhere(bool remote) {
+                if (remote == remote_) return;
+                remote_ = remote;
+                host_ = remote ? app_.cluster().status().host : std::string();
+                folder_.clear();
+                startListing();
+            }
+
+            void browse(App& app) {
+                if (remote_) {
+                    if (!app.cluster().sshUp()) {
+                        app.clusterDialog();
+                        return;
+                    }
+                    app.showDialog(makeClusterBrowser(app, folder_, true, [this, alive = alive_](const std::string& chosen) {
+                        if (alive->load() && isOpen() && !chosen.empty()) setFolder(chosen);
+                    }));
+                    return;
+                }
+                std::string start = folder_.empty() ? app.lastDir() : parentPath(folder_);
+                if (start.empty() || !isDirectory(start)) start = platform::homeDirectory();
+                const std::string chosen = platform::pickFolderDialog("Open folder as dataset", start);
+                if (chosen.empty()) return;
+                app.setLastDir(chosen);
+                setFolder(chosen);
+            }
+
             void listed(const Listing& l) {
+                if (l.generation != listGeneration_) return;   // a folder chosen since
+                if (!l.error.empty()) {
+                    names_ = l.names;
+                    canonicalFolder_ = l.canonicalFolder;
+                    status_ = "Could not list the folder on " + host_ + ": " + l.error;
+                    statusBad_ = true;
+                    canOpen_ = false;
+                    return;
+                }
+                cluster_ = l.cluster;
                 names_ = l.names;
                 canonicalFolder_ = l.canonicalFolder;
                 // a manifest loaded (Load…) while the folder was being listed stands
@@ -480,7 +615,7 @@ namespace sirius::app::gui {
                 if (touched_) {
                     // typed while the folder was being listed: what was typed stands
                 } else if (existing_) {
-                    loadedManifestPath_ = folder_ + "/" + DatasetManifest::kFileName;
+                    if (!remote_) loadedManifestPath_ = folder_ + "/" + DatasetManifest::kFileName;
                     applyManifest(*existing_);
                     if (trimmed(pattern_).empty() && !remembered.empty()) setPattern(remembered);
                 } else if (!remembered.empty()) {
@@ -533,7 +668,8 @@ namespace sirius::app::gui {
                 }
                 touched_ = true;
                 applyManifest(m);
-                if (samePath(m.filesRoot(toPath(chosen)), toPath(folder_))) {
+                // on the cluster a manifest of this computer is a template: its pattern and metadata
+                if (!remote_ && samePath(m.filesRoot(toPath(chosen)), toPath(folder_))) {
                     manifestPath_ = chosen;
                     loadedManifestPath_ = chosen;
                 }
@@ -637,8 +773,16 @@ namespace sirius::app::gui {
                                           static_cast<int>(std::max<std::size_t>(tokens_.size(), 1)), static_cast<int>(times.size()),
                                           static_cast<int>(tiles.size()));
                 }
+                if (cluster_ && cluster_->truncated)
+                    status_ += format(" · only the first %d TIFF names were listed", static_cast<int>(cluster_->tiffs.size()));
                 statusBad_ = !r.error.empty() || (patternOk_ && matchedCount_ == 0);
                 canOpen_ = patternOk_ && matchedCount_ > 0;
+                if (cluster_ && cluster_->store && names_->empty()) {
+                    // a zarr / N5 store names its own axes: it opens as it is
+                    status_ = "A zarr / N5 store: it opens as it is, without a pattern.";
+                    statusBad_ = false;
+                    canOpen_ = true;
+                }
             }
 
             // One row per channel token the pattern found, seeded from the
@@ -750,6 +894,10 @@ namespace sirius::app::gui {
             // manifest is opened as-is.
             void saveAndOpen() {
                 if (building_ || !canOpen_) return;
+                if (remote_) {
+                    saveAndOpenOnCluster();
+                    return;
+                }
                 BuildRequest q;
                 q.folder = folder_;
                 q.destText = trimmed(manifestPath_);
@@ -769,14 +917,64 @@ namespace sirius::app::gui {
                 });
             }
 
+            // The same manifest, built from the cluster's listing with the
+            // stacks' shapes from the engine on the node, kept in
+            // ~/.sirius/manifests there (never in the data folder), and
+            // opened by its cluster:// path: the engine reads it as any manifest.
+            void saveAndOpenOnCluster() {
+                if (!cluster_) return;
+                if (cluster_->store && cluster_->tiffs.empty()) {
+                    open(cluster_->clusterPath(), {pattern_, positions_, overlap_}, "Another task is still running: cancel it or wait, then open the dataset.");
+                    return;
+                }
+                if (!app_.cluster().connected()) {
+                    app_.message(kTitle, "The engine on the node reads the stacks' sizes and opens the dataset: start the worker first "
+                                         "(the Cluster button), then Open. The preview needs only the login.");
+                    return;
+                }
+                building_ = true;
+                cluster::Session* session = &app_.cluster().session();
+                worker_.run([this, alive = alive_, session, folder = cluster_, rule = rule(),
+                             fields = RememberedFields{pattern_, positions_, overlap_}](const Worker::Post& post) {
+                    if (!alive->load()) return;
+                    BuildResult r;
+                    r.fields = fields;
+                    DatasetManifest manifest;
+                    try {
+                        manifest = manifestFromClusterFolder(*folder, rule);
+                    } catch (const std::exception& e) {
+                        r.error = std::string("The files do not form a dataset:\n") + e.what();
+                    }
+                    if (r.error.empty()) {
+                        try {
+                            r.openPath = writeClusterManifest(*session, *folder, std::move(manifest));
+                        } catch (const ssh::SshError& e) {
+                            r.error = std::string("Could not keep the manifest in ~/.sirius/manifests on the cluster:\n") + e.what() +
+                                      (e.detail.empty() ? std::string() : "\n" + e.detail);
+                        } catch (const std::exception& e) {
+                            r.error = std::string("Could not keep the manifest on the cluster:\n") + e.what();
+                        }
+                    }
+                    post([this, alive, r = std::move(r)] {
+                        if (alive->load() && isOpen()) built(r);
+                    });
+                });
+            }
+
             void built(const BuildResult& r) {
                 building_ = false;
                 if (!r.error.empty()) {
                     app_.message(kTitle, r.error);
                     return;
                 }
+                if (!r.openPath.empty()) {
+                    app_.wb().logLine("Open folder: " + makeClusterPath(host_, folder_) + " -> " + r.openPath +
+                                      " (the manifest is kept on the cluster; the data folder is not written)");
+                    open(r.openPath, r.fields, "The mapping is ready but another task is still running: cancel it or wait, then open the dataset.");
+                    return;
+                }
                 if (r.openAsIs) {
-                    open(r.dest, r.fields, "Another task is still running: cancel it or wait, then open the dataset.");
+                    open(fromPath(r.dest), r.fields, "Another task is still running: cancel it or wait, then open the dataset.");
                     return;
                 }
                 // Nothing is written into a folder, or over a file, the user has
@@ -849,18 +1047,20 @@ namespace sirius::app::gui {
                         return;
                     }
                 }
-                open(dest, fields, "The mapping is ready but another task is still running: cancel it or wait, then open the dataset.");
+                open(fromPath(dest), fields, "The mapping is ready but another task is still running: cancel it or wait, then open the dataset.");
             }
 
-            void open(const fs::path& dest, const RememberedFields& fields, const char* busyText) {
+            void open(const std::string& path, const RememberedFields& fields, const char* busyText) {
                 OpenOptions options;
                 options.tile = 0;
-                options.readAll = readAll_;
+                // on the cluster it stays there: the viewer gets what it draws
+                options.readAll = remote_ ? false : readAll_;
                 // refused while a run or another task is active: the dialog stays
-                if (!app_.wb().canEdit() || !bridge_.openDatasetAsync(fromPath(dest), options)) {
+                if (!app_.wb().canEdit() || !bridge_.openDatasetAsync(path, options)) {
                     app_.message(kTitle, busyText);
                     return;
                 }
+                if (remote_) App::addRecentFile(path);
                 // only a pattern that opened something is worth offering again,
                 // and it is the one the manifest was built with, not what the
                 // fields were edited to while it was being built
@@ -874,19 +1074,84 @@ namespace sirius::app::gui {
             void drawFolderRows(App& app) {
                 const float scale = std::max(theme::scale(), 0.01f);
                 const float spacing = px(8);
+                ClusterLink& link = app.cluster();
+                if (link.sshUp() || remote_) {
+                    // where the folder is: this computer, or the cluster (read there by the engine)
+                    int where = remote_ ? 1 : 0;
+                    widgets::SegmentedOpts so;
+                    so.enabled = !building_;
+                    so.tooltips = {"A folder on this computer",
+                                   "A folder on the cluster: listed over the SSH session, read on the node by the engine; the manifest "
+                                   "is kept in ~/.sirius/manifests there"};
+                    if (widgets::segmented("##where", {"This computer", "Cluster"}, &where, so)) {
+                        const bool remote = where == 1;
+                        app.defer([this, alive = alive_, remote] {
+                            if (alive->load() && isOpen()) setWhere(remote);
+                        });
+                    }
+                    if (remote_) {
+                        ImGui::SameLine(0.0f, px(10));
+                        // centred on the switch's row
+                        ImGui::SetCursorPosY(ImGui::GetCursorPosY() + std::floor((theme::snap(px(26)) - theme::textSize("Ag", 11).y) * 0.5f));
+                        if (!link.sshUp()) widgets::text("Not logged in to the cluster", 11, theme::kAccentText);
+                        else if (!link.connected())
+                            widgets::text(host_ + " · the preview works now; Open waits for the worker", 11, theme::kNeutral600);
+                        else widgets::text(host_ + " · names listed over SSH, files read on the node", 11, theme::kNeutral600);
+                    }
+                    gap(6);
+                }
                 {
-                    // folder + file count
-                    const std::string count = names_ ? format("%d TIFF file(s)", static_cast<int>(names_->size())) : std::string("listing…");
-                    const float countW = theme::textSize(count, 12).x;
+                    // folder + Browse + file count
+                    std::string count = names_ ? format("%d TIFF file(s)", static_cast<int>(names_->size()))
+                                               : (folder_.empty() ? std::string() : std::string("listing…"));
+                    if (cluster_ && cluster_->truncated) count += "+";
+                    const float countW = count.empty() ? 0.0f : theme::textSize(count, 12).x;
+                    const ImVec2 browseSize = buttonSize("Browse…", widgets::ButtonKind::Secondary, true);
                     const Line line;
                     line.at(0.0f, line.height());
                     widgets::FieldOpts f;
-                    f.width = std::max(px(80), line.width() - countW - spacing) / scale;
+                    f.width = std::max(px(80), line.width() - countW - browseSize.x - 2 * spacing) / scale;
                     f.readOnly = true;
-                    widgets::inputText("##folder", &folder_, f);
-                    widgets::tooltip(folder_);
-                    line.text(line.width() - countW, count, 12, theme::kNeutral600);
+                    f.hint = remote_ ? "a folder on the cluster…" : "a folder…";
+                    std::string shown = remote_ && !folder_.empty() ? host_ + ":" + folder_ : folder_;
+                    widgets::inputText("##folder", &shown, f);
+                    widgets::tooltip(remote_ && !folder_.empty() ? makeClusterPath(host_, folder_) : folder_);
+                    const float browseX = line.width() - countW - (countW > 0.0f ? spacing : 0.0f) - browseSize.x;
+                    line.at(browseX, browseSize.y);
+                    widgets::ButtonOpts b;
+                    b.small = true;
+                    b.enabled = !building_;
+                    b.tooltip = remote_ ? "The cluster's folders, through the SSH session" : "Choose the folder of TIFF stacks";
+                    if (widgets::button("Browse…##folder", b)) {
+                        app.defer([this, alive = alive_, &app] {
+                            if (alive->load() && isOpen()) browse(app);
+                        });
+                    }
+                    if (countW > 0.0f) line.text(line.width() - countW, count, 12, theme::kNeutral600);
                     line.end();
+                }
+                if (remote_) {
+                    // nothing is written into the data folder on the cluster: the manifest is kept with the user's own files there
+                    const std::string label = "Manifest";
+                    const float labelW = theme::textSize(label, 11).x;
+                    const ImVec2 load = buttonSize("Load…", widgets::ButtonKind::Secondary, true);
+                    const Line line;
+                    line.text(0.0f, label, 11, theme::kNeutral700);
+                    const std::string where = "kept in ~/.sirius/manifests on " + (host_.empty() ? std::string("the cluster") : host_) +
+                                              "; the data folder is not written";
+                    line.text(labelW + spacing, widgets::elideText(where, line.width() - labelW - load.x - 3 * spacing, 12), 12,
+                              theme::kNeutral600);
+                    line.at(line.width() - load.x, load.y);
+                    widgets::ButtonOpts b;
+                    b.small = true;
+                    b.tooltip = "Use the pattern and metadata of a dataset manifest on this computer";
+                    if (widgets::button("Load…", b)) {
+                        app.defer([this, alive = alive_, &app] {
+                            if (alive->load()) loadManifestFile(app);
+                        });
+                    }
+                    line.end();
+                    return;
                 }
                 {
                     const std::string label = "Manifest";
@@ -1351,8 +1616,12 @@ namespace sirius::app::gui {
             Bridge& bridge_;
             std::function<void()> opened_;                // the Open dialog under this one, when it raised it
             bool readAll_ = true;                         // full load, or lazy: that dialog's "Read as"
-            std::string folder_;
-            std::string canonicalFolder_;
+            bool remote_ = false;                         // folder_ is on the cluster (host_)
+            std::string host_;
+            std::string folder_;                          // "" until one is chosen
+            std::string canonicalFolder_;                 // on the cluster: its cluster:// path
+            std::shared_ptr<const ClusterFolder> cluster_;   // the cluster folder as listed
+            std::uint64_t listGeneration_ = 0;
             Names names_;                                 // null until the folder is listed
             std::optional<DatasetManifest> existing_;     // a manifest already in the folder or loaded
             std::string loadedManifestPath_;              // toml we loaded; empty if none

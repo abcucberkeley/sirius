@@ -447,6 +447,102 @@ namespace sirius::app::gui::widgets {
         return glyphButtonImpl(id, Icon::None, glyph, size, opts);
     }
 
+    // --- messages to copy --------------------------------------------------------
+
+    namespace {
+        constexpr double kCopiedSeconds = 1.5;
+        // The copy button clicked last, and until when it says so.
+        struct CopiedMark {
+            ImGuiID id = 0;
+            double until = 0.0;
+        };
+        CopiedMark& copiedMark() {
+            static CopiedMark mark;
+            return mark;
+        }
+        float copySide(float lineH) { return theme::snap(std::max(px(16), lineH)); }
+    } // namespace
+
+    void copyToClipboard(const std::string& text) { ImGui::SetClipboardText(text.c_str()); }
+
+    bool copyButton(const char* id, const std::string& text, float side, bool onDark) {
+        const ImGuiID key = ImGui::GetID(id);
+        CopiedMark& mark = copiedMark();
+        const bool copied = mark.id == key && ImGui::GetTime() < mark.until;
+        GlyphOpts o;
+        o.borderless = true;
+        o.onDark = onDark;
+        o.idle = onDark ? theme::kViewerText : theme::kNeutral500;
+        o.iconPx = std::max(10.0f, side - 4.0f);
+        o.tooltip = copied ? "Copied" : "Copy to the clipboard";
+        const bool clicked = glyphButton(id, copied ? Icon::Check : Icon::Copy, ImVec2(side, side), o);
+        if (clicked) {
+            copyToClipboard(text);
+            mark.id = key;
+            mark.until = ImGui::GetTime() + kCopiedSeconds;
+        }
+        return clicked;
+    }
+
+    void copyOnRightClick(const char* id, const std::string& text, const std::vector<std::pair<std::string, std::string>>& more) {
+        // by the item's rectangle: text drawn over a row's button is never the
+        // hovered item itself, and it is the text that is right-clicked
+        const bool over = ImGui::IsWindowHovered(ImGuiHoveredFlags_AllowWhenBlockedByActiveItem) &&
+                          ImGui::IsMouseHoveringRect(ImGui::GetItemRectMin(), ImGui::GetItemRectMax());
+        if (over && ImGui::IsMouseReleased(ImGuiMouseButton_Right)) ImGui::OpenPopup(id);
+        ImGui::PushStyleColor(ImGuiCol_Border, theme::kText);
+        ImGui::PushStyleVar(ImGuiStyleVar_PopupBorderSize, theme::crispPen(2));
+        ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, px(0, 4));
+        ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, px(0, 0));
+        if (ImGui::BeginPopup(id)) {
+            auto item = [](const std::string& label) {
+                const ImVec2 p = ImGui::GetCursorScreenPos();
+                const float h = theme::snap(px(26));
+                const float w = std::max(px(160), theme::textSize(label, 12).x + px(36));
+                const bool clicked = ImGui::Selectable(("##" + label).c_str(), false, ImGuiSelectableFlags_None, ImVec2(w, h));
+                drawTextIn(ImGui::GetWindowDrawList(), ImVec2(p.x + px(12), p.y), ImVec2(p.x + w, p.y + h), label, 12, theme::kText,
+                           Weight::Regular, 0.0f, 0.5f);
+                return clicked;
+            };
+            if (item("Copy")) copyToClipboard(text);
+            for (const auto& [label, value] : more)
+                if (item(label)) copyToClipboard(value);
+            ImGui::EndPopup();
+        }
+        ImGui::PopStyleVar(3);
+        ImGui::PopStyleColor();
+    }
+
+    float copyableTextHeight(const std::string& s, float pxSize, float wrapWidth, Weight w) {
+        const theme::FontScope f(pxSize, w);
+        const float lineH = ImGui::GetTextLineHeight();
+        const float side = copySide(lineH);
+        const float textW = std::max(px(20), wrapWidth - side - px(4));
+        const float h = ImGui::CalcTextSize(s.c_str(), s.c_str() + s.size(), false, textW).y;
+        return std::max(h, side);
+    }
+
+    void copyableText(const char* id, const std::string& s, float pxSize, ImU32 color, Weight w, float wrapWidth, const std::string& copied) {
+        ImGui::PushID(id);
+        const float total = wrapWidth > 0.0f ? wrapWidth : std::max(px(40), ImGui::GetContentRegionAvail().x);
+        float lineH = 0.0f;
+        {
+            const theme::FontScope f(pxSize, w);
+            lineH = ImGui::GetTextLineHeight();
+        }
+        const float side = copySide(lineH);
+        const float textW = std::max(px(20), total - side - px(4));
+        const std::string& text = copied.empty() ? s : copied;
+        // the button first, at the end of the first line; then the text, which leaves the cursor
+        const ImVec2 at = ImGui::GetCursorScreenPos();
+        ImGui::SetCursorScreenPos(ImVec2(at.x + total - side, theme::snap(at.y + (lineH - side) * 0.5f)));
+        copyButton("##copy", text, side / std::max(theme::scale(), 0.01f));
+        ImGui::SetCursorScreenPos(at);
+        textWrapped(s, pxSize, color, w, textW);
+        copyOnRightClick("##copyMenu", text);
+        ImGui::PopID();
+    }
+
     bool tokenCheck(const char* label, bool checked, const char* cap, bool enabled, bool onDark) {
         const char* end = labelEnd(label);
         const std::string shown(label, end);

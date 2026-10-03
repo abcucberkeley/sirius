@@ -71,6 +71,9 @@ namespace sirius::app {
                 return gpuName(ctx.device.isCuda() && ctx.device.index >= 0 ? ctx.device.index : 0);
             }
             if (out.ranOn == Backend::Hpc) return "HPC";
+            // A GPU was asked for and the operation has no GPU code: said, so
+            // "CPU" next to a GPU chosen does not read as a device mix-up.
+            if (ctx.backend == Backend::Cuda && !op.info().hasGpuPath) return kCpuNoGpuPath;
             return "CPU";
         }
     } // namespace

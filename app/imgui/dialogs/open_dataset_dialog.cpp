@@ -768,14 +768,14 @@ namespace sirius::app::gui {
                 gap(10);
                 if (location_ == 1 && !unbound_.empty()) {
                     // what the worker's read would fail on, in words that say what to do
-                    widgets::textWrapped(unbound_, 11, theme::kAccentText);
+                    widgets::copyableText("##unbound", unbound_, 11, theme::kAccentText);
                     return;
                 }
                 if (!facts_.empty()) widgets::textWrapped(facts_, 12, theme::kNeutral600);
                 else if (error_.empty()) widgets::text(probing_ || probeAt_ ? "Reading…" : "", 12, theme::kNeutral600);
                 if (!error_.empty()) {
                     if (!facts_.empty()) gap(6);
-                    widgets::textWrapped(error_, 11, theme::kAccentText);
+                    widgets::copyableText("##error", error_, 11, theme::kAccentText);
                 }
             }
 

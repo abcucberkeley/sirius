@@ -22,6 +22,7 @@
 
 #include <cstdint>
 #include <string>
+#include <utility>
 #include <vector>
 
 #include "imgui/theme.hpp"
@@ -60,6 +61,31 @@ namespace sirius::app::gui::widgets {
     void tooltip(const std::string& s);
     // "Move step up" + "Alt+Up" -> "Move step up (Alt+Up)".
     std::string withShortcut(const std::string& text, const std::string& shortcut);
+
+    // --- messages to copy --------------------------------------------------------
+    // An error, a failure's detail, a reason something cannot run: text the
+    // user pastes into a report or a search. Every such message is drawn
+    // with these, the same way everywhere.
+    //
+    // Wrapped text (`wrapWidth` display pixels in all, the button included;
+    // 0 = the rest of the line) with a small Copy button at the end of its
+    // first line, and "Copy" on a right-click of the text. `copied` is what
+    // goes to the clipboard ("" = the text itself). The cursor ends where
+    // textWrapped leaves it.
+    void copyableText(const char* id, const std::string& s, float px = theme::kBodyPx, ImU32 color = theme::kText,
+                      theme::Weight w = theme::Weight::Regular, float wrapWidth = 0.0f, const std::string& copied = {});
+    // Its height at `wrapWidth`, for a layout placed by hand.
+    float copyableTextHeight(const std::string& s, float px, float wrapWidth, theme::Weight w = theme::Weight::Regular);
+    // The small Copy button alone (a `side` design-px square, borderless):
+    // copies `text`, then shows a tick and "Copied" for a moment. True on the
+    // click.
+    bool copyButton(const char* id, const std::string& text, float side = 16.0f, bool onDark = false);
+    // A right-click on the last item offers "Copy" of `text` (and the
+    // `more` entries after it: label, text to copy).
+    void copyOnRightClick(const char* id, const std::string& text,
+                          const std::vector<std::pair<std::string, std::string>>& more = {});
+    // Puts `text` on the clipboard (the one place every copy goes through).
+    void copyToClipboard(const std::string& text);
 
     // --- buttons -------------------------------------------------------------
     enum class ButtonKind { Secondary,   // ink outline (the default look)

@@ -37,7 +37,7 @@ app_test(tracks    test_app_tracks.cpp    UNITS tracks labels workbench tool_api
 # one -- so what a per-operation binary would prove, the unit targets already
 # do, and several cases here are regressions that cross two steps.
 app_test(ops       test_app_ops.cpp       UNITS ops_registry ops_common ops_contrast_api ops_torch_model
-                                                executor pipeline rpc array_source
+                                                executor pipeline rpc array_source model_folder
                    LINK TIFF::TIFF)
 
 # --- what sirius-cli stands on -------------------------------------------------
@@ -85,6 +85,16 @@ target_compile_definitions(test_app_cluster_objects PRIVATE
     SIRIUS_TEST_SOURCE_DIR="${PROJECT_SOURCE_DIR}"
     SIRIUS_TEST_CLI="$<TARGET_FILE:sirius-cli>")
 add_dependencies(test_app_cluster sirius_test_askpass sirius-cli)
+# "Open folder as dataset" on the cluster: the fake cluster's listing, a real
+# `sirius-cli serve` for the stacks' shapes and the dataset, the same as this computer's.
+app_test(cluster_folder test_app_cluster_folder.cpp UNITS cluster_folder cluster remote_host remote_source array_source manifest rpc
+                                                          process host workbench ops_registry)
+target_compile_definitions(test_app_cluster_folder_objects PRIVATE
+    SIRIUS_TEST_ASKPASS="$<TARGET_FILE:sirius_test_askpass>"
+    SIRIUS_TEST_FAKE_SSH="${PROJECT_SOURCE_DIR}/tests/tools/fake_ssh.py"
+    SIRIUS_TEST_FAKE_SLURM_DIR="${PROJECT_SOURCE_DIR}/tests/tools/fake_slurm"
+    SIRIUS_TEST_CLI="$<TARGET_FILE:sirius-cli>")
+add_dependencies(test_app_cluster_folder sirius_test_askpass sirius-cli)
 
 # SIRIUS's C++ engine (`sirius-cli serve`): the build identity, the
 # serializer, the server half of the worker protocol, the cluster datasets in

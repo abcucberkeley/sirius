@@ -82,8 +82,10 @@ namespace sirius::app {
     // --- where a step ran ------------------------------------------------------
 
     std::string placementTag(const StepOutput& out) {
-        if (out.where.empty()) return out.ranOnDevice.empty() ? std::string("this computer") : "this computer \xC2\xB7 " + out.ranOnDevice;
-        return out.ranOnDevice.empty() ? std::string("node") : "node " + out.ranOnDevice;
+        // short on the row: the reason is in the log line and the row's tip
+        const std::string device = out.ranOnDevice == kCpuNoGpuPath ? std::string("CPU") : out.ranOnDevice;
+        if (out.where.empty()) return device.empty() ? std::string("this computer") : "this computer \xC2\xB7 " + device;
+        return device.empty() ? std::string("node") : "node " + device;
     }
 
     std::string placementText(const StepOutput& out) {

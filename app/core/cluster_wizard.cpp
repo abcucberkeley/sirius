@@ -187,7 +187,7 @@ namespace sirius::app::cluster::wizard {
         JobLine l;
         if (jobHeld(st)) {
             l.kind = JobLine::Kind::Running;
-            l.text = "Running on " + st.node + kDot + "job " + st.jobId;
+            l.text = "Running on " + st.node + kDot + "job " + st.jobId + (st.adopted ? std::string(" (yours, never cancelled by SIRIUS)") : std::string());
             if (const std::string left = timeLeftText(st, now); !left.empty()) l.text += kDot + left;
             return l;
         }
@@ -261,7 +261,13 @@ namespace sirius::app::cluster::wizard {
                     case StepStatus::Warning: m = Mark::Warn; break;
                     case StepStatus::Failed: m = Mark::Fail; break;
                 }
-                row(s == Step::Checks ? "Image checks" : (s == Step::Start ? "Worker start" : "Connection"), v, m);
+                row(s == Step::Checks ? "Checks" : (s == Step::Start ? "Worker start" : "Connection"), v, m);
+                // the checklist of the checks in the job, each with its fix
+                if (s == Step::Checks)
+                    for (const NodeCheck& c : st.nodeChecks) {
+                        const Mark cm = c.status == StepStatus::Failed ? Mark::Fail : (c.status == StepStatus::Warning ? Mark::Warn : Mark::Ok);
+                        row(c.label, c.detail + (cm != Mark::Ok && !c.fix.empty() && c.status != StepStatus::Failed ? kDot + c.fix : std::string()), cm);
+                    }
             }
             if (st.noEngine) row("C++ engine", "not found" + (st.fix.empty() ? std::string() : kDot + st.fix), Mark::Fail);
             if (jobHeld(st)) {
@@ -282,6 +288,14 @@ namespace sirius::app::cluster::wizard {
         };
 
         row("Node", st.node + kDot + "job " + st.jobId, Mark::Ok);
+        // what the checks in the job found before the start: their warnings
+        if (!st.nodeChecks.empty()) {
+            std::string notes;
+            for (const NodeCheck& check : st.nodeChecks)
+                if (check.status == StepStatus::Warning && check.name != "torch") notes += (notes.empty() ? "" : "; ") + check.label + ": " + check.detail;
+            if (notes.empty()) row("Checks in the job", std::to_string(st.nodeChecks.size()) + " passed on " + st.node, Mark::Ok);
+            else row("Checks in the job", notes, warn(Mark::Warn));
+        }
         // GPUs and CUDA
         if (!c.gpus.empty()) row("GPU", gpuSummary(c.gpus), Mark::Ok);
         else if (p.gpus > 0) row("GPU", "none found (the job asked for " + std::to_string(p.gpus) + ")", warn(Mark::Warn));
@@ -293,11 +307,23 @@ namespace sirius::app::cluster::wizard {
         std::string torch = c.torch;
         std::string pythonState = jsonString(python, "state");
         if (torch.empty() && python.is_object() && python.contains("caps")) torch = jsonString(python["caps"], "torch");
-        if (!torch.empty()) row("torch", torch, Mark::Ok);
-        else if (hasEngine && (pythonState == "starting" || pythonState == "idle" || pythonState.empty()))
-            row("torch", "the Python worker beside the engine is still starting", Mark::Info);
-        else if (hasEngine && pythonState == "failed")
-            row("torch", "the Python worker did not start: " + jsonString(python, "error"), warn(Mark::Warn));
+        if (hasEngine && pythonState == "failed") {
+            // its last words, for what to do about it
+            std::string tail = jsonString(python, "stderr");
+            while (!tail.empty() && (tail.back() == '\n' || tail.back() == '\r')) tail.pop_back();
+            if (const std::size_t cut = tail.size() > 600 ? tail.find('\n', tail.size() - 600) : std::string::npos; cut != std::string::npos) tail = tail.substr(cut + 1);
+            row("torch", "the Python worker beside the engine did not start: " + jsonString(python, "error") + (tail.empty() ? std::string() : "\n" + tail),
+                warn(Mark::Fail));
+        } else if (!torch.empty()) {
+            // and whether it computes on the GPU
+            const nlohmann::json pc = python.is_object() && python.contains("caps") ? python["caps"] : nlohmann::json();
+            std::string v = torch;
+            if (pc.is_object() && pc.contains("cuda_usable") && pc["cuda_usable"].is_boolean())
+                v += pc["cuda_usable"].get<bool>() ? kDot + "CUDA usable"
+                                                   : kDot + "CPU only" + (jsonString(pc, "cuda_reason").empty() ? std::string() : ": " + jsonString(pc, "cuda_reason"));
+            row("torch", v, Mark::Ok);
+        } else if (hasEngine && (pythonState == "starting" || pythonState == "idle" || pythonState.empty()))
+            row("torch", "the Python worker beside the engine is still starting (this report follows it)", Mark::Info);
         else row("torch", "not in the image: Python steps that need it fail", warn(Mark::Warn));
         // the sirius package (TIFF on the cluster)
         if (!c.tiffReader.empty()) row("sirius package", c.tiffReader, Mark::Ok);

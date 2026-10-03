@@ -109,7 +109,8 @@ namespace sirius::app::gui {
         Diagnostics d;
         try {
             d = wb.selectedDiagnostics();
-        } catch (const std::exception&) {
+        } catch (const std::exception& e) {
+            d.warnings.push_back(std::string("No diagnostics: ") + e.what());   // shown above the cells, copyable
         }
         std::vector<std::string> names = DiagnosticsBody::tabNames(d, kind);
         // tracked labels add a table of their tracks beside the cleanup tools

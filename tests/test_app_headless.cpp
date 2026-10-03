@@ -747,9 +747,9 @@ TEST_CASE("headless: a step that needs the worker fails as no_interpreter withou
         o.workerDir = SIRIUS_TEST_WORKER_DIR;
     });
     f.openRaw();
-    // a foundation model runs only in the worker; a bundle that is not on this
-    // machine is a warning, not an error, so the run gets as far as the worker
-    f.ok("add_step", {{"kind", "foundation"}, {"params", {{"model", "not-here.ltb"}}}});
+    // a foundation model runs only in the worker; a model folder that is not on
+    // this machine is a warning, not an error, so the run gets as far as the worker
+    f.ok("add_step", {{"kind", "foundation"}, {"params", {{"model", "models/not-here/v1"}}}});
     const agent::ToolResult r = f.call("run", {{"wait_s", -1}});
     INFO(r.error.message);
     REQUIRE_FALSE(r.ok);
@@ -772,9 +772,9 @@ TEST_CASE("headless: cancel_run ends a slow worker start", "[app][headless]") {
         o.workerDir = fake.path.u8string();
     });
     f.openRaw();
-    // a foundation model runs only in the worker; a bundle that is not on this
-    // machine is a warning, not an error, so the run gets as far as the worker
-    f.ok("add_step", {{"kind", "foundation"}, {"params", {{"model", "not-here.ltb"}}}});
+    // a foundation model runs only in the worker; a model folder that is not on
+    // this machine is a warning, not an error, so the run gets as far as the worker
+    f.ok("add_step", {{"kind", "foundation"}, {"params", {{"model", "models/not-here/v1"}}}});
     CHECK(f.ok("run", {{"wait_s", 0.3}})["status"] == "running");
     const auto t0 = std::chrono::steady_clock::now();
     f.ok("cancel_run");

@@ -9,7 +9,10 @@
 // pattern with named groups (FilenameRule), and read on every later open.
 
 #include <array>
+#include <cstddef>
+#include <cstdint>
 #include <filesystem>
+#include <functional>
 #include <map>
 #include <optional>
 #include <string>
@@ -62,6 +65,10 @@ namespace sirius::app {
         static DatasetManifest fromJson(const nlohmann::json& j);
         void save(const std::filesystem::path& path) const;              // TOML
         static DatasetManifest load(const std::filesystem::path& path);
+        // The TOML save() writes, and back; `source` names it in errors. For
+        // a manifest kept on a cluster (core/cluster_folder.hpp).
+        std::string toText() const;
+        static DatasetManifest fromText(const std::string& text, const std::string& source);
         // Problems that make the manifest unusable for `folder`: missing files,
         // unknown channels / tiles, a (tile, channel, t) with no file. Empty = fine.
         std::vector<std::string> validate(const std::filesystem::path& folder) const;
@@ -118,6 +125,21 @@ namespace sirius::app {
     DatasetManifest manifestFromFolder(const std::filesystem::path& folder, const FilenameRule& rule,
                                        std::vector<std::string>* unmatched = nullptr);
 
+    // What manifestFromFolder needs to know of one file: its stack's size.
+    struct StackShape {
+        std::uint32_t width = 0, height = 0;
+        std::size_t pages = 0;
+    };
+    using StackShapeProbe = std::function<StackShape(const std::string& fileName)>;
+    // manifestFromFolder over a listing made elsewhere: `names` are the
+    // folder's file names (in tiffNamesOf's order), `probe` gives a file's
+    // shape (the first file of each tile is asked), `datasetName` is the
+    // manifest's name. The same manifest for the same names and shapes,
+    // wherever the folder is: on this computer, or on a cluster
+    // (core/cluster_folder.hpp, whose probe is the engine's dataset_info).
+    DatasetManifest manifestFromNames(const std::string& datasetName, const std::vector<std::string>& names, const FilenameRule& rule,
+                                      const StackShapeProbe& probe, std::vector<std::string>* unmatched = nullptr);
+
     // The simple case, without a pattern to write: every TIFF in the folder is
     // one time point of one stack, in the order a person reads the names --
     // "f2" before "f10", which plain alphabetical order gets wrong. One
@@ -127,6 +149,9 @@ namespace sirius::app {
 
     // File names in that reading order, for the dialog to show and count.
     std::vector<std::string> tiffNamesInOrder(const std::filesystem::path& folder);
+    // The same filter and order over names listed elsewhere (a cluster's
+    // folder): TIFF names, not hidden ones, in natural order.
+    std::vector<std::string> tiffNamesOf(std::vector<std::string> names);
 
 } // namespace sirius::app
 

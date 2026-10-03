@@ -1,22 +1,19 @@
-"""The foundation-model kind: the contract the application depends on.
+"""The Foundation step's models: self-contained folders, run without the latents package.
 
-Not a quality test. The weights here are untrained, so nothing is checked about
-where the objects land. What is checked is the shape of the exchange, because
-that is what breaks silently: the application sends (c, t, z, y, x) and reads
-back labels of exactly (t, z, y, x) uint32 plus a confidence map of the same
-shape, a tracking run must give one label id per object for its whole life
-rather than a fresh id each frame, and a missing package must say what to
-install rather than raise ModuleNotFoundError from four frames down.
-
-`Foundation` runs against the real package (SIRIUS_LATENTS_PATH). The geometry
-the worker derives from a heatmap -- voxel order, thresholds, tiles, sizes,
-tracks -- is checked in `WithScriptedHeatmap` on a stand-in for the package
-whose heatmap the test decides, which needs no latents, torch or weights.
+A model is a folder (latents scripts/export_model.py writes it): model.py with
+load(folder, device) -> Model, model.json ("latents-model/1"), weights and
+_lib/ (the model's own code, imported by that name). These tests build a FAKE
+model folder with the same API and a trivial numpy network -- a threshold and a
+connected-component decode -- so they need neither torch nor latents. What is
+checked is the contract the application depends on: how a folder is found,
+imported (its _lib kept apart from another model's), cached, told what to do
+(Segment, Prompt with the joint objects form), and how a broken folder or an
+old .ltb bundle is said.
 """
 
 from __future__ import annotations
 
-import importlib.util
+import json
 import os
 import shutil
 import socket
@@ -24,9 +21,7 @@ import sys
 import tempfile
 import threading
 import time
-import types
 import unittest
-from dataclasses import dataclass, field
 from pathlib import Path
 
 import numpy as np
@@ -35,748 +30,540 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from sirius_worker import foundation, protocol  # noqa: E402
 
-_path = list(sys.path)
 try:
-    foundation._import_latents()
-    HAVE, WHY = True, ""
-except Exception as exc:                                   # noqa: BLE001
-    HAVE, WHY = False, str(exc)
-finally:
-    # _import_latents puts SIRIUS_LATENTS_PATH first on sys.path, and a latents
-    # checkout has a top-level `tests` package of its own: left there while the
-    # suite is being discovered, it hides this directory's from test_models.
-    # The package stays importable from sys.modules; runs put the path back.
-    sys.path[:] = _path
-
-try:
-    from scipy import ndimage as ndi
-    from scipy.optimize import linear_sum_assignment
-    from skimage.segmentation import watershed
+    import scipy.ndimage  # noqa: F401 - the fake model's decode
 
     HAVE_SCIPY = True
 except ImportError:                                        # pragma: no cover - environment dependent
     HAVE_SCIPY = False
 
+try:
+    import safetensors.numpy  # noqa: F401
 
-def make_bundle(path: str, five_d: bool = False, head: str = "detection") -> None:
-    """An untrained bundle of the smallest shape the model supports."""
-    from latents.deploy import Bundle, Manifest
-    from latents.downstream.instance import ThreeClassHead
-    from latents.downstream.track_train import DetectionHead
-    from latents.model import ChannelTimeMAE, build_model
-
-    patch = (4, 16, 16)
-    if five_d:
-        cfg = {"seq": True, "patch": patch, "dim": 192, "depth": 2, "heads": 3,
-               "dec_dim": 128, "dec_depth": 1}
-        enc = ChannelTimeMAE(patch=patch, dim=192, depth=2, heads=3, dec_dim=128, dec_depth=1)
-    else:
-        cfg = {"patch": patch, "in_channels": 1, "dim": 192, "depth": 2, "heads": 3,
-               "dec_dim": 128, "dec_depth": 1}
-        enc = build_model(cfg)
-    if head == "threeclass":
-        head_args = dict(dim=192, patch=patch)
-        module = ThreeClassHead(**head_args)
-    elif head == "sam":
-        # a promptable head: ConvHead's dense branch plus the prompt encoder and mask decoder
-        from latents.downstream.sam_head import SamHead
-        head_args = dict(dim=192, patch=patch, n_classes=2, ch=16, embed=32, depth=1, heads=2,
-                         mlp_dim=64, dropout=0.0, ref=[8, 64, 64], low=[1, 2, 2])
-        module = SamHead(**head_args)
-    elif head == "conv":
-        # what a coat student is: (foreground, distance to the wall), decoded by a seeded watershed
-        from latents.downstream.seg import ConvHead
-        head_args = dict(dim=192, patch=patch, n_classes=2, ch=16)
-        module = ConvHead(**head_args)
-    else:
-        head_args = dict(dim=192, patch=patch, flow=False)
-        module = DetectionHead(**head_args)
-    extra = dict(fg_threshold=0.5, seed_hmax=0.15, seed_hrel=0.0, seed_sigma=2.0,
-                 min_voxels=50) if head in ("conv", "sam") else {}
-    man = Manifest(task=("prompt" if head == "sam" else "segment" if head == "conv" else "detect"),
-                   name="test", encoder=cfg, head=head, head_args=head_args,
-                   patch=patch, crop=(8, 64, 64), voxel_size=(0.5, 0.15, 0.15),
-                   peak_threshold=0.5, min_separation_um=1.0, **extra)
-    Bundle.save(path, man, enc, module)
+    HAVE_SAFETENSORS = True
+except ImportError:                                        # pragma: no cover - environment dependent
+    HAVE_SAFETENSORS = False
 
 
-def blobs(c=1, t=1, z=8, y=64, x=64):
-    """A few bright balls, so the model has something with structure to look at."""
+# model.py of the fake model: the exported API (load, Model.info/tasks/segment/prompt/logits) on a
+# network that is a threshold. It imports its code as `_lib`, as an exported model does, and once
+# lazily inside a method, which is what goes wrong when two models' _lib packages are confused.
+MODEL_PY = '''
+"""A fake exported model: the latents-model API on a threshold network (tests only)."""
+import json
+import sys
+from pathlib import Path
+
+import numpy as np
+
+HERE = Path(__file__).resolve().parent
+if str(HERE) not in sys.path:
+    sys.path.insert(0, str(HERE))
+
+from _lib.net import KIND, normalise          # noqa: E402
+
+LOADS = []
+
+
+class Model:
+    def __init__(self, folder, device=None):
+        self.folder = Path(folder)
+        self.manifest = json.loads((self.folder / "model.json").read_text())
+        self.device = device or "cpu"
+        self.kind = KIND
+        self.scale = 1.0
+        w = self.folder / "weights.safetensors"
+        if w.exists():
+            from safetensors.numpy import load_file
+            self.scale = float(load_file(str(w))["head.scale"][0])
+        d = self.manifest["decode"]
+        self.fg_threshold = float(d["fg_threshold"])
+        self.min_voxels = int(d["min_voxels"])
+        LOADS.append(self.device)
+
+    def info(self):
+        return self.manifest
+
+    def tasks(self):
+        return list(self.manifest["tasks"])
+
+    def _fg(self, volume, channels):
+        v = np.asarray(volume, np.float32)
+        if channels:
+            v = v.mean(axis=0)
+        n = self.manifest["input"]["normalisation"]
+        return normalise(v, n["percentiles"], n["clip"]) * self.scale
+
+    def logits(self, volume, channels=False):
+        fg = self._fg(volume, channels)
+        return np.stack([fg, fg])
+
+    def segment(self, volume, channels=False, threshold=None, min_voxels=None):
+        if threshold is not None:
+            self.fg_threshold = float(threshold)
+        if min_voxels is not None:
+            self.min_voxels = int(min_voxels)
+        from _lib.decode import components          # lazy, as the real decode is
+        lab = components(self._fg(volume, channels) > self.fg_threshold, self.min_voxels)
+        return np.asarray(lab, np.uint32)
+
+    def prompt(self, volume, objects=None, points=None, point_labels=None, boxes=None, scribbles=None,
+               channels=False, snap_z=True, origin=(0, 0, 0)):
+        if "prompt" not in self.manifest["tasks"]:
+            raise ValueError("no prompt decoder")
+        from _lib.decode import components
+        fg = self._fg(volume, channels) > self.fg_threshold
+        lab = components(fg, 0)
+        masks, scores = [], []
+        for ob in list(objects or []):
+            m = np.zeros(fg.shape, bool)
+            if ob.get("box") is not None:
+                z0, y0, x0, z1, y1, x1 = [int(v) for v in ob["box"]]
+                m[z0:z1, y0:y1, x0:x1] = fg[z0:z1, y0:y1, x0:x1]
+            pts = np.asarray(ob.get("points", np.zeros((0, 3))), np.float32).reshape(-1, 3)
+            labs = np.asarray(ob.get("point_labels", np.ones(len(pts))), np.int64).reshape(-1)
+            for p, l in zip(pts.astype(int), labs):
+                if l == 1 and lab[tuple(p)]:
+                    m |= lab == lab[tuple(p)]
+            for sc in ob.get("scribbles", []) or []:
+                for p in np.asarray(sc["points"]).astype(int):
+                    if int(sc.get("label", 1)) == 1 and lab[tuple(p)]:
+                        m |= lab == lab[tuple(p)]
+            for p, l in zip(pts.astype(int), labs):
+                if l == 0:
+                    z, y, x = p
+                    m[max(z - 1, 0):z + 2, max(y - 2, 0):y + 3, max(x - 2, 0):x + 3] = False
+            masks.append(m)
+            scores.append(0.9 - 0.1 * len(masks))
+        n = len(masks)
+        return (np.stack(masks) if n else np.zeros((0,) + fg.shape, bool), np.asarray(scores, np.float32),
+                {"clipped": [], "window": list(self.manifest["input"]["crop"]), "kind": self.kind})
+
+
+def load(folder=None, device=None):
+    return Model(folder or HERE, device)
+'''
+
+LIB_NET = '''
+import numpy as np
+
+KIND = "{kind}"
+
+
+def normalise(v, percentiles, clip):
+    lo, hi = np.percentile(v, percentiles)
+    return np.clip((v - lo) / max(hi - lo, 1e-6), clip[0], clip[1])
+'''
+
+LIB_DECODE = '''
+import numpy as np
+from scipy import ndimage as ndi
+
+from .net import KIND  # noqa: F401 - relative, as the vendored code imports
+
+
+def components(mask, min_voxels):
+    lab, n = ndi.label(mask)
+    if min_voxels:
+        sizes = np.bincount(lab.ravel())
+        small = np.nonzero(sizes < min_voxels)[0]
+        lab[np.isin(lab, small[small > 0])] = 0
+    return lab
+'''
+
+
+def manifest(name="fake-sam", version="v1", tasks=("segment", "prompt"), channels=1, voxel_zyx=(0.5, 0.1, 0.1),
+             fg_threshold=0.5, min_voxels=0, notes="A fake model for tests."):
+    return {
+        "format": "latents-model/1", "name": name, "version": version, "created": "2026-10-03T00:00:00Z",
+        "tasks": list(tasks),
+        "encoder": {"dim": 8, "patch": [2, 4, 4]},
+        "head": {"kind": "sam" if "prompt" in tasks else "conv", "class": "Fake", "args": {}},
+        "input": {"axes": "(c, t, z, y, x), any leading axis optional", "dtype": "float32", "channels": channels,
+                  "channel_merge": "", "patch": [2, 4, 4], "crop": [8, 32, 32],
+                  "normalisation": {"kind": "robust percentile, per volume", "percentiles": [0.5, 99.8],
+                                    "clip": [-0.5, 2.0]},
+                  "voxel_um": list(voxel_zyx)},
+        "output": {"channels": 2, "0": "foreground logit", "1": "distance"},
+        "decode": {"kind": "distance-watershed", "fg_threshold": fg_threshold, "seed_hmax": 0.1, "seed_hrel": 0.0,
+                   "seed_sigma": 2.0, "min_voxels": min_voxels, "needs": ["scipy.ndimage"]},
+        "prompt": ({"form": "objects", "pad_width": 2, "snap_z": "on"} if "prompt" in tasks else None),
+        "provenance": {"latents_commit": "c037177", "latents_dirty": False, "run": "/runs/fake"},
+        "notes": notes,
+    }
+
+
+def make_model(root, name="fake-sam", version="v1", kind="a", weights_scale=None, **kw) -> str:
+    """<root>/<name>/<version>/ with model.py, model.json, README.md and _lib/."""
+    folder = Path(root) / name / version
+    (folder / "_lib").mkdir(parents=True, exist_ok=True)
+    (folder / "model.py").write_text(MODEL_PY)
+    (folder / "model.json").write_text(json.dumps(manifest(name=name, version=version, **kw), indent=2))
+    (folder / "README.md").write_text(f"# {name} ({version})\n\nSegments bright blobs; a fake for tests.\n\n## Use\n")
+    (folder / "_lib" / "__init__.py").write_text("")
+    (folder / "_lib" / "net.py").write_text(LIB_NET.format(kind=kind))
+    (folder / "_lib" / "decode.py").write_text(LIB_DECODE)
+    if weights_scale is not None:
+        from safetensors.numpy import save_file
+
+        save_file({"head.scale": np.asarray([weights_scale], np.float32)}, str(folder / "weights.safetensors"))
+    return str(folder)
+
+
+def blobs(c=1, t=1, z=8, y=32, x=32):
+    """Three bright balls on a dark background, (c, t, z, y, x)."""
     v = np.zeros((c, t, z, y, x), np.float32)
     zz, yy, xx = np.ogrid[:z, :y, :x]
-    for cz, cy, cx in ((4, 16, 16), (4, 44, 20), (4, 24, 46)):
-        v += np.exp(-((zz - cz) ** 2 * 4.0 + (yy - cy) ** 2 + (xx - cx) ** 2) / 18.0)
-    return v + 0.01 * np.random.default_rng(0).random(v.shape).astype(np.float32)
+    for cz, cy, cx in ((4, 8, 8), (4, 22, 10), (4, 12, 24)):
+        v += (((zz - cz) ** 2) / 4.0 + (yy - cy) ** 2 + (xx - cx) ** 2 <= 9).astype(np.float32) * 100.0
+    return v + 5.0
 
 
-def load_workbench_under_test():
-    """This checkout's bindings/python/sirius/workbench.py, whatever `sirius`
-    the interpreter has installed (as bindings/tests/test_workbench_schema.py)."""
-    here = Path(__file__).resolve().parents[3] / "bindings" / "python" / "sirius" / "workbench.py"
-    try:
-        import sirius.workbench as wb  # type: ignore
-
-        if Path(wb.__file__).resolve() == here:
-            return wb
-    except Exception:  # noqa: BLE001
-        pass
-    name = "sirius_workbench_under_test"
-    if name not in sys.modules:
-        spec = importlib.util.spec_from_file_location(name, here)
-        module = importlib.util.module_from_spec(spec)
-        sys.modules[name] = module
-        spec.loader.exec_module(module)  # type: ignore[union-attr]
-    return sys.modules[name]
-
-
-@unittest.skipUnless(HAVE, f"latents not importable: {WHY}")
-class Foundation(unittest.TestCase):
-    @classmethod
-    def setUpClass(cls):
-        cls.dir = tempfile.mkdtemp()
-        cls.path = os.path.join(cls.dir, "m.ltb")
-        make_bundle(cls.path)
-        cls.path5 = os.path.join(cls.dir, "m5.ltb")
-        make_bundle(cls.path5, five_d=True)
-
-    def test_model_info_reads_the_manifest(self):
-        foundation._BUNDLES.clear()
-        info = foundation.model_info(self.path)
-        self.assertEqual(foundation._BUNDLES, {})              # read, not loaded: nothing cached or evicted
-        self.assertEqual(info["format"], "latents-bundle")
-        # (x, y, z) like every voxel size in the application; the manifest's
-        # own (0.5, 0.15, 0.15) is (z, y, x)
-        self.assertEqual(info["voxel_um"], [0.15, 0.15, 0.5])
-        self.assertEqual(info["crop"], [8, 64, 64])
-        self.assertEqual(info["peak_threshold"], 0.5)
-        self.assertIn("track", info["tasks"])
-
-    def test_segment_returns_labels_of_the_input_shape(self):
-        v = blobs(t=2)
-        labels, info, extras = foundation.run(v, {"model": self.path, "task": "segment"}, "cpu")
-        self.assertEqual(labels.shape, v.shape[1:])
-        self.assertEqual(labels.dtype, np.uint32)
-        self.assertEqual(extras["confidence"].shape, v.shape[1:])
-        self.assertEqual(info["frames"], 2)
-
-    def test_detect_marks_one_voxel_per_object(self):
-        v = blobs()
-        labels, info, _ = foundation.run(v, {"model": self.path, "task": "detect"}, "cpu")
-        self.assertEqual(labels.shape, v.shape[1:])
-        self.assertEqual(int((labels > 0).sum()), info["objects"])
-
-    def test_track_keeps_one_id_per_object(self):
-        v = blobs(t=3)
-        labels, info, extras = foundation.run(v, {"model": self.path, "task": "track"}, "cpu")
-        self.assertEqual(labels.shape, v.shape[1:])
-        self.assertIn("tracks", info)
-        self.assertIn("divisions", info)
-        # Ids must come from one numbering across the whole clip, not restart
-        # per frame: that is what makes the label volume a set of tracks.
-        biggest = int(labels.max())
-        self.assertLessEqual(biggest, info["tracks"] if info["tracks"] else biggest)
-
-    def test_colour_needs_the_five_d_model(self):
-        v = blobs(c=2)
-        with self.assertRaises(ValueError) as cm:
-            foundation.run(v, {"model": self.path, "task": "segment"}, "cpu")
-        self.assertIn("channel", str(cm.exception))
-        labels, _, _ = foundation.run(v, {"model": self.path5, "task": "segment"}, "cpu")
-        self.assertEqual(labels.shape, v.shape[1:])
-
-    def test_caller_thresholds_override_the_bundle(self):
-        v = blobs()
-        _, info, _ = foundation.run(v, {"model": self.path, "task": "detect"}, "cpu")
-        self.assertEqual(info["threshold"], 0.5)             # 0 means "the bundle's"
-        _, info, _ = foundation.run(v, {"model": self.path, "task": "detect", "threshold": 0.8}, "cpu")
-        self.assertEqual(info["threshold"], 0.8)
-
-    def test_a_tile_does_not_stick_to_the_cached_bundle(self):
-        v = blobs()
-        _, info, _ = foundation.run(v, {"model": self.path, "task": "detect", "tile": [8, 32, 32]}, "cpu")
-        self.assertEqual(info["tile"], [8, 32, 32])
-        _, info, _ = foundation.run(v, {"model": self.path, "task": "detect"}, "cpu")
-        self.assertEqual(info["tile"], [8, 64, 64])
-        self.assertEqual(foundation.model_info(self.path)["crop"], [8, 64, 64])
-
-    def test_a_three_class_bundle_segments_and_refuses_the_rest(self):
-        # Bundle.heatmap writes this head's three channels into a one-channel
-        # buffer and raises, so every task used to fail on such a bundle.
-        path = os.path.join(self.dir, "tc.ltb")
-        make_bundle(path, head="threeclass")
-        v = blobs(t=2)
-        labels, info, extras = foundation.run(v, {"model": path, "task": "segment"}, "cpu")
-        self.assertEqual(labels.shape, v.shape[1:])
-        conf = extras["confidence"]
-        self.assertEqual(conf.shape, v.shape[1:])
-        self.assertTrue(np.all((conf >= 0) & (conf <= 1)))
-        self.assertEqual(info["objects"], sum(int(f.max()) for f in labels))
-        for task in ("detect", "track"):
-            with self.assertRaises(ValueError) as cm:
-                foundation.run(v, {"model": path, "task": task}, "cpu")
-            self.assertIn("Segment", str(cm.exception))
-        self.assertEqual(foundation.model_info(path)["tasks"], ["segment"])
-
-    def test_divisions_are_counted_from_latents_own_parent_map(self):
-        from latents.downstream.track import track_points
-
-        # One mother dividing at frame 1 and her continuing daughter dividing
-        # again at frame 3, nothing else in the field.
-        frames = [np.array([[0, 50, 50]], np.float32),
-                  np.array([[0, 50, 44], [0, 50, 56]], np.float32),
-                  np.array([[0, 50, 44], [0, 50, 56]], np.float32),
-                  np.array([[0, 44, 44], [0, 56, 44], [0, 50, 56]], np.float32)]
-        _, parents = track_points(frames, max_dist=10.0, voxel_size=(1.0, 1.0, 1.0), division_dist=15.0)
-        self.assertEqual(len(foundation.lineage(parents)), 2)
-        self.assertEqual(set(foundation.lineage(parents).values()), {1})
-
-    def test_an_unknown_task_is_refused(self):
-        with self.assertRaises(ValueError):
-            foundation.run(blobs(), {"model": self.path, "task": "cluster"}, "cpu")
-
-    def test_a_missing_bundle_says_so(self):
-        with self.assertRaises(FileNotFoundError):
-            foundation.run(blobs(), {"model": os.path.join(self.dir, "nope.ltb")}, "cpu")
-
-
-# --- a scripted stand-in for the package ---------------------------------------
-
-
-def blob(shape, centre, sigma, peak):
-    grids = np.meshgrid(*[np.arange(s) for s in shape], indexing="ij")
-    return peak * np.exp(-sum(((g - c) / s) ** 2 for g, c, s in zip(grids, centre, sigma)) / 2)
-
-
-def clip(t, z, y, x, c=1):
-    """An input whose first voxel of frame t is t, so the stand-in's per-frame
-    heatmap() knows which scripted frame it was handed."""
-    v = np.zeros((c, t, z, y, x), np.float32)
-    v[:, :, 0, 0, 0] = np.arange(t, dtype=np.float32)
-    return v
-
-
-class Script:
-    """What the stand-in model predicts and what it was asked, reset per test."""
-    heatmaps = None          # (t, z, y, x)
-    logits = None            # (t, 3, z, y, x), three-class head only
-    parents = None           # a scripted track_points parent map
-    head = "detection"
-    delay = 0.0
-    loads: list = []
-    calls: list = []
-
-
-@dataclass
-class StubManifest:
-    task: str = "detect"
-    name: str = "stub"
-    encoder: dict = field(default_factory=dict)
-    head: str = "detection"
-    head_args: dict = field(default_factory=dict)
-    patch: tuple = (4, 16, 16)
-    crop: tuple = (32, 192, 192)
-    voxel_size: tuple = (1.0, 1.0, 1.0)       # (z, y, x), as in latents
-    peak_threshold: float = 0.5
-    min_separation_um: float = 1.0
-    link_max_dist_um: float = 4.0
-    division_dist_um: float = 4.0
-    channels: int = 1
-    notes: str = ""
-
-
-class StubBundle:
-    def __init__(self, device):
-        self.m = StubManifest(head=Script.head)
-        self.device = device
-
-    @staticmethod
-    def load(path, device=None):
-        Script.loads.append(device)
-        return StubBundle(device or "cpu")
-
-    def heatmap(self, volume, *, time=False, channels=False, batch=4):
-        Script.calls.append(("heatmap", tuple(self.m.crop), bool(time)))
-        if Script.delay:
-            import time as clock
-
-            clock.sleep(Script.delay)
-        if time:
-            return Script.heatmaps
-        return Script.heatmaps[int(round(float(np.asarray(volume).reshape(-1)[0])))]
-
-    # Bundle.detect / segment / track as latents' deploy.py has them: they read
-    # the threshold, the separation and the voxel size from the manifest. The
-    # worker must not call them (the caller's values would not reach the
-    # model), but a regression that did should fail on its result here rather
-    # than on a missing method.
-    def detect(self, volume, *, threshold=None, voxel_size=None, **kw):
-        return stub_peaks(self.heatmap(volume, **kw), self.m.peak_threshold if threshold is None else threshold,
-                          voxel_size=tuple(voxel_size or self.m.voxel_size), min_sep_um=self.m.min_separation_um)
-
-    def segment(self, volume, *, min_size=20, **kw):
-        return stub_watershed(self.heatmap(volume, **kw), self.detect(volume, **kw), self.m.peak_threshold, min_size)
-
-    def track(self, clip, *, channels=False, voxel_size=None, **kw):
-        hm = self.heatmap(clip, time=True, channels=channels)
-        vs = tuple(voxel_size or self.m.voxel_size)
-        pts = [stub_peaks(h, self.m.peak_threshold, voxel_size=vs, min_sep_um=self.m.min_separation_um) for h in hm]
-        ids, parents = stub_track_points(pts, self.m.link_max_dist_um, vs, self.m.division_dist_um)
-        return {"points": pts, "ids": ids, "parents": parents}
-
-    def _check_channels(self, c):
-        pass
-
-    def _class_logits(self, volume, *, time=False, channels=False, batch=4):
-        Script.calls.append(("logits", tuple(self.m.crop), False))
-        return Script.logits[int(round(float(np.asarray(volume).reshape(-1)[0])))]
-
-
-def stub_peaks(hm, threshold=0.3, min_distance=3, voxel_size=None, min_sep_um=0.0):
-    # latents.downstream.track.peaks_from_heatmap: a per-axis gate in microns
-    vs = np.asarray(voxel_size, np.float32)[-hm.ndim:]
-    rad = np.maximum(np.round(min_sep_um / vs).astype(int), 1)
-    peak = hm >= ndi.maximum_filter(hm, size=tuple(2 * int(r) + 1 for r in rad), mode="nearest")
-    return np.argwhere(peak & (hm >= threshold)).astype(np.float32)
-
-
-def stub_track_points(frames, max_dist=15.0, voxel_size=(1.0, 1.0, 1.0), division_dist=None):
-    # latents' one-to-one linker in (z, y, x) microns, without the division pass
-    vs = np.asarray(voxel_size, np.float32)
-    ids, parents, nxt = [], {}, 1
-    for t, pts in enumerate(frames):
-        cur = np.zeros(len(pts), np.int64)
-        if t and len(pts) and len(frames[t - 1]):
-            d = np.linalg.norm((frames[t - 1][:, None] - pts[None]) * vs, axis=-1)
-            cost = np.where(d <= max_dist, d, 1e6)
-            for i, j in zip(*linear_sum_assignment(cost)):
-                if cost[i, j] < 1e6:
-                    cur[j] = ids[t - 1][i]
-        for j in range(len(pts)):
-            if not cur[j]:
-                cur[j] = nxt
-                if t:
-                    parents[nxt] = 0
-                nxt += 1
-        ids.append(cur)
-    return ids, (Script.parents if Script.parents is not None else parents)
-
-
-def stub_watershed(hm, peaks, threshold, min_size=20):
-    # latents.deploy.watershed_from_heatmap: region i grows from peaks[i - 1],
-    # regions under min_size are zeroed and not renumbered
-    Script.calls.append(("watershed", float(threshold), int(min_size)))
-    markers = np.zeros(hm.shape, np.int32)
-    for i, p in enumerate(np.round(peaks).astype(int), start=1):
-        markers[tuple(np.clip(p, 0, np.array(hm.shape) - 1))] = i
-    lab = watershed(-hm, markers, mask=hm >= threshold).astype(np.int32)
-    if min_size > 0:
-        small = np.flatnonzero(np.bincount(lab.ravel()) < min_size)
-        lab[np.isin(lab, small)] = 0
-    return lab
-
-
-def stub_instances(logits, min_size=20):
-    lab, _ = ndi.label(np.asarray(logits).argmax(0) > 0)
-    small = np.flatnonzero(np.bincount(lab.ravel()) < min_size)
-    lab[np.isin(lab, small[small > 0])] = 0
-    return lab.astype(np.int32)
-
-
-def stub_modules():
-    deploy = types.ModuleType("latents.deploy")
-    deploy.Bundle, deploy.Manifest, deploy.BUNDLE_VERSION = StubBundle, StubManifest, 1
-    deploy.watershed_from_heatmap = stub_watershed
-    track = types.ModuleType("latents.downstream.track")
-    track.peaks_from_heatmap, track.track_points = stub_peaks, stub_track_points
-    instance = types.ModuleType("latents.downstream.instance")
-    instance.instances_from_three_class = stub_instances
-    downstream = types.ModuleType("latents.downstream")
-    downstream.track, downstream.instance = track, instance
-    latents = types.ModuleType("latents")
-    latents.deploy, latents.downstream = deploy, downstream
-    return {"latents": latents, "latents.deploy": deploy, "latents.downstream": downstream,
-            "latents.downstream.track": track, "latents.downstream.instance": instance}
-
-
-@unittest.skipUnless(HAVE_SCIPY, "scipy and scikit-image are needed for the scripted model")
-class WithScriptedHeatmap(unittest.TestCase):
-    Z, Y, X = 16, 48, 48
-
+class Base(unittest.TestCase):
     def setUp(self):
-        # Only these names are swapped and put back: mock.patch.dict would also
-        # drop every module first imported during the test, and a nanobind
-        # extension (sirius._sirius_ext) aborts the process when imported twice.
-        stubs = stub_modules()
-        self.saved = {name: sys.modules.get(name) for name in stubs}
-        sys.modules.update(stubs)
-        foundation._BUNDLES.clear()
-        Script.heatmaps = Script.logits = Script.parents = None
-        Script.head, Script.delay = "detection", 0.0
-        Script.loads, Script.calls = [], []
-        self.dir = tempfile.mkdtemp()
-        self.path = os.path.join(self.dir, "stub.ltb")
-        Path(self.path).write_text("stub")
+        foundation.unload()
+        self.root = tempfile.mkdtemp(prefix="sirius-models-")
+        self.addCleanup(shutil.rmtree, self.root, ignore_errors=True)
+        self.addCleanup(foundation.unload)
+        self.path_before = list(sys.path)
 
     def tearDown(self):
-        foundation._BUNDLES.clear()
-        for name, module in self.saved.items():
-            if module is None:
-                sys.modules.pop(name, None)
-            else:
-                sys.modules[name] = module
+        # nothing of a model's folder is left on sys.path
+        self.assertEqual(sys.path, self.path_before)
 
-    def run_model(self, task, t=1, **params):
-        return foundation.run(clip(t, self.Z, self.Y, self.X), {"model": self.path, "task": task, **params}, "cpu")
 
-    def ids(self, labels):
-        return [sorted(set(np.unique(f).tolist()) - {0}) for f in labels]
+class Folder(Base):
+    def test_model_info_reads_model_json_and_readme(self):
+        folder = make_model(self.root)
+        info = foundation.model_info(folder)
+        self.assertEqual(info["format"], "latents-model")
+        self.assertEqual((info["name"], info["version"]), ("fake-sam", "v1"))
+        self.assertEqual(info["tasks"], ["segment", "prompt"])
+        self.assertTrue(info["promptable"])
+        self.assertEqual(info["description"], "A fake model for tests.")
+        self.assertEqual(info["voxel_um"], [0.1, 0.1, 0.5])            # the application's (x, y, z)
+        self.assertEqual(info["crop"], [8.0, 32.0, 32.0])
+        self.assertEqual(info["input"]["normalisation"]["percentiles"], [0.5, 99.8])
+        self.assertEqual(info["channels"], 1)
+        self.assertFalse(info["loaded"])
+        # model.json itself names the folder too, and model_info imports nothing
+        self.assertEqual(foundation.model_info(os.path.join(folder, "model.json"))["path"], folder)
+        self.assertFalse(any(k == "_lib" or k.startswith("_lib.") for k in sys.modules))
 
-    def test_the_voxel_size_reaches_latents_as_z_y_x(self):
-        # two nuclei 4 planes = 3 um apart in depth, on 0.15 x 0.15 x 0.75 um
-        # data: distinct at a 1 um separation, one object if z is read as 0.15
-        Script.heatmaps = np.maximum(blob((self.Z, self.Y, self.X), (5, 24, 24), (1, 3, 3), 0.9),
-                                     blob((self.Z, self.Y, self.X), (9, 24, 24), (1, 3, 3), 0.8))[None]
-        _, info, _ = self.run_model("detect", voxel_um=[0.15, 0.15, 0.75])
-        self.assertEqual(info["objects"], 2)
-        self.assertEqual(info["voxel_um"], [0.15, 0.15, 0.75])       # reported back in the application's order
-        # an axis not given, or <= 0, is the bundle's calibration
-        self.assertEqual(foundation.voxel_zyx([0.2, 0.3, 0], (0.75, 0.15, 0.15)), (0.75, 0.3, 0.2))
-        self.assertEqual(foundation.voxel_zyx(None, (0.75, 0.15, 0.15)), (0.75, 0.15, 0.15))
+    def test_description_falls_back_to_the_readme(self):
+        folder = make_model(self.root, notes="", tasks=("segment",))
+        info = foundation.model_info(folder)
+        self.assertEqual(info["description"], "Segments bright blobs; a fake for tests.")
+        self.assertFalse(info["promptable"])
 
-    def test_a_track_is_linked_in_microns_along_the_right_axes(self):
-        # one nucleus moving 10 px = 1.5 um a frame in x; the link gate is 4 um
-        Script.heatmaps = np.stack([blob((self.Z, self.Y, self.X), (8, 24, 10 + 10 * t), (1.5, 2, 2), 0.9)
-                                    for t in range(3)])
-        labels, info, _ = self.run_model("track", t=3, voxel_um=[0.15, 0.15, 0.75])
-        self.assertEqual(self.ids(labels), [[1], [1], [1]])
-        self.assertEqual(info["tracks"], 1)
+    def test_a_broken_folder_says_what_is_wrong(self):
+        with self.assertRaisesRegex(FileNotFoundError, "model folder not found"):
+            foundation.model_info(os.path.join(self.root, "nope"))
+        empty = os.path.join(self.root, "empty")
+        os.makedirs(empty)
+        with self.assertRaisesRegex(foundation.ModelError, "no model.json"):
+            foundation.model_info(empty)
+        folder = make_model(self.root)
+        Path(folder, "model.json").write_text("{ not json")
+        with self.assertRaisesRegex(foundation.ModelError, "not valid JSON"):
+            foundation.model_info(folder)
+        Path(folder, "model.json").write_text(json.dumps({"format": "something-else/1", "tasks": ["segment"]}))
+        with self.assertRaisesRegex(foundation.ModelError, "not latents-model"):
+            foundation.model_info(folder)
+        Path(folder, "model.json").write_text(json.dumps({**manifest(), "format": "latents-model/2"}))
+        with self.assertRaisesRegex(foundation.ModelError, "this worker reads latents-model/1"):
+            foundation.model_info(folder)
 
-    def test_threshold_and_separation_reach_every_task(self):
-        # a bright and a dim object; the bundle's threshold (0.5) sees one
-        two = np.maximum(blob((self.Z, self.Y, self.X), (8, 12, 12), (1.5, 3, 3), 0.9),
-                         blob((self.Z, self.Y, self.X), (8, 36, 36), (1.5, 3, 3), 0.4))
-        Script.heatmaps = two[None]
-        vox = [0.15, 0.15, 0.75]
-        for task in ("detect", "segment"):
-            labels, info, _ = self.run_model(task, threshold=0.3, voxel_um=vox)
-            self.assertEqual(len(self.ids(labels)[0]), 2, task)
-            self.assertEqual(info["objects"], 2, task)
-            labels, _, _ = self.run_model(task, threshold=0.3, min_separation=20.0, voxel_um=vox)
-            self.assertEqual(len(self.ids(labels)[0]), 1, task)
-        Script.heatmaps = np.stack([two, two])
-        _, info, _ = self.run_model("track", t=2, threshold=0.3, voxel_um=vox)
-        self.assertEqual(info["tracks"], 2)
-        _, info, _ = self.run_model("track", t=2, threshold=0.3, min_separation=20.0, voxel_um=vox)
-        self.assertEqual(info["tracks"], 1)
-        self.assertTrue(all(c[1] == 0.3 for c in Script.calls if c[0] == "watershed"))
+    def test_an_old_bundle_says_to_re_export(self):
+        old = os.path.join(self.root, "cells.ltb")
+        Path(old).write_bytes(b"PK")
+        for call in (lambda: foundation.model_info(old),
+                     lambda: foundation.run(blobs(), {"model": old, "task": "segment"}, "cpu")):
+            with self.assertRaises(foundation.ModelError) as e:
+                call()
+            self.assertIn("old bundle format", str(e.exception))
+            self.assertIn("scripts/export_model.py", str(e.exception))
 
-    def test_the_model_runs_once_per_frame_or_once_per_clip(self):
-        Script.heatmaps = np.stack([blob((self.Z, self.Y, self.X), (8, 24, 24), (1.5, 3, 3), 0.9)] * 3)
-        for task, expected in (("segment", 3), ("detect", 3), ("track", 1)):
-            Script.calls = []
-            self.run_model(task, t=3)
-            self.assertEqual(sum(1 for c in Script.calls if c[0] == "heatmap"), expected, task)
+    def test_nothing_imports_latents(self):
+        self.assertNotIn("latents", sys.modules)
+        src = Path(foundation.__file__).read_text(encoding="utf-8")
+        self.assertNotIn("SIRIUS_LATENTS_PATH", src)
+        self.assertNotIn("import latents", src)
 
-    def test_a_tile_applies_to_its_own_run_only(self):
-        Script.heatmaps = blob((self.Z, self.Y, self.X), (8, 24, 24), (1.5, 3, 3), 0.9)[None]
-        _, info, _ = self.run_model("detect", tile=[4, 16, 16])
-        self.run_model("detect")                                     # the app sends no tile for all zeros
-        self.run_model("detect", tile=[0, 16, 0])                    # zero is the bundle's, per axis
-        self.assertEqual([c[1] for c in Script.calls if c[0] == "heatmap"],
-                         [(4, 16, 16), (32, 192, 192), (32, 16, 192)])
-        self.assertEqual(info["tile"], [4, 16, 16])
-        self.assertEqual(foundation.model_info(self.path)["crop"], [32, 192, 192])
 
-    def test_model_info_does_not_evict_the_bundle_a_run_loaded(self):
-        Script.heatmaps = blob((self.Z, self.Y, self.X), (8, 24, 24), (1.5, 3, 3), 0.9)[None]
-        foundation.run(clip(1, self.Z, self.Y, self.X), {"model": self.path, "task": "detect"}, "cuda:0")
-        info = foundation.model_info(self.path)
-        self.assertEqual(info["voxel_um"], [1.0, 1.0, 1.0])
-        foundation.run(clip(1, self.Z, self.Y, self.X), {"model": self.path, "task": "detect"}, "cuda:0")
-        self.assertEqual(Script.loads, ["cuda:0"])
+@unittest.skipUnless(HAVE_SCIPY, "the fake model's decode needs scipy")
+class Running(Base):
+    def test_segment_returns_dense_labels_per_time_point(self):
+        folder = make_model(self.root)
+        labels, info, extras = foundation.run(blobs(t=2), {"model": folder, "task": "segment"}, "cpu")
+        self.assertEqual(labels.shape, (2, 8, 32, 32))
+        self.assertEqual(labels.dtype, np.uint32)
+        self.assertEqual(int(labels[0].max()), 3)
+        self.assertEqual(sorted(np.unique(labels[1]).tolist()), [0, 1, 2, 3])
+        self.assertEqual(info["objects"], 6)
+        self.assertEqual(info["threshold"], 0.5)                     # model.json's, the call gave none
+        self.assertEqual(info["model"], "fake-sam v1")
 
-    def test_detect_ignores_min_voxels(self):
-        Script.heatmaps = np.maximum(blob((self.Z, self.Y, self.X), (8, 12, 12), (1.5, 3, 3), 0.9),
-                                     blob((self.Z, self.Y, self.X), (8, 36, 36), (1.5, 3, 3), 0.8))[None]
-        labels, info, _ = self.run_model("detect", min_voxels=50)
-        self.assertEqual(int((labels > 0).sum()), 2)
-        self.assertEqual(info["objects"], 2)
+    def test_a_threshold_and_min_voxels_apply_to_their_run_only(self):
+        folder = make_model(self.root)
+        big = foundation.run(blobs(), {"model": folder, "task": "segment", "min_voxels": 10 ** 6}, "cpu")[0]
+        self.assertEqual(int(big.max()), 0)
+        again = foundation.run(blobs(), {"model": folder, "task": "segment"}, "cpu")
+        self.assertEqual(int(again[0].max()), 3)                     # not the last run's min_voxels
+        self.assertEqual(again[1]["min_voxels"], 0)
 
-    def test_segment_drops_small_objects_and_numbers_the_rest_densely(self):
-        shape = (self.Z, self.Y, self.X)
-        Script.heatmaps = np.maximum.reduce([blob(shape, (8, 8, 24), (2, 4, 4), 0.9),
-                                             blob(shape, (8, 24, 24), (0.6, 0.8, 0.8), 0.9),
-                                             blob(shape, (8, 40, 24), (2, 4, 4), 0.9)])[None]
-        labels, info, _ = self.run_model("segment", min_voxels=30)
-        self.assertEqual(self.ids(labels), [[1, 2]])
-        self.assertEqual(labels[0, 8, 24, 24], 0)
-        self.assertEqual(info["objects"], 2)
+    def test_a_model_is_loaded_once_per_folder_and_device(self):
+        folder = make_model(self.root)
+        foundation.run(blobs(), {"model": folder, "task": "segment"}, "cpu")
+        first = foundation.load_model(folder, "cpu")
+        foundation.run(blobs(), {"model": folder, "task": "segment"}, "cpu")
+        self.assertIs(foundation.load_model(folder, "cpu"), first)
+        self.assertEqual(first.module.LOADS, ["cpu"])
+        self.assertTrue(foundation.model_info(folder)["loaded"])
+        # another device is another model; one model is resident at a time
+        other = foundation.load_model(folder, "cuda:1")
+        self.assertIsNot(other, first)
+        self.assertEqual(other.model.device, "cuda:1")
+        self.assertEqual(len(foundation._MODELS), 1)
 
-    def test_a_tracking_run_keeps_small_objects(self):
-        # the small object is under Min. voxels in frame 1 only; dropping it
-        # there would leave a hole in its track
-        shape = (self.Z, self.Y, self.X)
-        big = blob(shape, (8, 36, 36), (2.0, 5, 5), 0.9)
-        Script.heatmaps = np.stack([np.maximum(blob(shape, (8, 12, 12), (1.0, 1.5, 1.5), 0.9), big),
-                                    np.maximum(blob(shape, (8, 12, 13), (0.6, 0.8, 0.8), 0.9), big)])
-        labels, _, _ = self.run_model("track", t=2, min_voxels=10)
-        self.assertEqual(self.ids(labels), [[1, 2], [1, 2]])
-        self.assertTrue(all(c[2] == 0 for c in Script.calls if c[0] == "watershed"))
+    def test_a_re_export_in_place_is_picked_up(self):
+        folder = make_model(self.root)
+        first = foundation.load_model(folder, "cpu")
+        time.sleep(0.02)
+        man = json.loads(Path(folder, "model.json").read_text())
+        man["decode"]["fg_threshold"] = 0.25
+        Path(folder, "model.json").write_text(json.dumps(man))
+        os.utime(os.path.join(folder, "model.json"), ns=(time.time_ns() + 10 ** 9,) * 2)
+        second = foundation.load_model(folder, "cpu")
+        self.assertIsNot(second, first)
+        self.assertEqual(second.model.fg_threshold, 0.25)
 
-    def test_divisions_count_each_daughter_track(self):
-        # latents' shape for a mother (1) dividing twice: daughters 2 and 3,
-        # the continuing daughter recorded as her own parent, 4 a fresh start
-        self.assertEqual(foundation.lineage({1: 1, 2: 1, 3: 1, 4: 0}), {2: 1, 3: 1})
-        Script.heatmaps = np.stack([blob((self.Z, self.Y, self.X), (8, 24, 24), (1.5, 3, 3), 0.9)] * 2)
-        Script.parents = {1: 1, 2: 1, 3: 1, 4: 0}
-        _, info, extras = self.run_model("track", t=2)
-        self.assertEqual(info["divisions"], 2)
-        self.assertEqual(extras["lineage"], {2: 1, 3: 1})
+    def test_two_models_keep_their_own_lib(self):
+        a = make_model(self.root, name="model-a", kind="a")
+        b = make_model(self.root, name="model-b", kind="b")
+        la = foundation.load_model(a, "cpu")
+        self.assertEqual(la.model.kind, "a")
+        lb = foundation.load_model(b, "cpu")
+        self.assertEqual(lb.model.kind, "b")
+        self.assertEqual(sys.modules["_lib.net"].KIND, "b")
+        # model-a again: its own _lib, imported anew, not model-b's left in sys.modules
+        la2 = foundation.load_model(a, "cpu")
+        self.assertEqual(la2.model.kind, "a")
+        self.assertEqual(la2.call("prompt", blobs()[0, 0], objects=[{"points": [[4, 8, 8]]}])[2]["kind"], "a")
 
-    def test_a_three_class_head_segments_from_its_class_logits(self):
-        Script.head = "threeclass"
-        logits = np.zeros((1, 3, self.Z, self.Y, self.X), np.float32)
-        logits[0, 0] = 4.0
-        logits[0, 1, 4:12, 10:20, 10:20] = 8.0
-        Script.logits = logits
-        labels, info, extras = self.run_model("segment")
-        self.assertEqual(self.ids(labels), [[1]])
-        self.assertGreater(float(extras["confidence"][0, 8, 15, 15]), 0.95)
-        self.assertLess(float(extras["confidence"][0, 0, 0, 0]), 0.05)
-        with self.assertRaises(ValueError):
-            self.run_model("detect")
-        self.assertEqual(foundation.model_info(self.path)["tasks"], ["segment"])
+    def test_prompt_returns_one_mask_per_object_labelled_by_position(self):
+        folder = make_model(self.root)
+        objects = [{"points": [[8, 8, 4]]},                       # the application's (x, y, z)
+                   {"box": [20, 8, 2, 30, 17, 7]},                 # around the blob at (x 24, y 12)
+                   {"scribbles": [{"points": [[10, 22, 4], [11, 22, 4]], "label": 1}]}]
+        labels, info, extras = foundation.run(blobs(), {"model": folder, "task": "prompt", "objects": objects}, "cpu")
+        self.assertEqual(labels.shape, (1, 8, 32, 32))
+        self.assertEqual(labels[0, 4, 8, 8], 1)
+        self.assertEqual(labels[0, 4, 12, 24], 2)
+        self.assertEqual(labels[0, 4, 22, 10], 3)
+        self.assertEqual(info["mask_scores"], [0.8, 0.7, 0.6])
+        self.assertEqual(info["prompt_kinds"]["objects"], 3)
+        self.assertEqual(extras["confidence"].shape, (1, 8, 32, 32))
+        self.assertAlmostEqual(float(extras["confidence"][0, 4, 8, 8]), 0.8, places=5)
+        self.assertEqual(info["window"], [8, 32, 32])
+
+    def test_a_background_click_corrects_its_objects_mask(self):
+        folder = make_model(self.root)
+        one = {"points": [[8, 8, 4]]}
+        before = foundation.run(blobs(), {"model": folder, "task": "prompt", "objects": [one]}, "cpu")[0]
+        fixed = {"points": [[8, 8, 4], [8, 10, 4]], "point_labels": [1, 0]}
+        after = foundation.run(blobs(), {"model": folder, "task": "prompt", "objects": [fixed]}, "cpu")[0]
+        self.assertEqual(int(after.max()), 1)                         # still one object, one mask
+        self.assertLess(int((after == 1).sum()), int((before == 1).sum()))
+
+    def test_a_segment_only_model_cannot_be_prompted(self):
+        folder = make_model(self.root, name="fake-conv", tasks=("segment",))
+        with self.assertRaisesRegex(foundation.ModelError, "cannot be prompted.*offers segment"):
+            foundation.run(blobs(), {"model": folder, "task": "prompt", "objects": [{"points": [[8, 8, 4]]}]}, "cpu")
+        with self.assertRaisesRegex(foundation.ModelError, "cannot track"):
+            foundation.run(blobs(t=2), {"model": folder, "task": "track"}, "cpu")
+
+    def test_the_channel_contract_is_checked(self):
+        folder = make_model(self.root)
+        with self.assertRaisesRegex(foundation.ModelError, "takes one channel and was sent 2"):
+            foundation.run(blobs(c=2), {"model": folder, "task": "segment"}, "cpu")
+        two = make_model(self.root, name="two", channels=2)
+        with self.assertRaisesRegex(foundation.ModelError, "takes 2 channels"):
+            foundation.run(blobs(c=3), {"model": two, "task": "segment"}, "cpu")
+        labels, info, _ = foundation.run(blobs(c=2), {"model": two, "task": "segment"}, "cpu")
+        self.assertEqual(int(labels.max()), 3)
+
+    def test_a_far_voxel_size_is_warned_about(self):
+        folder = make_model(self.root)
+        _, near, _ = foundation.run(blobs(), {"model": folder, "task": "segment", "voxel_um": [0.11, 0.1, 0.6]}, "cpu")
+        self.assertNotIn("warnings", near)
+        _, far, _ = foundation.run(blobs(), {"model": folder, "task": "segment", "voxel_um": [0.4, 0.4, 0.5]}, "cpu")
+        self.assertEqual(len(far["warnings"]), 1)
+        self.assertIn("trained at", far["warnings"][0])
+        self.assertIn("x, y", far["warnings"][0])
+        _, tiled, _ = foundation.run(blobs(), {"model": folder, "task": "segment", "tile": [4, 16, 16]}, "cpu")
+        self.assertIn("Tile is ignored", tiled["warnings"][0])
+
+    def test_a_model_py_that_fails_names_the_folder(self):
+        folder = make_model(self.root)
+        Path(folder, "model.py").write_text("raise RuntimeError('weights do not match the code')\n")
+        with self.assertRaises(foundation.ModelError) as e:
+            foundation.load_model(folder, "cpu")
+        self.assertIn(folder, str(e.exception))
+        self.assertIn("weights do not match the code", str(e.exception))
+        Path(folder, "model.py").write_text("import torch_that_is_not_there\n")
+        with self.assertRaisesRegex(foundation.ModelError, "needs torch_that_is_not_there"):
+            foundation.load_model(folder, "cpu")
+        Path(folder, "model.py").write_text("x = 1\n")
+        with self.assertRaisesRegex(foundation.ModelError, r"no load\(folder, device\)"):
+            foundation.load_model(folder, "cpu")
+        os.remove(os.path.join(folder, "model.py"))
+        with self.assertRaisesRegex(foundation.ModelError, "no model.py"):
+            foundation.load_model(folder, "cpu")
+        self.assertFalse(any(k.startswith("_sirius_model_") for k in sys.modules))
 
     def test_cancel_raises_an_exception_not_a_keyboard_interrupt(self):
-        Script.heatmaps = blob((self.Z, self.Y, self.X), (8, 24, 24), (1.5, 3, 3), 0.9)[None]
+        folder = make_model(self.root)
         self.assertTrue(issubclass(foundation.Cancelled, Exception))
         with self.assertRaises(foundation.Cancelled):
-            foundation.run(clip(1, self.Z, self.Y, self.X), {"model": self.path}, "cpu", cancelled=lambda: True)
+            foundation.run(blobs(), {"model": folder, "task": "segment"}, "cpu", cancelled=lambda: True)
 
-    def test_a_cancelled_run_is_answered_over_the_socket(self):
-        # KeyboardInterrupt escaped the server's handler: no reply at all, and
-        # the application waited out its grace period, then dropped the link
+    @unittest.skipUnless(HAVE_SAFETENSORS, "safetensors is not installed in this Python: the weights file "
+                                           "cannot be written, so the weights path is not tested here")
+    def test_the_weights_file_is_the_models_own(self):
+        folder = make_model(self.root, weights_scale=0.0)            # a network that sees nothing
+        labels = foundation.run(blobs(), {"model": folder, "task": "segment"}, "cpu")[0]
+        self.assertEqual(int(labels.max()), 0)
+
+
+class Listing(Base):
+    def test_models_are_listed_by_name_and_version(self):
+        make_model(self.root, name="coat-sam-s2", version="v1")
+        make_model(self.root, name="coat-sam-s2", version="v2", tasks=("segment",))
+        make_model(self.root, name="alpha", version="v1")
+        broken = Path(self.root, "broken", "v1")
+        broken.mkdir(parents=True)
+        (broken / "model.json").write_text("{")
+        Path(self.root, "old.ltb").write_bytes(b"PK")
+        Path(self.root, "not-a-model").mkdir()
+        got = foundation.list_models([self.root, os.path.join(self.root, "missing")])
+        rows = [(m["name"], m["version"], m["tasks"], bool(m["error"])) for m in got["models"]]
+        self.assertEqual(rows, [("old", "", [], True),
+                                ("alpha", "v1", ["segment", "prompt"], False),
+                                ("broken", "v1", [], True),
+                                ("coat-sam-s2", "v1", ["segment", "prompt"], False),
+                                ("coat-sam-s2", "v2", ["segment"], False)])
+        self.assertIn("old bundle format", got["models"][0]["error"])
+        self.assertEqual(got["models"][1]["description"], "A fake model for tests.")
+        self.assertEqual(got["errors"], [f"not a folder: {os.path.join(self.root, 'missing')}"])
+        # a model folder named directly is its own listing
+        one = foundation.list_models([os.path.join(self.root, "alpha", "v1")])
+        self.assertEqual([m["name"] for m in one["models"]], ["alpha"])
+
+    def test_listing_loads_nothing(self):
+        make_model(self.root)
+        foundation.list_models([self.root])
+        self.assertEqual(foundation._MODELS, {})
+        self.assertFalse(any(k.startswith("_sirius_model_") for k in sys.modules))
+
+
+@unittest.skipUnless(HAVE_SCIPY, "the fake model's decode needs scipy")
+class OverTheSocket(Base):
+    """What the application sends: model_info, list_bundles and run kind foundation."""
+
+    def call(self, method, params, tensors=None):
         from sirius_worker.server import WorkerServer
 
-        Script.heatmaps = np.zeros((6, 2, 8, 8), np.float32)
-        Script.delay = 0.3
         server = WorkerServer("127.0.0.1", 0, "t", "cpu")
         port = server.bind()
         thread = threading.Thread(target=server.serve_forever, daemon=True)
         thread.start()
-        sock = socket.create_connection(("127.0.0.1", port), timeout=10)
+        sock = socket.create_connection(("127.0.0.1", port), timeout=20)
         try:
             self.assertEqual(protocol.client_handshake(sock, "t", first_id=100)["type"], "result")
-            vol = clip(6, 2, 8, 8)
-            protocol.write_frame(sock, {"id": 2, "type": "request", "method": "run",
-                                        "params": {"kind": "foundation", "params": {"model": self.path, "task": "segment"}}},
-                                 {"input": vol})
-            header, _ = protocol.read_frame(sock)
-            self.assertEqual(header["type"], "progress")
-            protocol.write_frame(sock, {"id": 3, "type": "request", "method": "cancel", "params": {"id": 2}})
-            t0, answer = time.time(), None
-            while answer is None:
-                header, _ = protocol.read_frame(sock)
+            protocol.write_frame(sock, {"id": 2, "type": "request", "method": method, "params": params}, tensors or {})
+            while True:
+                header, got = protocol.read_frame(sock)
                 if header.get("id") == 2 and header["type"] != "progress":
-                    answer = header
-            self.assertEqual(answer["type"], "error")
-            self.assertEqual(answer["message"], "cancelled")
-            self.assertLess(time.time() - t0, 5.0)
+                    return header, got
         finally:
             sock.close()
             server.stop()
             thread.join(timeout=5)
 
-    def test_run_step_hands_the_step_its_device_progress_and_cancel(self):
-        wb = load_workbench_under_test()
-        Script.heatmaps = blob((self.Z, self.Y, self.X), (8, 24, 24), (1.5, 3, 3), 0.9)[None]
+    def test_model_info_of_a_folder(self):
+        folder = make_model(self.root)
+        header, _ = self.call("model_info", {"path": folder, "model": folder, "spec": folder})
+        self.assertEqual(header["type"], "result", header)
+        self.assertEqual(header["result"]["tasks"], ["segment", "prompt"])
+        self.assertTrue(header["result"]["promptable"])
+
+    def test_model_info_of_a_folder_that_is_not_there(self):
+        missing = os.path.join(self.root, "coat-sam-s2", "v9")
+        header, _ = self.call("model_info", {"path": missing, "model": missing, "spec": missing})
+        self.assertEqual(header["type"], "error", header)
+        self.assertIn("model folder not found", header["message"])
+
+    def test_list_bundles_lists_the_model_folders(self):
+        make_model(self.root)
+        header, _ = self.call("list_bundles", {"dirs": [self.root]})
+        self.assertEqual(header["type"], "result", header)
+        self.assertEqual([m["name"] for m in header["result"]["models"]], ["fake-sam"])
+
+    def test_a_prompt_run(self):
+        folder = make_model(self.root)
+        header, got = self.call("run", {"kind": "foundation",
+                                        "params": {"model": folder, "task": "prompt", "voxel_um": [0.1, 0.1, 0.5],
+                                                   "objects": [{"points": [[8, 8, 4]], "point_labels": [1]}]}},
+                                {"input": blobs()})
+        self.assertEqual(header["type"], "result", header)
+        self.assertEqual(got["labels"].shape, (1, 8, 32, 32))
+        self.assertEqual(int(got["labels"][0, 4, 8, 8]), 1)
+        self.assertEqual(header["result"]["mask_scores"], [0.8])
+
+
+class WorkbenchStep(Base):
+    """bindings' run_step("foundation", ...) goes through the same folder loader."""
+
+    @staticmethod
+    def workbench():
+        """This checkout's bindings/python/sirius/workbench.py, whatever `sirius` the interpreter has
+        installed (as bindings/tests/test_workbench_schema.py)."""
+        import importlib.util
+
+        here = Path(__file__).resolve().parents[3] / "bindings" / "python" / "sirius" / "workbench.py"
+        try:
+            import sirius.workbench as wb  # type: ignore
+
+            if Path(wb.__file__).resolve() == here:
+                return wb
+        except Exception:  # noqa: BLE001
+            pass
+        name = "sirius_workbench_under_test"
+        if name not in sys.modules:
+            spec = importlib.util.spec_from_file_location(name, here)
+            module = importlib.util.module_from_spec(spec)
+            sys.modules[name] = module
+            spec.loader.exec_module(module)  # type: ignore[union-attr]
+        return sys.modules[name]
+
+    @unittest.skipUnless(HAVE_SCIPY, "the fake model's decode needs scipy")
+    def test_run_step_segments_and_prompts_with_a_folder(self):
+        wb = self.workbench()
+        folder = make_model(self.root)
         seen = []
-        res = wb.run_step("foundation", {"model": self.path, "task": "Detect centroids"},
-                          clip(1, self.Z, self.Y, self.X), {"voxel_um": [0.15, 0.15, 0.75]},
-                          progress=lambda f, m: seen.append(f), device="cuda:3")
-        self.assertEqual(Script.loads, ["cuda:3"])
+        res = wb.run_step("foundation", {"model": folder, "task": "Segment objects"}, blobs(),
+                          {"voxel_um": [0.1, 0.1, 0.5]}, progress=lambda f, m: seen.append(f), device="cpu")
+        self.assertEqual(int(np.asarray(res.labels).max()), 3)
         self.assertTrue(seen)
-        self.assertEqual(res.info["voxel_um"], [0.15, 0.15, 0.75])
+        prompts = [{"kind": "point", "x": 8, "y": 8, "z": 4, "object": 7}]
+        res = wb.run_step("foundation", {"model": folder, "task": "Prompt objects", "prompts": prompts}, blobs(),
+                          {"voxel_um": [0.1, 0.1, 0.5]}, device="cpu")
+        self.assertEqual(int(np.asarray(res.labels)[0, 4, 8, 8]), 7)   # labelled with the object's id
         with self.assertRaises(wb.Cancelled):
-            wb.run_step("foundation", {"model": self.path, "task": "Detect centroids"},
-                        clip(1, self.Z, self.Y, self.X), None, cancelled=lambda: True)
+            wb.run_step("foundation", {"model": folder, "task": "Segment objects"}, blobs(), None,
+                        cancelled=lambda: True)
 
-
-
-@unittest.skipUnless(HAVE, f"latents not importable: {WHY}")
-class DistanceHead(unittest.TestCase):
-    """A coat student: the head outputs foreground and distance to the wall, and the instances come
-    from a watershed seeded on the h-maxima of that distance.
-
-    This is NOT a centroid heatmap, and until 2026-10-01 the Segment task ran one anyway: it asked
-    Bundle.heatmap for a one-channel map from a two-channel head, and watershedding a foreground
-    probability as if it were centroids merges every cell that touches another. The decode rule
-    lives in the bundle because it is what the model was scored with and cannot be recovered from
-    the weights."""
-
-    def setUp(self):
-        self.dir = tempfile.mkdtemp()
-        self.path = os.path.join(self.dir, "dist.ltb")
-        make_bundle(self.path, five_d=True, head="conv")
-        self.v = blobs()
-
-    def tearDown(self):
-        shutil.rmtree(self.dir, ignore_errors=True)
-
-    def test_it_offers_segment_only(self):
-        info = foundation.model_info(self.path)
-        self.assertEqual(info["tasks"], ["segment"])
-        self.assertEqual(info["decode"]["seed_hmax"], 0.15)
-        self.assertEqual(info["decode"]["min_voxels"], 50)
-
-    def test_segment_decodes_through_the_distance_route(self):
-        labels, info, extras = foundation.run(self.v, {"model": self.path, "task": "segment"}, "cpu")
-        self.assertEqual(labels.shape, self.v.shape[1:])
-        self.assertEqual(info["decode"]["kind"], "distance")
-        self.assertEqual(info["decode"]["fg_threshold"], 0.5)
-        self.assertIn("confidence", extras)                 # the foreground probability, not a heatmap
-
-    def test_a_caller_threshold_overrides_the_bundles_foreground(self):
-        _, info, _ = foundation.run(self.v, {"model": self.path, "task": "segment",
-                                             "threshold": 0.8}, "cpu")
-        self.assertEqual(info["decode"]["fg_threshold"], 0.8)
-
-    def test_detect_and_track_are_refused(self):
-        for task in ("detect", "track"):
-            with self.assertRaises(ValueError):
-                foundation.run(self.v, {"model": self.path, "task": task}, "cpu")
-
-
-@unittest.skipUnless(HAVE, f"latents not importable: {WHY}")
-class PromptTask(unittest.TestCase):
-    """A promptable (SamHead) bundle: the person points at an object and gets that object.
-
-    This is the path a model that cannot segment unattended is still useful on, so it is
-    tested for CONTRACT -- one mask per point, the application's (x, y, z) order, a score per
-    mask, and clear errors -- not for segmentation quality, which an untrained head has none of.
-    """
-
-    def setUp(self):
-        self.dir = tempfile.mkdtemp()
-        self.path = os.path.join(self.dir, "prompt.ltb")
-        make_bundle(self.path, five_d=True, head="sam")
-        self.v = blobs()
-
-    def tearDown(self):
-        shutil.rmtree(self.dir, ignore_errors=True)
-
-    def test_model_info_offers_prompt(self):
-        info = foundation.model_info(self.path)
-        self.assertIn("prompt", info["tasks"])
-        self.assertIn("segment", info["tasks"])
-        self.assertNotIn("track", info["tasks"])        # a region head has no centroids to link
-
-    def test_one_mask_per_point_in_application_order(self):
-        pts = [[16, 16, 4], [20, 44, 4]]                # (x, y, z), the application's order
-        labels, info, extras = foundation.run(self.v, {"model": self.path, "task": "prompt",
-                                                       "points": pts}, "cpu")
-        self.assertEqual(labels.shape, self.v.shape[1:])
-        self.assertEqual(info["prompts"], 2)
-        self.assertEqual(len(info["mask_scores"]), 2)
-        self.assertLessEqual(int(labels.max()), 2)
-        self.assertIn("confidence", extras)
-
-    def test_point_labels_may_mark_background(self):
-        labels, info, _ = foundation.run(self.v, {"model": self.path, "task": "prompt",
-                                                  "points": [[16, 16, 4]], "point_labels": [0]}, "cpu")
-        self.assertEqual(info["prompts"], 1)
-
-    def test_a_box_and_a_scribble_are_prompts_too(self):
-        """The box is the strongest prompt we measure, and a scribble is ONE mask, not K."""
-        labels, info, _ = foundation.run(self.v, {"model": self.path, "task": "prompt",
-                                                  "boxes": [[8, 8, 2, 28, 28, 6]]}, "cpu")
-        self.assertEqual(info["prompts"], 1)
-        self.assertEqual(info["prompt_kinds"], {"points": 0, "boxes": 1, "scribbles": 0, "objects": 0})
-        labels, info, _ = foundation.run(self.v, {"model": self.path, "task": "prompt",
-                                                  "scribbles": [{"points": [[16, 16, 4], [18, 18, 4]],
-                                                                 "label": 1}]}, "cpu")
-        self.assertEqual(info["prompts"], 1)            # one stroke, one mask
-        self.assertLessEqual(int(labels.max()), 1)
-
-    def test_prompt_kinds_combine_and_keep_their_order(self):
-        labels, info, _ = foundation.run(self.v, {"model": self.path, "task": "prompt",
-                                                  "points": [[16, 16, 4]],
-                                                  "boxes": [[8, 8, 2, 28, 28, 6]],
-                                                  "scribbles": [{"points": [[20, 44, 4]], "label": 1}]}, "cpu")
-        self.assertEqual(info["prompts"], 3)
-        self.assertEqual(info["prompt_kinds"], {"points": 1, "boxes": 1, "scribbles": 1, "objects": 0})
-        self.assertEqual(len(info["mask_scores"]), 3)
-
-    def test_a_box_outside_the_image_is_refused(self):
-        with self.assertRaisesRegex(ValueError, "box falls outside"):
-            foundation.run(self.v, {"model": self.path, "task": "prompt",
-                                    "boxes": [[8, 8, 2, 999, 28, 6]]}, "cpu")
-
-    def test_errors_are_specific(self):
-        with self.assertRaisesRegex(ValueError, "at least one point, box, scribble or object"):
-            foundation.run(self.v, {"model": self.path, "task": "prompt", "points": []}, "cpu")
-        with self.assertRaisesRegex(ValueError, "outside the image"):
-            foundation.run(self.v, {"model": self.path, "task": "prompt", "points": [[999, 1, 1]]}, "cpu")
-        with self.assertRaisesRegex(ValueError, "point labels"):
-            foundation.run(self.v, {"model": self.path, "task": "prompt",
-                                    "points": [[16, 16, 4]], "point_labels": [1, 1]}, "cpu")
-        with self.assertRaisesRegex(ValueError, "one frame"):
-            foundation.run(blobs(t=2), {"model": self.path, "task": "prompt",
-                                        "points": [[16, 16, 4]]}, "cpu")
-
-
-    def test_an_object_is_one_mask_holding_all_of_its_prompts(self):
-        """The joint form: a box plus a corrective background click is ONE object and ONE mask, which
-        is what makes a correction refine a mask instead of adding another one."""
-        labels, info, _ = foundation.run(self.v, {"model": self.path, "task": "prompt", "objects": [
-            {"box": [8, 8, 2, 28, 28, 6], "points": [[24, 24, 4]], "point_labels": [0]},
-            {"points": [[20, 44, 4]]},
-        ]}, "cpu")
-        self.assertEqual(info["prompts"], 2)                        # two objects, not four prompts
-        self.assertEqual(info["prompt_kinds"], {"points": 0, "boxes": 0, "scribbles": 0, "objects": 2})
-        self.assertEqual(len(info["mask_scores"]), 2)
-        self.assertLessEqual(int(labels.max()), 2)
-
-    def test_a_correction_changes_the_mask(self):
-        box = [8, 8, 2, 28, 28, 6]
-        a, _, _ = foundation.run(self.v, {"model": self.path, "task": "prompt",
-                                          "objects": [{"box": box}]}, "cpu")
-        b, _, _ = foundation.run(self.v, {"model": self.path, "task": "prompt", "objects": [
-            {"box": box, "points": [[24, 24, 4]], "point_labels": [0]}]}, "cpu")
-        self.assertFalse(np.array_equal(a, b))
-
-    def test_one_objects_prompts_do_not_change_another_objects_mask(self):
-        """The pad token attends, so decoding every slot in one padded tensor made a mask depend on
-        how many prompts the OTHER objects carried. An interactive tool cannot have that: a click on
-        cell A must leave cell B alone. deploy.Bundle.prompt groups equal-width slots for this."""
-        lone = {"points": [[20, 44, 4]]}
-        _, alone, _ = foundation.run(self.v, {"model": self.path, "task": "prompt",
-                                              "objects": [lone]}, "cpu")
-        _, with_other, _ = foundation.run(self.v, {"model": self.path, "task": "prompt", "objects": [
-            lone, {"box": [8, 8, 2, 28, 28, 6], "points": [[16, 16, 4]], "point_labels": [1]}]}, "cpu")
-        # the decoder's own score for object 0, which the label volume does not preserve: a later
-        # mask paints over an earlier one where they overlap
-        self.assertEqual(alone["mask_scores"][0], with_other["mask_scores"][0])
-
-    def test_object_errors_name_the_object(self):
-        with self.assertRaisesRegex(ValueError, "object 0 has no prompts"):
-            foundation.run(self.v, {"model": self.path, "task": "prompt", "objects": [{}]}, "cpu")
-        with self.assertRaisesRegex(ValueError, "object 1: 1 points but 2 point labels"):
-            foundation.run(self.v, {"model": self.path, "task": "prompt", "objects": [
-                {"points": [[16, 16, 4]]}, {"points": [[16, 16, 4]], "point_labels": [1, 0]}]}, "cpu")
-        with self.assertRaisesRegex(ValueError, "point of object 0 falls outside"):
-            foundation.run(self.v, {"model": self.path, "task": "prompt",
-                                    "objects": [{"points": [[999, 1, 1]]}]}, "cpu")
-        with self.assertRaisesRegex(ValueError, "box of object 0 falls outside"):
-            foundation.run(self.v, {"model": self.path, "task": "prompt",
-                                    "objects": [{"box": [8, 8, 2, 999, 28, 6]}]}, "cpu")
-
-    def test_a_non_promptable_bundle_says_so(self):
-        other = os.path.join(self.dir, "plain.ltb")
-        make_bundle(other, five_d=True, head="threeclass")
-        self.assertNotIn("prompt", foundation.model_info(other)["tasks"])
-        with self.assertRaisesRegex(ValueError, "no prompt decoder"):
-            foundation.run(self.v, {"model": other, "task": "prompt", "points": [[16, 16, 4]]}, "cpu")
 
 if __name__ == "__main__":
     unittest.main()

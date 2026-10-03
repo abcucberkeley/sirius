@@ -55,6 +55,10 @@ cache = ""
 # The definition file "Build an image" builds from. "" =
 # <checkout>/containers/sirius-worker.def.
 def_file = ""
+# The cluster's models folder: <models>/<name>/<version>/ model folders
+# (model.py, model.json, weights.safetensors), what Models… lists on the
+# Foundation step while connected. "" = none.
+models = ""
 
 # The job Connect asks for. Empty strings leave it to Slurm (your default
 # partition, account and QoS).

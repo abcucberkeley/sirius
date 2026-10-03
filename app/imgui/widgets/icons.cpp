@@ -237,6 +237,10 @@ namespace sirius::app::gui {
                     p.line(11.5f, 7.5f, 16.5f, 7.5f);
                     p.line(11.5f, 16.5f, 16.5f, 16.5f);
                     break;
+                case Icon::Copy:   // the copy in front, the original behind it
+                    p.box(4, 8.5f, 11.5f, 11.5f);
+                    p.poly({{8.5f, 8.5f}, {8.5f, 4}, {20, 4}, {20, 15.5f}, {15.5f, 15.5f}});
+                    break;
                 case Icon::Help:
                     p.ring(12, 12, 9);
                     p.moveTo(8.6f, 9.4f);

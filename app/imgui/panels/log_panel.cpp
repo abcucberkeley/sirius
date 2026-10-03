@@ -55,6 +55,7 @@ namespace sirius::app::gui {
         bool resetScrollX = true;           // the next frame puts the view on the first column
         float lastScrollY = 0.0f;
         double copiedUntil = 0.0;           // "Copied" on the button until then
+        std::string menuLine;               // the line the context menu was opened on
 
         // selection: anchor where the drag started, caret where it is now
         bool hasSelection = false;
@@ -174,6 +175,32 @@ namespace sirius::app::gui {
 
         void drawHeader();
         void drawView();
+
+        // The text view's context menu: Copy line, Copy selection, Copy all.
+        void drawLineMenu() {
+            ImGui::PushStyleColor(ImGuiCol_Border, theme::kText);
+            ImGui::PushStyleVar(ImGuiStyleVar_PopupBorderSize, theme::crispPen(2));
+            ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, px(0, 4));
+            ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, px(0, 0));
+            if (ImGui::BeginPopup("##lineMenu")) {
+                auto item = [](const char* label, bool enabled) {
+                    const ImVec2 p = ImGui::GetCursorScreenPos();
+                    const float h = theme::snap(px(26)), w = px(180);
+                    const bool clicked = ImGui::Selectable((std::string("##") + label).c_str(), false,
+                                                           enabled ? ImGuiSelectableFlags_None : ImGuiSelectableFlags_Disabled, ImVec2(w, h));
+                    widgets::drawTextIn(ImGui::GetWindowDrawList(), ImVec2(p.x + px(12), p.y), ImVec2(p.x + w, p.y + h), label, 12,
+                                        enabled ? theme::kText : theme::kNeutral500, theme::Weight::Regular, 0.0f, 0.5f);
+                    return clicked;
+                };
+                const bool selection = hasSelection && !(anchor == caret);
+                if (item("Copy line", true)) widgets::copyToClipboard(menuLine);
+                if (item("Copy selection", selection)) widgets::copyToClipboard(selectedText());
+                if (item("Copy all", true)) widgets::copyToClipboard(allText());
+                ImGui::EndPopup();
+            }
+            ImGui::PopStyleVar(3);
+            ImGui::PopStyleColor();
+        }
     };
 
     void LogPanel::Impl::drawHeader() {
@@ -362,6 +389,14 @@ namespace sirius::app::gui {
                 app.requestRedraw();
             }
             if (!ImGui::IsItemActive()) selecting = false;
+            // A right-click offers the line under the mouse (an error to paste
+            // into a report), the selection and the whole log.
+            if (hovered && ImGui::IsMouseReleased(ImGuiMouseButton_Right) && !lines.empty()) {
+                const TextPos p = posAt(io.MousePos);
+                menuLine = lines[std::min(p.line, lines.size() - 1)];
+                ImGui::OpenPopup("##lineMenu");
+            }
+            drawLineMenu();
             // Ctrl+A / Ctrl+C while the log has the keyboard
             if (ImGui::IsWindowFocused() && !io.WantTextInput) {
                 // Edit > Copy parameters is Ctrl+C too: the log's copy wins while it has focus

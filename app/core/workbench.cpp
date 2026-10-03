@@ -209,15 +209,51 @@ namespace sirius::app {
             queue.clear();
         }
 
-        std::optional<Answer> ask(const std::string& method, const json& params) {
+        // What a request stands for: a newer request of the same slot (the
+        // same method for the same step) replaces one still waiting in the
+        // queue, so a slider dragged over a hundred values asks the node once
+        // for the value it stopped at, not a hundred times in a row.
+        static std::string slotOf(const std::string& method, const json& params) {
+            std::string slot = method;
+            if (params.is_object()) {
+                if (params.contains("index")) slot += "/" + params["index"].dump();
+                if (params.contains("params")) slot += "/params";
+            }
+            return slot;
+        }
+
+        // The answer to `method` with `params`, or nullopt while it is asked.
+        // `urgent`: the user waits on it (Auto contrast): it goes to the
+        // front of the queue.
+        std::optional<Answer> ask(const std::string& method, const json& params, bool urgent = false) {
             const std::string key = method + "\n" + params.dump();
             const std::lock_guard<std::mutex> g(qm);
             if (auto it = answers.find(key); it != answers.end()) return it->second;
-            if (asked.insert(key).second) {
-                queue.emplace_back(key, method, params);
-                if (!thread.joinable()) thread = std::thread([this] { loop(); });
-                qcv.notify_all();
+            const auto queued = std::find_if(queue.begin(), queue.end(), [&key](const auto& q) { return std::get<0>(q) == key; });
+            if (queued != queue.end()) {
+                // asked already and still waiting: an urgent ask moves it forward
+                if (urgent && queued != queue.begin()) {
+                    auto entry = std::move(*queued);
+                    queue.erase(queued);
+                    queue.push_front(std::move(entry));
+                }
+                return std::nullopt;
             }
+            if (asked.count(key)) return std::nullopt;   // the request the loop is making now
+            const std::string slot = slotOf(method, params);
+            for (auto it = queue.begin(); it != queue.end();) {
+                if (slotOf(std::get<1>(*it), std::get<2>(*it)) == slot) {
+                    asked.erase(std::get<0>(*it));
+                    it = queue.erase(it);
+                } else {
+                    ++it;
+                }
+            }
+            asked.insert(key);
+            if (urgent) queue.emplace_front(key, method, params);
+            else queue.emplace_back(key, method, params);
+            if (!thread.joinable()) thread = std::thread([this] { loop(); });
+            qcv.notify_all();
             return std::nullopt;
         }
 
@@ -247,10 +283,19 @@ namespace sirius::app {
                 std::function<void()> wakeUp;
                 {
                     const std::lock_guard<std::mutex> g(qm);
-                    if (!asked.count(key)) continue;   // asked of an engine that was replaced since
-                    if (answers.size() > 256) answers.clear();
-                    answers[key] = std::move(a);
                     wakeUp = wake;
+                    // Asked of an engine that was replaced since: not kept, but
+                    // the host is woken all the same, so whoever waits on it
+                    // (a pending Auto contrast) asks the new one.
+                    if (asked.count(key)) {
+                        if (answers.size() > 256) {
+                            // A forgotten answer is asked again: its key left in
+                            // `asked` would have waited for it forever.
+                            for (const auto& entry : answers) asked.erase(entry.first);
+                            answers.clear();
+                        }
+                        answers[key] = std::move(a);
+                    }
                 }
                 arrived.store(true);
                 if (wakeUp) wakeUp();
@@ -1604,7 +1649,39 @@ namespace sirius::app {
             // engine, on the data as the node holds it: nothing comes here but
             // the diagnostics (answered on the engine's thread; poll()).
             // (an input not computed on the node yet has no preview: none is guessed from another step's data)
-            if (inputOnCluster(index) && !previewedOnNode(index)) return d;
+            if (inputOnCluster(index) && !previewedOnNode(index)) {
+                int nearest = index - 1;
+                while (nearest > 0 && !pipeline_.at(nearest).enabled) --nearest;
+                d.warnings.push_back("No preview: the input (step " + Step::number(nearest) + " " + pipeline_.at(nearest).name +
+                                     ") is not computed on the cluster node yet. Run up to it.");
+                return d;
+            }
+            if (previewedOnNode(index) && s.kind == "contrast") {
+                // the node's one measurement of the input, with this window
+                // and gamma drawn on it here: a window dragged asks nothing
+                try {
+                    const std::optional<Diagnostics> m = nodeContrast(index, s.params);
+                    if (!m) {
+                        d.warnings.push_back("Measuring the input on the cluster node\xE2\x80\xA6");
+                        return d;
+                    }
+                    Diagnostics p = *m;
+                    const bool automatic = !(s.params.getDouble("max", 0.0) > s.params.getDouble("min", 0.0));
+                    for (DiagnosticHistogram& h : p.histograms) {
+                        if (!automatic) {
+                            h.lo = s.params.getDouble("min", h.binLo);
+                            h.hi = s.params.getDouble("max", h.binHi);
+                        }
+                        h.gamma = s.params.getDouble("gamma", 1.0);
+                    }
+                    p.summary = d.summary;
+                    p.warnings.insert(p.warnings.end(), d.warnings.begin(), d.warnings.end());
+                    return p;
+                } catch (const std::exception& e) {
+                    d.warnings.push_back("Preview on the cluster node: " + std::string(e.what()));
+                    return d;
+                }
+            }
             if (previewedOnNode(index)) {
                 std::string error;
                 std::vector<rpc::Tensor> tensors;
@@ -1704,6 +1781,8 @@ namespace sirius::app {
     void Workbench::setRemoteConfig(RemoteConfig c) {
         remote_ = std::move(c);
         engine_->setConfig(remote_);
+        // what was asked of the engine before is asked again (or said to be gone)
+        if (!contrastPending_.empty()) settleContrastRequests();
         notify(&Observer::backendChanged);
     }
 
@@ -1779,7 +1858,10 @@ namespace sirius::app {
     }
 
     bool Workbench::poll() {
-        if (!engine_->arrived.exchange(false)) return false;
+        const bool arrived = engine_->arrived.exchange(false);
+        // a pending Auto / Reset is applied the moment its answer is here
+        if (!contrastPending_.empty()) settleContrastRequests();
+        if (!arrived) return false;
         notify(&Observer::outputsChanged);
         return true;
     }
@@ -1802,11 +1884,46 @@ namespace sirius::app {
         return actual == nearest && outputFresh(actual);
     }
 
-    std::optional<Diagnostics> Workbench::nodePreview(int index, const ParamSet& params) const {
+    namespace {
+        // What the node measures for every question about a Contrast step's
+        // window: its preview with an automatic window and gamma 1. Only the
+        // percentiles change what it says.
+        ParamSet contrastProbe(const ParamSet& params) {
+            ParamSet p = params;
+            if (const Operation* op = findOperation("contrast")) p.applyDefaults(op->info().params);
+            p.set("min", 0.0);
+            p.set("max", 0.0);
+            p.set("gamma", 1.0);
+            return p;
+        }
+        bool automaticWindow(const ParamSet& params) { return !(params.getDouble("max", 0.0) > params.getDouble("min", 0.0)); }
+        const char* contrastActionName(Workbench::ContrastAction a) {
+            return a == Workbench::ContrastAction::Auto ? "Auto contrast" : "Reset contrast";
+        }
+    } // namespace
+
+    std::optional<Diagnostics> Workbench::nodeContrast(int index, const ParamSet& params, bool urgent) const {
+        if (!previewedOnNode(index)) {
+            // its input is not computed yet: the node has nothing to measure
+            int nearest = index - 1;
+            while (nearest > 0 && !pipeline_.at(nearest).enabled) --nearest;
+            throw std::runtime_error("its input, step " + Step::number(nearest) + " " + pipeline_.at(nearest).name +
+                                     ", is not computed on the cluster node yet: run up to step " + Step::number(nearest) + " first");
+        }
+        // The pipeline up to the step, the step itself as measured: the same
+        // question (one answer kept) whatever its window, name or the steps below.
+        const ParamSet probe = contrastProbe(params);
+        json pipeline = nodePipelineJson();
+        if (pipeline.contains("steps") && pipeline["steps"].is_array() && static_cast<int>(pipeline["steps"].size()) > index) {
+            json& steps = pipeline["steps"];
+            steps.erase(steps.begin() + index + 1, steps.end());
+            steps[static_cast<std::size_t>(index)]["params"] = probe.toJson();
+            steps[static_cast<std::size_t>(index)]["name"] = "Contrast";
+        }
         std::string error;
         std::vector<rpc::Tensor> tensors;
         const std::optional<json> a =
-            askEngine("step_preview", {{"pipeline", nodePipelineJson()}, {"index", index}, {"params", params.toJson()}}, &error, &tensors);
+            askEngine("step_preview", {{"pipeline", pipeline}, {"index", index}, {"params", probe.toJson()}}, &error, &tensors, urgent);
         if (!a) return std::nullopt;
         if (!error.empty()) throw std::runtime_error(error);
         if (!a->contains("diagnostics") || !(*a)["diagnostics"].is_object()) throw std::runtime_error("the node has no preview of this step");
@@ -1817,15 +1934,23 @@ namespace sirius::app {
         const std::shared_ptr<const StepOutput> up = upstreamOutput(index);
         if (!up) return std::nullopt;
         if (!inputOnCluster(index)) return contrastWindow(up->asInput(), params, c, 8, wantRange);
+        ContrastWindow w;
+        w.gamma = static_cast<float>(params.getDouble("gamma", 1.0));
+        const bool automatic = automaticWindow(params);
+        if (!automatic) {
+            w.lo = static_cast<float>(params.getDouble("min", 0.0));
+            w.hi = static_cast<float>(params.getDouble("max", 1.0));
+            if (!wantRange) return w;   // nothing to measure
+        }
         if (!previewedOnNode(index)) return std::nullopt;   // its input is not computed on the node yet
-        const std::optional<Diagnostics> d = nodePreview(index, params);
+        const std::optional<Diagnostics> d = nodeContrast(index, params);
         if (!d) return std::nullopt;
         if (c < 0 || static_cast<std::size_t>(c) >= d->histograms.size()) throw std::runtime_error("the node's preview has no channel " + std::to_string(c));
         const DiagnosticHistogram& h = d->histograms[static_cast<std::size_t>(c)];
-        ContrastWindow w;
-        w.lo = static_cast<float>(h.lo);
-        w.hi = static_cast<float>(h.hi);
-        w.gamma = static_cast<float>(params.getDouble("gamma", 1.0));
+        if (automatic) {
+            w.lo = static_cast<float>(h.lo);
+            w.hi = static_cast<float>(h.hi);
+        }
         w.dataMin = static_cast<float>(h.binLo);
         w.dataMax = static_cast<float>(h.binHi);
         return w;
@@ -1836,14 +1961,9 @@ namespace sirius::app {
         if (!up) return std::nullopt;
         if (!inputOnCluster(index)) return contrastAutoParams(current, up->asInput());
         if (!previewedOnNode(index)) return std::nullopt;
-        // the automatic window is the preview's own when min / max say automatic
-        ParamSet p = current;
-        if (const Operation* op = findOperation("contrast")) p.applyDefaults(op->info().params);
-        ParamSet automatic = p;
-        automatic.set("min", 0.0);
-        automatic.set("max", 0.0);
-        const std::optional<Diagnostics> d = nodePreview(index, automatic);
+        const std::optional<Diagnostics> d = nodeContrast(index, current);
         if (!d) return std::nullopt;
+        // the automatic window is the preview's own: one for every channel
         float lo = std::numeric_limits<float>::infinity(), hi = -lo;
         for (const DiagnosticHistogram& h : d->histograms) {
             lo = std::min(lo, static_cast<float>(h.lo));
@@ -1853,6 +1973,8 @@ namespace sirius::app {
             lo = 0.0f;
             hi = 1.0f;
         }
+        ParamSet p = current;
+        if (const Operation* op = findOperation("contrast")) p.applyDefaults(op->info().params);
         p.set("min", static_cast<double>(lo));
         p.set("max", static_cast<double>(hi));
         return p;
@@ -1863,7 +1985,7 @@ namespace sirius::app {
         if (!up) return std::nullopt;
         if (!inputOnCluster(index)) return contrastResetParams(current, up->asInput());
         if (!previewedOnNode(index)) return std::nullopt;
-        const std::optional<Diagnostics> d = nodePreview(index, current);
+        const std::optional<Diagnostics> d = nodeContrast(index, current);
         if (!d) return std::nullopt;
         float mn = std::numeric_limits<float>::infinity(), mx = -mn;
         for (const DiagnosticHistogram& h : d->histograms) {
@@ -1881,13 +2003,141 @@ namespace sirius::app {
         return p;
     }
 
+    bool Workbench::requestContrast(int index, ContrastAction action) {
+        if (index < 1 || index >= pipeline_.size() || pipeline_.at(index).kind != "contrast") return false;
+        const StepId id = pipeline_.at(index).id;
+        const std::string what = contrastActionName(action);
+        contrastErrors_.erase(id);
+        contrastPending_.erase(id);
+        auto fail = [&](const std::string& why) {
+            contrastErrors_[id] = why;
+            logLine(what + " of step " + Step::number(index) + ": " + why);
+            notify(&Observer::outputsChanged);
+            return false;
+        };
+        if (!upstreamOutput(index)) return fail("the step has no input yet: open a dataset, and run the steps above it");
+        if (inputOnCluster(index)) {
+            // Measured on the node: asked now, ahead of everything else it
+            // was asked, and applied by poll() when the answer is here.
+            try {
+                if (!nodeContrast(index, pipeline_.at(index).params, true)) {
+                    PendingContrast p;
+                    p.action = action;
+                    p.since = std::chrono::steady_clock::now();
+                    p.source = source_.get();
+                    contrastPending_[id] = p;
+                    notify(&Observer::outputsChanged);
+                    return true;
+                }
+            } catch (const std::exception& e) {
+                return fail(e.what());
+            }
+        }
+        // on this computer (or answered by the node already)
+        try {
+            const ParamSet& current = pipeline_.at(index).params;
+            const std::optional<ParamSet> p = action == ContrastAction::Auto ? contrastAutoOf(index, current) : contrastResetOf(index, current);
+            if (!p) return fail("the step's input could not be measured");
+            setStepParams(index, *p, what);
+            return true;
+        } catch (const std::exception& e) {
+            // the window samples planes of the input, which a lazy source can fail to read
+            return fail(e.what());
+        }
+    }
+
+    void Workbench::settleContrastRequests() {
+        const std::map<StepId, PendingContrast> pending = contrastPending_;
+        for (const auto& [id, req] : pending) {
+            const int index = pipeline_.indexOf(id);
+            if (index < 1 || req.source != source_.get() || pipeline_.at(index).kind != "contrast") {
+                contrastPending_.erase(id);   // the step, or the dataset, went away
+                continue;
+            }
+            if (running()) continue;   // parameters cannot change during a run: applied after it
+            const std::string what = contrastActionName(req.action);
+            auto fail = [&, id = id](const std::string& why) {
+                contrastPending_.erase(id);
+                contrastErrors_[id] = why;
+                logLine(what + " of step " + Step::number(index) + ": " + why);
+                notify(&Observer::outputsChanged);
+            };
+            try {
+                // Not on the node any more (its engine went away): said, as a new press would say it.
+                if (!inputOnCluster(index)) {
+                    fail(std::string("the cluster engine that was measuring the input is gone: press ") +
+                         (req.action == ContrastAction::Auto ? "Auto" : "Reset") + " again");
+                    continue;
+                }
+                // asked again when the answer was lost (a new engine): the same key
+                const ParamSet& current = pipeline_.at(index).params;
+                if (!nodeContrast(index, current, true)) continue;
+                const std::optional<ParamSet> p = req.action == ContrastAction::Auto ? contrastAutoOf(index, current) : contrastResetOf(index, current);
+                if (!p) {
+                    fail("the step's input could not be measured");
+                    continue;
+                }
+                contrastPending_.erase(id);
+                setStepParams(index, *p, what);
+            } catch (const std::exception& e) {
+                fail(e.what());
+            }
+        }
+    }
+
+    std::optional<Workbench::ContrastRequest> Workbench::contrastRequest(int index) const {
+        if (index < 1 || index >= pipeline_.size()) return std::nullopt;
+        const auto it = contrastPending_.find(pipeline_.at(index).id);
+        if (it == contrastPending_.end()) return std::nullopt;
+        ContrastRequest r;
+        r.action = it->second.action;
+        r.seconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - it->second.since).count();
+        return r;
+    }
+
+    std::string Workbench::contrastError(int index) const {
+        if (index < 1 || index >= pipeline_.size()) return {};
+        const auto it = contrastErrors_.find(pipeline_.at(index).id);
+        return it == contrastErrors_.end() ? std::string() : it->second;
+    }
+
+    bool Workbench::contrastMeasuring(int index) const {
+        if (contrastRequest(index)) return true;
+        if (!previewedOnNode(index)) return false;
+        try {
+            return !nodeContrast(index, pipeline_.at(index).params).has_value();
+        } catch (const std::exception&) {
+            return false;   // answered, with an error
+        }
+    }
+
     std::optional<json> Workbench::askEngine(const std::string& method, const json& params, std::string* error,
-                                             std::vector<rpc::Tensor>* tensors) const {
-        std::optional<EngineLink::Answer> a = engine_->ask(method, params);
+                                             std::vector<rpc::Tensor>* tensors, bool urgent) const {
+        std::optional<EngineLink::Answer> a = engine_->ask(method, params, urgent);
         if (!a) return std::nullopt;
         if (error) *error = a->error;
         if (tensors) *tensors = a->tensors;
         return a->result;
+    }
+
+    std::optional<json> Workbench::clusterModelInfo(const std::string& clusterPath, std::string* error) const {
+        std::string host, path;
+        if (!splitClusterPath(clusterPath, host, path)) {
+            if (error) *error = "not a path on the cluster: " + clusterPath;
+            return std::nullopt;
+        }
+        if (!remote_.hasEngine()) {
+            if (error) *error = "connect to the cluster (with SIRIUS's engine) to read this model";
+            return std::nullopt;
+        }
+        std::string why;
+        std::optional<json> a = askEngine("model_info", {{"path", path}, {"model", path}, {"spec", path}}, &why);
+        if (!a) return std::nullopt;
+        if (!why.empty()) {
+            if (error) *error = why;
+            return std::nullopt;
+        }
+        return a;
     }
 
     int Workbench::loadPlugins(bool reload) {
@@ -2015,6 +2265,23 @@ namespace sirius::app {
                 return refuseRun(RunRefusal::Kind::NeedsUpload, 0,
                                  "The dataset is a folder on this computer: the HPC backend computes on the cluster node, and a folder is not "
                                  "uploaded. Open the dataset from the cluster (cluster://\xE2\x80\xA6), or choose CPU/CUDA to run here.");
+            // A folder a step reads (a model folder) is not uploaded either: the
+            // node would be handed a path of this computer's.
+            for (int i = 1; i <= target; ++i) {
+                const Step& s = pipeline_.at(i);
+                if (!s.enabled) continue;
+                const Operation* op = findOperation(s.kind);
+                if (!op) continue;
+                for (const ParamSpec& spec : op->info().params) {
+                    if (spec.type != ParamType::Path) continue;
+                    const std::string v = s.params.getString(spec.key);
+                    if (v.empty() || isRemoteDatasetPath(v) || !std::filesystem::is_directory(std::filesystem::u8path(v), ec)) continue;
+                    return refuseRun(RunRefusal::Kind::NeedsUpload, i,
+                                     "Step " + Step::number(i) + " " + s.name + ": " + spec.label + " is a folder on this computer (" + v +
+                                         "). The HPC backend computes on the cluster node, and a folder is not uploaded. Choose it on the "
+                                         "cluster (Browse \xE2\x96\xB8 Cluster, or Models\xE2\x80\xA6 while connected), or choose CPU/CUDA to run here.");
+                }
+            }
             std::vector<UploadFile> missing;
             std::uint64_t bytes = 0;
             for (UploadFile& f : filesToUpload(target)) {

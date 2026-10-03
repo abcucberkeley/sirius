@@ -239,6 +239,11 @@ sirius_core_unit(dataset_service   HEADERS dataset_service.hpp SOURCES dataset_s
 sirius_core_unit(remote_source     HEADERS remote_source.hpp SOURCES remote_source.cpp
                                    DEPENDS array_source array_codec dataset rpc errors lib/checked_math
                                    PUBLIC_LINK nlohmann_json::nlohmann_json LINK Threads::Threads)
+# A folder of TIFF stacks on the cluster as one dataset: listed over the
+# session, its manifest built as on this computer and kept in ~/.sirius/manifests there.
+sirius_core_unit(cluster_folder    HEADERS cluster_folder.hpp SOURCES cluster_folder.cpp
+                                   DEPENDS cluster remote_host remote_source array_source manifest
+                                   LINK nlohmann_json::nlohmann_json)
 if(WIN32)
     target_link_libraries(sirius_core_remote_host PRIVATE ws2_32)
 endif()
@@ -321,6 +326,14 @@ sirius_core_unit(ops_torch_model
     DEPENDS rpc ops_common
     PUBLIC_LINK nlohmann_json::nlohmann_json)
 
+# A trained model folder (model.json, latents-model/1): what the Foundation
+# step and the parameter panel read of one, without the worker.
+sirius_core_unit(model_folder
+    HEADERS model_folder.hpp
+    SOURCES model_folder.cpp
+    DEPENDS host params
+    PUBLIC_LINK nlohmann_json::nlohmann_json)
+
 # op(<name> <source> [DEPENDS ...]): one built-in operation.
 op(load        ops/load.cpp        DEPENDS ops_load_api array_source manifest)
 op(sim         ops/sim.cpp         DEPENDS ops_sim_params session volume_ops lib/legacy_config lib/device lib/constants)
@@ -337,7 +350,7 @@ op(merge       ops/merge.cpp       DEPENDS lib/image_ops)
 op(stitch      ops/stitch.cpp      DEPENDS array_source lib/stitching lib/stitching_tiff)
 op(register    ops/register.cpp    DEPENDS lib/image_ops lib/registration)
 op(seg         ops/seg.cpp         DEPENDS ops_segment_common ops_torch_model rpc remote_source cancel errors)
-op(foundation  ops/foundation.cpp  DEPENDS tracks rpc)
+op(foundation  ops/foundation.cpp  DEPENDS tracks rpc model_folder)
 op(classic     ops/classic.cpp     DEPENDS ops_segment_common lib/image_ops lib/constants)
 op(cleanup     ops/cleanup.cpp     DEPENDS labels)
 op(track       ops/track.cpp       DEPENDS tracking tracks rpc)

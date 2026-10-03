@@ -134,6 +134,8 @@ namespace {
                 writeScript(bin / tool, lf);
             }
             writeScript(bin / "python3", "#!/bin/bash\nexec \"$FAKE_PYTHON\" \"$@\"\n");
+            // the image's python, for the checks in the job (the fake apptainer runs them here)
+            writeScript(bin / "python", "#!/bin/bash\nexec \"$FAKE_PYTHON\" \"$@\"\n");
             setEnv("FAKE_SSH_LOG", log.generic_string());
             setEnv("FAKE_SSH_HOME", home.generic_string());
             setEnv("FAKE_SSH_PATH", bin.string());
@@ -1135,8 +1137,9 @@ namespace {
         return session.status();
     }
 
-    // No worker step was started (srun.args names none).
-    bool noWorkerStarted(const FakeCluster& fc) { return readAll(fc.slurm / "srun.args").find("sirius_worker-") == std::string::npos; }
+    // No worker step was started (srun.args names none; the checks before
+    // a start are a step of their own, sirius-check).
+    bool noWorkerStarted(const FakeCluster& fc) { return readAll(fc.slurm / "srun.args").find("--job-name=sirius-worker") == std::string::npos; }
 } // namespace
 
 TEST_CASE("cluster: the profile keeps the container image and its launcher", "[app][cluster]") {
@@ -1422,7 +1425,8 @@ TEST_CASE("cluster: no data folder is a warning; the data folders and the Python
 
     // binds ("~/" made $HOME) and a Python path: checked, then in the job's environment
     fs::remove(fc.slurm / "apptainer.args");
-    p.bind = "~/data:/data, /tmp";
+    // (the fake apptainer mounts nothing: a folder is checked "inside the image" at its own path)
+    p.bind = "~/data, /tmp";
     p.containerPythonPath = "/opt/extra";
     st = workerUntilSettled(session, p);
     const cluster::StepState checks2 = st.steps[static_cast<int>(cluster::Step::Checks)];
@@ -1432,13 +1436,18 @@ TEST_CASE("cluster: no data folder is a warning; the data folders and the Python
     env = readAll(fc.slurm / "4711.env");   // the same job's next step
     INFO(env);
     CHECK(env.find("SIRIUS_CONTAINER_BIND=") != std::string::npos);
-    CHECK(env.find("/data:/data,/tmp\n") != std::string::npos);
+    CHECK(env.find("/data,/tmp\n") != std::string::npos);
     CHECK(env.find("SIRIUS_CONTAINER_BIND=~") == std::string::npos);
     CHECK(env.find("SIRIUS_CONTAINER_PYTHONPATH=/opt/extra\n") != std::string::npos);
     CHECK(env.find("SIRIUS_TOKEN=") == std::string::npos);   // never the token itself
     // the image was tried with the same binds
     CHECK(readAll(fc.slurm / "apptainer.args").find("--bind ") != std::string::npos);
-    CHECK(readAll(fc.slurm / "apptainer.args").find("/data:/data,/tmp") != std::string::npos);
+    CHECK(readAll(fc.slurm / "apptainer.args").find("/data,/tmp") != std::string::npos);
+    // and each folder checked in the job, on its node, inside the image
+    bool dataRow = false;
+    for (const cluster::NodeCheck& c : st.nodeChecks)
+        if (c.name == "data:0") dataRow = c.status == cluster::StepStatus::Done && c.detail == "~/data";
+    CHECK(dataRow);
     session.disconnect(true);
     setEnv("FAKE_CONTAINER_SITE", "");
 }
@@ -1640,7 +1649,7 @@ TEST_CASE("cluster: connect starts SIRIUS's engine; a pipeline runs there and st
     CHECK_FALSE(fs::exists(fc.slurm / "4712.args"));
     CHECK(st.steps[static_cast<int>(cluster::Step::Submit)].detail.find("reattached") != std::string::npos);
     CHECK(st.steps[static_cast<int>(cluster::Step::Checks)].detail.find("still runs") != std::string::npos);   // its worker too
-    CHECK(countOf(readAll(fc.slurm / "srun.args"), cluster::workerLaunchScriptName()) == 1);   // no second worker
+    CHECK(countOf(readAll(fc.slurm / "srun.args"), "--job-name=sirius-worker") == 1);   // no second worker
     CHECK(st.caps.engine.value("session", std::string()) == session1);
     // the engine kept what it computed: the same handle draws again, through the new tunnel
     ViewRequest other = req;
@@ -2028,8 +2037,8 @@ TEST_CASE("cluster: the engine build of this application, or one of the same ope
     CHECK(note == "the same operations as this build");
     // never one that cannot run, cannot be read, or has other operations
     CHECK(cluster::pickEngineBuild({found[2], found[3], found[4]}, app, &note) == -1);
-    // a matching build that cannot be run is named first: its fix is a reinstall, not a new build
-    CHECK(note.find("cannot be run") != std::string::npos);
+    // a matching build that is not whole is named first: its fix is a reinstall, not a new build
+    CHECK(note.find("matches this application but has no bin/sirius-cli") != std::string::npos);
     CHECK(note.find("3 builds checked") != std::string::npos);
     CHECK(cluster::pickEngineBuild({found[3], found[4]}, app, &note) == -1);
     CHECK(note.find("None of the 2 engine builds can be used") != std::string::npos);
@@ -2083,7 +2092,12 @@ TEST_CASE("cluster: the job first, then the worker in it; a new image restarts o
     REQUIRE(st.state == cluster::State::Connected);
     CHECK(st.jobId == "4711");
     const std::string steps = readAll(fc.slurm / "srun.args");
-    CHECK(countOf(steps, cluster::workerLaunchScriptName()) == 1);
+    CHECK(countOf(steps, "--job-name=sirius-worker") == 1);
+    // the checks ran in the job before it, through srun, with the job's id
+    CHECK(countOf(steps, "--job-name=sirius-check") == 1);
+    CHECK(steps.find("--jobid=4711 --overlap --nodes=1 --ntasks=1 --job-name=sirius-check bash ") != std::string::npos);
+    CHECK(steps.find(cluster::workerLaunchScriptName() + " --check") != std::string::npos);
+    CHECK(steps.find("--job-name=sirius-check") < steps.find("--job-name=sirius-worker"));
     CHECK(steps.find("--jobid=4711 --overlap") != std::string::npos);
 
     // a new image: the worker again, in the same job
@@ -2097,7 +2111,8 @@ TEST_CASE("cluster: the job first, then the worker in it; a new image restarts o
     REQUIRE(st.state == cluster::State::Connected);
     CHECK(st.jobId == "4711");
     CHECK_FALSE(fs::exists(fc.slurm / "4712.args"));
-    CHECK(countOf(readAll(fc.slurm / "srun.args"), cluster::workerLaunchScriptName()) == 2);
+    CHECK(countOf(readAll(fc.slurm / "srun.args"), "--job-name=sirius-worker") == 2);
+    CHECK(countOf(readAll(fc.slurm / "srun.args"), "--job-name=sirius-check") == 2);   // checked again before it
     CHECK(readAll(fc.slurm / "cancelled_steps").find("4711.") != std::string::npos);   // the first worker's step ended
     CHECK(readAll(fc.slurm / "4711.env").find("w2.sif") != std::string::npos);
     CHECK(fs::exists(fc.home / ".sirius" / "run" / "sirius-worker-4711-2.log"));
@@ -2393,8 +2408,8 @@ TEST_CASE("cluster wizard: the worker's health report from its hello", "[app][cl
     st.node = "g0003.abc0";
     wz::HealthReport r = wz::healthReport(st, p, app, now);
     CHECK(r.verdict == V::None);
-    REQUIRE(find(r, "Image checks"));
-    CHECK(find(r, "Image checks")->value == "not yet");
+    REQUIRE(find(r, "Checks"));
+    CHECK(find(r, "Checks")->value == "not yet");
 
     // it failed: the reason, the fix, the cluster's words
     st.steps[3] = cluster::StepState{cluster::StepStatus::Failed, "The worker image /x.sif is not there."};
@@ -2406,7 +2421,7 @@ TEST_CASE("cluster wizard: the worker's health report from its hello", "[app][cl
     CHECK(r.headline == "Not ready: The worker image /x.sif is not there.");
     CHECK(r.fix == st.fix);
     CHECK(r.details == st.remoteOutput);
-    CHECK(find(r, "Image checks")->mark == M::Fail);
+    CHECK(find(r, "Checks")->mark == M::Fail);
 
     // the engine's hello
     st = cluster::Status{};
@@ -2528,8 +2543,11 @@ namespace {
     fs::path pythonOnlyEngine(const FakeCluster& fc) {
         const fs::path p = fc.home / "bin" / "not-an-engine";
         fs::create_directories(p.parent_path());
-        writeScript(p, "#!/bin/bash\nargs=()\nfor a in \"$@\"; do case \"$a\" in serve|--no-python-worker) ;; *) args+=(\"$a\") ;; esac; done\n"
-                       "exec \"$FAKE_PYTHON\" -m sirius_worker \"${args[@]}\"\n");
+        // it even answers `version` as this build: only its hello gives it away
+        const nlohmann::json version = {{"command", "version"}, {"ok", true}, {"result", {{"name", "sirius-cli"}, {"build", toJson(buildInfo())}}}};
+        writeScript(p, "#!/bin/bash\nif [ \"$1\" = version ]; then printf '%s\\n' '" + version.dump() +
+                           "'; exit 0; fi\nargs=()\nfor a in \"$@\"; do case \"$a\" in serve|--no-python-worker) ;; *) args+=(\"$a\") ;; esac; done\n"
+                           "exec \"$FAKE_PYTHON\" -m sirius_worker \"${args[@]}\"\n");
         return p;
     }
 
@@ -2540,7 +2558,10 @@ namespace {
         const fs::path b = folder / dir;
         fs::create_directories(b / "bin");
         fs::create_directories(b / "lib");
-        writeScript(b / "bin" / "sirius-cli", std::string("#!/bin/bash\nexec \"") + SIRIUS_TEST_CLI + "\" \"$@\"\n");
+        // `version` answers with the build of BUILD.json, as a real build's does
+        const nlohmann::json version = {{"command", "version"}, {"ok", true}, {"result", {{"name", "sirius-cli"}, {"build", buildJson}}}};
+        writeScript(b / "bin" / "sirius-cli", "#!/bin/bash\nif [ \"$1\" = version ]; then printf '%s\\n' '" + version.dump() + "'; exit 0; fi\nexec \"" +
+                                                  std::string(SIRIUS_TEST_CLI) + "\" \"$@\"\n");
         fs::create_directories(b / "python");
         fs::copy(fs::path(SIRIUS_TEST_SOURCE_DIR) / "app" / "python" / "sirius_worker", b / "python" / "sirius_worker", fs::copy_options::recursive);
         std::ofstream(b / "BUILD.json") << buildJson.dump();
@@ -2786,9 +2807,22 @@ TEST_CASE("cluster: BUILD.json's schema hash under either key, the python column
     changed["schema_hash"] = "0000";
     CHECK(cluster::pickEngineBuild(cluster::parseEngineBuilds("@@build 8368aab yes yes " + changed.dump() + "\n"), app, &note) == -1);
     CHECK(note.find("their operations or engine API differ") != std::string::npos);
-    // the same operations, but bin/sirius-cli cannot be run: a broken install, said as such
+    // the same operations, but no bin/sirius-cli: a broken install, said as such
     CHECK(cluster::pickEngineBuild(cluster::parseEngineBuilds("@@build 8368aab4582f no yes " + onlyNew.dump() + "\n"), app, &note) == -1);
-    CHECK(note.find("8368aab4582f matches this application but its bin/sirius-cli cannot be run") != std::string::npos);
+    CHECK(note.find("8368aab4582f matches this application but has no bin/sirius-cli") != std::string::npos);
+    // a bin/sirius-cli without an execute bit in its mode, or no lib/: the same, with what is wrong
+    const std::vector<cluster::EngineBuild> nox = cluster::parseEngineBuilds("@@build 8368aab4582f nox yes yes " + onlyNew.dump() + "\n");
+    REQUIRE(nox.size() == 1);
+    CHECK(nox[0].binThere);
+    CHECK_FALSE(nox[0].runnable);
+    CHECK(nox[0].python);
+    CHECK(nox[0].lib);
+    CHECK(nox[0].readable);
+    CHECK(cluster::pickEngineBuild(nox, app, &note) == -1);
+    CHECK(note.find("without an execute bit in its mode (chmod +x bin/sirius-cli)") != std::string::npos);
+    CHECK(cluster::pickEngineBuild(cluster::parseEngineBuilds("@@build 8368aab4582f yes yes no " + onlyNew.dump() + "\n"), app, &note) == -1);
+    CHECK(note.find("has no lib/ folder") != std::string::npos);
+    CHECK(cluster::pickEngineBuild(cluster::parseEngineBuilds("@@build 8368aab4582f yes yes yes " + onlyNew.dump() + "\n"), app, &note) == 0);
     CHECK(note.find("operations or engine API differ") == std::string::npos);
     const std::string fix = cluster::engineBuildFix("/clusterfs/me/sirius-builds", app);
     CHECK(fix.find("/clusterfs/me/sirius-builds/" + app.commit) != std::string::npos);
@@ -2796,10 +2830,509 @@ TEST_CASE("cluster: BUILD.json's schema hash under either key, the python column
     CHECK(fix.find("README.md") != std::string::npos);
     CHECK(cluster::noEngineFix("").find("e.g. ~/sirius-builds") != std::string::npos);
     CHECK(cluster::engineBuildsScript("~/b").find("python/sirius_worker/__main__.py") != std::string::npos);
+    // the login node is asked about files only: never whether it can run one (it may mount the builds noexec)
+    const std::string listing = cluster::engineBuildsScript("~/b");
+    CHECK(listing.find("ls -lLd") != std::string::npos);
+    CHECK(listing.find("-x ") == std::string::npos);
+    CHECK(listing.find("[ -d \"$EB/$d/lib\" ]") != std::string::npos);
     // the upload: base64 through the command channel, 0700, by the build's name
     const std::string up = cluster::uploadLaunchScript();
     CHECK(up.find("base64 -d") != std::string::npos);
     CHECK(up.find("chmod 700") != std::string::npos);
     CHECK(up.find(cluster::workerLaunchScriptName()) != std::string::npos);
     CHECK(up.find("SIRIUS_ENGINE") == std::string::npos);   // the text itself never meets the shell
+}
+
+// --- the checks run where the engine runs: in the job, on its node, in the image ----------------
+
+TEST_CASE("cluster: the checks in the job, read: each line in words with its fix, the engine's version against BUILD.json", "[app][cluster]") {
+    const BuildInfo app = buildInfo();
+    cluster::Profile p;
+    p.container = "~/w.sif";
+    p.engine = true;
+    p.engineBuilds = "~/b";
+    p.bind = "~/data:/data, /scratch";
+    p.gpus = 1;
+    p.scratch = "/tmp/cache";
+    nlohmann::json bj = toJson(app);
+    bj["commit"] = "8368aab4582f71273b16eaa63ce09d38ba867d8e";
+    bj["build"] = "0.1.0+g8368aab";
+    const std::string dir = "~/b/8368aab4582f71273b16eaa63ce09d38ba867d8e";
+    const auto envelope = [](const nlohmann::json& build, int cudaDevices) {
+        return nlohmann::json{{"command", "version"},
+                              {"ok", true},
+                              {"result", {{"name", "sirius-cli"}, {"build", build}, {"features", {{"cuda", true}, {"cuda_devices", cudaDevices}}}}}};
+    };
+    const std::string head = "check launcher ok apptainer\ncheck image ok starts on g0004\ncheck python ok python 3.11, sirius, numpy\n"
+                             "check torch warn not in the image: models will not run\ncheck worker ok /x/python\n";
+    const std::string tail = "check gpu ok 1 visible (CUDA_VISIBLE_DEVICES=0)\ncheck data:0 ok /data\ncheck data:1 ok /scratch\ncheck cache ok /tmp/cache\n@@check-exit 0\n";
+
+    // all well: no failure, each check in words, the engine's own build named
+    cluster::NodeCheckReport rep = cluster::readNodeChecks(head + "@@version " + envelope(bj, 1).dump() + "\ncheck engine ok " + dir + "/bin/sirius-cli\n" + tail,
+                                                           p, buildInfoFromJson(bj), dir, app, "g0004");
+    CHECK(rep.failure() == nullptr);
+    CHECK(rep.exitCode == 0);
+    CHECK_FALSE(rep.noEngine);
+    const auto find = [](const cluster::NodeCheckReport& r, const std::string& name) -> const cluster::NodeCheck* {
+        for (const cluster::NodeCheck& c : r.checks)
+            if (c.name == name) return &c;
+        return nullptr;
+    };
+    REQUIRE(find(rep, "engine"));
+    CHECK(find(rep, "engine")->status == cluster::StepStatus::Done);
+    CHECK(find(rep, "engine")->detail.find("0.1.0+g8368aab (8368aab458) runs in the image, from " + dir) != std::string::npos);
+    REQUIRE(find(rep, "cuda"));
+    CHECK(find(rep, "cuda")->detail == "1 device for the engine");
+    CHECK(find(rep, "torch")->status == cluster::StepStatus::Warning);
+    CHECK_FALSE(find(rep, "torch")->fix.empty());
+    CHECK(find(rep, "data:0")->detail == "~/data");   // as the profile names it
+    CHECK(find(rep, "data:1")->detail == "/scratch");
+    CHECK(find(rep, "cache")->detail == "/tmp/cache");
+    CHECK(find(rep, "launcher")->detail == "apptainer");
+
+    // the engine's CUDA finds no GPU of the step's: a warning, with what to do
+    rep = cluster::readNodeChecks(head + "@@version " + envelope(bj, 0).dump() + "\ncheck engine ok x\n" + tail, p, buildInfoFromJson(bj), dir, app, "g0004");
+    CHECK(rep.failure() == nullptr);
+    CHECK(find(rep, "cuda")->status == cluster::StepStatus::Warning);
+
+    // the folder holds another build's executable: refused, a broken install
+    nlohmann::json other = bj;
+    other["commit"] = "1111111111111111111111111111111111111111";
+    other["build"] = "0.1.0+g1111111";
+    rep = cluster::readNodeChecks(head + "@@version " + envelope(other, 1).dump() + "\ncheck engine ok x\n" + tail, p, buildInfoFromJson(bj), dir, app, "g0004");
+    REQUIRE(rep.failure());
+    CHECK(rep.failure()->name == "engine");
+    CHECK(rep.failure()->detail.find("is 0.1.0+g1111111, but its BUILD.json says 0.1.0+g8368aab") != std::string::npos);
+    CHECK(rep.failure()->fix.find("Reinstall that build") != std::string::npos);
+    CHECK(rep.noEngine);
+
+    // an executable that does not answer `version` as SIRIUS's engine does
+    rep = cluster::readNodeChecks(head + "@@version {\"something\": 1}\ncheck engine ok x\n" + tail, p, buildInfoFromJson(bj), dir, app, "g0004");
+    REQUIRE(rep.failure());
+    CHECK(rep.failure()->detail.find("did not answer `version` as SIRIUS's engine does") != std::string::npos);
+
+    // `version` fails: the node's own words kept for Details
+    rep = cluster::readNodeChecks(head + "sirius-cli: error while loading shared libraries: libnvtiff.so.0\ncheck engine fail sirius-cli version exited with 127\n" + tail,
+                                  p, buildInfoFromJson(bj), dir, app, "g0004");
+    REQUIRE(rep.failure());
+    CHECK(rep.failure()->detail.find("SIRIUS's engine does not run in the image on g0004") != std::string::npos);
+    CHECK(rep.failure()->fix.find("lib/") != std::string::npos);
+    CHECK(rep.output.find("libnvtiff.so.0") != std::string::npos);
+    CHECK(rep.noEngine);
+
+    // a data folder not on the node: named as the profile has it, before the image is tried
+    rep = cluster::readNodeChecks("check launcher ok apptainer\ncheck data:1 fail /scratch is not on g0004\n", p, buildInfoFromJson(bj), dir, app, "g0004");
+    REQUIRE(rep.failure());
+    CHECK(rep.failure()->detail == "The data folder /scratch is not a folder on g0004: apptainer would stop before the worker starts.");
+    CHECK(rep.failure()->fix.find("Data folders") != std::string::npos);
+
+    // an image that does not start: no line from inside it
+    rep = cluster::readNodeChecks("check launcher ok apptainer\nFATAL:   while loading image: could not mount squashfs\n@@check-exit 255\n", p,
+                                  buildInfoFromJson(bj), dir, app, "g0004");
+    REQUIRE(rep.failure());
+    CHECK(rep.failure()->name == "image");
+    CHECK(rep.failure()->detail.find("cannot run the worker on g0004: it does not start") != std::string::npos);
+    CHECK(rep.output.find("squashfs") != std::string::npos);
+    CHECK(rep.exitCode == 255);
+
+    // nothing came back at all: the step did not run (srun's words kept)
+    rep = cluster::readNodeChecks("srun: error: Unable to confirm allocation for job 4711\n", p, buildInfoFromJson(bj), dir, app, "g0004");
+    REQUIRE(rep.failure());
+    CHECK(rep.failure()->name == "step");
+    CHECK(rep.output.find("Unable to confirm allocation") != std::string::npos);
+
+    // the image's own engine is not there: no engine, with the fix that names a builds folder
+    cluster::Profile own = p;
+    own.engineBuilds.clear();
+    rep = cluster::readNodeChecks(head + "check engine-missing fail /opt/sirius/bin/sirius-cli is not there inside the image\n" + tail, own, std::nullopt, {}, app,
+                                  "g0004", "/clusterfs/me/sirius-builds");
+    REQUIRE(rep.failure());
+    CHECK(rep.noEngine);
+    CHECK(rep.failure()->detail.rfind("No SIRIUS C++ engine found: the image ~/w.sif has no /opt/sirius/bin/sirius-cli", 0) == 0);
+    CHECK(rep.failure()->fix.find("e.g. /clusterfs/me/sirius-builds") != std::string::npos);
+
+    // the data folders go to the check as host / in-image pairs
+    const std::vector<std::pair<std::string, std::string>> pairs = cluster::bindPairs("~/data:/data:ro, /scratch ,,");
+    REQUIRE(pairs.size() == 2);
+    CHECK(pairs[0] == std::make_pair(std::string("~/data"), std::string("/data")));
+    CHECK(pairs[1] == std::make_pair(std::string("/scratch"), std::string("/scratch")));
+}
+
+TEST_CASE("cluster: a build on scratch the login node mounts noexec is listed by its mode and checked where it runs", "[app][cluster][engine]") {
+    FakeCluster fc;
+    if (!fc.usable()) SKIP("no Python or bash for the fake ssh");
+    if (!pythonHas(fc.python, "numpy")) SKIP("no numpy in " + fc.python + " for the checks");
+    copyCheckout(fc.home / "sirius");
+    setEnv("FAKE_SLURM_PENDING_POLLS", "0");
+    // the builds on a scratch file system the login node mounts noexec (fiona's /clusterfs/nvme2)
+    const std::string commit = "8368aab4582f71273b16eaa63ce09d38ba867d8e";
+    nlohmann::json bj = toJson(buildInfo());
+    bj["commit"] = commit;
+    bj["build"] = "0.1.0+g8368aab";
+    const fs::path builds = fc.root / "noexec-nvme2" / "sirius-builds";
+    const fs::path b = engineBuild(builds, commit, bj);
+    setEnv("FAKE_SSH_NOEXEC", "noexec-nvme2");
+    // the login node says access(X_OK) "no" for the build's executable, though its mode has the bit
+    {
+        ssh::Session s;
+        s.open(fc.options(), {}, std::chrono::seconds(60));
+        const std::string f = (b / "bin" / "sirius-cli").generic_string();
+        const ssh::CommandResult r = s.run("f='" + f + "'; [ -x \"$f\" ] && echo x=yes || echo x=no; test -x \"$f\" && echo t=yes || echo t=no; "
+                                                       "[ -f \"$f\" ] && echo f=yes; ls -lLd \"$f\" | cut -c1-10");
+        INFO(r.out << r.err);
+        CHECK(r.out.find("x=no") != std::string::npos);
+        CHECK(r.out.find("t=no") != std::string::npos);
+        CHECK(r.out.find("f=yes") != std::string::npos);
+        CHECK(r.out.find("-rwx") != std::string::npos);
+        s.close();
+    }
+    cluster::Session session;
+    session.setPollInterval(std::chrono::milliseconds(200), std::chrono::milliseconds(500));
+    cluster::Profile p = engineProfile(fc);
+    p.engineBin.clear();
+    p.engineBuilds = builds.generic_string();
+    const cluster::Status st = connectUntilSettled(session, p);
+    setEnv("FAKE_SSH_NOEXEC", "");
+    INFO(st.reason << "\n"
+                   << st.remoteOutput);
+    // accepted: listed by its mode on the login node, run in the job on the node
+    REQUIRE(st.state == cluster::State::Connected);
+    CHECK(st.engineBuild.find(commit) != std::string::npos);
+    CHECK(cluster::hasEngine(st.caps));
+    const cluster::NodeCheck* engine = nullptr;
+    for (const cluster::NodeCheck& c : st.nodeChecks)
+        if (c.name == "engine") engine = &c;
+    REQUIRE(engine);
+    CHECK(engine->status == cluster::StepStatus::Done);
+    CHECK(engine->detail.find("0.1.0+g8368aab") != std::string::npos);
+    // the check ran as a step of the job, through srun with its id, before the worker
+    const std::string steps = readAll(fc.slurm / "srun.args");
+    CHECK(steps.find("--jobid=4711 --overlap --nodes=1 --ntasks=1 --job-name=sirius-check bash ") != std::string::npos);
+    CHECK(steps.find(" --check") != std::string::npos);
+    CHECK(steps.find("--job-name=sirius-check") < steps.find("--job-name=sirius-worker"));
+    CHECK(readAll(fc.slurm / "4711.checks").find(cluster::workerLaunchScriptName() + " --check") != std::string::npos);
+    // nothing moved or linked: the build stays where it is
+    CHECK(fs::is_regular_file(b / "bin" / "sirius-cli"));
+    CHECK_FALSE(fs::is_symlink(b / "bin" / "sirius-cli"));
+    session.disconnect(true);
+    setEnv("FAKE_CONTAINER_SITE", "");
+}
+
+TEST_CASE("cluster: an engine build whose `version` fails in the job is refused with its output, and nothing starts", "[app][cluster][engine]") {
+    FakeCluster fc;
+    if (!fc.usable()) SKIP("no Python or bash for the fake ssh");
+    if (!pythonHas(fc.python, "numpy")) SKIP("no numpy in " + fc.python + " for the checks");
+    copyCheckout(fc.home / "sirius");
+    setEnv("FAKE_SLURM_PENDING_POLLS", "0");
+    const fs::path b = engineBuild(fc.home / "sirius-builds", "deadbeef", toJson(buildInfo()));
+    // its executable is there, with its execute bit, and the login node lists it: it does not run on the node
+    writeScript(b / "bin" / "sirius-cli",
+                "#!/bin/bash\necho 'sirius-cli: error while loading shared libraries: libnvtiff.so.0: cannot open shared object file: No such file or directory' >&2\n"
+                "exit 127\n");
+    cluster::Session session;
+    session.setPollInterval(std::chrono::milliseconds(200), std::chrono::milliseconds(500));
+    cluster::Profile p = engineProfile(fc);
+    p.engineBin.clear();
+    p.engineBuilds = "~/sirius-builds";
+    const cluster::Status st = connectUntilSettled(session, p);
+    setEnv("FAKE_CONTAINER_SITE", "");
+    INFO(st.reason << "\n"
+                   << st.remoteOutput);
+    CHECK(st.state == cluster::State::JobReady);   // the job holds on
+    CHECK(st.steps[static_cast<int>(cluster::Step::Checks)].status == cluster::StepStatus::Failed);
+    CHECK(st.reason.find("SIRIUS's engine does not run in the image on fakenode") != std::string::npos);
+    CHECK(st.reason.find("version exited with 127") != std::string::npos);
+    CHECK(st.remoteOutput.find("libnvtiff.so.0") != std::string::npos);
+    CHECK(st.fix.find("lib/") != std::string::npos);
+    CHECK(st.noEngine);
+    CHECK(noWorkerStarted(fc));   // never the Python worker instead, never a worker at all
+    CHECK(readAll(fc.slurm / "srun.args").find("--jobid=4711 --overlap --nodes=1 --ntasks=1 --job-name=sirius-check") != std::string::npos);
+    // the Worker page's checklist: the engine's line failed, the others as found
+    const cluster::wizard::HealthReport r = cluster::wizard::healthReport(st, p, buildInfo(), std::chrono::steady_clock::now());
+    CHECK(r.verdict == cluster::wizard::HealthReport::Verdict::Failed);
+    bool engineRow = false, pythonRow = false;
+    for (const cluster::wizard::HealthRow& row : r.rows) {
+        if (row.label == "C++ engine" && row.mark == cluster::wizard::Mark::Fail) engineRow = true;
+        if (row.label == "Python" && row.mark == cluster::wizard::Mark::Ok) pythonRow = true;
+    }
+    CHECK(engineRow);
+    CHECK(pythonRow);
+    session.disconnect(true);
+}
+
+TEST_CASE("cluster: the checks and the worker ask for the job's GPUs; a step given more is held to them", "[app][cluster]") {
+    FakeCluster fc;
+    if (!fc.usable()) SKIP("no Python or bash for the fake ssh");
+    if (!pythonHas(fc.python, "numpy")) SKIP("no numpy in " + fc.python + " for the worker");
+    copyCheckout(fc.home / "sirius");
+    std::ofstream(fc.home / "w.sif") << "image\n";
+    setEnv("FAKE_CONTAINER_SITE", containerSite(fc).string());
+    setEnv("FAKE_SLURM_PENDING_POLLS", "0");
+    fc.fakeNvidiaSmi({"GPU 0: NVIDIA A100-SXM4-80GB (UUID: GPU-a)", "GPU 1: NVIDIA A100-SXM4-80GB (UUID: GPU-b)",
+                      "GPU 2: NVIDIA A100-SXM4-80GB (UUID: GPU-c)", "GPU 3: NVIDIA A100-SXM4-80GB (UUID: GPU-d)"});
+    // a node that hands every step all four of its GPUs, whatever the step asked for
+    std::ofstream(fc.slurm / "step_gpus") << "0,1,2,3\n";
+    cluster::Session session;
+    session.setPollInterval(std::chrono::milliseconds(200), std::chrono::milliseconds(500));
+    cluster::Profile p = containerProfile(fc, "~/w.sif");
+    p.partition = "dgx";   // a partition with GPUs (the default one has none)
+    p.gpus = 1;
+    cluster::Status st = connectUntilSettled(session, p);
+    INFO(st.reason << "\n"
+                   << st.remoteOutput);
+    REQUIRE(st.state == cluster::State::Connected);
+    const std::string steps = readAll(fc.slurm / "srun.args");
+    CHECK(steps.find("--job-name=sirius-check --gres=gpu:1 ") != std::string::npos);
+    CHECK(steps.find("--job-name=sirius-worker --gres=gpu:1 ") != std::string::npos);
+    CHECK(readAll(fc.slurm / "4711.gpus").find("sirius-check 0,1,2,3") != std::string::npos);
+    const auto gpuCheck = [](const cluster::Status& s) {
+        for (const cluster::NodeCheck& c : s.nodeChecks)
+            if (c.name == "gpu") return c;
+        return cluster::NodeCheck{};
+    };
+    cluster::NodeCheck g = gpuCheck(st);
+    CHECK(g.status == cluster::StepStatus::Done);
+    CHECK(g.detail == "1 visible (CUDA_VISIBLE_DEVICES=0); the step was given 4 GPUs (0,1,2,3), the job asked for 1: held to 0");
+    CHECK(st.steps[static_cast<int>(cluster::Step::Checks)].detail.find("GPUs: 1 visible") != std::string::npos);
+    // a node that confines the step to what it asked for: no note
+    fs::remove(fc.slurm / "step_gpus");
+    st = workerUntilSettled(session, p);
+    REQUIRE(st.state == cluster::State::Connected);
+    g = gpuCheck(st);
+    CHECK(g.status == cluster::StepStatus::Done);
+    CHECK(g.detail == "1 visible (CUDA_VISIBLE_DEVICES=0)");
+    session.disconnect(true);
+    setEnv("FAKE_CONTAINER_SITE", "");
+
+    // the worker's own start: the step's CUDA_VISIBLE_DEVICES held to the job's GPUs, handed into the image
+    ssh::Session s;
+    s.open(fc.options(), {}, std::chrono::seconds(60));
+    fs::remove(fc.slurm / "apptainer.args");
+    const std::string job = "cd ~/sirius && mkdir -p ~/.sirius/run && export FAKE_APPTAINER_DRY=1 SIRIUS_CONTAINER=\"$HOME/w.sif\" "
+                            "SIRIUS_TOKEN_FILE=\"$HOME/.sirius/run/token.x\" SLURM_SUBMIT_DIR=\"$PWD\" CUDA_VISIBLE_DEVICES=0,1,2,3 SIRIUS_GPUS=1 && ";
+    const ssh::CommandResult r = s.run(job + "bash app/python/slurm/sirius_worker.sbatch");
+    INFO(r.out << "\n"
+               << r.err);
+    CHECK(r.ok());
+    CHECK(r.out.find("GPUs: CUDA_VISIBLE_DEVICES=0 (the step was given 4 GPUs (0,1,2,3), the job asked for 1: held to 0)") != std::string::npos);
+    const std::string args = readAll(fc.slurm / "apptainer.args");
+    const std::size_t at = args.find("--env-file ");
+    REQUIRE(at != std::string::npos);
+    const std::string envFile = args.substr(at + 11, args.find(' ', at + 11) - (at + 11));
+    const std::string env = s.run("cat '" + envFile + "'").out;   // the cluster's path for it
+    INFO(envFile << "\n"
+                 << env);
+    CHECK(env.find("CUDA_VISIBLE_DEVICES=0") != std::string::npos);
+    CHECK(env.find("CUDA_VISIBLE_DEVICES=0,") == std::string::npos);
+    s.close();
+}
+
+// --- a job of the user's own --------------------------------------------------------------------
+
+TEST_CASE("cluster: the user's jobs as squeue lists them, their GPUs and a line for each", "[app][cluster]") {
+    CHECK(cluster::gresGpus("gpu:2") == 2);
+    CHECK(cluster::gresGpus("gres:gpu:a100:2") == 2);
+    CHECK(cluster::gresGpus("gres/gpu:a100=2") == 2);
+    CHECK(cluster::gresGpus("gres/gpu=4") == 4);
+    CHECK(cluster::gresGpus("gres/gpu") == 1);
+    CHECK(cluster::gresGpus("gres/gpu:a100=2,gres/gpu:v100=1") == 3);
+    CHECK(cluster::gresGpus("N/A") == 0);
+    CHECK(cluster::gresGpus("(null)") == 0);
+    CHECK(cluster::gresGpus("") == 0);
+    const std::vector<cluster::ClusterJob> jobs = cluster::parseUserJobs("5001|jupyter|gpu-a100|RUNNING|1:02:03|2-00:00:00|1|g0004|gres/gpu:a100=2|16|128G\n"
+                                                                         "5002|train|cpu|PENDING|0:00|1:00:00|1|(Resources)|N/A|4|8G\n"
+                                                                         "squeue: error: something to ignore\n\n");
+    REQUIRE(jobs.size() == 2);
+    CHECK(jobs[0].id == "5001");
+    CHECK(jobs[0].name == "jupyter");
+    CHECK(jobs[0].partition == "gpu-a100");
+    CHECK(jobs[0].running());
+    CHECK(jobs[0].gpus == 2);
+    CHECK(jobs[0].cpus == 16);
+    CHECK(jobs[0].mem == "128G");
+    CHECK(jobs[0].where == "g0004");
+    CHECK(cluster::jobSummary(jobs[0]) == "g0004 \xC2\xB7 2 GPUs \xC2\xB7 16 CPUs \xC2\xB7 128G \xC2\xB7 1:02:03 of 2-00:00:00");
+    CHECK_FALSE(jobs[1].running());
+    CHECK(jobs[1].gpus == 0);
+    CHECK(cluster::jobSummary(jobs[1]) == "pending (Resources) \xC2\xB7 no GPU \xC2\xB7 4 CPUs \xC2\xB7 8G \xC2\xB7 time limit 1:00:00");
+    CHECK(cluster::userJobsScript().find("squeue -h -u") != std::string::npos);
+    CHECK(cluster::userJobsScript().find("RUNNING,PENDING") != std::string::npos);
+}
+
+namespace {
+    // A job of the user's own on the fake cluster, not SIRIUS's: running (or
+    // waiting, `pendingPolls` > 0), `info` = "name|partition|gres|cpus|mem|node".
+    void ownJob(const FakeCluster& fc, const std::string& id, const std::string& info, int pendingPolls = 0) {
+        std::ofstream(fc.slurm / (id + ".state")) << "RUNNING\n";
+        std::ofstream(fc.slurm / (id + ".holder")) << "\n";
+        std::ofstream(fc.slurm / (id + ".pending")) << pendingPolls << "\n";
+        std::ofstream(fc.slurm / (id + ".info")) << info << "\n";
+    }
+} // namespace
+
+TEST_CASE("cluster: one of the user's own jobs is taken up, its worker runs in it, and SIRIUS never cancels it", "[app][cluster]") {
+    FakeCluster fc;
+    if (!fc.usable()) SKIP("no Python or bash for the fake ssh");
+    if (!pythonHas(fc.python, "numpy")) SKIP("no numpy in " + fc.python + " for the worker");
+    copyCheckout(fc.home / "sirius");
+    std::ofstream(fc.home / "w.sif") << "image\n";
+    setEnv("FAKE_CONTAINER_SITE", containerSite(fc).string());
+    setEnv("FAKE_SLURM_PENDING_POLLS", "0");
+    ownJob(fc, "5001", "jupyter|gpu-a100|gres/gpu:a100=2|16|128G|fakenode");
+    ownJob(fc, "5002", "train|cpu|N/A|4|8G|", 1000);
+    cluster::Session session;
+    session.setPollInterval(std::chrono::milliseconds(200), std::chrono::milliseconds(500));
+    const cluster::Profile p = containerProfile(fc, "~/w.sif");
+
+    // logged in: the user's jobs, SIRIUS's or not, running and waiting
+    session.logIn(p);
+    REQUIRE(waitFor([&] { return settled(session) && session.status().sshUp; }, std::chrono::seconds(120)));
+    std::vector<cluster::ClusterJob> jobs = session.listJobs();
+    REQUIRE(jobs.size() == 2);
+    CHECK(jobs[0].id == "5001");
+    CHECK(jobs[0].gpus == 2);
+    CHECK(jobs[0].running());
+    CHECK(jobs[1].id == "5002");
+    CHECK(jobs[1].state == "PENDING");
+
+    // take up 5001: no sbatch, the job's own GPUs for the checks and the worker
+    session.adoptJob(p, "5001");
+    REQUIRE(waitFor([&] { return settled(session); }, std::chrono::seconds(120)));
+    cluster::Status st = session.status();
+    INFO(st.reason << "\n"
+                   << st.remoteOutput);
+    REQUIRE(st.state == cluster::State::JobReady);
+    CHECK(st.jobId == "5001");
+    CHECK(st.adopted);
+    CHECK_FALSE(fs::exists(fc.slurm / "4711.args"));   // nothing submitted
+    CHECK(st.steps[static_cast<int>(cluster::Step::Submit)].detail.find("job 5001 (yours)") != std::string::npos);
+    CHECK(cluster::wizard::jobLine(st, std::chrono::steady_clock::now()).text.find("never cancelled by SIRIUS") != std::string::npos);
+    st = workerUntilSettled(session, p);
+    INFO(st.reason << "\n"
+                   << st.remoteOutput);
+    REQUIRE(st.state == cluster::State::Connected);
+    const std::string steps = readAll(fc.slurm / "srun.args");
+    CHECK(steps.find("--jobid=5001 --overlap --nodes=1 --ntasks=1 --job-name=sirius-check --gres=gpu:2 ") != std::string::npos);
+    CHECK(steps.find("--jobid=5001 --overlap --nodes=1 --ntasks=1 --job-name=sirius-worker --gres=gpu:2 ") != std::string::npos);
+
+    // disconnect, even asked to cancel: the job keeps running, and says why
+    session.disconnect(true);
+    st = session.status();
+    CHECK(st.reason.find("job 5001 was yours before SIRIUS: it keeps running") != std::string::npos);
+    CHECK(readAll(fc.slurm / "cancelled").find("5001") == std::string::npos);
+    CHECK(readAll(fc.slurm / "5001.state").rfind("RUNNING", 0) == 0);
+
+    // connect again: taken up again, still the user's
+    session.connectJob(p);
+    REQUIRE(waitFor([&] { return settled(session); }, std::chrono::seconds(120)));
+    st = session.status();
+    INFO(st.reason);
+    CHECK((st.state == cluster::State::JobReady || st.state == cluster::State::Connected));
+    CHECK(st.jobId == "5001");
+    CHECK(st.adopted);
+    CHECK_FALSE(fs::exists(fc.slurm / "4711.args"));
+
+    // Let go of it (Change job): not cancelled, the login kept
+    session.cancelJob();
+    st = session.status();
+    CHECK(st.state == cluster::State::Idle);
+    CHECK(st.jobId.empty());
+    CHECK_FALSE(st.adopted);
+    CHECK(st.reason.find("was yours before SIRIUS: it keeps running") != std::string::npos);
+    CHECK(readAll(fc.slurm / "cancelled").find("5001") == std::string::npos);
+    CHECK(readAll(fc.slurm / "5001.state").rfind("RUNNING", 0) == 0);
+
+    // a job that is not the user's (or not there): said, nothing taken up
+    session.adoptJob(p, "9999");
+    REQUIRE(waitFor([&] { return settled(session); }, std::chrono::seconds(120)));
+    st = session.status();
+    CHECK(st.steps[static_cast<int>(cluster::Step::Submit)].status == cluster::StepStatus::Failed);
+    CHECK(st.reason.find("Job 9999 is not among your running or waiting jobs") != std::string::npos);
+    CHECK(st.jobId.empty());
+    session.disconnect(true);
+    CHECK(readAll(fc.slurm / "cancelled").find("5001") == std::string::npos);
+    setEnv("FAKE_CONTAINER_SITE", "");
+}
+
+// --- the engine's Python child comes up after the hello ----------------------------------------
+
+TEST_CASE("cluster wizard: the torch row follows the engine's Python child: starting, ready (with its CUDA), failed (with its last words)", "[app][cluster]") {
+    namespace wz = cluster::wizard;
+    const auto now = std::chrono::steady_clock::now();
+    const BuildInfo app = buildInfo();
+    cluster::Profile p;
+    p.gpus = 1;
+    p.engine = true;
+    cluster::Status st;
+    st.state = cluster::State::Connected;
+    st.jobId = "4711";
+    st.node = "g0004";
+    nlohmann::json engine = toJson(app);
+    engine["python"] = {{"state", "starting"}};
+    st.caps.engine = engine;
+    const auto torchRow = [&](const cluster::Status& s) {
+        for (const wz::HealthRow& r : wz::healthReport(s, p, app, now).rows)
+            if (r.label == "torch") return r;
+        return wz::HealthRow{};
+    };
+    CHECK(torchRow(st).value.find("still starting") != std::string::npos);
+    CHECK(torchRow(st).mark == wz::Mark::Info);
+    // ready: its version, and whether it computes on the GPU
+    engine["python"] = {{"state", "ready"}, {"caps", {{"torch", "2.5.1+cu124"}, {"cuda_usable", false}, {"cuda_reason", "torch 2.5.1 is a CPU-only build"}}}};
+    st.caps.engine = engine;
+    st.caps.torch = "2.5.1+cu124";
+    CHECK(torchRow(st).value == "2.5.1+cu124 \xC2\xB7 CPU only: torch 2.5.1 is a CPU-only build");
+    CHECK(torchRow(st).mark == wz::Mark::Ok);
+    // failed: a failure, with the end of what it wrote
+    engine["python"] = {{"state", "failed"}, {"error", "the Python worker did not start (exit code 1)"}, {"stderr", "Traceback (most recent call last):\nImportError: libcudart.so.12"}};
+    st.caps.engine = engine;
+    st.caps.torch.clear();
+    const wz::HealthRow failed = torchRow(st);
+    CHECK(failed.mark == wz::Mark::Fail);
+    CHECK(failed.value.find("did not start (exit code 1)") != std::string::npos);
+    CHECK(failed.value.find("ImportError: libcudart.so.12") != std::string::npos);
+    // the checks in the job, once connected: their warnings in one row
+    st.nodeChecks = {cluster::NodeCheck{"gpu", "GPUs", cluster::StepStatus::Warning, "Slurm named no GPU for this step", "ask"},
+                     cluster::NodeCheck{"python", "Python", cluster::StepStatus::Done, "python 3.11, sirius, numpy", {}}};
+    bool checksRow = false;
+    for (const wz::HealthRow& r : wz::healthReport(st, p, app, now).rows)
+        if (r.label == "Checks in the job") checksRow = r.mark == wz::Mark::Warn && r.value.find("GPUs: Slurm named no GPU") != std::string::npos;
+    CHECK(checksRow);
+}
+
+TEST_CASE("cluster: the session asks the engine again until its Python child is up, and the report follows", "[app][cluster][engine]") {
+    FakeCluster fc;
+    if (!fc.usable()) SKIP("no Python or bash for the fake ssh");
+    if (!pythonHas(fc.python, "numpy")) SKIP("no numpy in " + fc.python + " for the worker");
+    copyCheckout(fc.home / "sirius");
+    setEnv("FAKE_SLURM_PENDING_POLLS", "0");
+    setEnv("FAKE_ENGINE_PYTHON", "1");   // the engine starts its Python child, as on a cluster
+    cluster::Session session;
+    session.setPollInterval(std::chrono::milliseconds(200), std::chrono::milliseconds(300));
+    const cluster::Profile p = engineProfile(fc);
+    cluster::Status st = connectUntilSettled(session, p);
+    INFO(st.reason << "\n"
+                   << st.remoteOutput);
+    REQUIRE(st.state == cluster::State::Connected);
+    REQUIRE(cluster::hasEngine(st.caps));
+    CHECK(std::find(st.caps.methods.begin(), st.caps.methods.end(), "capabilities") != st.caps.methods.end());
+    const auto pythonState = [](const cluster::Status& s) {
+        const nlohmann::json py = s.caps.engine.value("python", nlohmann::json::object());
+        return py.is_object() ? py.value("state", std::string()) : std::string();
+    };
+    const std::string first = pythonState(st);
+    const int serial = st.capsSerial;
+    CHECK(serial >= 1);
+    // the child is up (or has failed) in a while: the session hears of it without a new hello
+    REQUIRE(waitFor([&] { return pythonState(session.status()) != "starting"; }, std::chrono::seconds(120)));
+    st = session.status();
+    INFO(st.caps.engine.dump());
+    CHECK(pythonState(st) == "ready");
+    if (first == "starting") CHECK(st.capsSerial > serial);
+    // the report's torch row no longer says it is starting
+    for (const cluster::wizard::HealthRow& r : cluster::wizard::healthReport(st, p, buildInfo(), std::chrono::steady_clock::now()).rows)
+        if (r.label == "torch") CHECK(r.value.find("still starting") == std::string::npos);
+    session.disconnect(true);
+    setEnv("FAKE_ENGINE_PYTHON", "0");
+    setEnv("FAKE_CONTAINER_SITE", "");
 }

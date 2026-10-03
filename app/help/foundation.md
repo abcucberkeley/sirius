@@ -3,77 +3,103 @@ title: Foundation model
 figure: One encoder, four input shapes
 ---
 
-Runs a self-supervised microscopy model over the data and returns objects. One
-set of weights handles a plane, a volume, a multi-channel stack or a time
-series, because the model was pretrained on all of them: the axes it is not
-given are simply absent, not zero-filled. This is the step to reach for when a
-classical pipeline needs more tuning than the result is worth.
+Runs a trained microscopy model over the data and returns objects: every
+object (*Segment*), or the ones you point at (*Prompt*). This is the step to
+reach for when a classical pipeline needs more tuning than the result is
+worth.
 
 $$
-p = \sigma\left(h\left(f_\theta(x)\right)\right),\qquad \text{objects} = \text{peaks}\left(p > \tau,\; s_{\text{um}}\right)
+p = \sigma\left(h\left(f_\theta(x)\right)\right),\qquad \text{objects} = \text{decode}\left(p,\; \text{model.json}\right)
 $$
 
-Unlike **Segmentation**, which sends one volume of one channel per call, this
-step sends the whole `(c, t, z, y, x)` array at once. That is the point of it:
-the time axis is an input the model reasons over, not a loop around it.
+## The model: a folder
 
-## The model file
+A model is a **folder**, complete in itself:
 
-A **bundle** (`.ltb`), not a bare TorchScript or ONNX graph. The weights alone
-do not reproduce a result. The peak threshold, the minimum separation between
-two objects, the intensity normalisation and the voxel size the distances were
-calibrated at were all chosen on held-out data when the model was trained, and
-a guessed peak threshold is the difference between an F1 of 0.9 and an F1 of
-0.03. The bundle carries them beside the weights.
+```
+<models>/<name>/<version>/
+    model.py              the model's own code: load(), segment(), prompt()
+    model.json            what it offers and takes: tasks, channels, voxel size,
+                          normalisation, the decode rule it was scored with
+    weights.safetensors   the weights
+    README.md             what it segments, what it was trained on, its limits
+    _lib/                 the network's code, copied in when it was exported
+```
 
-So **Threshold** and **Min. separation** default to zero here, and zero means
-*use the bundle's own value*. Set them only to override a model that was
-validated on data unlike yours.
+latents' `scripts/export_model.py` writes one from a training run, for
+example `coat-sam-s2/v1` (promptable cells) or `coat-conv-r0/v1` (automatic
+only). Nothing else is needed: SIRIUS does not need the latents package, and a
+model is copied, shared or archived by copying its folder.
 
-The model runs in the Python worker, never inside the app process, and the
-worker needs the `latents` package. If it is not importable the step says so
-and names the environment variable (`SIRIUS_LATENTS_PATH`) that points at a
-checkout.
+The model runs in the Python worker, never inside the app process: the worker
+imports the folder's `model.py` and calls it. It needs `torch`, `numpy`,
+`safetensors`, and `scipy` + `scikit-image` for the decode; the cluster's
+worker image has them. A worker without one says which.
 
-## Choosing one: the registry
+The weights alone do not reproduce a result: the foreground threshold, the
+seeding rule that splits touching cells, the intensity normalisation and the
+voxel size were all fixed when the model was scored. `model.json` carries
+them, so **Threshold** and **Min. voxels** default to zero here, and zero
+means *the model's own value*. The model normalises the image itself; send it
+the raw intensities.
 
-**Bundles…** beside the Model field lists the bundles in a registry directory
-with what each one is for: its task, the voxel size it was calibrated at, the
-peak threshold it was validated with, its channels and its notes. Two `.ltb`
-files differ in what is inside them, which a file dialog cannot show, so this
-is the way to pick one.
+The single-file bundles of before (`.ltb`) needed the latents package to load
+and are no longer read: the step says *old bundle format* and names the
+script that re-exports the run as a folder.
 
-The listing is made by the **worker**, not by the application, so on a cluster
-the registry is a directory on the cluster and need not exist on the machine
-the window is on. Set it once in the dialog and it is remembered;
-`SIRIUS_BUNDLE_REGISTRY` sets the default for a shared installation, so that
-everyone starts pointed at the same directory.
+## Choosing one
 
-A bundle whose manifest cannot be read is still listed, with its fields shown
-as `?`. It can still be chosen, but this step's Threshold and Min. separation
-then have no validated values to fall back on, so leaving them at zero is no
-longer safe.
+- **Browse** picks the model's folder, on **This computer** or, when you are
+  logged in to a cluster, on the **Cluster** (`cluster://host/path`).
+- **Models…** lists the models in your models folders, one row per model and
+  version, with its tasks and a line about what it is for (`model.json`'s
+  notes, else the README's first paragraph). Selecting one shows the voxel
+  size it was trained at and its channels; **Use** makes it the step's model.
+
+Where the models folders are is set in `sirius-app.toml` (*File ▸ Edit
+settings file…*):
+
+```toml
+[models]
+folders = ['D:/models', '//lab-share/models']   # this computer's
+
+[cluster.mycluster]
+models = '/clusterfs/nvme2/Users/me/models'     # the cluster's
+```
+
+A folder may also be typed into Models… itself; it is remembered. The
+cluster's models are listed by the worker beside SIRIUS's engine on the node,
+the process that sees that filesystem, so they appear once you are connected.
+
+Under the Model field the panel says what the model is ("coat-sam-s2 v1 ·
+segment, prompt — …"), and the **Task** choice offers only what `model.json`
+lists: *Prompt objects* only for a model with a prompt decoder.
+
+On the HPC backend the model must be on the cluster: a model folder of this
+computer is not uploaded, and the run says so.
 
 ## Parameters
 
 | Parameter | Explanation |
 |---|---|
-| **Model** <br> `.ltb` bundle | Encoder, task head and the thresholds the model was validated with. Its manifest also supplies this step's defaults. |
-| **Task** <br> segment · detect · track · prompt | *Segment* returns objects with extents, by growing each detected centre out to where the model's confidence falls away. *Detect* returns one voxel per object, which is what the model predicts directly and is the fastest. *Track* follows objects across time and needs more than one time point. *Prompt objects* segments only the objects you point at (below). A bundle whose head predicts regions rather than centres (three classes, a dense or a prompt head) has no centres to detect or link, and runs *Segment* only, plus *Prompt* when it has a prompt decoder. |
+| **Model** <br> a model folder | `model.py`, `model.json` and the weights (above). On this computer or on the cluster. |
+| **Task** <br> segment · prompt | *Segment objects* finds every object: the model's foreground and wall-distance maps, decoded by the rule in `model.json` (a watershed seeded on the distance). *Prompt objects* segments only the objects you point at (below), and needs a model whose tasks include `prompt`. |
 | **Prompts** <br> Prompt only | The objects placed with the viewer's Prompt tool, each with its box, points, scribbles and corrections, listed under Task with a button to remove an object or a prompt. |
-| **Channels** <br> one · all | The model accepts several channels together. Send all of them only when the bundle was trained with channel identities; otherwise pick the one channel the structure is in. |
-| **Threshold** <br> 0 = bundle's | Peak probability cut. Lower recovers dim objects, higher separates touching ones. |
-| **Min. separation** <br> µm, 0 = bundle's | Two peaks closer together than this are treated as one object. In **microns**, not voxels, so it means the same thing along z as in plane. On anisotropic data a voxel-based gate is a different physical distance on every axis, which splits single objects in plane while merging distinct ones in depth. |
-| **Min. voxels** <br> Segment only | Drop smaller objects. *Detect* returns one voxel per object, so there is no size to filter. A tracking run keeps every object: there the label id is a track id, and dropping an object in the one frame where it looks small would leave a hole in its track. |
-| **Tile** <br> 0 = bundle's | Inference tile (z, y, x); a zero extent uses the bundle's own crop size on that axis. The bundle's size is usually right; reduce it if the GPU runs out of memory. |
+| **Channels** <br> one · all | Send the one channel the structure is in, or all of them to a model trained on several (`model.json`'s `input.channels`). A mismatch is refused before anything runs. |
+| **Threshold** <br> Segment, 0 = model's | Foreground probability cut. Lower keeps dim objects; the model's own value is the one it was scored at. |
+| **Min. voxels** <br> 0 = model's / all | Drop smaller objects. On *Segment*, 0 uses the model's own minimum; on *Prompt*, 0 keeps every mask. |
+
+The image's voxel size is compared with the one the model was trained at
+(`model.json`'s `input.voxel_um`): more than 1.5× off on an axis is said under
+the parameters. Nothing in the model adapts to scale, so resample the image to
+the model's voxel size first when it is far.
 
 ## Prompt: pointing at objects
 
 With **Task: Prompt objects** the step segments the objects you point at
-instead of every object, in 3-D, one mask per **object**. It needs a bundle
-with a prompt decoder; any other is refused by name when the step runs. Choose
-the viewer's **Prompt** tool (the pointer in the tool strip; selecting a Prompt
-step picks it), then in **XY**:
+instead of every object, in 3-D, one mask per **object**. Choose the viewer's
+**Prompt** tool (the pointer in the tool strip; selecting a Prompt step picks
+it), then in **XY**:
 
 - **Box** (the default mode): drag a box around an object; it starts a new
   object. Its z span is the box's larger side in microns, centred on the plane
@@ -105,15 +131,20 @@ has them side by side, with the objects listed ("Object 3 · box + 2 points +
 1 correction · score 0.81"), a button to remove an object or one of its
 prompts, and Clear all. Clicks in XZ and YZ place points on those planes too.
 
+Each mask is answered inside one window the size of the model's crop
+(`model.json`'s `input.crop`, e.g. 32 planes) placed around its object's
+prompts, and never extends past it; a prompt that does not fit is clipped, and
+the step says so. For an object deeper than the window a click beats a box.
+
 The step re-runs on its own a moment after the last change, so a few quick
 clicks make one run. Edits, undo and the pipeline file keep the prompts like
 any other parameter, and agents set them with `set_params` (`prompts`, below).
 Each time point sends only its own objects, one call per time point that has
 any; a time point without them is left empty without asking the model. An
 object with only corrections names nothing and is not sent (the panel says
-so). The diagnostics give the model's score for each object's mask. A click on
-an object's end plane is moved in z to the object's middle by the worker
-(`snap_z`); a correction never is.
+so). The diagnostics give the model's score for each object's mask. A lone
+click on an object's end plane is moved in z to the object's middle by the
+model (`snap_z`); a correction never is.
 
 The prompts are a list of records in voxels of the step's input, x y z order,
 each with the id of its object: `{"kind": "point", "x", "y", "z", "t",
@@ -126,28 +157,12 @@ object point and scribble becomes an object of its own, and each background
 point joins the nearest object on its time point, or, when there is none,
 an object of only background points, which is kept but not sent.
 
-## Tracking
-
-A track is stored the way the rest of this application stores one: a single
-label id naming the same object at every time point, with the *tracked* flag
-set, so the viewer, the review table and the label editor all work on the
-result without knowing a model produced it.
-
-The lineage the model reports is kept beside the labels: the step's Tracks
-tab lists each track's parent and children, and the diagnostics give the
-model's own division count. Treat both as approximate. The linker matches one
-object to one object, so a division is recovered afterwards by a geometric
-rule, and that rule still misses divisions on real detections; and a detector
-that splits one bright object into two peaks produces the same local geometry
-as a division, which only part of that rule can tell apart. See the Track
-objects help for reviewing tracks.
-
 ## When it is not the right tool
 
-The model is only as general as what it was pretrained on. On a structure
-unlike anything in its training data it will produce confident, wrong,
-cell-shaped objects rather than nothing at all, which is harder to notice than
-an outright failure. Check the confidence overlay before trusting a count. For
-filaments, vessels and networks, the **Classical segmentation** step with the
-*Tubes* enhancement still traces the structure rather than carving the field
-into blobs.
+A model is only as general as what it was trained on; its README says what
+that was and where it fails. On a structure unlike anything in its training
+data it will produce confident, wrong, cell-shaped objects rather than nothing
+at all, which is harder to notice than an outright failure. Check the result
+before trusting a count. For filaments, vessels and networks, the **Classical
+segmentation** step with the *Tubes* enhancement still traces the structure
+rather than carving the field into blobs.

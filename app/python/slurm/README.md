@@ -151,6 +151,65 @@ A build of another commit serves the application as long as the operation
 schema and the engine API are the same: a new build is needed only when
 they changed.
 
+A build is a plain, self-contained folder — `bin/sirius-cli`, `lib/`,
+`python/`, `help/`, `BUILD.json` — and nothing else: no symlinks into
+`$HOME`, no copy of the executable elsewhere. It may live on a scratch file
+system the login node mounts `noexec` (fiona's `/clusterfs/nvme2`): the login
+node only *reads* it. There the checks look at files alone — the folder,
+`BUILD.json` parsed, `bin/sirius-cli` a file (or a link to one) with an
+execute bit in its mode (`ls -lL`, never `[ -x ]`, which asks
+`access(X_OK)` and says no on a `noexec` mount), `python/sirius_worker`,
+`lib/` — to list the builds and pick one. Whether it runs is checked where it
+runs: in the job, on its compute node, inside the image, before the worker
+starts (below). `chmod +x bin/sirius-cli` is the fix for a build listed
+"without an execute bit".
+
+### The checks in the job
+
+Before every worker start the application runs its own launch script with
+`--check` as one step of the job (`srun --jobid=<job> --overlap --ntasks=1
+[--gres=gpu:N] bash ~/.sirius/run/sirius_worker-<build>.sbatch --check
+<data folder pairs>`), so it runs on the compute node with the same image,
+binds, library path and environment as the start, in a couple of seconds:
+
+| check | what | fails when |
+|---|---|---|
+| launcher | `apptainer` (or `singularity`, `module load` tried) on the node | neither runs there |
+| image | the image starts | it is unreadable, or does not start |
+| python | `import sirius, numpy` in the image (torch noted) | they do not import |
+| worker | the worker's code is visible inside the image | it is not there |
+| engine | `<engine> version` in the image, its `build` the same as the picked build's `BUILD.json`, and of this application's operations | it is not there, does not run (its output is shown), or is another build |
+| gpu / cuda | `CUDA_VISIBLE_DEVICES` names as many GPUs as the job asked for, `nvidia-smi` sees them, the engine's CUDA finds them | (a warning) |
+| data:*n* | each data folder is on the node, and readable inside the image | it is not |
+| cache | the node cache folder can be written | it cannot |
+
+Each comes back as a line of the Worker page's checklist with what to do;
+one that fails stops the start, and nothing runs (the worker is never started
+without the engine it was asked for). By hand:
+
+```
+SIRIUS_CONTAINER=<image> SIRIUS_ENGINE=1 SIRIUS_ENGINE_DIR=<builds>/<commit> SIRIUS_WORKER_DIR=<builds>/<commit>/python \
+    srun --jobid=<job> --overlap --ntasks=1 bash app/python/slurm/sirius_worker.sbatch --check /data /data
+```
+
+### The job's GPUs
+
+The worker's step (and the check's) asks for the job's GPUs
+(`--gres=gpu:N`), and Slurm names them in `CUDA_VISIBLE_DEVICES`. The image is
+entered with `--cleanenv`, which would leave that behind — CUDA in the image
+then sees every GPU of a node that does not confine a job's devices — so the
+launch script hands it into the image with the rest of the environment. A
+step given more GPUs than the job asked for is held to the first of them,
+and the log and the checks say so.
+
+### A job of your own
+
+The Job page lists your jobs that run or wait on the cluster (any of them,
+`squeue -u $USER`), each with *Use this job*: SIRIUS's worker then runs in
+that job as a step, with its GPUs, after the checks on its node — no new job
+is asked for. SIRIUS never cancels such a job: Disconnect and *Let go of this
+job* leave it running, and Connect takes it up again while it runs.
+
 Empty, the engine inside the image (`/opt/sirius/bin/sirius-cli`) is used;
 *Engine executable* names one outright (testing a build of your own).
 
@@ -298,10 +357,15 @@ partition, account and QoS are that site's, yours will differ:
     SIRIUS_CONTAINER=/clusterfs/nvme2/Users/velatkilic/containers/latents.sif \
     SIRIUS_CONTAINER_BIND=/clusterfs/vast/velatkilic,/clusterfs/nvme2/Users/velatkilic \
     SIRIUS_CONTAINER_PYTHONPATH=/clusterfs/nvme2/Users/velatkilic/pylibs/lib/python3.12/site-packages \
-    SIRIUS_LATENTS_PATH=$HOME/dev/latents \
+\
     sbatch --partition=dgx --account=co_abc --qos=abc_high --time=04:00:00 \
         --output="$HOME/.sirius/run/sirius-worker-%j.log" \
         app/python/slurm/sirius_worker.sbatch
+
+(The Foundation step's models are self-contained folders now: the worker imports
+a model folder's own `model.py` and needs no latents checkout, so the
+`SIRIUS_LATENTS_PATH` that example once carried is gone. Bind the models folder
+so the worker sees it.)
 
 A bind is not optional on a cluster: without `SIRIUS_CONTAINER_BIND` the worker
 cannot see the data directories, and a path that does not exist (or that you

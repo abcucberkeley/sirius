@@ -224,6 +224,10 @@ namespace sirius::app {
     // "cuda_reason", "cpu_threads") into `caps`, whose `cuda` is already
     // read; a field that is missing or of another type is left as it is.
     void parseWorkerHardware(const nlohmann::json& hello, WorkerCapabilities& caps);
+    // A worker's capabilities as its handshake ("auth") answers them, or as
+    // SIRIUS's engine answers "capabilities" later (its Python child up by
+    // then); fields that are missing or of another type stay empty.
+    WorkerCapabilities parseWorkerCapabilities(const nlohmann::json& r);
 
     struct WorkerResult {
         nlohmann::json result;

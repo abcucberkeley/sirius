@@ -33,6 +33,7 @@
 #include "core/array_source.hpp"
 #include "core/cancel.hpp"
 #include "core/executor.hpp"
+#include "core/model_folder.hpp"
 #include "core/ops/common.hpp"
 #include "core/ops/contrast.hpp"
 #include "core/ops/torch_model.hpp"
@@ -2045,7 +2046,7 @@ namespace {
                 if (spec.rfind("microsam:", 0) == 0)
                     reply["result"] = {{"format", "micro-sam"}, {"model", spec.substr(9)}, {"available", true}, {"promptable", promptable}};
                 else
-                    reply["result"] = {{"format", "latents-bundle"}, {"head", promptable ? "sam" : "threeclass"}, {"tasks", promptable ? nlohmann::json{"segment", "prompt"} : nlohmann::json{"segment"}}};
+                    reply["result"] = {{"format", "latents-model"}, {"name", promptable ? "fake-sam" : "fake-conv"}, {"version", "v1"}, {"tasks", promptable ? nlohmann::json{"segment", "prompt"} : nlohmann::json{"segment"}}, {"promptable", promptable}, {"description", "a fake model"}, {"voxel_um", {0.1, 0.1, 0.5}}};
                 transport->send(rpc::encodeFrame(reply, {}));
             } else if (method == "run") {
                 REQUIRE(msg->tensors.size() == 1);
@@ -2059,7 +2060,7 @@ namespace {
                 if (mode == FakePrompt::Refuses) {
                     reply["type"] = "error";
                     reply["message"] = "object 0 has prompts on planes [1, 3]; microsam:vit_b_lm is a 2-D model and cannot refine across z. "
-                                       "Put the object's corrective prompts in the plane it was opened in, or prompt a .ltb bundle, whose decoder is 3-D.";
+                                       "Put the object's corrective prompts in the plane it was opened in, or prompt a model folder on the Foundation step, whose decoder is 3-D.";
                     transport->send(rpc::encodeFrame(reply, {}));
                     continue;
                 }
@@ -2174,7 +2175,7 @@ TEST_CASE("The foundation step's Prompt task sends each frame its objects", "[ap
     auto data = rampArray(dims);
     const Operation& op = requireOperation("foundation");
     ParamSet p = op.defaults();
-    p.set("model", std::string("bundle.ltb"));
+    p.set("model", std::string("models/fake-sam/v1"));   // the worker's, not on this machine: a warning
     p.set("task", std::string(kPromptTask));
     REQUIRE(isPromptStep(p));
     // t 0: object 1 a click and a correction beside it, object 2 a box,
@@ -2279,22 +2280,201 @@ TEST_CASE("The foundation step's Prompt task sends each frame its objects", "[ap
     }
 }
 
-TEST_CASE("A bundle without a prompt decoder is refused by name", "[app][ops][prompt][rpc]") {
+TEST_CASE("A model without a prompt decoder is refused by name", "[app][ops][prompt][rpc]") {
     const Dims5 dims{1, 1, 4, 20, 24};
     const DatasetMeta meta = metaFor(dims);
     auto data = rampArray(dims);
     const Operation& op = requireOperation("foundation");
     ParamSet p = op.defaults();
-    p.set("model", std::string("plain.ltb"));
+    p.set("model", std::string("models/fake-conv/v1"));
     p.set("task", std::string(kPromptTask));
     p.set(kPromptsKey, promptsValue({Prompt::point(5, 6, 1)}));
     clearPromptRequests();
     std::string error;
     (void)runWithFakeWorker(op, inputOf(data, meta), p, FakePrompt::NotPromptable, &error);
     CHECK(error.find("cannot be prompted") != std::string::npos);
-    CHECK(error.find("'threeclass' head has no prompt decoder") != std::string::npos);
+    CHECK(error.find("fake-conv v1 cannot be prompted: it has no prompt decoder") != std::string::npos);
     CHECK(error.find("it offers segment") != std::string::npos);
     CHECK(promptRequests.empty());   // refused before any frame went out
+}
+
+namespace {
+    // A models folder of model.json files (what the application reads of a
+    // model folder; the worker's tests run whole fake models).
+    struct ModelsFolder {
+        std::filesystem::path root = test::uniqueTempPath("models", "");
+        ModelsFolder() { std::filesystem::create_directories(root); }
+        ~ModelsFolder() {
+            std::error_code ec;
+            std::filesystem::remove_all(root, ec);
+        }
+        ModelsFolder(const ModelsFolder&) = delete;
+        ModelsFolder& operator=(const ModelsFolder&) = delete;
+
+        std::string add(const std::string& name, const std::string& version, std::vector<std::string> tasks, int channels = 1,
+                        const std::string& notes = "") {
+            const std::filesystem::path folder = root / name / version;
+            std::filesystem::create_directories(folder);
+            const nlohmann::json man = {{"format", "latents-model/1"}, {"name", name}, {"version", version}, {"tasks", tasks}, {"input", {{"channels", channels}, {"channel_merge", ""}, {"crop", {32, 192, 192}}, {"voxel_um", {0.3, 0.1, 0.1}}}}, {"decode", {{"fg_threshold", 0.5}, {"min_voxels", 0}}}, {"notes", notes}};
+            std::ofstream(folder / "model.json") << man.dump(2);
+            std::ofstream(folder / "README.md") << "# " << name << "\n\nMembrane-stained cells, from the README.\n";
+            std::ofstream(folder / "weights.safetensors", std::ios::binary) << std::string(100, '\0');
+            return folder.string();
+        }
+    };
+} // namespace
+
+TEST_CASE("The Foundation step takes a model folder and offers only what model.json lists", "[app][ops][foundation]") {
+    const Dims5 dims{2, 1, 4, 20, 24};
+    const DatasetMeta meta = metaFor(dims);   // 0.1 x 0.1 x 0.3 um
+    const Operation& op = requireOperation("foundation");
+    const ParamSpec* model = nullptr;
+    const ParamSpec* task = nullptr;
+    for (const ParamSpec& s : op.info().params) {
+        if (s.key == "model") model = &s;
+        if (s.key == "task") task = &s;
+    }
+    REQUIRE(model);
+    CHECK(model->type == ParamType::Path);
+    CHECK(model->directory);   // Browse picks a folder, on this computer or on the cluster
+    REQUIRE(task);
+    CHECK(task->choices == std::vector<std::string>{"Segment objects", kPromptTask});
+
+    ModelsFolder models;
+    const std::string sam = models.add("coat-sam-s2", "v1", {"segment", "prompt"}, 1, "Promptable cells.");
+    const std::string conv = models.add("coat-conv-r0", "v1", {"segment"});
+    ParamSet p = op.defaults();
+    p.set("model", sam);
+    CHECK(op.validate(p, meta).ok());
+    CHECK(op.summary(p, meta).find("coat-sam-s2 v1") != std::string::npos);
+    p.set("task", std::string(kPromptTask));
+    p.set(kPromptsKey, promptsValue({Prompt::point(5, 6, 1)}));
+    CHECK(op.validate(p, meta).ok());
+    // model.json itself names its folder too
+    p.set("model", (std::filesystem::path(sam) / "model.json").string());
+    CHECK(op.validate(p, meta).ok());
+    p.set("model", sam);
+
+    SECTION("a model without a prompt decoder offers Segment only") {
+        p.set("model", conv);
+        const Validation v = op.validate(p, meta);
+        REQUIRE_FALSE(v.ok());
+        CHECK(v.firstError().find("coat-conv-r0 v1 cannot be prompted") != std::string::npos);
+        CHECK(v.firstError().find("it offers segment") != std::string::npos);
+        p.set("task", std::string("Segment objects"));
+        CHECK(op.validate(p, meta).ok());
+    }
+    SECTION("the channels the model takes") {
+        p.set("channels", std::string("All channels"));   // two channels to a one-channel model
+        Validation v = op.validate(p, meta);
+        REQUIRE_FALSE(v.ok());
+        CHECK(v.firstError().find("takes one channel") != std::string::npos);
+        p.set("model", models.add("two", "v1", {"segment"}, 2));
+        p.set("task", std::string("Segment objects"));
+        CHECK(op.validate(p, meta).ok());
+        p.set("channels", std::string("Selected channel"));
+        v = op.validate(p, meta);
+        REQUIRE_FALSE(v.ok());
+        CHECK(v.firstError().find("takes 2 channels") != std::string::npos);
+    }
+    SECTION("a voxel size far from the model's is a warning") {
+        const Validation near = op.validate(p, meta);
+        CHECK(std::none_of(near.warnings.begin(), near.warnings.end(), [](const std::string& w) { return w.find("trained at") != std::string::npos; }));
+        const Validation far = op.validate(p, metaFor(dims, 0.4, 0.3));
+        CHECK(far.ok());
+        CHECK(std::any_of(far.warnings.begin(), far.warnings.end(), [](const std::string& w) {
+            return w.find("coat-sam-s2 was trained at 0.3 x 0.1 x 0.1 um") != std::string::npos && w.find("far on x, y") != std::string::npos;
+        }));
+    }
+    SECTION("what is not a model folder says what to do") {
+        p.set("model", std::string("C:/models/cells.ltb"));
+        Validation v = op.validate(p, meta);
+        REQUIRE_FALSE(v.ok());
+        CHECK(v.firstError().find("Old bundle format") != std::string::npos);
+        CHECK(v.firstError().find("scripts/export_model.py") != std::string::npos);
+        p.set("model", models.root.string());   // the models folder, not one model
+        v = op.validate(p, meta);
+        REQUIRE_FALSE(v.ok());
+        CHECK(v.firstError().find("no model.json") != std::string::npos);
+        std::ofstream(std::filesystem::path(conv) / "model.json") << "{ not json";
+        p.set("model", conv);
+        v = op.validate(p, meta);
+        REQUIRE_FALSE(v.ok());
+        CHECK(v.firstError().find("not valid JSON") != std::string::npos);
+        p.set("model", std::string());
+        CHECK(op.validate(p, meta).firstError().find("Choose a model folder") != std::string::npos);
+        // on the cluster: the engine checks it there, with the node's path
+        p.set("model", std::string("cluster://hpc/clusterfs/models/coat-sam-s2/v1"));
+        CHECK(op.validate(p, meta).ok());
+    }
+}
+
+TEST_CASE("The Task choice is what the worker's model_info lists", "[app][ops][foundation][rpc]") {
+    for (const bool promptable : {true, false}) {
+        auto pair = rpc::loopbackPair();
+        std::thread worker(fakePromptWorker, std::move(pair.second), promptable ? FakePrompt::Promptable : FakePrompt::NotPromptable);
+        RemoteWorker remote(std::move(pair.first));
+        const std::string spec = promptable ? "/clusterfs/models/fake-sam/v1" : "/clusterfs/models/fake-conv/v1";
+        const nlohmann::json info = remote.call("model_info", {{"path", spec}, {"model", spec}, {"spec", spec}}).result;
+        remote.close();
+        worker.join();
+        std::string error;
+        const std::optional<ModelFolderFacts> facts = modelFactsFromJson(info, &error);
+        REQUIRE(facts);
+        CHECK(facts->name == (promptable ? "fake-sam" : "fake-conv"));
+        CHECK(facts->promptable == promptable);
+        CHECK(facts->voxelUm == std::vector<double>{0.1, 0.1, 0.5});
+        CHECK(modelTaskChoices(facts) ==
+              (promptable ? std::vector<std::string>{"Segment objects", kPromptTask} : std::vector<std::string>{"Segment objects"}));
+    }
+    // nothing known yet: both; a reply that is not a model folder's is refused
+    CHECK(modelTaskChoices(std::nullopt).size() == 2);
+    std::string error;
+    CHECK_FALSE(modelFactsFromJson({{"format", "latents-bundle"}, {"tasks", {"track"}}}, &error));
+    CHECK(error.find("not a model folder") != std::string::npos);
+    CHECK(modelTaskOfLabel(kPromptTask) == "prompt");
+    CHECK(modelTaskOfLabel("Segment objects") == "segment");
+}
+
+TEST_CASE("Models are listed by name and version from a models folder", "[app][ops][foundation]") {
+    ModelsFolder models;
+    models.add("coat-sam-s2", "v1", {"segment", "prompt"}, 1, "Promptable cells.");
+    models.add("coat-sam-s2", "v2", {"segment"});
+    models.add("alpha", "v1", {"segment"});   // no notes: the README's first paragraph
+    std::filesystem::create_directories(models.root / "broken" / "v1");
+    std::ofstream(models.root / "broken" / "v1" / "model.json") << "{";
+    std::ofstream(models.root / "old.ltb") << "PK";
+    std::filesystem::create_directories(models.root / "notes");   // a folder that holds no model
+    const std::string missing = (models.root / "missing").string();
+    const ModelListing got = listModelFolders({models.root.string(), missing});
+    std::vector<std::string> rows;
+    for (const ModelFolderFacts& m : got.models) rows.push_back(m.name + " " + m.version + (m.error.empty() ? "" : " !"));
+    CHECK(rows == std::vector<std::string>{"old  !", "alpha v1", "broken v1 !", "coat-sam-s2 v1", "coat-sam-s2 v2"});
+    CHECK(got.models[0].error.find("Old bundle format") != std::string::npos);
+    CHECK(got.models[1].description == "Membrane-stained cells, from the README.");
+    CHECK(got.models[3].description == "Promptable cells.");
+    CHECK(got.models[3].promptable);
+    CHECK(got.models[3].sizeBytes == 100);
+    CHECK(got.models[3].title() == "coat-sam-s2 v1 \xC2\xB7 segment, prompt");
+    CHECK(got.errors == std::vector<std::string>{"not a folder: " + missing});
+    // a model folder named directly is its own listing
+    const ModelListing one = listModelFolders({(models.root / "alpha" / "v1").string()});
+    REQUIRE(one.models.size() == 1);
+    CHECK(one.models[0].name == "alpha");
+
+    // the worker's answer for a folder on the cluster reads the same
+    const nlohmann::json reply = {
+        {"models",
+         {{{"format", "latents-model"}, {"path", "/clusterfs/models/coat-sam-s2/v1"}, {"name", "coat-sam-s2"}, {"version", "v1"}, {"tasks", {"segment", "prompt"}}, {"description", "Promptable cells."}, {"size_bytes", 123}, {"error", ""}},
+          {{"path", "/clusterfs/models/broken/v1"}, {"name", "broken"}, {"version", "v1"}, {"tasks", nlohmann::json::array()}, {"error", "not valid JSON"}}}},
+        {"errors", {"not a folder: /nope"}}};
+    const ModelListing remote = modelListingFromJson(reply);
+    REQUIRE(remote.models.size() == 2);
+    CHECK(remote.models[0].path == "/clusterfs/models/coat-sam-s2/v1");
+    CHECK(remote.models[0].promptable);
+    CHECK(remote.models[0].sizeBytes == 123);
+    CHECK(remote.models[1].error == "not valid JSON");
+    CHECK(remote.errors == std::vector<std::string>{"not a folder: /nope"});
 }
 
 TEST_CASE("The segmentation step prompts a micro-SAM model with the same objects, plane by plane", "[app][ops][prompt][rpc]") {

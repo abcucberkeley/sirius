@@ -21,6 +21,7 @@
 
 #include <array>
 #include <atomic>
+#include <chrono>
 #include <functional>
 #include <map>
 #include <memory>
@@ -490,6 +491,11 @@ namespace sirius::app {
         void setHpcDevice(HpcDevice d);
         const RemoteConfig& remoteConfig() const noexcept { return remote_; }
         void setRemoteConfig(RemoteConfig c);
+        // What the worker beside the engine on the node says about a model on
+        // the cluster ("cluster://host/path"): its model_info, asked once and
+        // remembered; nullopt while it is asked, or with `error` set when it
+        // cannot be (no engine, the worker's refusal).
+        std::optional<nlohmann::json> clusterModelInfo(const std::string& clusterPath, std::string* error = nullptr) const;
         // Whether a run may start (RunGate above); createRun refuses with
         // the same reason, so a caller that did not ask first is told so.
         RunGate runGate() const;
@@ -520,10 +526,34 @@ namespace sirius::app {
         // on this computer; for one that stays on the cluster, by the engine
         // there, from its preview (step_preview), so not a plane comes here.
         // nullopt without an input, or while the node is asked (poll()).
+        // On the node every one of these is one measurement of the input
+        // (its histograms, the automatic window, the data range), the same
+        // whatever min / max / gamma are: a window dragged asks nothing.
         std::optional<ContrastWindow> contrastWindowOf(int index, const ParamSet& params, Index c, bool wantRange) const;
         // The parameters behind the Auto and Reset buttons, the same way.
         std::optional<ParamSet> contrastAutoOf(int index, const ParamSet& current) const;
         std::optional<ParamSet> contrastResetOf(int index, const ParamSet& current) const;
+        // The Auto and Reset buttons of Contrast step `index`: applied at once
+        // (an undoable parameter change) for an input on this computer; for
+        // one on the cluster the node measures it, and poll() applies the
+        // answer when it arrives -- nothing to press again. False (and
+        // contrastError says why) when it cannot be done at all.
+        enum class ContrastAction { Auto,
+                                    Reset };
+        bool requestContrast(int index, ContrastAction action);
+        // The request of step `index` the node is answering, if any, and for
+        // how long it has been asked.
+        struct ContrastRequest {
+            ContrastAction action = ContrastAction::Auto;
+            double seconds = 0.0;
+        };
+        std::optional<ContrastRequest> contrastRequest(int index) const;
+        // Why the last request of step `index` failed ("" when it did not);
+        // cleared by the next one.
+        std::string contrastError(int index) const;
+        // The input of Contrast step `index` is on the cluster and the node
+        // has not answered for it yet (its window, its histograms).
+        bool contrastMeasuring(int index) const;
         // Steps that need the Python worker (Operation::needsWorker) get a
         // local worker from this launcher when the backend is not HPC; the
         // GUI installs one that spawns app/python/sirius_worker. A run
@@ -698,13 +728,25 @@ namespace sirius::app {
         // The engine's answer to `method` (step_preview, step_validate), or
         // nullopt while it is asked; `error` set when it failed.
         std::optional<nlohmann::json> askEngine(const std::string& method, const nlohmann::json& params, std::string* error,
-                                                std::vector<rpc::Tensor>* tensors = nullptr) const;
+                                                std::vector<rpc::Tensor>* tensors = nullptr, bool urgent = false) const;
         // The input of step `index` stays on the cluster, and the engine there answers for it.
         bool inputOnCluster(int index) const;
         // ... and that input is the step's own, computed (fresh): the node can preview the step on it.
         bool previewedOnNode(int index) const;
-        // The engine's preview of step `index` with `params`; nullopt while asked; throws its error.
-        std::optional<Diagnostics> nodePreview(int index, const ParamSet& params) const;
+        // The node's measurement of the input of Contrast step `index` (its
+        // preview with an automatic window and gamma 1: the histograms'
+        // lo / hi are the automatic window, binLo / binHi the data range);
+        // nullopt while asked; throws its error, or why it cannot be asked.
+        std::optional<Diagnostics> nodeContrast(int index, const ParamSet& params, bool urgent = false) const;
+        // Applies the answers of the pending contrast requests that arrived.
+        void settleContrastRequests();
+        struct PendingContrast {
+            ContrastAction action = ContrastAction::Auto;
+            std::chrono::steady_clock::time_point since;
+            const ArraySource* source = nullptr;   // the dataset it was asked for
+        };
+        std::map<StepId, PendingContrast> contrastPending_;
+        std::map<StepId, std::string> contrastErrors_;
         // The first "before" of the merge group the top history entry belongs
         // to (History::mergesWith decides whether it still applies).
         std::optional<std::pair<std::string, Snapshot>> mergeFirst_;

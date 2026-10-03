@@ -3825,32 +3825,31 @@ def step_seg(a: np.ndarray, params: Dict[str, Any], meta: Dict[str, Any], progre
 _FOUNDATION = StepSpec(
     "foundation",
     {"model": "", "task": "Segment objects", "prompts": [], "channels": "Selected channel", "input_channel": 0,
-     "threshold": 0.0, "min_separation": 0.0, "min_voxels": 0, "tile": [0.0, 0.0, 0.0],
-     "label_opacity": 0.45, "class_name": "object"},
-    choices={"task": ("Segment objects", "Detect centroids", "Track over time", _PROMPT_TASK),
+     "threshold": 0.0, "min_voxels": 0, "label_opacity": 0.45, "class_name": "object"},
+    choices={"task": ("Segment objects", _PROMPT_TASK),
              "channels": ("Selected channel", "All channels")},
-    aliases={"bundle": "model", "model_path": "model", "channel": "input_channel",
-             "min_sep": "min_separation", "minVoxels": "min_voxels", "tile_size": "tile"},
-    # Python-only: the voxel size to calibrate distances with, [x, y, z] like the
-    # metadata's, when the caller knows better than the dataset metadata does
+    aliases={"bundle": "model", "model_path": "model", "model_folder": "model", "channel": "input_channel",
+             "minVoxels": "min_voxels"},
+    # Python-only: the image's voxel size, [x, y, z] like the metadata's, compared
+    # with the one the model was trained at, when the caller knows better than the
+    # dataset metadata does
     extra=("voxel_um", "device"))
 
 
 @_step(_FOUNDATION)
 def step_foundation(a: np.ndarray, params: Dict[str, Any], meta: Dict[str, Any], progress: ProgressFn = None,
                     cancelled: CancelFn = None, device: str = "auto") -> StepResult:
-    """The latents foundation model: model (a .ltb bundle), task (Segment
-    objects | Detect centroids | Track over time | Prompt objects, with
-    prompts: one mask per object, labelled with its id), channels, input_channel,
-    threshold, min_separation (um), min_voxels (Segment only), tile [z, y, x]
-    (a zero extent uses the bundle's), class_name; label_opacity is
-    display-only.
+    """A trained model folder (model.py + model.json "latents-model/1", as
+    latents scripts/export_model.py writes it; no latents package needed): model
+    (the folder), task (Segment objects | Prompt objects, with prompts: one mask
+    per object, labelled with its id; what the folder's model.json lists),
+    channels, input_channel, threshold (the foreground threshold), min_voxels,
+    class_name; label_opacity is display-only.
 
-    Unlike step_seg this passes the whole (c, t, z, y, x) array to the model in
-    one call: the time and channel axes are inputs the model reasons over, not
-    a loop around it. A threshold or separation of zero means "use the value
-    the bundle was validated at", which is why they default to zero rather than
-    to a number this file would otherwise be inventing."""
+    A threshold or minimum size of zero means "use the value in model.json",
+    the one the model was scored with, which is why they default to zero rather
+    than to a number this file would otherwise be inventing. The model
+    normalises its own input (model.json's input.normalisation)."""
     try:
         from sirius_worker import foundation as fm  # type: ignore
     except ImportError as e:
@@ -3858,19 +3857,15 @@ def step_foundation(a: np.ndarray, params: Dict[str, Any], meta: Dict[str, Any],
             "the foundation model needs the sirius_worker package (app/python) on the Python path") from e
     path = _str(params, "model")
     if not path:
-        raise ValueError("foundation: no model bundle given")
+        raise ValueError("foundation: no model folder given")
     task = _choice(params.get("task"), _FOUNDATION.choices["task"], "Segment objects")
-    key = {"Track over time": "track", "Detect centroids": "detect", _PROMPT_TASK: "prompt"}.get(task, "segment")
+    key = "prompt" if task == _PROMPT_TASK else "segment"
     allc = _choice(params.get("channels"), _FOUNDATION.choices["channels"], "Selected channel") == "All channels"
     c = _channel_index(params, "input_channel", meta, a.shape[0])
     sub = a if allc else a[c:c + 1]
-    tile = [int(v) for v in _as_list(params.get("tile"), 3, [0, 0, 0])]
     call = {"model": path, "task": key, "threshold": _float(params, "threshold", 0.0),
-            "min_separation": _float(params, "min_separation", 0.0),
             "min_voxels": _int(params, "min_voxels", 0),
             "voxel_um": params.get("voxel_um") or (meta or {}).get("voxel_um")}
-    if any(v > 0 for v in tile):
-        call["tile"] = tile
     if key == "prompt":
         # one time point per call, as the prompt decoder takes it; a frame
         # without prompts stays empty and asks nothing of the model

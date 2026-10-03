@@ -1,4 +1,53 @@
-# Running the latents 5-D model in sirius: decisions and what is left
+# Running trained models in sirius: decisions and what is left
+
+## 0. Now (2026-10-03): models are self-contained folders; `.ltb` is gone
+
+sirius and latents are decoupled. A trained model is a **folder** that runs
+without the latents package, written by latents `scripts/export_model.py`
+(commit c037177 or later):
+
+```
+<models>/<name>/<version>/
+    model.py              the API: load(folder=None, device=None) -> Model with
+                          .info(), .tasks(), .segment(volume, channels, threshold,
+                          min_voxels) -> uint32 labels, .prompt(volume, objects=...,
+                          points, boxes, scribbles, channels, snap_z) -> (masks,
+                          scores, info), .logits(volume)
+    model.json            format "latents-model/1": tasks, encoder cfg, head,
+                          input contract (axes, channels, channel_merge, patch,
+                          crop, normalisation percentiles + clip, voxel_um),
+                          output channels, decode (fg_threshold, seed_hmax,
+                          seed_hrel, seed_sigma, min_voxels, needs), prompt
+                          block, provenance (latents commit, run, hashes)
+    weights.safetensors   README.md   _lib/ (latents modules vendored verbatim;
+                          they import only torch, numpy and each other)
+```
+
+What replaced what:
+
+| before (sections below) | now |
+|---|---|
+| a `.ltb` bundle, loaded by `latents.deploy.Bundle` | a model folder; the worker imports its `model.py` (`app/python/sirius_worker/foundation.py`) under a module name of its own, with the folder on `sys.path` only while it is imported and each model's `_lib` modules swapped into `sys.modules` for its calls, cached per (folder, files' stamp, device), one resident at a time |
+| `SIRIUS_LATENTS_PATH`, the latents package in the worker | nothing: torch, numpy, safetensors, scipy, scikit-image in the worker (the cluster image) |
+| tasks segment / detect / track / prompt | what `model.json`'s `tasks` lists: `segment`, plus `prompt` for a SAM head. The step's Task choice offers only those (Detect, Track, Min. separation and Tile are gone) |
+| the bundle registry (a directory of `.ltb`, Bundles…, `SIRIUS_BUNDLE_REGISTRY`) | **Models…**: the model folders under `sirius-app.toml`'s `[models] folders = [...]` (read by the application itself) and the current cluster profile's `models = '...'` (listed by the worker beside the engine on the node, method `list_bundles`, which the engine relays) |
+| `model_info` from the bundle's manifest | `model_info` from `model.json` and the README, without importing anything: name, version, tasks, promptable, description, input contract (voxel_um given as (x, y, z)), decode, prompt block, provenance |
+| `.ltb` | refused with "old bundle format: re-export with latents scripts/export_model.py" |
+
+The model normalises its own input, so the raw intensities go to it. The
+worker checks the rest of the contract: the channel count (refused with what
+to choose), and the voxel size (a warning in the step's diagnostics when the
+image is more than 1.5x off the model's on an axis). The application reads a
+local folder's `model.json` itself (`app/core/model_folder.hpp`) to check the
+step before it runs; a folder on the cluster (`cluster://host/path`) is checked
+by the engine on the node, which also hands the Python worker child the node's
+path when it runs the step. A local model folder is not uploaded to the HPC
+backend: the run is refused with what to do.
+
+The sections below are the September handoff, kept for the reasoning; read
+"bundle" as "model folder" and "manifest" as `model.json`.
+
+---
 
 Handoff for whoever builds the sirius side. Written 2026-09-13.
 Branch `foundation-model`, commit `233314d`, 545/545 tests passing.

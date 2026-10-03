@@ -135,8 +135,9 @@ namespace sirius::app {
         Backend ranOn = Backend::Cpu;
         // Where it ran: "" = this computer; otherwise the machine that
         // computed and holds it ("fiona · n0042 · job 4711", a cluster node's
-        // SIRIUS engine). And on what there: "A100", "CPU", "Python cuda:0"
-        // (the executor fills it in from the context the step ran with).
+        // SIRIUS engine). And on what there: "A100", "CPU", "Python cuda:0",
+        // kCpuNoGpuPath (the executor fills it in from the context the step
+        // ran with).
         std::string where;
         std::string ranOnDevice;
         // Set when the data this output stood for went away with the machine
@@ -148,6 +149,10 @@ namespace sirius::app {
             return StepInput{meta, array, source, labels};
         }
     };
+
+    // StepOutput::ranOnDevice of a step run on the CPU with a GPU chosen,
+    // because its operation has no GPU code (OpInfo::hasGpuPath).
+    inline constexpr const char* kCpuNoGpuPath = "CPU \xE2\x80\x94 no GPU implementation";
 
     // The output's placement, short, for the ops row: "node A100", "node
     // CPU", "node Python cuda:0", "this computer · CUDA"; "" before it ran.

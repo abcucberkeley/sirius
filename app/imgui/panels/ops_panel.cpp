@@ -382,6 +382,8 @@ namespace sirius::app::gui {
                         place(bodyX + px(12) + px(6), sumY);
                         const ImU32 base = d.ok ? theme::kNeutral600 : theme::kAccentText;
                         widgets::elided(d.summary, sumW, 11, d.enabled ? base : theme::withAlpha(theme::kNeutral600, opacity));
+                        // an error says so in full on a right-click: Copy
+                        if (!d.ok) widgets::copyOnRightClick("##summaryCopy", d.summary);
                     }
                 }
             }
@@ -830,6 +832,7 @@ namespace sirius::app::gui {
                     place(origin.x + px(14), y + rule + px(10));
                     widgets::text(widgets::elideText(gate.why, width, 11), 11, theme::kAccentText);
                     tip(gate.why);
+                    widgets::copyOnRightClick("##gateCopy", gate.why);
                 }
                 place(origin.x + px(14), y + rule + px(12) + gateH);
                 widgets::ButtonOpts run;

@@ -565,7 +565,7 @@ A step, as the editing tools return it:
 GUI's view, are not served: every tool here takes explicit steps and
 coordinates instead.
 
-**Prompt steps.** A `foundation` step (a `.ltb` bundle with a prompt decoder)
+**Prompt steps.** A `foundation` step (a model folder whose `model.json` tasks include `prompt`)
 or a `seg` step with a `microsam:` model, whose `task` is `"Prompt objects"`,
 segments only what its `prompts` parameter points at. `add_step` and
 `set_params` take the list, `get_step` returns it, `describe_operation` gives
@@ -587,7 +587,7 @@ is left empty and costs no worker call. micro-SAM's masks are per plane, so
 all of one object's prompts must share a plane.
 
 ```
-sirius-cli --dataset raw.tif call add_step --args '{"kind": "foundation", "params": {"model": "cells.ltb",
+sirius-cli --dataset raw.tif call add_step --args '{"kind": "foundation", "params": {"model": "models/coat-sam-s2/v1",
   "task": "Prompt objects", "prompts": [{"kind": "box", "x0": 10, "y0": 12, "z0": 60, "x1": 30, "y1": 34, "z1": 75, "object": 1},
   {"x": 22, "y": 30, "z": 67, "label": 0, "object": 1}, {"x": 40, "y": 40, "z": 67, "object": 2}]}}'
 ```

@@ -21,6 +21,7 @@
 //   engine_bin = ""                     # an engine named outright
 //   cache = ""                          # the node cache folder
 //   def_file = ""                       # what a new image is built from
+//   models = ""                         # the models folder Models… lists (Foundation step)
 //   [cluster.mycluster.job]             # the job asked for
 //   partition = "gpu"  account = "lab"  qos = "normal"  time = "01:00:00"
 //   gpus = 1  cpus = 8  mem = "64G"

@@ -21,6 +21,7 @@
 #include <atomic>
 #include <functional>
 #include <memory>
+#include <mutex>
 #include <optional>
 #include <string>
 #include <thread>
@@ -73,6 +74,21 @@ namespace sirius::app::gui {
         // Step 1, the job: the SSH login, then a job that holds the
         // allocation (saves the profile).
         void connectJob(const cluster::Profile& profile);
+        // Step 1 with one of the user's own jobs in place of a new one
+        // (userJobs): taken up as it is, never cancelled by SIRIUS (saves the
+        // profile).
+        void adoptJob(const cluster::Profile& profile, const std::string& jobId);
+        // The user's jobs that run or wait on the cluster, any of them, as
+        // last asked (refreshJobs, off the GUI thread).
+        struct UserJobs {
+            std::string host;                       // where they were asked
+            std::vector<cluster::ClusterJob> jobs;
+            bool loading = false;
+            bool known = false;                     // asked at least once (for `host`)
+            std::string error;                      // the last ask failed: why
+        };
+        UserJobs userJobs() const;
+        void refreshJobs();
         // Step 2, the worker in that job (saves the profile); restarts a
         // running worker in the same job.
         void startWorker(const cluster::Profile& profile);
@@ -138,8 +154,14 @@ namespace sirius::app::gui {
         // the reason the workbench's HPC config was last given (hpcNoEngineReason)
         bool synced_ = false;
         std::string syncedWhy_;
+        // and the worker's capabilities it was given with (Status::capsSerial):
+        // the engine's Python child comes up after the hello
+        int syncedCaps_ = -1;
         std::shared_ptr<std::atomic<bool>> alive_;
         std::thread disconnecting_;   // a disconnect, stop or new job, off the GUI thread
+        mutable std::mutex jobsMutex_;
+        UserJobs jobs_;               // under jobsMutex_
+        std::thread jobsThread_;      // asks squeue for them
         // Runs `fn` on disconnecting_ (after the one before it).
         void offThread(std::function<void()> fn);
     };

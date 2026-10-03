@@ -29,7 +29,7 @@ namespace sirius::app {
             static const std::vector<std::string> m{"hello", "ping", "cancel", "shutdown", "dataset_info",
                                                     "dataset_read", "dataset_view", "dataset_stats", "pipeline_run", "step_preview",
                                                     "step_validate", "output_stats", "put_file", "stat_file", "outputs_release",
-                                                    "cache_status"};
+                                                    "cache_status", "capabilities"};
             return m;
         }
         // What it relays to the Python worker (server.py's method list, less
@@ -59,7 +59,7 @@ namespace sirius::app {
         // the Python child
         std::unique_ptr<LocalWorker> child;
         mutable std::mutex pythonMutex;
-        std::string pythonState = "disabled", pythonError;
+        std::string pythonState = "disabled", pythonError, pythonStderr;
         json pythonCaps;
         std::vector<std::unique_ptr<RemoteWorker>> idle;   // connections to the child, ready for the next relay
         std::thread starter;
@@ -123,6 +123,9 @@ namespace sirius::app {
                 return w;
             } catch (const CancelledError&) {
                 throw;
+            } catch (const WorkerStartError& e) {
+                failed(e.what(), e.log);
+                throw std::runtime_error("the engine's Python worker is not available: " + std::string(e.what()));
             } catch (const std::exception& e) {
                 failed(e.what());
                 throw std::runtime_error("the engine's Python worker is not available: " + std::string(e.what()));
@@ -135,18 +138,31 @@ namespace sirius::app {
             if (idle.size() < 4) idle.push_back(std::move(w));
         }
 
+        // What the child said in its hello: what the application shows of it
+        // (torch, its CUDA) and the methods it adds (model steps, plugins).
         void ready(const WorkerCapabilities& caps) {
-            json c = {{"version", caps.version}, {"python", caps.python}, {"device", caps.device}, {"cuda", caps.cuda}, {"methods", caps.methods}};
+            json c = {{"version", caps.version}, {"python", caps.python}, {"device", caps.device}, {"cuda", caps.cuda}, {"torch", caps.torch}, {"cuda_usable", caps.cudaUsable}, {"cuda_reason", caps.cudaReason}, {"methods", caps.methods}};
             const std::lock_guard<std::mutex> g(pythonMutex);
             pythonState = "ready";
             pythonError.clear();
+            pythonStderr.clear();
             pythonCaps = std::move(c);
         }
 
-        void failed(const std::string& error) {
+        // `stderrText`: what the child wrote before it gave up; its last lines are kept.
+        void failed(const std::string& error, const std::string& stderrText = {}) {
+            std::string tail = stderrText;
+            while (!tail.empty() && (tail.back() == '\n' || tail.back() == '\r')) tail.pop_back();
+            std::size_t at = tail.size();
+            for (int lines = 0; at > 0 && lines < 12; ++lines) {
+                const std::size_t nl = tail.rfind('\n', at - 1);
+                at = nl == std::string::npos ? 0 : nl;
+            }
+            if (at > 0) tail = tail.substr(at + 1);
             const std::lock_guard<std::mutex> g(pythonMutex);
             pythonState = "failed";
             pythonError = error;
+            pythonStderr = tail;
         }
 
         // Starts the child now, in the background: torch takes minutes to
@@ -224,6 +240,7 @@ namespace sirius::app {
             json s = {{"state", pythonState}};
             if (!pythonCaps.is_null()) s["caps"] = pythonCaps;
             if (!pythonError.empty()) s["error"] = pythonError;
+            if (!pythonStderr.empty()) s["stderr"] = pythonStderr;
             return s;
         }
 
@@ -262,10 +279,11 @@ namespace sirius::app {
             engine["cache_used"] = node->cacheStatus().value("bytes", std::uint64_t{0});
             engine["job"] = {{"id", host::environment("SLURM_JOB_ID")}};
             engine["python"] = pythonStatus();
-            std::string python;
+            std::string python, torch;
             {
                 const std::lock_guard<std::mutex> g(pythonMutex);
                 if (pythonCaps.contains("python") && pythonCaps["python"].is_string()) python = pythonCaps["python"].get<std::string>();
+                if (pythonCaps.contains("torch") && pythonCaps["torch"].is_string()) torch = pythonCaps["torch"].get<std::string>();
             }
             // why this engine computes on no GPU, in the Python worker's words
             const std::string cudaReason = gpus > 0           ? std::string()
@@ -284,6 +302,7 @@ namespace sirius::app {
                     {"cpu_threads", std::max(1u, std::thread::hardware_concurrency())},
                     {"hostname", host::hostName()},
                     {"python", python},
+                    {"torch", torch},
                     {"sirius", buildInfo().version},
                     {"encodings", codec::availableEncodings()},
                     {"max_clients", options.maxClients},
@@ -304,6 +323,15 @@ namespace sirius::app {
         d.server.handle("put_file", [this](const rpc::Request& req, rpc::CallContext&) { return impl_->node->putFile(req); });
         d.server.handle("stat_file", [this](const rpc::Request& req, rpc::CallContext&) { return impl_->node->statFile(req); });
         d.server.handle("outputs_release", [this](const rpc::Request& req, rpc::CallContext&) { return impl_->node->releaseOutputs(req); });
+        // the hello's capabilities again: the Python child is up (or has failed) by now
+        d.server.handle(
+            "capabilities",
+            [this](const rpc::Request&, rpc::CallContext&) {
+                rpc::Reply r;
+                r.result = impl_->capabilities();
+                return r;
+            },
+            rpc::Dispatch::Inline);
         d.server.handle("cache_status", [this](const rpc::Request&, rpc::CallContext&) {
             rpc::Reply r;
             r.result = impl_->node->cacheStatus();

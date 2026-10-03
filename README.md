@@ -383,7 +383,10 @@ Max projection, Mean over time · Contrast (percentile window + gamma, live hist
 Flat-field · Bleach correction · Deskew + rotate · Crop / pad · Resample · Merge
 channels (RGB) · Stitch tiles and Register (the masked-NCC code above) · Segmentation (a TorchScript / ONNX model run tile-wise by the Python worker, labels by
 watershed or connected components; or a model family — Cellpose, micro-SAM — that
-returns labels itself) · Classical segmentation (blob / tube enhancement, white
+returns labels itself) · Foundation model (a trained model folder — `model.py`,
+`model.json`, weights, as latents `scripts/export_model.py` exports it — run by the
+Python worker without the latents package: Segment, or Prompt the objects you point at
+when the model has a prompt decoder) · Classical segmentation (blob / tube enhancement, white
 top-hat, Gaussian, Otsu / multi-Otsu / percentile / manual / local-mean /
 local-contrast threshold, binary opening, hole filling, watershed on distance,
 h-maxima or scale-space blob-centre seeds) · Track objects (frame-to-frame optimal
@@ -463,6 +466,14 @@ nuclei, organelles. Filaments, vessels and networks are not what they are traine
 and on a dense filament network they return cell-shaped pieces that ignore the
 filaments; use Classical segmentation with the Tubes enhancement there, which traces the
 structure (`app/help/seg.md` gives the measurement on the bundled SIM reconstruction).
+
+**Foundation models** are folders, `<models>/<name>/<version>/` with `model.py`,
+`model.json` and `weights.safetensors`: Browse picks one (on this computer or on the
+cluster), and Models… next to the Model field lists those under the models folders of
+`sirius-app.toml` (`[models] folders = [...]`, and a cluster profile's `models = '...'`
+while connected) with their tasks and a line about each. The Task choice offers what
+`model.json` lists. The old `.ltb` bundles are refused with how to re-export them
+(`app/help/foundation.md`).
 
 **Backends**: CUDA (when the build has it and a device is present), CPU, or HPC — a
 Python worker on a cluster node reached over TCP (see "Python worker and HPC backend").

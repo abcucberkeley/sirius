@@ -809,6 +809,27 @@ namespace sirius::app::gui {
             for (std::size_t i = 0; i < d.histograms.size(); ++i) histogramCell(d.histograms[i].channel, i);
         }
 
+        // --- what the step's diagnostics say in words (an error of the preview,
+        // the node still measuring): above the cells, each one copyable ---------
+        if (!d.warnings.empty()) {
+            const ImVec2 top = ImGui::GetCursorScreenPos();
+            const float width = ImGui::GetContentRegionAvail().x;
+            const float textW = std::max(px(40), width - px(28));
+            float y = top.y + px(6);
+            for (std::size_t i = 0; i < d.warnings.size() && i < 4; ++i) {
+                ImGui::PushID(static_cast<int>(i));
+                ImGui::SetCursorScreenPos(ImVec2(top.x + px(14), y));
+                widgets::copyableText("##warning", d.warnings[i], theme::kSmallPx, theme::kNeutral700, Weight::Regular, textW);
+                ImGui::PopID();
+                y += widgets::copyableTextHeight(d.warnings[i], theme::kSmallPx, textW) + px(4);
+            }
+            // the band as one item: the cells start under it
+            ImGui::SetCursorScreenPos(top);
+            ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, ImVec2(0, 0));
+            ImGui::Dummy(ImVec2(std::max(1.0f, width), y + px(2) - top.y));
+            ImGui::PopStyleVar();
+        }
+
         // --- the grid: one row, 2 px of divider between the cells ---------------
         const ImVec2 origin = ImGui::GetCursorScreenPos();
         const ImVec2 avail = ImGui::GetContentRegionAvail();

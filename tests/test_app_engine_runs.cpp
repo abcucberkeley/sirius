@@ -18,6 +18,7 @@
 // No network host is contacted: everything is loopback.
 
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <cmath>
 #include <cstdint>
@@ -38,6 +39,7 @@
 #include <sirius/tiff_io.hpp>
 
 #include "core/build_info.hpp"
+#include "core/ops/builtin.hpp"
 #include "core/ops/contrast.hpp"
 #include "core/ops/load.hpp"
 #include "core/engine_node.hpp"
@@ -503,6 +505,154 @@ TEST_CASE("engine runs: no engine, another engine, files of this computer: refus
     CHECK_THAT(folder.lastRunRefusal().message, Catch::Matchers::ContainsSubstring("a folder is not uploaded"));
 }
 
+namespace {
+
+    // The engine's Python worker child, played here: model_info from the
+    // folder it is given, and a Foundation run that labels one voxel per time
+    // point. Records the model path each request named.
+    struct FakeModelWorker {
+        std::mutex m;
+        std::vector<std::string> models;   // params.model of every run, as the child got it
+        std::vector<std::thread> threads;
+
+        ~FakeModelWorker() {
+            for (std::thread& t : threads) t.join();
+        }
+
+        std::unique_ptr<RemoteWorker> connect() {
+            auto [client, server] = rpc::loopbackPair();
+            {
+                const std::lock_guard<std::mutex> g(m);
+                threads.emplace_back([this, s = std::move(server)]() mutable { serve(std::move(s)); });
+            }
+            return std::make_unique<RemoteWorker>(std::move(client));
+        }
+
+        void serve(std::unique_ptr<rpc::Transport> transport) {
+            std::vector<std::byte> inbox;
+            rpc::HandshakeResponder handshake;
+            for (;;) {
+                std::optional<rpc::Message> msg;
+                while (!(msg = rpc::decodeFrame(inbox))) {
+                    try {
+                        (void)transport->receive(inbox, std::chrono::milliseconds(200));   // false: nothing yet
+                    } catch (const std::exception&) {
+                        return;
+                    }
+                }
+                const json& h = msg->header;
+                const std::string method = h.value("method", "");
+                const json params = h.value("params", json::object());
+                json reply = {{"id", h.value("id", 0)}, {"type", "result"}};
+                if (method == "hello" || method == "auth") {
+                    std::string error;
+                    const json caps = {{"version", "test"}, {"methods", {"run:foundation", "model_info"}}, {"cuda", false}, {"device", "cpu"}, {"hostname", "node"}, {"python", "3"}};
+                    if (auto r = handshake.answer(method, params, caps, error)) reply["result"] = *r;
+                    else reply = {{"id", h.value("id", 0)}, {"type", "error"}, {"message", error}};
+                    transport->send(rpc::encodeFrame(reply, {}));
+                } else if (method == "model_info") {
+                    const std::string path = params.value("path", std::string());
+                    std::string body;
+                    const json man = host::readFile(path + "/model.json", body) ? json::parse(body, nullptr, false) : json();
+                    if (!man.is_object()) {
+                        reply = {{"id", h.value("id", 0)}, {"type", "error"}, {"message", "model folder not found: " + path}};
+                    } else {
+                        reply["result"] = {{"format", "latents-model"}, {"path", path}, {"name", man.value("name", "")}, {"version", man.value("version", "")}, {"tasks", man["tasks"]}};
+                    }
+                    transport->send(rpc::encodeFrame(reply, {}));
+                } else if (method == "run") {
+                    const json p = params.value("params", json::object());
+                    {
+                        const std::lock_guard<std::mutex> g(m);
+                        models.push_back(p.value("model", std::string()));
+                    }
+                    const std::vector<Index> s = msg->tensors.at(0).shape;   // (c, t, z, y, x)
+                    std::vector<std::uint32_t> labels(static_cast<std::size_t>(s[1] * s[2] * s[3] * s[4]), 0u);
+                    for (Index t = 0; t < s[1]; ++t) labels[static_cast<std::size_t>(t * s[2] * s[3] * s[4])] = 1u;
+                    rpc::TensorRef out{"labels", "uint32", {s[1], s[2], s[3], s[4]}, labels.data(), labels.size() * sizeof(std::uint32_t)};
+                    reply["result"] = {{"model", "coat-conv-r0 v1"}, {"objects", s[1]}, {"threshold", 0.5}, {"min_voxels", 0}};
+                    transport->send(rpc::encodeFrame(reply, {out}));
+                } else if (method != "cancel") {
+                    reply = {{"id", h.value("id", 0)}, {"type", "error"}, {"message", "unknown method " + method}};
+                    transport->send(rpc::encodeFrame(reply, {}));
+                }
+            }
+        }
+    };
+
+} // namespace
+
+TEST_CASE("engine runs: a Foundation step's model folder on the cluster goes to the engine's Python worker as the node's path",
+          "[app][engine][hpc][foundation]") {
+    TempDir dir;
+    const std::string data = dir.file("raw.tif");
+    writeStack(data, 2, 6, 48, 40);
+    // the cluster's models folder: <models>/<name>/<version>/model.json
+    const fs::path model = dir.path / "models" / "coat-conv-r0" / "v1";
+    fs::create_directories(model);
+    std::ofstream(model / "model.json") << json{{"format", "latents-model/1"}, {"name", "coat-conv-r0"}, {"version", "v1"}, {"tasks", {"segment"}}, {"input", {{"channels", 1}, {"voxel_um", {0.3, 0.1, 0.1}}}}}
+                                               .dump();
+    FakeModelWorker python;
+    EngineOptions o = quietEngine(dir.file("node-scratch"));
+    o.connectPython = [&](const std::function<bool()>&) { return python.connect(); };
+    {
+        LoopbackEngine le(o);
+        auto ep = std::make_shared<Endpoint>();
+        ep->engine = &le;
+        auto datasets = std::make_shared<RemoteDatasets>("enginehost", [ep] { return ep->connect(); });
+        datasets->install();
+
+        TempDir scratch;
+        Workbench wb(scratch.path / "wb");
+        wb.openDataset(makeClusterPath("enginehost", data));
+        REQUIRE(wb.hasDataset());
+        wb.setRemoteConfig(engineConfig(ep));
+        wb.setBackend(Backend::Hpc);
+        wb.setHpcDevice(HpcDevice::Cpu);
+        while (wb.pipeline().size() > 1) wb.removeStep(1);
+        wb.addStep("foundation", -1, false);
+        const std::string onCluster = makeClusterPath("enginehost", model.generic_string());
+        wb.setStepParam(1, "model", onCluster);
+
+        // what the panel shows: model.json, as the worker beside the engine reads it
+        std::optional<json> info;
+        REQUIRE(pollUntil(wb, [&] { return (info = wb.clusterModelInfo(onCluster)).has_value(); }));
+        CHECK((*info)["tasks"] == json{"segment"});
+        CHECK((*info)["path"] == model.generic_string());
+
+        // checked on the node, with the node's path: Prompt is not what this model offers
+        wb.setStepParam(1, "task", std::string(kPromptTask));
+        (void)wb.stepValidation(1);
+        REQUIRE(pollUntil(wb, [&] { return !wb.stepValidation(1).ok(); }));
+        CHECK_THAT(wb.stepValidation(1).firstError(), Catch::Matchers::ContainsSubstring("coat-conv-r0 v1 cannot be prompted"));
+        wb.setStepParam(1, "task", std::string("Segment objects"));
+        REQUIRE(pollUntil(wb, [&] { return wb.stepValidation(1).ok() && wb.stepValidation(1).warnings.empty(); }));
+
+        std::shared_ptr<RunJob> job = run(wb);
+        REQUIRE(job);
+        INFO(job->error());
+        REQUIRE(job->succeeded());
+        CHECK(job->ranOnEngine());
+        {
+            const std::lock_guard<std::mutex> g(python.m);
+            // the child was handed the folder as the node sees it, not as cluster://
+            CHECK(python.models == std::vector<std::string>{model.generic_string()});
+        }
+        REQUIRE(wb.output(1));
+        CHECK(wb.diagnosticsOf(1).summary.find("coat-conv-r0 v1") != std::string::npos);
+
+        // a model folder of this computer is not uploaded: refused, in words
+        const fs::path local = dir.path / "local-model";
+        fs::create_directories(local);
+        fs::copy_file(model / "model.json", local / "model.json");
+        wb.setStepParam(1, "model", local.generic_string());
+        CHECK_FALSE(wb.createRun());
+        CHECK(wb.lastRunRefusal().kind == RunRefusal::Kind::NeedsUpload);
+        CHECK_THAT(wb.lastRunRefusal().message, Catch::Matchers::ContainsSubstring("is a folder on this computer"));
+        datasets->uninstall();
+    }
+}
+
 TEST_CASE("engine runs: previews and validation come from the node; a missing node file says so", "[app][engine][hpc]") {
     TempDir dir;
     const std::string data = dir.file("raw.tif");
@@ -848,4 +998,214 @@ TEST_CASE("engine runs: Load of a folder on the cluster runs on the node and equ
         CHECK(back.pipeline().size() == 2);
     }
     datasets->uninstall();
+}
+
+// The Contrast step on a dataset like the one it was reported on (c1 t1 z151
+// y512 x256, uint16): one press of Auto (or Reset) asks the node and the
+// answer is applied when it arrives, without a second press; a window
+// dragged asks the node nothing; what cannot be measured says why.
+TEST_CASE("engine runs: Auto and Reset contrast on the cluster complete by themselves", "[app][engine][hpc][contrast]") {
+    TempDir dir;
+    const std::string data = dir.file("raw.tif");
+    writeStack(data, 1, 151, 512, 256);
+    LoopbackEngine le(quietEngine());
+    auto ep = std::make_shared<Endpoint>();
+    ep->engine = &le;
+    auto datasets = std::make_shared<RemoteDatasets>("enginehost", [ep] { return ep->connect(); });
+    datasets->install();
+    TempDir scratch;
+    Workbench wb(scratch.path / "wb");
+    std::atomic<int> wakes{0};
+    wb.setWakeHandler([&wakes] { ++wakes; });
+    wb.openDataset(makeClusterPath("enginehost", data));
+    wb.setRemoteConfig(engineConfig(ep));
+    wb.setBackend(Backend::Hpc);
+    while (wb.pipeline().size() > 1) wb.removeStep(1);
+    wb.addStep("contrast");
+    REQUIRE(wb.pipeline().at(1).params.getDouble("max") <= wb.pipeline().at(1).params.getDouble("min"));   // automatic
+
+    // what this computer computes from the same planes
+    ParamSet expectedAuto, expectedReset;
+    {
+        RemoteDownloads::Allow allow("the test's comparison");
+        expectedAuto = contrastAutoParams(wb.pipeline().at(1).params, wb.output(0)->asInput());
+        expectedReset = contrastResetParams(wb.pipeline().at(1).params, wb.output(0)->asInput());
+    }
+
+    // one press: asked, measuring, then applied by poll() alone
+    const std::uint64_t volumes = RemoteDownloads::volumeBytes(), planes = RemoteDownloads::planeBytes();
+    REQUIRE(wb.requestContrast(1, Workbench::ContrastAction::Auto));
+    CHECK(wb.contrastError(1).empty());
+    REQUIRE(wb.contrastRequest(1));
+    CHECK(wb.contrastRequest(1)->action == Workbench::ContrastAction::Auto);
+    CHECK(wb.contrastMeasuring(1));
+    // an engine set again meanwhile (the cluster's capabilities changed): asked again, not lost
+    wb.setRemoteConfig(engineConfig(ep));
+    REQUIRE(pollUntil(wb, [&] { return !wb.contrastRequest(1); }));
+    CHECK(wakes.load() > 0);
+    INFO(wb.contrastError(1));
+    CHECK(wb.contrastError(1).empty());
+    const ParamSet automatic = wb.pipeline().at(1).params;
+    CHECK(automatic.getDouble("min") == expectedAuto.getDouble("min"));
+    CHECK(automatic.getDouble("max") == expectedAuto.getDouble("max"));
+    CHECK(automatic.getDouble("max") > automatic.getDouble("min"));
+    CHECK_FALSE(wb.contrastMeasuring(1));
+    // nothing but the measurement came here
+    CHECK(RemoteDownloads::volumeBytes() == volumes);
+    CHECK(RemoteDownloads::planeBytes() == planes);
+    // an undoable change, as on this computer
+    CHECK(wb.history().undoLabel() == "Auto contrast");
+    wb.undo();
+    CHECK(wb.pipeline().at(1).params.getDouble("max") <= wb.pipeline().at(1).params.getDouble("min"));
+    wb.redo();
+    CHECK(wb.pipeline().at(1).params.getDouble("max") == automatic.getDouble("max"));
+
+    // Reset: answered from the same measurement, at once
+    REQUIRE(wb.requestContrast(1, Workbench::ContrastAction::Reset));
+    CHECK_FALSE(wb.contrastRequest(1));
+    CHECK(wb.pipeline().at(1).params.getDouble("min") == expectedReset.getDouble("min"));
+    CHECK(wb.pipeline().at(1).params.getDouble("max") == expectedReset.getDouble("max"));
+    CHECK(wb.pipeline().at(1).params.getDouble("gamma") == 1.0);
+
+    // A window dragged (or typed) is drawn at once, with no new measurement:
+    // the effective window, the sliders' range and the histograms.
+    for (double mx : {300.0, 900.0, 1500.0}) {
+        ParamSet p = wb.pipeline().at(1).params;
+        p.set("min", 120.0);
+        p.set("max", mx);
+        p.set("gamma", 0.8);
+        wb.setStepParams(1, p, "drag");
+        const std::optional<ContrastWindow> eff = wb.contrastWindowOf(1, p, 0, false);
+        REQUIRE(eff);
+        CHECK(eff->lo == 120.0f);
+        CHECK(eff->hi == static_cast<float>(mx));
+        const std::optional<ContrastWindow> range = wb.contrastWindowOf(1, p, 0, true);
+        REQUIRE(range);
+        CHECK(range->dataMin == static_cast<float>(expectedReset.getDouble("min")));
+        CHECK(range->dataMax == static_cast<float>(expectedReset.getDouble("max")));
+        const Diagnostics d = wb.diagnosticsOf(1);
+        REQUIRE(d.histograms.size() == 1);
+        CHECK(d.histograms[0].hi == mx);
+        CHECK(d.histograms[0].gamma == 0.8);
+        CHECK_FALSE(wb.contrastMeasuring(1));
+    }
+
+    // other percentiles: a new measurement, applied when it arrives
+    wb.setStepParam(1, "hi_percentile", 50.0);
+    REQUIRE(wb.requestContrast(1, Workbench::ContrastAction::Auto));
+    REQUIRE(pollUntil(wb, [&] { return !wb.contrastRequest(1); }));
+    CHECK(wb.contrastError(1).empty());
+    CHECK(wb.pipeline().at(1).params.getDouble("max") < expectedAuto.getDouble("max"));
+    CHECK(wb.pipeline().at(1).params.getDouble("max") > wb.pipeline().at(1).params.getDouble("min"));
+
+    // An input not computed on the node: said at once, nothing is waited on.
+    wb.addStep("maxproj", 1, false);
+    REQUIRE(wb.pipeline().at(2).kind == "contrast");
+    CHECK_FALSE(wb.requestContrast(2, Workbench::ContrastAction::Auto));
+    CHECK_FALSE(wb.contrastRequest(2));
+    CHECK_THAT(wb.contrastError(2), Catch::Matchers::ContainsSubstring("is not computed on the cluster node yet"));
+    CHECK_THAT(wb.contrastError(2), Catch::Matchers::ContainsSubstring("Max projection"));
+    CHECK(logHas(wb, "Auto contrast of step 03: its input, step 02 Max projection"));
+    CHECK_FALSE(wb.diagnosticsOf(2).warnings.empty());
+    // ... and once it ran there, Auto measures it
+    std::shared_ptr<RunJob> job = run(wb, 1);
+    REQUIRE(job);
+    INFO(job->error());
+    REQUIRE(job->succeeded());
+    REQUIRE(wb.requestContrast(2, Workbench::ContrastAction::Auto));
+    REQUIRE(pollUntil(wb, [&] { return !wb.contrastRequest(2); }));
+    CHECK(wb.contrastError(2).empty());
+    CHECK(wb.pipeline().at(2).params.getDouble("max") > wb.pipeline().at(2).params.getDouble("min"));
+
+    // the engine gone while it measures: said, not waited on forever
+    wb.setStepParam(2, "lo_percentile", 1.0);
+    REQUIRE(wb.requestContrast(2, Workbench::ContrastAction::Auto));
+    REQUIRE(wb.contrastRequest(2));
+    wb.setRemoteConfig(RemoteConfig{});
+    CHECK_FALSE(wb.contrastRequest(2));
+    CHECK_THAT(wb.contrastError(2), Catch::Matchers::ContainsSubstring("is gone"));
+    datasets->uninstall();
+}
+
+TEST_CASE("engine runs: Auto contrast through a real sirius-cli serve", "[app][engine][hpc][contrast]") {
+    TempDir dir;
+    const std::string data = dir.file("raw.tif");
+    writeStack(data, 1, 151, 512, 256);
+    const std::string tokenFile = dir.file("token");
+    std::ofstream(fs::u8path(tokenFile)) << "serve-token-7\n";
+    fs::permissions(fs::u8path(tokenFile), fs::perms::owner_read | fs::perms::owner_write, fs::perm_options::replace);
+    ChildProcess p;
+    ChildProcess::Options o;
+    o.program = SIRIUS_TEST_CLI;
+    o.arguments = {"serve", "--port", "0", "--no-python-worker", "--device", "cpu", "--exit-with-parent", "--scratch", dir.file("scratch")};
+    o.environment = {{"SIRIUS_TOKEN_FILE", tokenFile}};
+    o.killTree = true;
+    REQUIRE(p.start(o));
+    std::string line;
+    REQUIRE(p.readLine(line, 60000));
+    RemoteConfig rc;
+    rc.host = "127.0.0.1";
+    rc.port = json::parse(line)["port"].get<int>();
+    rc.token = "serve-token-7";
+    auto control = rc.open();
+    rc.known = true;
+    rc.engine = control->capabilities().engine;
+    REQUIRE(rc.hasEngine());
+    auto datasets = std::make_shared<RemoteDatasets>("localengine", [rc] { return rc.open(); });
+    datasets->install();
+    TempDir scratch;
+    Workbench wb(scratch.path / "wb");
+    wb.openDataset(makeClusterPath("localengine", data));
+    wb.setRemoteConfig(rc);
+    wb.setBackend(Backend::Hpc);
+    while (wb.pipeline().size() > 1) wb.removeStep(1);
+    wb.addStep("contrast");
+    REQUIRE(wb.requestContrast(1, Workbench::ContrastAction::Auto));
+    REQUIRE(pollUntil(wb, [&] { return !wb.contrastRequest(1); }));
+    INFO(wb.contrastError(1));
+    CHECK(wb.contrastError(1).empty());
+    CHECK(wb.pipeline().at(1).params.getDouble("max") > wb.pipeline().at(1).params.getDouble("min"));
+    CHECK(wb.history().undoLabel() == "Auto contrast");
+    // the step runs there with that window; the viewer reads its output's range from the node
+    std::shared_ptr<RunJob> job = run(wb);
+    REQUIRE(job);
+    INFO(job->error());
+    REQUIRE(job->succeeded());
+    auto* node = dynamic_cast<NodeOutputSource*>(const_cast<ArraySource*>(wb.output(1)->source.get()));
+    REQUIRE(node);
+    (void)node->window(0, 0, true);
+    node->waitIdle();
+    const auto window = node->window(0, 0, true);
+    REQUIRE(window);
+    CHECK(window->first >= 0.0f);
+    CHECK(window->second <= 1.0f);
+    CHECK(window->second > window->first);
+    control->call("shutdown", json::object());
+    CHECK(p.waitForExit(30000));
+    datasets->uninstall();
+}
+
+// A step run on the CPU with a GPU chosen says why: its operation has no GPU code.
+TEST_CASE("engine runs: a step without GPU code says so when a GPU was chosen", "[app][engine]") {
+    registerBuiltinOperations();   // (a Workbench registers them; this test has none)
+    TempDir dir;
+    const std::string data = dir.file("raw.tif");
+    writeStack(data, 1, 6, 32, 24);
+    Executor ex(dir.path / "scratch");
+    Pipeline p;
+    p.at(0).params.set("path", data);
+    p.add("maxproj");
+    StepContext ctx;
+    ctx.backend = Backend::Cuda;
+    REQUIRE(ex.run(p, 1, ctx));
+    const std::shared_ptr<const StepOutput> out = ex.lastOutput(p.at(1).id);
+    REQUIRE(out);
+    CHECK(out->ranOnDevice == kCpuNoGpuPath);
+    CHECK(placementText(*out) == "on this computer (CPU \xE2\x80\x94 no GPU implementation)");
+    CHECK(placementTag(*out) == "this computer \xC2\xB7 CPU");
+    // asked for the CPU, it is just the CPU
+    Executor cpu(dir.path / "scratch2");
+    StepContext onCpu;
+    REQUIRE(cpu.run(p, 1, onCpu));
+    CHECK(cpu.lastOutput(p.at(1).id)->ranOnDevice == "CPU");
 }

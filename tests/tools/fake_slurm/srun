@@ -12,7 +12,9 @@
 # $SIRIUS_ENGINE_BIN serve, without its Python child unless
 # $FAKE_ENGINE_PYTHON=1 -- on 127.0.0.1 (never 0.0.0.0) with the token file
 # the application wrote, through the launcher ($SIRIUS_LAUNCHER, the fake
-# apptainer) as the script starts it. What reached its environment goes to
+# apptainer) as the script starts it. The checks before a start (`bash
+# <launch script> --check ...`) are run, the real script, its command line
+# appended to <id>.checks. Each step gets CUDA_VISIBLE_DEVICES as below. What reached its environment goes to
 # <id>.env (the token only as "set"). With $FAKE_SLURM_DETACH=1 the engine
 # outlives the ssh session that started it, as a real step does: on POSIX in
 # a session of its own, on Windows started by WMI, outside the job object
@@ -43,7 +45,34 @@ step="$dir/$id.step$n"
 echo "${name:-bash}" > "$step.name"
 [ -n "$gres" ] && echo "$gres" > "$step.gres"
 
+# The step's GPUs, as Slurm names them: a node that confines a job's devices
+# gives the step as many as --gres=gpu:N asks for (CUDA_VISIBLE_DEVICES=0..N-1);
+# a file step_gpus in $FAKE_SLURM_DIR plays one that hands every step all of
+# its GPUs (its text, "0,1,2,3"), whatever the step asked for.
+unset CUDA_VISIBLE_DEVICES SLURM_STEP_GPUS
+if [ -f "$dir/step_gpus" ]; then
+    export CUDA_VISIBLE_DEVICES="$(tr -d '\r\n' < "$dir/step_gpus")"
+elif [ -n "$gres" ]; then
+    gn="${gres##*:}"
+    ids=""
+    for ((g = 0; g < gn; g++)); do ids="${ids:+$ids,}$g"; done
+    export CUDA_VISIBLE_DEVICES="$ids"
+fi
+# what each step was given: "<step name> <ids>" in <id>.gpus
+if [ -n "${CUDA_VISIBLE_DEVICES+x}" ]; then printf '%s %s\n' "${name:-bash}" "$CUDA_VISIBLE_DEVICES" >> "$dir/$id.gpus"; fi
+
 case " $* " in
+    # the checks before a worker's start (`bash <launch script> --check ...`): run, as srun would
+    *sirius_worker*.sbatch\ --check*)
+        printf '%s\n' "$*" >> "$dir/$id.checks"
+        "$@" &
+        pid=$!
+        echo "$pid" > "$step.pid"
+        wait "$pid"
+        rc=$?
+        rm -f "$step".*
+        exit $rc
+        ;;
     *sirius_worker*.sbatch*) ;;
     *)
         "$@" &
@@ -62,7 +91,7 @@ printf '%s\n' "$script" > "$dir/$id.script"
 cp "$script" "$dir/$id.script.txt" 2>/dev/null
 # the worker's code: where the application said it is (else the checkout's, as before)
 wdir="${SIRIUS_WORKER_DIR:-$PWD/app/python}"
-env | grep -E '^SIRIUS_(PORT|VENV|DEVICE|MAX_CLIENTS|CONTAINER|CONTAINER_BIND|CONTAINER_PYTHONPATH|LAUNCHER|ENGINE|ENGINE_BIN|ENGINE_DIR|ENGINE_SCRATCH|WORKER_DIR)=' |
+env | grep -E '^(SIRIUS_(PORT|VENV|DEVICE|GPUS|MAX_CLIENTS|CONTAINER|CONTAINER_BIND|CONTAINER_PYTHONPATH|LAUNCHER|ENGINE|ENGINE_BIN|ENGINE_DIR|ENGINE_SCRATCH|WORKER_DIR)|CUDA_VISIBLE_DEVICES)=' |
     sort > "$dir/$id.env"
 [ -n "${SIRIUS_TOKEN:-}" ] && echo "SIRIUS_TOKEN=<set>" >> "$dir/$id.env"
 [ -n "${SIRIUS_TOKEN_FILE:-}" ] && echo "SIRIUS_TOKEN_FILE=<set>" >> "$dir/$id.env"

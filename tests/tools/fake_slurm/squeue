@@ -4,15 +4,40 @@
 # steps instead (fake_slurm/srun), with %i (<id>.<n>) and %j (the step's name).
 set -u
 dir="${FAKE_SLURM_DIR:?}"
-id="" fmt="%T" steps=0
+id="" fmt="%T" steps=0 user=""
 while [ $# -gt 0 ]; do
     case "$1" in
         -j) id="$2"; shift 2 ;;
         -o) fmt="$2"; shift 2 ;;
         -s) steps=1; shift ;;
+        -u) user="$2"; shift 2 ;;
         *) shift ;;
     esac
 done
+
+# `squeue -u <user> -o ...`: every job of the fake cluster that runs or waits,
+# SIRIUS's or not, with %i %j %P %T %M %l %D %R %b %C %m. A job's
+# <id>.info ("name|partition|gres|cpus|mem|node") says what it is; SIRIUS's
+# own holders are "sirius" on the default partition with the test's GPUs.
+if [ -n "$user" ] && [ -z "$id" ]; then
+    for f in "$dir"/*.state; do
+        [ -f "$f" ] || continue
+        j=$(basename "$f" .state)
+        st=$(cat "$f")
+        left=$(cat "$dir/$j.pending" 2>/dev/null || echo 0)
+        [ "$st" = RUNNING ] && [ "$left" -gt 0 ] && st=PENDING
+        case "$st" in RUNNING | PENDING) ;; *) continue ;; esac
+        name=sirius part=gpu gres=gpu:1 cpus=8 mem=64G node="${FAKE_SLURM_NODE:-fakenode}"
+        if [ -f "$dir/$j.info" ]; then IFS='|' read -r name part gres cpus mem node < "$dir/$j.info" || true; fi
+        where="$node"
+        [ "$st" = PENDING ] && where="(Resources)"
+        out="${fmt//%i/$j}"; out="${out//%j/$name}"; out="${out//%P/$part}"; out="${out//%T/$st}"
+        out="${out//%M/0:42}"; out="${out//%l/${FAKE_SLURM_LIMIT:-1:00:00}}"; out="${out//%D/1}"; out="${out//%R/$where}"
+        out="${out//%b/$gres}"; out="${out//%C/$cpus}"; out="${out//%m/$mem}"
+        echo "$out"
+    done
+    exit 0
+fi
 [ -f "$dir/$id.state" ] || exit 0
 
 alive() {   # a step's process: there, or not yet written (it is starting)

@@ -42,7 +42,7 @@ namespace sirius::app::cluster {
             case Step::Login: return "Log in";
             case Step::Submit: return "Ask for a job";
             case Step::Queue: return "Wait for the job to start";
-            case Step::Checks: return "Check the image";
+            case Step::Checks: return "Check the image and the engine in the job";
             case Step::Start: return "Start the worker in the job";
             case Step::Hello: return "Connect to the worker";
         }
@@ -246,6 +246,18 @@ namespace sirius::app::cluster {
             const std::string e = stripped(entry);
             const std::string host = stripped(e.substr(0, e.find(':')));
             if (!host.empty()) out.push_back(host);
+        }
+        return out;
+    }
+
+    std::vector<std::pair<std::string, std::string>> bindPairs(const std::string& bind) {
+        std::vector<std::pair<std::string, std::string>> out;
+        for (const std::string& entry : splitOn(bind, ',')) {
+            const std::vector<std::string> f = splitOn(stripped(entry), ':');
+            const std::string host = f.empty() ? std::string() : stripped(f[0]);
+            if (host.empty()) continue;
+            const std::string inside = f.size() > 1 && !stripped(f[1]).empty() ? stripped(f[1]) : host;
+            out.emplace_back(host, inside);
         }
         return out;
     }
@@ -950,7 +962,12 @@ namespace sirius::app::cluster {
         int workerSeq = 0;                           // numbers the worker steps' and builds' logs, under m
         std::string engineDir;                       // the engine build the checks picked ("" none), under m
         std::string workerDir;                       // the worker's code the checks found (a shell word), under m
+        std::optional<BuildInfo> engineJson;         // the picked engine build's BUILD.json, under m
+        std::string buildsHint;                      // a builds folder the checks found on the cluster ("" none), under m
+        std::string codeNote;                        // where the worker's code comes from, in words, under m
         std::string reattachJob;                     // a job left running at the last disconnect, to reattach to, under m
+        std::string adoptId;                         // a job of the user's to take up (adoptJob), under m
+        std::string adoptedJob;                      // the job taken up so ("" none): never cancelled, under m
         std::optional<ClusterInfo> info;             // under m
         std::atomic<bool> querying{false};
         std::mutex controlMutex;
@@ -1158,11 +1175,46 @@ namespace sirius::app::cluster {
             {
                 const std::lock_guard<std::mutex> g(m);
                 jobProfile = p;
+                adoptedJob.clear();
             }
-            update([&](Status& x) { x.jobId = id; });
+            update([&](Status& x) {
+                x.jobId = id;
+                x.adopted = false;
+            });
             const std::string where = p.partition.empty() ? std::string() : " to " + p.partition;
             stepState(Step::Submit, StepStatus::Done, "job " + id + where);
             say("Cluster: submitted job " + id + where);
+        }
+
+        // A job of the user's own, taken up in place of a new one: it holds
+        // what it holds (its node, its GPUs: the worker's step asks for as
+        // many), and SIRIUS never cancels it.
+        void takeUp(const Profile& p, const std::string& id) {
+            stepState(Step::Submit, StepStatus::Running, "job " + id + " (yours)");
+            const ssh::CommandResult r = remote(userJobsScript(), std::chrono::seconds(60));
+            const std::vector<ClusterJob> jobs = parseUserJobs(r.out);
+            const auto it = std::find_if(jobs.begin(), jobs.end(), [&id](const ClusterJob& j) { return j.id == id; });
+            if (it == jobs.end())
+                throw Failure{Step::Submit, "Job " + id + " is not among your running or waiting jobs on " + p.host + ".", trim(r.err.empty() ? r.out : r.err),
+                              "Refresh the list of your jobs, or start a new job."};
+            Profile held = p;
+            held.gpus = it->gpus;
+            if (it->cpus > 0) held.cpus = it->cpus;
+            held.mem = it->mem;
+            held.partition = it->partition;
+            held.time = it->limit;
+            {
+                const std::lock_guard<std::mutex> g(m);
+                jobProfile = held;
+                adoptedJob = id;
+            }
+            update([&](Status& x) {
+                x.jobId = id;
+                x.adopted = true;
+            });
+            const std::string what = jobSummary(*it);
+            stepState(Step::Submit, StepStatus::Done, "job " + id + " (yours) \xC2\xB7 " + it->partition + (what.empty() ? std::string() : " \xC2\xB7 " + what));
+            say("Cluster: taking up your job " + id + " (" + it->name + ", " + it->partition + "): SIRIUS never cancels it");
         }
 
         // The job's log (the holder's), in the private ~/.sirius/run.
@@ -1262,10 +1314,13 @@ namespace sirius::app::cluster {
         // Step 2: the worker in the job
         // ================================================================================
 
-        // Checks for the worker: srun, the checkout (the worker's code is
-        // bound into the image from it), the image, the launcher, the data
-        // folders, sirius and numpy importable in the image, the engine
-        // build that fits this application, and the node cache folder.
+        // Checks for the worker, part one, on the login node: srun, the image
+        // file, the worker's code (bound into the image from the checkout, or
+        // the engine build's python/), and the engine builds, to list them and
+        // pick the one that fits this application. File checks only: nothing
+        // here asks whether anything runs on the login node, whose scratch
+        // may be mounted noexec (the engine never runs there). What runs is
+        // checked in the job (checkInJob).
         void checks(const Profile& p) {
             if (trim(p.container).empty())
                 throw Failure{Step::Checks, "No worker image is set: SIRIUS's worker runs in an Apptainer/Singularity image (.sif) on the cluster.", {}, "Pick the image under Worker image (Browse lists the cluster's files), or build one with \"Build an image\". "
@@ -1274,7 +1329,7 @@ namespace sirius::app::cluster {
             // the worker's code: the engine build's own (its commit's), else the checkout's
             if (trim(p.checkout).empty() && !builds)
                 throw Failure{Step::Checks, "No SIRIUS checkout on the cluster is set, and " + p.host + " did not say where your home folder is.", {}, "Set \"SIRIUS checkout on the cluster\" under Job \xE2\x96\xB8 More options to the folder you cloned SIRIUS into there."};
-            stepState(Step::Checks, StepStatus::Running, "the worker's code, the image, the launcher, the engine");
+            stepState(Step::Checks, StepStatus::Running, "on the login node: the image file, the worker's code, the engine builds");
             const std::string co = trim(p.checkout).empty() ? std::string() : remotePathWord(p.checkout);
             std::string script;
             script += "command -v srun >/dev/null 2>&1 && echo srun=yes || echo srun=no\n";
@@ -1282,43 +1337,15 @@ namespace sirius::app::cluster {
             script += "echo \"home=$HOME\"\n";
             script += "C=" + remotePathWord(p.container) + "\n";
             script += "if [ ! -f \"$C\" ]; then echo image=no; elif test -r \"$C\"; then echo image=yes; else echo image=unreadable; fi\n";
-            // each bind's host path: apptainer stops before the worker starts on one that is not there
-            const std::vector<std::string> binds = bindHostPaths(p.bind);
-            for (std::size_t i = 0; i < binds.size(); ++i)
-                script += "test -d " + remotePathWord(binds[i]) + " && echo bind" + std::to_string(i) + "=yes || echo bind" + std::to_string(i) + "=no\n";
             if (builds) script += engineBuildsScript(p.engineBuilds);
-            script += launcherScript(p);
-            script += "echo \"launcher=$L\"\n";
-            const std::string bw = bindWord(p.bind);
-            const std::string bindArgs = bw.empty() ? std::string() : "--bind " + bw + " ";
-            script += "if test -r \"$C\" && [ -n \"$L\" ]; then\n"
-                      // a folder named sirius (a checkout in the working directory) imports as an empty namespace: not the package
-                      "    \"$L\" exec " +
-                      bindArgs +
-                      "\"$C\" python -c 'import sys, importlib.util as u; import sirius, numpy; "
-                      "assert getattr(sirius, \"__file__\", None), \"sirius is only a folder named so, not the compiled package\"; print(\"c_pyver=%d.%d\" % "
-                      "sys.version_info[:2]); print(\"c_torch=%s\" % (\"yes\" if u.find_spec(\"torch\") else \"no\"))' </dev/null\n"
-                      "    echo \"c_rc=$?\"\n"
-                      "fi\n";
-            // SIRIUS's engine when no builds folder names it: the executable
-            // named outright (on this file system, or in the image), or the
-            // image's own; and where per-commit builds may be, for the fix
-            if (p.engine && !builds) {
-                const std::string bin = trim(p.engineBin).empty() ? std::string("/opt/sirius/bin/sirius-cli") : trim(p.engineBin);
-                script += "EBIN=" + (trim(p.engineBin).empty() ? shellQuote(bin) : remotePathWord(bin)) + "\n";
-                script += "if [ -x \"$EBIN\" ] && [ \"$EBIN\" != /opt/sirius/bin/sirius-cli ]; then echo ebin=host\n"
-                          "elif test -r \"$C\" && [ -n \"$L\" ] && \"$L\" exec " +
-                          bindArgs +
-                          "\"$C\" test -x \"$EBIN\" </dev/null >/dev/null 2>&1; then echo ebin=image\n"
-                          "else echo ebin=no; fi\n";
+            // where per-commit builds may be, for the fix when no builds folder is set
+            if (p.engine && !builds)
                 script += "for d in \"$(dirname \"$C\")/sirius-builds\" \"$(dirname \"$(dirname \"$C\")\")/sirius-builds\" \"$HOME/sirius-builds\"" +
                           (co.empty() ? std::string() : " " + co + "/../sirius-builds") +
                           "; do\n"
                           "    if ls \"$d\"/*/BUILD.json >/dev/null 2>&1; then echo \"builds_hint=$(cd \"$d\" && pwd -P)\"; break; fi\n"
                           "done\n";
-            }
-            // a first exec of a large image on a network file system takes a while
-            const ssh::CommandResult r = remote(script, std::chrono::seconds(300));
+            const ssh::CommandResult r = remote(script, std::chrono::seconds(120));
             auto kv = keyValues(r.out);
             const std::string ask = "Build the worker image again (\"Build an image\", or app/python/slurm/README.md), or ask whoever builds it on this "
                                     "cluster for the current one, and pick it under Worker image.";
@@ -1330,23 +1357,9 @@ namespace sirius::app::cluster {
                 throw Failure{Step::Checks, "The worker image " + p.container + " on " + p.host + " cannot be read (test -r failed).", trim(r.err),
                               "Make it readable to you (chmod a+r), or pick a copy you can read under Worker image."};
             if (kv["image"] != "yes") throw Failure{Step::Checks, "There is no worker image at " + p.container + " on " + p.host + ".", trim(r.err), ask};
-            for (std::size_t i = 0; i < binds.size(); ++i)
-                if (kv["bind" + std::to_string(i)] != "yes")
-                    throw Failure{Step::Checks, "The data folder " + binds[i] + " is not a folder on " + p.host + ": apptainer would stop before the worker starts.",
-                                  trim(r.err), "Correct it or remove it under Data folders (the folders on the cluster your datasets live in)."};
-            if (kv["launcher"].empty())
-                throw Failure{Step::Checks,
-                              "Neither " + (p.launcher.empty() ? std::string("apptainer") : p.launcher) + " nor singularity can be run on " + p.host +
-                                  " (module load was tried).",
-                              trim(r.err),
-                              "Ask your cluster's support how to run apptainer there, or set \"Container launcher\" under Job \xE2\x96\xB8 More options to its full path."};
-            if (kv["c_rc"] != "0")
-                throw Failure{Step::Checks, "The worker image " + p.container + " cannot run the worker: sirius and numpy do not import in it.", trim(r.err), ask};
-            std::string detail = kv["launcher"] + " \xC2\xB7 image: python " + kv["c_pyver"] + ", sirius, numpy";
-            detail += kv["c_torch"] == "yes" ? ", torch" : " \xC2\xB7 no torch (models will not run)";
-            if (!binds.empty()) detail += " \xC2\xB7 " + std::to_string(binds.size()) + (binds.size() == 1 ? " data folder" : " data folders");
-            // the engine that serves this application, made sure of
+            // the engine build that serves this application, from what its files say
             std::string buildDir, buildNote, codeDir;
+            std::optional<BuildInfo> buildJson;
             if (builds) {
                 if (kv["builds"] != "yes")
                     throw Failure{Step::Checks, "There is no engine builds folder at " + p.engineBuilds + " on " + p.host + ".", trim(r.err),
@@ -1358,17 +1371,12 @@ namespace sirius::app::cluster {
                 buildDir = trim(p.engineBuilds);
                 while (buildDir.size() > 1 && buildDir.back() == '/') buildDir.pop_back();
                 buildDir += "/" + b.dir;
-                detail += " \xC2\xB7 engine " + b.dir.substr(0, 12) + " (" + buildNote + ")";
+                buildJson = b.info;
                 if (b.python) codeDir = remotePathWord(buildDir + "/python");
             } else if (p.engine) {
-                if (kv["ebin"] != "host" && kv["ebin"] != "image") {
-                    const std::string where = trim(p.engineBin).empty() ? "the image " + p.container + " has no /opt/sirius/bin/sirius-cli, and no Engine builds folder is set"
-                                                                        : trim(p.engineBin) + " is neither an executable on " + p.host + " nor in the image";
-                    throw Failure{Step::Checks, "No SIRIUS C++ engine found: " + where + ".", trim(r.err), noEngineFix(trim(kv["builds_hint"])), true};
-                }
                 buildNote = trim(p.engineBin).empty() ? std::string("the image's own engine") : "engine " + trim(p.engineBin);
-                detail += " \xC2\xB7 " + buildNote;
             }
+            std::string code = "worker's code from the engine build";
             if (codeDir.empty()) {
                 if (co.empty() || kv["worker"] != "yes")
                     throw Failure{Step::Checks,
@@ -1378,27 +1386,27 @@ namespace sirius::app::cluster {
                                   "Clone this SIRIUS repository there (the same version as this application), or set \"SIRIUS checkout on the cluster\" under "
                                   "Job \xE2\x96\xB8 More options to where it is."};
                 codeDir = co + "/app/python";
-                detail = "checkout \xC2\xB7 " + detail;
-            } else {
-                detail = "worker's code from the engine build \xC2\xB7 " + detail;
+                code = "checkout";
             }
             {
                 const std::lock_guard<std::mutex> g(m);
                 engineDir = buildDir;
+                engineJson = buildJson;
                 workerDir = codeDir;
+                buildsHint = trim(kv["builds_hint"]);
+                codeNote = code;
             }
             update([&](Status& x) {
                 x.engineBuild = buildDir;
                 x.engineBuildNote = buildNote;
             });
-            if (const std::string w = emptyBindWarning(p); !w.empty()) {
-                // not a failure: data in the home folder opens all the same
-                stepState(Step::Checks, StepStatus::Warning, detail + " \xC2\xB7 " + w);
-                say("Cluster: " + w);
-            } else {
-                stepState(Step::Checks, StepStatus::Done, detail);
-            }
-            checkScratch(p);
+            stepState(Step::Checks, StepStatus::Running, code + (buildDir.empty() ? std::string() : " \xC2\xB7 engine " + shortCommit(buildDir)) + " \xC2\xB7 next: in the job");
+        }
+
+        // The last part of a build folder's path, cut to a commit's 12 characters.
+        static std::string shortCommit(const std::string& buildDir) {
+            const std::size_t slash = buildDir.find_last_of('/');
+            return (slash == std::string::npos ? buildDir : buildDir.substr(slash + 1)).substr(0, 12);
         }
 
         // A worker whose code is another version than this application's.
@@ -1413,42 +1421,132 @@ namespace sirius::app::cluster {
 
         static std::string listBuilds(const std::vector<EngineBuild>& found) {
             std::string out;
-            for (const EngineBuild& b : found)
-                out += b.dir + ": " + (b.readable ? b.info.build + (b.runnable ? std::string() : " (bin/sirius-cli missing)") : std::string("BUILD.json unreadable")) +
-                       "\n";
+            for (const EngineBuild& b : found) {
+                std::string why;
+                if (!b.binThere) why = " (no bin/sirius-cli)";
+                else if (!b.runnable) why = " (bin/sirius-cli has no execute bit)";
+                else if (!b.lib) why = " (no lib/)";
+                out += b.dir + ": " + (b.readable ? b.info.build + why : std::string("BUILD.json unreadable")) + "\n";
+            }
             return out;
         }
 
-        // The node cache folder (the engine's --scratch), when one is set: a
-        // folder there you can write to, or one that can be made. One that
-        // is not on the login node at all may be a node's own disk: said,
-        // not refused.
-        void checkScratch(const Profile& p) {
-            const std::string dir = trim(p.scratch);
-            if (!p.engine || dir.empty()) return;
-            std::string script = "S=" + remotePathWord(dir) + "\n";
-            script += "if [ -d \"$S\" ]; then if [ -w \"$S\" ]; then echo scratch=yes; else echo scratch=readonly; fi\n"
-                      "elif [ -e \"$S\" ]; then echo scratch=file\n"
-                      "else d=\"$S\"; while [ ! -e \"$d\" ] && [ \"$d\" != / ] && [ \"$d\" != . ]; do d=$(dirname \"$d\"); done\n"
-                      "     if [ -d \"$d\" ] && [ -w \"$d\" ]; then echo scratch=creatable; else echo scratch=missing; fi\n"
-                      "fi\n";
-            const ssh::CommandResult r = remote(script, std::chrono::seconds(30));
-            const std::string s = keyValues(r.out)["scratch"];
-            const std::string where = "Choose another folder under Job \xE2\x96\xB8 More options, or leave it empty to use the node's temporary folder.";
-            if (s == "file") throw Failure{Step::Checks, "The node cache folder " + dir + " is a file on " + p.host + ", not a folder.", trim(r.err), where};
-            if (s == "readonly") throw Failure{Step::Checks, "You cannot write to the node cache folder " + dir + " on " + p.host + ".", trim(r.err), where};
-            StepState now;
+        // What every step of the worker's is told, through the environment of
+        // the srun that starts it (sirius_worker.sbatch reads it): the
+        // worker's code, the image and its launcher, the data folders, the
+        // Python path, the job's GPUs, the engine and its node cache folder.
+        // Never the token.
+        static std::string stepEnvironment(const Profile& p, const std::string& dir, const std::string& code, int gpus) {
+            std::string script = "export SIRIUS_WORKER_DIR=" + code + "\n";
+            script += "export SIRIUS_CONTAINER=" + remotePathWord(p.container) + "\n";
+            script += "export SIRIUS_LAUNCHER=" + shellQuote(p.launcher.empty() ? std::string("apptainer") : p.launcher) + "\n";
+            // the data folders and the extra PYTHONPATH, quoted (a "~/" bind made $HOME)
+            if (const std::string bw = bindWord(p.bind); !bw.empty()) script += "export SIRIUS_CONTAINER_BIND=" + bw + "\n";
+            else script += "unset SIRIUS_CONTAINER_BIND\n";
+            if (const std::string pp = trim(p.containerPythonPath); !pp.empty()) script += "export SIRIUS_CONTAINER_PYTHONPATH=" + shellQuote(pp) + "\n";
+            else script += "unset SIRIUS_CONTAINER_PYTHONPATH\n";
+            // the job's GPUs: the step is held to as many as the job asked for
+            script += gpus <= 0 ? "export SIRIUS_DEVICE=cpu SIRIUS_GPUS=0\n" : "unset SIRIUS_DEVICE\nexport SIRIUS_GPUS=" + std::to_string(gpus) + "\n";
+            // SIRIUS's engine (`sirius-cli serve`) as the step's main process, the Python worker its child
+            if (p.engine) {
+                script += "export SIRIUS_ENGINE=1\n";
+                if (const std::string bin = trim(p.engineBin); !bin.empty()) {
+                    script += "export SIRIUS_ENGINE_BIN=" + remotePathWord(bin) + "\nunset SIRIUS_ENGINE_DIR\n";
+                } else if (!dir.empty()) {
+                    // the per-commit build, bound into the image by the script
+                    script += "export SIRIUS_ENGINE_DIR=" + remotePathWord(dir) + "\n";
+                    script += "export SIRIUS_ENGINE_BIN=\"$SIRIUS_ENGINE_DIR/bin/sirius-cli\"\n";
+                } else {
+                    script += "unset SIRIUS_ENGINE_BIN SIRIUS_ENGINE_DIR\n";
+                }
+                if (const std::string cache = trim(p.scratch); !cache.empty()) script += "export SIRIUS_ENGINE_SCRATCH=" + remotePathWord(cache) + "\n";
+                else script += "unset SIRIUS_ENGINE_SCRATCH\n";
+            } else {
+                script += "unset SIRIUS_ENGINE SIRIUS_ENGINE_BIN SIRIUS_ENGINE_DIR SIRIUS_ENGINE_SCRATCH\n";
+            }
+            return script;
+        }
+
+        // The srun that runs a step of the job: one task on the job's node,
+        // beside the job's own (--overlap), given the job's GPUs.
+        static std::string srunLine(const std::string& id, const std::string& name, int gpus) {
+            std::string srun = "srun --jobid=" + id + " --overlap --nodes=1 --ntasks=1 --job-name=" + name;
+            if (gpus > 0) srun += " --gres=gpu:" + std::to_string(gpus);
+            return srun;
+        }
+
+        // Checks for the worker, part two, where it will run: the launch
+        // script's --check as a step of the job, on its node, in the image,
+        // with the binds, library path and environment the start gives it
+        // (one srun, a few seconds). A failure stops here: nothing starts.
+        void checkInJob(const Profile& p, const std::string& id, const std::string& node) {
+            std::string dir, code, hint, codeText;
+            std::optional<BuildInfo> buildJson;
+            Profile job = p;
             {
                 const std::lock_guard<std::mutex> g(m);
-                now = status.steps[static_cast<std::size_t>(Step::Checks)];
+                dir = engineDir;
+                code = workerDir;
+                buildJson = engineJson;
+                hint = buildsHint;
+                codeText = codeNote;
+                job.gpus = jobProfile.gpus;
             }
-            if (s == "yes" || s == "creatable") {
-                stepState(Step::Checks, now.status, now.detail + " \xC2\xB7 node cache " + dir);
-                return;
+            stepState(Step::Checks, StepStatus::Running, "in job " + id + " on " + node + ": the image, the engine, the GPUs, the data folders");
+            std::string script = "umask 077\n";
+            script += "mkdir -p \"$HOME/.sirius/run\" && chmod 700 \"$HOME/.sirius/run\" || exit 4\n";
+            // the application's launch script, as for the start (never the checkout's)
+            script += uploadLaunchScript();
+            script += "cd \"$HOME\" || exit 3\n";
+            script += stepEnvironment(p, dir, code, job.gpus);
+            script += "unset SIRIUS_TOKEN SIRIUS_TOKEN_FILE\n";
+            std::string pairs;
+            for (const auto& [host, inside] : bindPairs(p.bind)) pairs += " " + remotePathWord(host) + " " + remotePathWord(inside);
+            script += srunLine(id, "sirius-check", job.gpus) + " bash \"$LS\" --check" + pairs + " < /dev/null 2>&1\n";
+            script += "echo \"@@check-exit $?\"\n";
+            // a first exec of a large image on a network file system takes a while
+            const ssh::CommandResult r = remote(script, std::chrono::seconds(300));
+            if (keyValues(r.out)["script"] == "failed")
+                throw Failure{Step::Checks, "The worker's launch script could not be written to ~/.sirius/run on " + p.host + ".", trim(r.err),
+                              "Check that your home folder on the cluster is writable and not full."};
+            const NodeCheckReport rep = readNodeChecks(r.out + (r.err.empty() ? std::string() : "\n" + r.err), job, buildJson, dir, buildInfo(), node, hint);
+            update([&](Status& x) { x.nodeChecks = rep.checks; });
+            if (const NodeCheck* f = rep.failure()) throw Failure{Step::Checks, f->detail, rep.output, f->fix, rep.noEngine};
+            // one line of what was found, the worker's code first
+            const auto find = [&rep](const std::string& name) -> const NodeCheck* {
+                for (const NodeCheck& c : rep.checks)
+                    if (c.name == name) return &c;
+                return nullptr;
+            };
+            std::string detail = codeText;
+            StepStatus mark = StepStatus::Done;
+            if (const NodeCheck* c = find("launcher")) detail += " \xC2\xB7 " + c->detail;
+            if (const NodeCheck* c = find("python")) detail += " \xC2\xB7 image: " + c->detail;
+            if (const NodeCheck* c = find("torch")) detail += c->status == StepStatus::Done ? std::string(", torch") : std::string(" \xC2\xB7 no torch (models will not run)");
+            const std::size_t binds = bindPairs(p.bind).size();
+            if (binds > 0) detail += " \xC2\xB7 " + std::to_string(binds) + (binds == 1 ? " data folder" : " data folders");
+            if (p.engine) {
+                std::string note;
+                {
+                    const std::lock_guard<std::mutex> g(m);
+                    note = status.engineBuildNote;
+                }
+                detail += dir.empty() ? " \xC2\xB7 " + note : " \xC2\xB7 engine " + shortCommit(dir) + " (" + note + ")";
             }
-            const std::string w = "the node cache folder " + dir + " is not on the login node: fine if it is a disk of the compute nodes only";
-            stepState(Step::Checks, StepStatus::Warning, now.detail + " \xC2\xB7 " + w);
-            say("Cluster: " + w);
+            for (const char* name : {"gpu", "cuda"})
+                if (const NodeCheck* c = find(name)) {
+                    detail += " \xC2\xB7 " + c->label + ": " + c->detail;
+                    if (c->status == StepStatus::Warning) mark = StepStatus::Warning;
+                }
+            if (const NodeCheck* c = find("cache")) detail += " \xC2\xB7 node cache " + c->detail;
+            if (const std::string w = emptyBindWarning(p); !w.empty()) {
+                // not a failure: data in the home folder opens all the same
+                mark = StepStatus::Warning;
+                detail += " \xC2\xB7 " + w;
+                say("Cluster: " + w);
+            }
+            stepState(Step::Checks, mark, detail);
+            say("Cluster: the checks in job " + id + " on " + node + " passed");
         }
 
         // The worker as a step of the held job: app/python/slurm/
@@ -1477,7 +1575,6 @@ namespace sirius::app::cluster {
             // this application's launch script, never the checkout's (which may be older)
             script += uploadLaunchScript();
             script += "cd \"$HOME\" || exit 3\n";
-            script += "export SIRIUS_WORKER_DIR=" + code + "\n";
             // The token is written to a private file over this command
             // channel (printf is a builtin: no argument list shows it) and the
             // step is told only the file's name. The worker reads it and deletes it.
@@ -1486,34 +1583,9 @@ namespace sirius::app::cluster {
             script += "unset SIRIUS_TOKEN SIRIUS_VENV\nexport SIRIUS_TOKEN_FILE=\"$tf\"\n";
             // port 0: the worker takes a free one and says which in its log
             script += "export SIRIUS_PORT=0 SIRIUS_MAX_CLIENTS=8\n";
-            script += "export SIRIUS_CONTAINER=" + remotePathWord(p.container) + "\n";
-            script += "export SIRIUS_LAUNCHER=" + shellQuote(p.launcher.empty() ? std::string("apptainer") : p.launcher) + "\n";
-            // the data folders and the extra PYTHONPATH, quoted (a "~/" bind made $HOME): never the token
-            if (const std::string bw = bindWord(p.bind); !bw.empty()) script += "export SIRIUS_CONTAINER_BIND=" + bw + "\n";
-            else script += "unset SIRIUS_CONTAINER_BIND\n";
-            if (const std::string pp = trim(p.containerPythonPath); !pp.empty()) script += "export SIRIUS_CONTAINER_PYTHONPATH=" + shellQuote(pp) + "\n";
-            else script += "unset SIRIUS_CONTAINER_PYTHONPATH\n";
-            script += gpus <= 0 ? "export SIRIUS_DEVICE=cpu\n" : "unset SIRIUS_DEVICE\n";
-            // SIRIUS's engine (`sirius-cli serve`) as the step's main process, the Python worker its child
-            if (p.engine) {
-                script += "export SIRIUS_ENGINE=1\n";
-                if (const std::string bin = trim(p.engineBin); !bin.empty()) {
-                    script += "export SIRIUS_ENGINE_BIN=" + remotePathWord(bin) + "\nunset SIRIUS_ENGINE_DIR\n";
-                } else if (!dir.empty()) {
-                    // the per-commit build, bound into the image by the script
-                    script += "export SIRIUS_ENGINE_DIR=" + remotePathWord(dir) + "\n";
-                    script += "export SIRIUS_ENGINE_BIN=\"$SIRIUS_ENGINE_DIR/bin/sirius-cli\"\n";
-                } else {
-                    script += "unset SIRIUS_ENGINE_BIN SIRIUS_ENGINE_DIR\n";
-                }
-                if (const std::string cache = trim(p.scratch); !cache.empty()) script += "export SIRIUS_ENGINE_SCRATCH=" + remotePathWord(cache) + "\n";
-                else script += "unset SIRIUS_ENGINE_SCRATCH\n";
-            } else {
-                script += "unset SIRIUS_ENGINE SIRIUS_ENGINE_BIN SIRIUS_ENGINE_DIR SIRIUS_ENGINE_SCRATCH\n";
-            }
+            script += stepEnvironment(p, dir, code, gpus);
             script += "S=; command -v setsid >/dev/null 2>&1 && S=setsid\n";
-            std::string srun = "srun --jobid=" + id + " --overlap --nodes=1 --ntasks=1 --job-name=sirius-worker";
-            if (gpus > 0) srun += " --gres=gpu:" + std::to_string(gpus);
+            const std::string srun = srunLine(id, "sirius-worker", gpus);
             script += "$S nohup " + srun + " bash \"$LS\" > " + logPath + " 2>&1 < /dev/null &\n";
             script += "echo \"srun=$!\"\n";
             const ssh::CommandResult r = remote(script, std::chrono::seconds(60));
@@ -1651,7 +1723,10 @@ namespace sirius::app::cluster {
                 const std::lock_guard<std::mutex> g(controlMutex);
                 control = std::move(w);
             }
-            update([&](Status& x) { x.caps = caps; });
+            update([&](Status& x) {
+                x.caps = caps;
+                ++x.capsSerial;
+            });
             StepStatus helloStatus = StepStatus::Done;
             std::string detail;
             if (caps.engine.is_object()) {
@@ -1740,15 +1815,24 @@ namespace sirius::app::cluster {
             // A job of this session's that still runs (left running at a
             // disconnect, or the SSH connection dropped) is reattached to:
             // its worker may still hold the results computed there.
-            std::string again;
+            std::string again, adopt;
+            bool wasAdopted = false;
             {
                 const std::lock_guard<std::mutex> g(m);
                 again = reattachJob;
                 reattachJob.clear();
+                adopt = adoptId;
+                adoptId.clear();
+                wasAdopted = !again.empty() && again == adoptedJob;
             }
-            if (!again.empty() && jobRunning(again)) {
-                update([&](Status& x) { x.jobId = again; });
-                stepState(Step::Submit, StepStatus::Done, "job " + again + " \xC2\xB7 reattached");
+            if (!adopt.empty()) {
+                takeUp(p, adopt);
+            } else if (!again.empty() && jobRunning(again)) {
+                update([&](Status& x) {
+                    x.jobId = again;
+                    x.adopted = wasAdopted;
+                });
+                stepState(Step::Submit, StepStatus::Done, "job " + again + " \xC2\xB7 reattached" + (wasAdopted ? std::string(" (yours)") : std::string()));
                 say("Cluster: job " + again + " still runs: reattaching to it");
             } else {
                 submitHolder(p);
@@ -1788,9 +1872,11 @@ namespace sirius::app::cluster {
                 x.remoteOutput.clear();
                 x.fix.clear();
                 x.noEngine = false;
+                x.nodeChecks.clear();
             });
             stopWorkerStep(id);   // a new image, new data folders: the old worker goes first
             checks(p);
+            checkInJob(p, id, node);
             startStep(p, id);
             waitForWorker(p, id, node);
             try {
@@ -1866,7 +1952,7 @@ namespace sirius::app::cluster {
                         connected();
                         return;
                     }
-                    if (how == Mode::Job) {
+                    if (how == Mode::Job || how == Mode::Adopt) {
                         jobReady();
                         return;
                     }
@@ -2105,14 +2191,59 @@ namespace sirius::app::cluster {
             say("HPC: " + reason + "; job still held");
         }
 
+        // SIRIUS's engine answered its hello before its Python child was up
+        // (torch takes seconds to minutes to import): that child is still to
+        // come, and the engine can say again ("capabilities").
+        static bool pythonPending(const WorkerCapabilities& caps) {
+            if (!caps.engine.is_object() || std::find(caps.methods.begin(), caps.methods.end(), "capabilities") == caps.methods.end()) return false;
+            const json python = caps.engine.value("python", json::object());
+            const std::string state = python.is_object() ? python.value("state", std::string()) : std::string();
+            return state == "starting" || state == "idle";
+        }
+
+        // The engine's capabilities asked again: the Python child's state,
+        // torch, the methods it adds (model steps, plugins). Status::caps
+        // and capsSerial change when they do.
+        void refreshed(const WorkerCapabilities& fresh) {
+            std::string before, after, error, torch;
+            bool differs = false;
+            update([&](Status& x) {
+                const auto state = [](const WorkerCapabilities& c) {
+                    const json py = c.engine.is_object() ? c.engine.value("python", json::object()) : json::object();
+                    return py.is_object() ? py.value("state", std::string()) : std::string();
+                };
+                before = state(x.caps);
+                WorkerCapabilities c = fresh;
+                c.protocolVersion = x.caps.protocolVersion;
+                if (!c.engine.is_object()) return;   // not the engine's answer: keep what the hello said
+                after = state(c);
+                differs = after != before || c.methods != x.caps.methods || c.torch != x.caps.torch;
+                if (!differs) return;
+                const json py = c.engine.value("python", json::object());
+                if (py.is_object()) error = py.value("error", std::string());
+                torch = c.torch;
+                x.caps = std::move(c);
+                ++x.capsSerial;
+            });
+            if (!differs || after == before) return;
+            if (after == "ready") say("HPC: the Python worker beside the engine is ready" + (torch.empty() ? std::string(" (no torch)") : " (torch " + torch + ")"));
+            else if (after == "failed") say("HPC: the Python worker beside the engine did not start: " + error);
+        }
+
         void keep() {
-            int tick = 0;
+            auto lastJobCheck = std::chrono::steady_clock::now();
             for (;;) {
+                bool pending = false;
+                {
+                    const std::lock_guard<std::mutex> g(m);
+                    pending = status.state == State::Connected && pythonPending(status.caps);
+                }
+                // more often while the engine's Python child comes up
+                const std::chrono::milliseconds wait = pending ? std::min(keepAlive, std::chrono::milliseconds(3000)) : keepAlive;
                 {
                     std::unique_lock<std::mutex> lk(keeperMutex);
-                    if (keeperWake.wait_for(lk, keepAlive, [this] { return stopKeeper.load(); })) return;
+                    if (keeperWake.wait_for(lk, wait, [this] { return stopKeeper.load(); })) return;
                 }
-                ++tick;
                 std::string id, host;
                 State state = State::Idle;
                 {
@@ -2129,20 +2260,33 @@ namespace sirius::app::cluster {
                 }
                 bool pingFailed = false;
                 std::string why;
+                std::optional<WorkerCapabilities> fresh;
                 {
                     const std::lock_guard<std::mutex> g(controlMutex);
                     if (control) {
                         const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(20);
+                        const auto stop = [&] { return stopKeeper.load() || std::chrono::steady_clock::now() > deadline; };
                         try {
-                            control->call("ping", json::object(), {}, {}, [&] { return stopKeeper.load() || std::chrono::steady_clock::now() > deadline; });
+                            control->call("ping", json::object(), {}, {}, stop);
                         } catch (const std::exception& e) {
                             if (stopKeeper.load()) return;
                             pingFailed = true;
                             why = isCancellation(e) ? std::string("no answer within 20 s") : std::string(e.what());
                         }
+                        if (!pingFailed && pending) {
+                            try {
+                                fresh = parseWorkerCapabilities(control->call("capabilities", json::object(), {}, {}, stop).result);
+                            } catch (const std::exception& e) {
+                                if (stopKeeper.load()) return;
+                                say(std::string("HPC: the engine's capabilities could not be asked again: ") + e.what());
+                            }
+                        }
                     }
                 }
-                if (pingFailed || tick % 2 == 0) {
+                if (fresh) refreshed(*fresh);
+                const auto now = std::chrono::steady_clock::now();
+                if (pingFailed || now - lastJobCheck >= 2 * keepAlive) {
+                    lastJobCheck = now;
                     std::string jobState;
                     try {
                         jobState = trim(remote("squeue -h -j " + id + " -o %T 2>/dev/null", std::chrono::seconds(30)).out);
@@ -2191,6 +2335,83 @@ namespace sirius::app::cluster {
             b.tooltip = why + "\n" + b.tooltip;
         }
         return b;
+    }
+
+    // --- the user's own jobs -----------------------------------------------------------
+
+    std::string userJobsScript() {
+        // every job of the user's that runs or waits, SIRIUS's or not
+        return "u=\"${USER:-$(id -un)}\"\n"
+               "squeue -h -u \"$u\" -t RUNNING,PENDING -o '%i|%j|%P|%T|%M|%l|%D|%R|%b|%C|%m' 2>&1\n";
+    }
+
+    int gresGpus(const std::string& gres) {
+        // "gpu:2", "gres:gpu:a100:2", "gres/gpu:a100=2", "gres/gpu=2", "gres/gpu" (one); several entries, comma separated
+        int total = 0;
+        for (const std::string& raw : splitOn(gres, ',')) {
+            const std::string e = stripped(raw);
+            const std::size_t at = e.find("gpu");
+            if (at == std::string::npos) continue;
+            std::string rest = e.substr(at + 3);
+            // the count: the last number after ':' or '=' (a type name such as "a100" is not one)
+            int n = 1;
+            const std::size_t sep = rest.find_last_of(":=");
+            if (sep != std::string::npos) {
+                const std::string tail = rest.substr(sep + 1);
+                std::size_t digits = 0;
+                while (digits < tail.size() && std::isdigit(static_cast<unsigned char>(tail[digits]))) ++digits;
+                if (digits > 0) n = std::atoi(tail.substr(0, digits).c_str());
+            }
+            total += n;
+        }
+        return total;
+    }
+
+    std::vector<ClusterJob> parseUserJobs(const std::string& output) {
+        std::vector<ClusterJob> out;
+        std::istringstream in(output);
+        std::string line;
+        while (std::getline(in, line)) {
+            const std::vector<std::string> f = splitOn(stripped(line), '|');
+            if (f.size() < 8 || stripped(f[0]).empty() || !std::isdigit(static_cast<unsigned char>(stripped(f[0])[0]))) continue;
+            ClusterJob j;
+            j.id = stripped(f[0]);
+            j.name = stripped(f[1]);
+            j.partition = stripped(f[2]);
+            j.state = stripped(f[3]);
+            j.used = stripped(f[4]);
+            j.limit = stripped(f[5]);
+            j.nodes = std::atoi(stripped(f[6]).c_str());
+            j.where = stripped(f[7]);
+            if (f.size() > 8) j.gpus = gresGpus(stripped(f[8]));
+            if (f.size() > 9) j.cpus = std::atoi(stripped(f[9]).c_str());
+            if (f.size() > 10) {
+                const std::string mem = stripped(f[10]);
+                if (mem != "0" && mem != "N/A") j.mem = mem;
+            }
+            out.push_back(j);
+        }
+        return out;
+    }
+
+    std::string jobSummary(const ClusterJob& job) {
+        std::vector<std::string> parts;
+        if (job.running()) {
+            if (!job.where.empty()) parts.push_back(job.where);
+        } else {
+            std::string why = job.where;
+            if (why.size() > 1 && why.front() == '(' && why.back() == ')') why = why.substr(1, why.size() - 2);
+            parts.push_back(lowerCase(job.state) + (why.empty() || why == "None" ? std::string() : " (" + why + ")"));
+        }
+        if (job.gpus > 0) parts.push_back(std::to_string(job.gpus) + (job.gpus == 1 ? " GPU" : " GPUs"));
+        else parts.push_back("no GPU");
+        if (job.cpus > 0) parts.push_back(std::to_string(job.cpus) + (job.cpus == 1 ? " CPU" : " CPUs"));
+        if (!job.mem.empty()) parts.push_back(job.mem);
+        if (job.running() && !job.used.empty()) parts.push_back(job.used + (job.limit.empty() ? std::string() : " of " + job.limit));
+        else if (!job.limit.empty()) parts.push_back("time limit " + job.limit);
+        std::string s;
+        for (const std::string& part : parts) s += (s.empty() ? "" : " \xC2\xB7 ") + part;
+        return s;
     }
 
     // --- the worker's launch script -------------------------------------------------
@@ -2261,15 +2482,21 @@ namespace sirius::app::cluster {
     // --- the engine builds ----------------------------------------------------------
 
     std::string engineBuildsScript(const std::string& folder) {
-        // the newest first; each line: "@@build <dir> <runnable yes|no> <python yes|no> <BUILD.json on one line>"
+        // The newest first; each line: "@@build <dir> <bin yes|nox|no> <python yes|no> <lib yes|no> <BUILD.json on one line>".
+        // bin/sirius-cli is judged by its mode (ls -lL: a file, or a link to one, with an x in its
+        // mode string), never by [ -x ]: that asks access(X_OK), which a login node answers "no"
+        // for every file of a scratch it mounts noexec (fiona's /clusterfs/nvme2) though the
+        // compute nodes run it. Whether it runs is checked in the job.
         return "EB=" + remotePathWord(folder) +
                "\n"
                "if [ -d \"$EB\" ]; then echo builds=yes\n"
                "  for d in $(ls -1t \"$EB\" 2>/dev/null); do\n"
                "    [ -f \"$EB/$d/BUILD.json\" ] || continue\n"
-               "    x=no; [ -x \"$EB/$d/bin/sirius-cli\" ] && x=yes\n"
+               "    x=no; f=\"$EB/$d/bin/sirius-cli\"\n"
+               "    if [ -f \"$f\" ]; then x=nox; case \"$(ls -lLd \"$f\" 2>/dev/null)\" in -??[xs]* | -?????[xs]* | -????????[xt]*) x=yes ;; esac; fi\n"
                "    y=no; [ -f \"$EB/$d/python/sirius_worker/__main__.py\" ] && y=yes\n"
-               "    printf '@@build %s %s %s ' \"$d\" \"$x\" \"$y\"; tr -d '\\n\\r' < \"$EB/$d/BUILD.json\"; echo\n"
+               "    l=no; [ -d \"$EB/$d/lib\" ] && l=yes\n"
+               "    printf '@@build %s %s %s %s ' \"$d\" \"$x\" \"$y\" \"$l\"; tr -d '\\n\\r' < \"$EB/$d/BUILD.json\"; echo\n"
                "  done\n"
                "else echo builds=no; fi\n";
     }
@@ -2281,19 +2508,33 @@ namespace sirius::app::cluster {
         while (std::getline(in, line)) {
             if (!line.empty() && line.back() == '\r') line.pop_back();
             if (line.rfind("@@build ", 0) != 0) continue;
-            std::istringstream words(line.substr(8));
+            std::string rest = line.substr(8);
+            const auto word = [&rest]() {
+                const std::size_t a = rest.find_first_not_of(' ');
+                if (a == std::string::npos) return std::string();
+                const std::size_t b = rest.find(' ', a);
+                return rest.substr(a, b == std::string::npos ? std::string::npos : b - a);
+            };
+            const auto drop = [&rest]() {
+                const std::size_t a = rest.find_first_not_of(' ');
+                const std::size_t b = a == std::string::npos ? std::string::npos : rest.find(' ', a);
+                rest = b == std::string::npos ? std::string() : rest.substr(b);
+            };
             EngineBuild b;
-            std::string runnable;
-            words >> b.dir >> runnable;
-            b.runnable = runnable == "yes";
-            std::string rest;
-            std::getline(words, rest);
-            // the python column (a script of before has none: the JSON follows)
-            const std::size_t first = rest.find_first_not_of(' ');
-            if (first != std::string::npos && (rest.compare(first, 4, "yes ") == 0 || rest.compare(first, 3, "no ") == 0)) {
-                b.python = rest.compare(first, 4, "yes ") == 0;
-                rest = rest.substr(first + (b.python ? 4 : 3));
+            b.dir = word();
+            drop();
+            // the columns: bin, then python and lib (a listing of before has fewer: the JSON follows)
+            std::vector<std::string> cols;
+            for (std::string w = word(); cols.size() < 3 && (w == "yes" || w == "no" || w == "nox"); w = word()) {
+                cols.push_back(w);
+                drop();
             }
+            if (!cols.empty()) {
+                b.runnable = cols[0] == "yes";
+                b.binThere = cols[0] == "yes" || cols[0] == "nox";
+            }
+            if (cols.size() > 1) b.python = cols[1] == "yes";
+            if (cols.size() > 2) b.lib = cols[2] == "yes";
             const json j = json::parse(rest, nullptr, false);
             if (j.is_object()) {
                 b.readable = true;
@@ -2305,11 +2546,11 @@ namespace sirius::app::cluster {
     }
 
     int pickEngineBuild(const std::vector<EngineBuild>& builds, const BuildInfo& app, std::string* note) {
+        const auto whole = [](const EngineBuild& b) { return b.runnable && b.readable && b.lib; };
         // this application's own commit first
         for (std::size_t i = 0; i < builds.size(); ++i) {
             const EngineBuild& b = builds[i];
-            if (b.runnable && b.readable && !app.commit.empty() && app.commit != "unknown" && b.info.commit == app.commit &&
-                engineMismatch(app, b.info).empty()) {
+            if (whole(b) && !app.commit.empty() && app.commit != "unknown" && b.info.commit == app.commit && engineMismatch(app, b.info).empty()) {
                 if (note) *note = "this build";
                 return static_cast<int>(i);
             }
@@ -2317,30 +2558,34 @@ namespace sirius::app::cluster {
         // else the newest with the same operations and engine API
         for (std::size_t i = 0; i < builds.size(); ++i) {
             const EngineBuild& b = builds[i];
-            if (b.runnable && b.readable && engineMismatch(app, b.info).empty()) {
+            if (whole(b) && engineMismatch(app, b.info).empty()) {
                 if (note) *note = "the same operations as this build";
                 return static_cast<int>(i);
             }
         }
         if (note) {
             // Say why each build was passed over: a build whose operations match
-            // but whose bin/sirius-cli cannot be run is a broken install, not a
-            // different version, and the fix is a different one.
-            std::size_t notRunnable = 0, unreadable = 0, mismatched = 0;
-            std::string firstBroken;
+            // but whose folder is not whole is a broken install, not a different
+            // version, and the fix is a different one.
+            std::size_t broken = 0, unreadable = 0, mismatched = 0;
+            std::string firstBroken, what;
             for (const EngineBuild& b : builds) {
                 if (!b.readable) ++unreadable;
                 else if (!engineMismatch(app, b.info).empty()) ++mismatched;
-                else if (!b.runnable) {
-                    ++notRunnable;
-                    if (firstBroken.empty()) firstBroken = b.dir.substr(0, 12);
+                else if (!whole(b)) {
+                    ++broken;
+                    if (firstBroken.empty()) {
+                        firstBroken = b.dir.substr(0, 12);
+                        what = !b.binThere ? "has no bin/sirius-cli"
+                                           : (!b.runnable ? "has a bin/sirius-cli without an execute bit in its mode (chmod +x bin/sirius-cli)"
+                                                          : "has no lib/ folder");
+                    }
                 }
             }
             if (builds.empty()) *note = "The engine builds folder holds no build (<commit>/BUILD.json and bin/sirius-cli).";
-            else if (notRunnable > 0)
-                *note = "Engine build " + firstBroken + " matches this application but its bin/sirius-cli cannot be run (missing or not "
-                                                        "executable on the cluster): reinstall that build" +
-                        (notRunnable + unreadable + mismatched > 1 ? " (" + std::to_string(builds.size()) + " builds checked)." : std::string("."));
+            else if (broken > 0)
+                *note = "Engine build " + firstBroken + " matches this application but " + what + ": reinstall that build" +
+                        (broken + unreadable + mismatched > 1 ? " (" + std::to_string(builds.size()) + " builds checked)." : std::string("."));
             else if (mismatched == builds.size())
                 *note = "None of the " + std::to_string(builds.size()) + (builds.size() == 1 ? " engine build" : " engine builds") +
                         " fits this application (" + app.build + "): their operations or engine API differ.";
@@ -2350,6 +2595,196 @@ namespace sirius::app::cluster {
                         " for other operations or engine API.";
         }
         return -1;
+    }
+
+    // --- the checks in the job ----------------------------------------------------------
+
+    const NodeCheck* NodeCheckReport::failure() const {
+        for (const NodeCheck& c : checks)
+            if (c.status == StepStatus::Failed) return &c;
+        return nullptr;
+    }
+
+    NodeCheckReport readNodeChecks(const std::string& output, const Profile& p, const std::optional<BuildInfo>& buildJson, const std::string& buildDir,
+                                   const BuildInfo& app, const std::string& node, const std::string& buildsHint) {
+        NodeCheckReport rep;
+        const std::string on = node.empty() ? std::string("the job's node") : node;
+        const std::string image = trim(p.container);
+        const std::string launcher = p.launcher.empty() ? std::string("apptainer") : p.launcher;
+        const std::string ask = "Build the worker image again (\"Build an image\", or app/python/slurm/README.md), or ask whoever builds it on this "
+                                "cluster for the current one, and pick it under Worker image.";
+        const std::vector<std::string> binds = bindHostPaths(p.bind);
+        std::optional<json> version;
+        std::vector<std::string> raw;
+        bool imageStarted = false, anyCheck = false;
+        const auto add = [&rep](std::string name, std::string label, StepStatus st, std::string detail, std::string fix = {}) {
+            rep.checks.push_back(NodeCheck{std::move(name), std::move(label), st, std::move(detail), std::move(fix)});
+        };
+        std::istringstream in(output);
+        std::string line;
+        while (std::getline(in, line)) {
+            if (!line.empty() && line.back() == '\r') line.pop_back();
+            if (line.rfind("@@check-exit ", 0) == 0) {
+                rep.exitCode = std::atoi(line.c_str() + 13);
+                continue;
+            }
+            if (line.rfind("@@version ", 0) == 0) {
+                const json j = json::parse(line.substr(10), nullptr, false);
+                if (!j.is_discarded()) version = j;
+                continue;
+            }
+            if (line.rfind("check ", 0) != 0) {
+                if (!trim(line).empty()) raw.push_back(line);
+                continue;
+            }
+            std::istringstream words(line.substr(6));
+            std::string name, word, rest;
+            words >> name >> word;
+            std::getline(words, rest);
+            rest = trim(rest);
+            const StepStatus st = word == "ok" ? StepStatus::Done : (word == "warn" ? StepStatus::Warning : StepStatus::Failed);
+            const bool ok = st == StepStatus::Done;
+            anyCheck = true;
+            if (name == "launcher") {
+                if (ok) add(name, "Launcher", st, rest);
+                else
+                    add(name, "Launcher", st, "Neither " + launcher + " nor singularity can be run on " + on + " (module load was tried).",
+                        "Ask your cluster's support how to run apptainer on its compute nodes, or set \"Container launcher\" under Job \xE2\x96\xB8 More "
+                        "options to its full path there.");
+            } else if (name == "image") {
+                if (ok) {
+                    imageStarted = true;
+                    add(name, "Image", st, image + " starts on " + on);
+                } else if (rest.find("not readable") != std::string::npos) {
+                    add(name, "Image", st, "The worker image " + image + " cannot be read on " + on + ".",
+                        "Make it readable to you (chmod a+r), or pick a copy you can read under Worker image.");
+                } else {
+                    add(name, "Image", st, "The worker image " + image + " cannot run the worker on " + on + ": " + rest + ".", ask);
+                }
+            } else if (name == "python") {
+                if (ok) add(name, "Python", st, rest);
+                else add(name, "Python", st, "The worker image " + image + " cannot run the worker: sirius and numpy do not import in it.", ask);
+            } else if (name == "torch") {
+                add(name, "torch", st, rest, ok ? std::string() : std::string("Build the image with torch (app/python/slurm/README.md) for the model steps."));
+            } else if (name == "worker") {
+                if (ok) add(name, "Worker's code", st, rest);
+                else
+                    add(name, "Worker's code", st, "The worker's code is not there on " + on + ": " + rest + ".",
+                        "Check that the SIRIUS checkout (or the engine build) is on a file system the compute nodes see, readable to you.");
+            } else if (name == "engine" || name == "engine-missing") {
+                if (ok) {
+                    // judged below, from what `version` said
+                    add("engine", "C++ engine", st, rest);
+                    continue;
+                }
+                rep.noEngine = true;
+                if (name == "engine-missing") {
+                    if (!buildDir.empty())
+                        add("engine", "C++ engine", st,
+                            "No SIRIUS C++ engine found: engine build " + buildDir + "'s bin/sirius-cli cannot be run on " + on + " (" + rest + ").",
+                            "The build's folder must be on a file system the compute nodes run programs from (scratch usually is: ask your cluster's "
+                            "support otherwise), and bin/sirius-cli an executable of this node's architecture; reinstall the build if it is not.");
+                    else if (!trim(p.engineBin).empty())
+                        add("engine", "C++ engine", st, "No SIRIUS C++ engine found: " + trim(p.engineBin) + " is neither an executable on " + on + " nor in the image.",
+                            noEngineFix(buildsHint));
+                    else
+                        add("engine", "C++ engine", st,
+                            "No SIRIUS C++ engine found: the image " + image + " has no /opt/sirius/bin/sirius-cli, and no Engine builds folder is set.",
+                            noEngineFix(buildsHint));
+                } else {
+                    add("engine", "C++ engine", st, "SIRIUS's engine does not run in the image on " + on + ": `" + rest + "` (its output is under Details).",
+                        "Its output says why: usually a library the build needs that is neither in the image nor in the build's lib/ folder (build the "
+                        "engine against this image: app/python/slurm/README.md, \"Engine builds\"), or, with \"Permission denied\", a folder the "
+                        "compute nodes mount noexec. Then Start worker again.");
+                }
+            } else if (name == "gpu") {
+                std::string fix;
+                if (!ok)
+                    fix = rest.find("named no GPU") != std::string::npos
+                              ? "The engine may compute on GPUs other jobs hold: ask your cluster's support how a job's GPUs are confined there "
+                                "(CUDA_VISIBLE_DEVICES), or set GPUs to 0 on the Job page."
+                              : "Check the job's GPUs on the Job page, and that the image is entered with the NVIDIA driver (--nv) on a GPU partition.";
+                add(name, "GPUs", st, rest, fix);
+            } else if (name.rfind("data:", 0) == 0) {
+                const std::size_t i = static_cast<std::size_t>(std::atoi(name.c_str() + 5));
+                const std::string folder = i < binds.size() ? binds[i] : rest;
+                if (ok) add(name, "Data folder", st, folder);
+                else if (rest.find("is not on") != std::string::npos)
+                    add(name, "Data folder", st, "The data folder " + folder + " is not a folder on " + on + ": apptainer would stop before the worker starts.",
+                        "Correct it or remove it under Data folders (the folders on the cluster your datasets live in).");
+                else
+                    add(name, "Data folder", st, "The data folder " + folder + " cannot be read inside the image on " + on + ".",
+                        "Make it readable to you, or correct it under Data folders.");
+            } else if (name == "cache") {
+                if (ok) add(name, "Node cache", st, trim(p.scratch).empty() ? rest : trim(p.scratch));
+                else
+                    add(name, "Node cache", st, "You cannot write to the node cache folder " + trim(p.scratch) + " on " + on + ".",
+                        "Choose another folder under Job \xE2\x96\xB8 More options, or leave it empty to use the node's temporary folder.");
+            } else {
+                add(name, name, st, rest);
+            }
+        }
+        // the engine's own answer: SIRIUS's engine, the build BUILD.json says, one that serves this application
+        for (NodeCheck& c : rep.checks) {
+            if (c.name != "engine" || c.status != StepStatus::Done) continue;
+            // sirius-cli's envelope ({"command": "version", "ok": true, "result": {...}}), or the result alone
+            if (version && version->is_object() && version->contains("result") && (*version)["result"].is_object()) version = json((*version)["result"]);
+            const json* build = version && version->is_object() && version->contains("build") && (*version)["build"].is_object() ? &(*version)["build"] : nullptr;
+            if (!build) {
+                c.status = StepStatus::Failed;
+                c.detail = "The engine " + c.detail + " did not answer `version` as SIRIUS's engine does, on " + on + ".";
+                c.fix = trim(p.engineBin).empty() ? engineBuildFix(p.engineBuilds, app) : noEngineFix(buildsHint);
+                rep.noEngine = true;
+                break;
+            }
+            const BuildInfo v = buildInfoFromJson(*build);
+            const auto known = [](const std::string& commit) { return !commit.empty() && commit != "unknown"; };
+            if (buildJson && ((known(v.commit) && known(buildJson->commit) && v.commit != buildJson->commit) || v.opsSchema != buildJson->opsSchema ||
+                              v.api != buildJson->api)) {
+                c.status = StepStatus::Failed;
+                c.detail = "Engine build " + buildDir + "'s bin/sirius-cli is " + (v.build.empty() ? v.commit : v.build) + ", but its BUILD.json says " +
+                           (buildJson->build.empty() ? buildJson->commit : buildJson->build) + ": the folder holds another build's executable.";
+                c.fix = "Reinstall that build (bin/sirius-cli, lib/, python/ and BUILD.json of one commit), or remove it from the builds folder; then Start worker again.";
+                rep.noEngine = true;
+                break;
+            }
+            if (const std::string refusal = engineMismatch(app, v); !refusal.empty()) {
+                c.status = StepStatus::Failed;
+                c.detail = refusal;
+                c.fix = engineBuildFix(p.engineBuilds, app);
+                break;
+            }
+            std::string what = v.build.empty() ? v.version : v.build;
+            if (known(v.commit)) what += " (" + v.commit.substr(0, 10) + ")";
+            c.detail = what + " runs in the image" + (buildDir.empty() ? std::string() : ", from " + buildDir);
+            // its CUDA, when the job has GPUs
+            const json features = version->value("features", json::object());
+            if (p.gpus > 0 && features.is_object()) {
+                const bool cuda = features.value("cuda", false);
+                const int devices = features.contains("cuda_devices") && features["cuda_devices"].is_number_integer() ? features["cuda_devices"].get<int>() : 0;
+                if (!cuda)
+                    rep.checks.push_back(NodeCheck{"cuda", "CUDA", StepStatus::Warning, "this engine was built without CUDA: every step runs on the CPU",
+                                                   "Use an engine build made with CUDA (app/python/slurm/README.md, \"Engine builds\")."});
+                else if (devices <= 0)
+                    rep.checks.push_back(NodeCheck{"cuda", "CUDA", StepStatus::Warning, "the engine's CUDA finds no GPU in the step",
+                                                   "Check that the image is entered with the NVIDIA driver (--nv) and the job holds a GPU."});
+                else
+                    rep.checks.push_back(NodeCheck{"cuda", "CUDA", StepStatus::Done, std::to_string(devices) + (devices == 1 ? " device" : " devices") + " for the engine", {}});
+            }
+            break;
+        }
+        // nothing at all came back: the step did not run; else an image that did not start
+        if (!anyCheck) {
+            add("step", "Check step", StepStatus::Failed, "The checks could not run in the job on " + on + ".",
+                "The output under Details says why (srun's own words); press Start worker again, or Change job if the job is gone.");
+        } else if (!imageStarted && !rep.failure()) {
+            add("image", "Image", StepStatus::Failed, "The worker image " + image + " cannot run the worker on " + on + ": it does not start.", ask);
+        }
+        // the node's own words, the last of them
+        const std::size_t from = raw.size() > 40 ? raw.size() - 40 : 0;
+        for (std::size_t i = from; i < raw.size(); ++i) rep.output += raw[i] + "\n";
+        rep.output = trim(rep.output);
+        return rep;
     }
 
     // --- the session's public face ---------------------------------------------------
@@ -2382,6 +2817,23 @@ namespace sirius::app::cluster {
     void Session::connect(const Profile& profile) { start(profile, Mode::Both); }
     void Session::logIn(const Profile& profile) { start(profile, Mode::Login); }
 
+    void Session::adoptJob(const Profile& profile, const std::string& jobId) {
+        if (trim(jobId).empty()) return;
+        {
+            const std::lock_guard<std::mutex> g(impl_->m);
+            impl_->adoptId = trim(jobId);
+        }
+        start(profile, Mode::Adopt);
+    }
+
+    std::vector<ClusterJob> Session::listJobs() {
+        auto s = impl_->sshSession();
+        if (!s || !s->isOpen()) throw ssh::SshError("not logged in to the cluster: connect first");
+        const ssh::CommandResult r = s->run(userJobsScript(), std::chrono::seconds(60));
+        if (!r.ok() && trim(r.out).empty()) throw ssh::SshError("squeue did not list your jobs", trim(r.err));
+        return parseUserJobs(r.out);
+    }
+
     void Session::start(const Profile& profile, Mode mode) {
         {
             // a held job takes the worker; a new job only once it is let go (disconnect)
@@ -2413,7 +2865,7 @@ namespace sirius::app::cluster {
             const std::string home = x.home;
             // a job left running (disconnect without cancelling it, or a drop) on this host
             const bool left = !x.jobId.empty() && x.host == profile.host && (x.state == State::Disconnected || x.state == State::Idle);
-            if (mode != Mode::Login && left) previousJob = x.jobId;
+            if (mode != Mode::Login && mode != Mode::Adopt && left) previousJob = x.jobId;
             const std::string keptJob = mode == Mode::Login && left ? x.jobId : std::string();
             const BuildStatus build = x.build;
             x = Status{};
@@ -2430,6 +2882,7 @@ namespace sirius::app::cluster {
             impl_->profile = profile;
             impl_->mode = mode;
             impl_->reattachJob = previousJob;
+            if (mode != Mode::Adopt) impl_->adoptId.clear();
             if (mode != Mode::Worker && previousJob.empty()) {
                 // a new job: nothing of the last one's worker to reattach to
                 impl_->workerLog.clear();
@@ -2468,14 +2921,19 @@ namespace sirius::app::cluster {
             impl_->control.reset();
         }
         std::string id, note;
-        bool ended = false;
+        bool ended = false, adopted = false;
         {
             const std::lock_guard<std::mutex> g(impl_->m);
             id = impl_->status.jobId;
+            adopted = impl_->status.adopted;
         }
         auto s = impl_->sshSession();
         const bool up = s && s->isOpen();
-        if (!id.empty() && up) {
+        if (!id.empty() && adopted) {
+            // the user's own job: its worker step ends, the job runs on
+            if (up) impl_->stopWorkerStep(id);
+            note = "job " + id + " was yours before SIRIUS: it keeps running";
+        } else if (!id.empty() && up) {
             try {
                 const ssh::CommandResult r = s->run("scancel " + id, std::chrono::seconds(30));
                 ended = r.ok();
@@ -2484,11 +2942,12 @@ namespace sirius::app::cluster {
                 note = "scancel " + id + " failed: " + e.what();
             }
         }
-        if (ended) {
+        if (ended || adopted) {
             const std::lock_guard<std::mutex> g(impl_->m);
             impl_->workerLog.clear();
             impl_->workerPort = 0;
             impl_->reattachJob.clear();
+            impl_->adoptedJob.clear();
         }
         impl_->update([&](Status& x) {
             x.state = up ? State::Idle : State::Disconnected;
@@ -2501,14 +2960,16 @@ namespace sirius::app::cluster {
             x.caps = WorkerCapabilities{};
             x.engineBuild.clear();
             x.engineBuildNote.clear();
+            x.nodeChecks.clear();
             for (std::size_t i = 1; i < x.steps.size(); ++i) x.steps[i] = StepState{};
-            if (ended) {
+            if (ended || adopted) {
                 x.jobId.clear();
                 x.node.clear();
                 x.jobState.clear();
                 x.jobLimitSeconds = -2;
                 x.jobStarted = {};
-                x.jobEnded = true;
+                x.jobEnded = ended;
+                x.adopted = false;
             }
         });
         impl_->say("HPC: " + (note.empty() ? std::string("no job to cancel") : note) + (up ? "; still logged in" : std::string()));
@@ -2548,14 +3009,17 @@ namespace sirius::app::cluster {
             impl_->control.reset();
         }
         std::string id, note;
-        bool ended = false;
+        bool ended = false, adopted = false;
         {
             const std::lock_guard<std::mutex> g(impl_->m);
             id = impl_->status.jobId;
+            adopted = impl_->status.adopted;
         }
         auto s = impl_->sshSession();
         if (!id.empty()) {
-            if (cancelJob && s && s->isOpen()) {
+            if (adopted) {
+                note = "job " + id + " was yours before SIRIUS: it keeps running";
+            } else if (cancelJob && s && s->isOpen()) {
                 try {
                     const ssh::CommandResult r = s->run("scancel " + id, std::chrono::seconds(30));
                     note = r.ok() ? "job " + id + " cancelled" : "scancel " + id + " failed: " + trim(r.err);
