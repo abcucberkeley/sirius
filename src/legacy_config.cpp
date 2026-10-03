@@ -224,6 +224,10 @@ namespace sirius {
         p.explodefact = c.explodefact;
         p.fast_si = c.bFastSIM;
         p.do_rescale = (c.do_rescale != 0);
+        if (!c.phaseSteps.empty())
+            p.phase_steps = std::vector<double>(c.phaseSteps.begin(), c.phaseSteps.end());
+        if (!c.forceamp.empty())
+            p.force_mod_amp = std::vector<double>(c.forceamp.begin(), c.forceamp.end());
         p.equalizez = c.equalizez;
         p.no_kz0 = c.bNoKz0;
         p.filter_overlaps = c.bFilteroverlaps;

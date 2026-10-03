@@ -85,6 +85,9 @@ namespace sirius::app {
         rpc::Reply stepPreview(const rpc::Request& req, rpc::CallContext& ctx);
         rpc::Reply stepValidate(const rpc::Request& req);
         rpc::Reply outputStats(const rpc::Request& req, rpc::CallContext& ctx);
+        // The label volume a held output carries, as one uint32 tensor "labels"
+        // of shape (t, z, y, x). The run's result only says that labels exist.
+        rpc::Reply outputLabels(const rpc::Request& req);
         rpc::Reply putFile(const rpc::Request& req);
         rpc::Reply statFile(const rpc::Request& req);
         rpc::Reply releaseOutputs(const rpc::Request& req);

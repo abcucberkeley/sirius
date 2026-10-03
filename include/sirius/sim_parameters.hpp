@@ -28,6 +28,11 @@ namespace sirius {
         double nimm = 1.33;   // immersion refractive index (>= na)
         double wavelength_nm = 510.;   // emission wavelength (nm)
         std::optional<std::vector<double>> k0_angles; // null, derive from k0_start_angles
+        // Absolute phase of each raw frame, radians, length nphases. Empty: equal steps 2πj/nphases.
+        std::optional<std::vector<double>> phase_steps;
+        // Modulation amplitudes that replace the fitted ones. Length norders (every direction)
+        // or ndirs * norders (per direction, direction-major). Empty: fit them.
+        std::optional<std::vector<double>> force_mod_amp;
 
         // Pixel sizes (um) in the sample plane
         double dx = 0.1;  // transverse pixel size, image column direction
@@ -59,6 +64,17 @@ namespace sirius {
         // order count goes through this, so a file that leaves norders out
         // means the same thing everywhere.
         int resolvedOrders() const noexcept { return norders > 0 ? norders : nphases / 2 + 1; }
+
+        // Lateral frequency of illumination order 1, in 1/um. The configured
+        // line spacing is the finest order, so a 3D pattern's order 1 sits at
+        // 1/linespacing/(resolvedOrders()-1). A 2D pattern's spacing is already
+        // order 1, and the search does not divide.
+        double patternFundamental(bool threeD) const noexcept {
+            const double k = 1.0 / linespacing_um;
+            if (!threeD) return k;
+            const int denom = resolvedOrders() - 1;
+            return k / static_cast<double>(denom < 1 ? 1 : denom);
+        }
 
         // Throws std::runtime_error on invalid parameters
         void validate() const;

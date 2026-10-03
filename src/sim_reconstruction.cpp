@@ -131,7 +131,14 @@ namespace sirius {
                                             " orders, need " + std::to_string(norders));
 
             // depends only on the parameters: flatten once, reuse for every volume
-            const Eigen::MatrixXd sepM = separationMatrix(p.nphases, norders);
+            Eigen::MatrixXd sepM;
+            if (p.phase_steps) {
+                Eigen::VectorXd phases(p.nphases);
+                for (int j = 0; j < p.nphases; ++j) phases(j) = (*p.phase_steps)[static_cast<std::size_t>(j)];
+                sepM = separationMatrix(phases, norders);
+            } else {
+                sepM = separationMatrix(p.nphases, norders);
+            }
             sepMatrix.resize(static_cast<std::size_t>(nbands) * p.nphases);
             for (int b = 0; b < nbands; ++b)
                 for (int j = 0; j < p.nphases; ++j)
@@ -736,8 +743,7 @@ namespace sirius {
             fit.k0.assign(static_cast<std::size_t>(p.ndirs), {0.0, 0.0});
             fit.amps.assign(static_cast<std::size_t>(p.ndirs),
                             std::vector<Cplx>(static_cast<std::size_t>(norders), Cplx(0, 0)));
-            double k0magGuess = 1.0 / p.linespacing_um;
-            if (nz > 1) k0magGuess /= (p.nphases / 2 + 1) - 1;
+            const double k0magGuess = p.patternFundamental(nz > 1);
             for (int d = 0; d < p.ndirs; ++d) {
                 checkCancelled();
                 const double angleGuess =
@@ -752,6 +758,15 @@ namespace sirius {
                     for (int order = 2; order < norders; ++order)
                         fit.amps[static_cast<std::size_t>(d)][static_cast<std::size_t>(order)] *=
                             fit.amps[static_cast<std::size_t>(d)][static_cast<std::size_t>(order - 1)];
+                if (p.force_mod_amp) {
+                    const std::vector<double>& forced = *p.force_mod_amp;
+                    const std::size_t base = forced.size() == static_cast<std::size_t>(norders)
+                                                 ? 0
+                                                 : static_cast<std::size_t>(d) * static_cast<std::size_t>(norders);
+                    auto& amps = fit.amps[static_cast<std::size_t>(d)];
+                    for (int order = 0; order < norders; ++order)
+                        amps[static_cast<std::size_t>(order)] = Cplx(forced[base + static_cast<std::size_t>(order)], 0.0);
+                }
                 fit.k0[static_cast<std::size_t>(d)] = k0;
             }
 

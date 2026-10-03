@@ -9,10 +9,12 @@
 #include "core/ops/builtin.hpp"
 
 #include <algorithm>
+#include <cctype>
 #include <chrono>
 #include <cmath>
 #include <cstdio>
 #include <filesystem>
+#include <fstream>
 #include <memory>
 #include <mutex>
 #include <vector>
@@ -31,6 +33,48 @@ namespace sirius::app {
         constexpr const char* kEstimate = "Estimate";
         constexpr const char* kManual = "Manual";
         constexpr const char* kFromFile = "From file";
+
+        // True when the parameter file sets the OTF's axial step. A missing key
+        // is not the library default: From file then uses the stack's dz.
+        bool fileSetsDzPsf(const std::string& path) {
+            std::ifstream in(std::filesystem::u8path(path));
+            if (!in) return false;
+            const bool toml = detectParameterFormat(path) == ParameterFormat::Toml;
+            std::string all;
+            std::string line;
+            while (std::getline(in, line)) {
+                const auto cut = line.find_first_of("#;");
+                if (cut != std::string::npos) line.resize(cut);
+                all += line;
+                all.push_back('\n');
+            }
+            // Every assignment, not only the first '=' on the line, so a dotted
+            // key and an inline table (pixels.dz_psf, pixels = { dz_psf = … })
+            // count. Only the key the loader actually reads: dz_psf in TOML
+            // (including a .toml file with no [table] header), zresPSF in a
+            // cudasirecon file.
+            const std::string want = toml ? "dz_psf" : "zrespsf";
+            for (std::size_t eq = all.find('='); eq != std::string::npos; eq = all.find('=', eq + 1)) {
+                std::size_t end = eq;
+                while (end > 0 && (all[end - 1] == ' ' || all[end - 1] == '\t')) --end;
+                std::size_t begin = end;
+                while (begin > 0) {
+                    const unsigned char c = static_cast<unsigned char>(all[begin - 1]);
+                    if (std::isalnum(c) || all[begin - 1] == '_' || all[begin - 1] == '.' || all[begin - 1] == '"' || all[begin - 1] == '\'') --begin;
+                    else break;
+                }
+                std::string key;
+                for (std::size_t i = begin; i < end; ++i) {
+                    const char c = all[i];
+                    if (c == '"' || c == '\'') continue;
+                    key.push_back(static_cast<char>(std::tolower(static_cast<unsigned char>(c))));
+                }
+                const auto dot = key.rfind('.');
+                if (dot != std::string::npos) key = key.substr(dot + 1);
+                if (key == want) return true;
+            }
+            return false;
+        }
 
         ApodizationType apodizationFromChoice(const std::string& s) {
             if (s == "Cosine") return ApodizationType::Cosine;
@@ -235,8 +279,12 @@ namespace sirius::app {
                 p.dx = input.dx();
                 p.dy = input.dy();
                 p.dz = input.dz();
+                // 0 means "not set". From file, that keeps the file's OTF step
+                // (and the stack's dz only when the file has none). Estimate
+                // and Manual have no file, so 0 means the stack's dz.
                 const double dzPsf = params.getDouble("dz_psf", 0.0);
-                p.dz_psf = dzPsf > 0.0 ? dzPsf : input.dz();
+                if (dzPsf > 0.0) p.dz_psf = dzPsf;
+                else if (mode != kFromFile || !fileSetsDzPsf(params.getString("params_file"))) p.dz_psf = input.dz();
                 return p;
             }
 

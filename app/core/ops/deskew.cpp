@@ -50,7 +50,6 @@ namespace sirius::app {
             }
 
             std::string summary(const ParamSet& params, const DatasetMeta& input) const override {
-                if (!input.lightSheet && input.dims.numel() > 1) return "not applicable to this dataset — skipped";
                 char a[32], s[32];
                 std::snprintf(a, sizeof a, "%.1f°", angleOf(params, input));
                 std::snprintf(s, sizeof s, "dz %.2f µm", params.getDouble("stage_step_um", 0.40));

@@ -1054,7 +1054,8 @@ namespace sirius::app {
                         auto tap = [&](Index j) { return blur[static_cast<std::size_t>(j)]; };
                         const float lx = tap(ix > 0 ? i - 1 : i) + tap(ix + 1 < x ? i + 1 : i) - 2.0f * c;
                         const float ly = tap(iy > 0 ? i - x : i) + tap(iy + 1 < y ? i + x : i) - 2.0f * c;
-                        const float lz = z > 1 ? tap(iz > 0 ? i - plane : i) + tap(iz + 1 < z ? i + plane : i) - 2.0f * c : 0.0f;
+                        const float zScale = static_cast<float>(zAspect * zAspect);
+                        const float lz = z > 1 ? (tap(iz > 0 ? i - plane : i) + tap(iz + 1 < z ? i + plane : i) - 2.0f * c) / zScale : 0.0f;
                         // bright blob: the Laplacian dips, so negate it
                         const float response = static_cast<float>(-norm * (lx + ly + lz));
                         if (response > best[static_cast<std::size_t>(i)]) {

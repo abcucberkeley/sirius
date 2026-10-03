@@ -2519,6 +2519,17 @@ namespace sirius::app::gui {
         // only when the user agrees, knowing how much (never by default).
         bridge_.uploadAsked.connect([this](int target) {
             const RunRefusal refusal = wb().lastRunRefusal();
+            // A script has nobody to agree. Do not upload, and do not pretend
+            // the question was cancelled: the process exits 2 and says why.
+            if (impl_->unattended) {
+                const std::string msg = refusal.message.empty() ? std::string("files on this computer have to be uploaded before the run, and a script cannot agree to that")
+                                                                : refusal.message;
+                std::fprintf(stderr, "%s\n", msg.c_str());
+                std::fflush(stderr);
+                wb().logLine(msg);
+                if (impl_->exitCode == 0) impl_->exitCode = 2;
+                return;
+            }
             ask("Upload to the cluster", refusal.message, {"Cancel", "Upload and run"}, [this, refusal, target](int answer) {
                 if (answer != 1) return;
                 wb().allowUploads(refusal.uploads);
@@ -3281,7 +3292,16 @@ namespace sirius::app::gui {
         bridge_.startRun(i);
     }
 
-    void App::runAll() { bridge_.startRun(-1); }
+    void App::runAll() {
+        if (bridge_.startRun(-1) || !impl_->unattended) return;
+        const RunRefusal& refusal = wb().lastRunRefusal();
+        // A non-empty upload list is reported by the uploadAsked handler.
+        if (refusal.kind == RunRefusal::Kind::NeedsUpload && !refusal.uploads.empty()) return;
+        const std::string msg = refusal.message.empty() ? std::string("the run could not start") : refusal.message;
+        std::fprintf(stderr, "%s\n", msg.c_str());
+        std::fflush(stderr);
+        if (impl_->exitCode == 0) impl_->exitCode = 2;
+    }
 
     void App::runTo(int index) { bridge_.startRun(index); }
 

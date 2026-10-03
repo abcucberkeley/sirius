@@ -113,8 +113,9 @@ namespace sirius::app::cluster {
     std::string exportProfile(const Profile& p);
     // The profiles of such a file (or of a whole settings file); throws
     // std::runtime_error with the line and column when it does not read,
-    // or names no profile.
-    std::vector<Profile> importProfiles(const std::string& text);
+    // or names no profile. An `ssh` program in the file is dropped;
+    // `ignoredSshProgram` says so when it is not null.
+    std::vector<Profile> importProfiles(const std::string& text, bool* ignoredSshProgram = nullptr);
 
     // --- the settings editor's checks --------------------------------------------------
 

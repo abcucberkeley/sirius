@@ -104,6 +104,30 @@ TEST_CASE("idealOTF tabulates the derived order count", "[otf][ideal][orders]") 
     CHECK(idealOTF(p, false).data().dimension(0) == 3);
 }
 
+TEST_CASE("idealOTF order-1 shift follows resolvedOrders, not nphases/2+1", "[otf][ideal]") {
+    // nphases = 5 makes (nphases/2+1)-1 = 2 for both of these. resolvedOrders()-1
+    // is 2 when norders is 3 and 1 when norders is 2, so the order-1 lobe moves.
+    SIMParameters p = lowNaParams();
+    p.nphases = 5;
+    p.linespacing_um = 0.2;
+    p.dz_psf = 0.2;
+    IdealOtfOptions opts;
+    opts.lateralSamples = 64;
+    opts.axialSamples = 32;
+    opts.dzPsf = 0.2;
+    p.norders = 3;
+    const auto three = idealOTF(p, true, opts).data();
+    p.norders = 2;
+    const auto two = idealOTF(p, true, opts).data();
+    REQUIRE(three.dimension(0) >= 2);
+    REQUIRE(two.dimension(0) >= 2);
+    double diff = 0;
+    for (Eigen::Index ir = 0; ir < three.dimension(1); ++ir)
+        for (Eigen::Index iz = 0; iz < three.dimension(2); ++iz)
+            diff += std::abs(three(1, ir, iz) - two(1, ir, iz));
+    CHECK(diff > 1e-3);
+}
+
 TEST_CASE("idealOTF rejects unphysical inputs", "[otf][ideal]") {
     SIMParameters p = lowNaParams();
     // an NA above the immersion index is invalid parameters for everything

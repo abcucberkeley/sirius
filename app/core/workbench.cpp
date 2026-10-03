@@ -661,8 +661,30 @@ namespace sirius::app {
                 out->ranOn = backendFromString(ranOn.value("backend", std::string("CPU"))).value_or(Backend::Cpu);
                 out->ranOnDevice = ranOn.value("device", std::string());
                 out->where = where;
-                if (o.contains("labels") && o["labels"].value("present", false))
-                    out->note += std::string(out->note.empty() ? "" : " \xC2\xB7 ") + "labels kept on the node";
+                if (o.contains("labels") && o["labels"].value("present", false) && out->source) {
+                    // The run's reply only counts them. The viewer draws a
+                    // LabelVolume, so the voxels come back in one read.
+                    try {
+                        const WorkerResult labels = ownedRemote_->call("output_labels", {{"path", handle}}, {}, {}, cancelled);
+                        const rpc::Tensor* got = nullptr;
+                        for (const rpc::Tensor& tensor : labels.tensors)
+                            if (tensor.name == "labels") got = &tensor;
+                        const Dims5& dim = out->meta.dims;
+                        if (!got || got->shape.size() != 4 || got->shape[0] != dim.t || got->shape[1] != dim.z || got->shape[2] != dim.y ||
+                            got->shape[3] != dim.x)
+                            throw std::runtime_error("the node's labels do not match the volume");
+                        auto volume = std::make_shared<LabelVolume>(dim.t, dim.z, dim.y, dim.x);
+                        const std::size_t plane = static_cast<std::size_t>(dim.z) * static_cast<std::size_t>(dim.planeSize());
+                        const std::uint32_t* src = got->asUInt32();
+                        for (Index t = 0; t < dim.t; ++t) {
+                            std::copy_n(src + static_cast<std::size_t>(t) * plane, plane, volume->volume(t));
+                            volume->recomputeStats(t);
+                        }
+                        out->labels = std::move(volume);
+                    } catch (const std::exception& e) {
+                        out->note += std::string(out->note.empty() ? "" : " \xC2\xB7 ") + "labels kept on the node (" + e.what() + ")";
+                    }
+                }
                 executor_->seed(pipeline_, index, out);
             }
         if (result.contains("error")) throw std::runtime_error(result["error"].get<std::string>());

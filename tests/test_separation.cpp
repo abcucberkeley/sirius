@@ -73,6 +73,35 @@ TEST_CASE("Separation recovers known bands from mixed phase images", "[separatio
     }
 }
 
+TEST_CASE("Separation recovers bands mixed with unequal phases", "[separation]") {
+    const int nphases = 5, norders = 3;
+    Eigen::VectorXd phases(nphases);
+    phases << 0.0, 0.4, 1.3, 2.2, 4.5;
+    const Eigen::Index nz = 2, ny = 3, nx = 3;
+    Eigen::Tensor<double, 4, Eigen::RowMajor> bandsTrue(2 * norders - 1, nz, ny, nx);
+    bandsTrue.setRandom();
+    Eigen::Tensor<double, 4, Eigen::RowMajor> stack(nphases, nz, ny, nx);
+    stack.setZero();
+    for (int j = 0; j < nphases; ++j)
+        for (Eigen::Index z = 0; z < nz; ++z)
+            for (Eigen::Index y = 0; y < ny; ++y)
+                for (Eigen::Index x = 0; x < nx; ++x) {
+                    double v = bandsTrue(0, z, y, x);
+                    for (int o = 1; o < norders; ++o)
+                        v += std::cos(o * phases(j)) * bandsTrue(2 * o - 1, z, y, x) +
+                             std::sin(o * phases(j)) * bandsTrue(2 * o, z, y, x);
+                    stack(j, z, y, x) = v;
+                }
+    const auto separated = separateBands(stack, separationMatrix(phases, norders));
+    for (int b = 0; b < 2 * norders - 1; ++b) {
+        const double scale = b == 0 ? nphases : nphases / 2.0;
+        for (Eigen::Index z = 0; z < nz; ++z)
+            for (Eigen::Index y = 0; y < ny; ++y)
+                for (Eigen::Index x = 0; x < nx; ++x)
+                    CHECK(separated(b, z, y, x) == Approx(scale * bandsTrue(b, z, y, x)).margin(1e-8));
+    }
+}
+
 TEST_CASE("Separation matrix rejects too few phases", "[separation]") {
     CHECK_THROWS(separationMatrix(4, 3));   // needs 2*3-1 = 5 phases
     CHECK_THROWS(separationMatrix(idealPhases(4), 3));

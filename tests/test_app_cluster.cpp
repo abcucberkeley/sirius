@@ -26,6 +26,7 @@
 #include <vector>
 
 #include <catch2/catch_test_macros.hpp>
+#include <catch2/matchers/catch_matchers_string.hpp>
 
 #include <sirius/tiff_io.hpp>
 
@@ -267,6 +268,7 @@ TEST_CASE("cluster: shell words and the ssh command line", "[app][cluster]") {
     CHECK(has("ForwardAgent=no"));
     CHECK(has("ForwardX11=no"));
     CHECK(has("PermitLocalCommand=no"));
+    CHECK(has("StrictHostKeyChecking=yes"));
     for (const std::string& s : a) CHECK(s.find("ClearAllForwardings") == std::string::npos);
 }
 
@@ -417,6 +419,34 @@ TEST_CASE("cluster: ssh's prompts reach the application through the askpass rela
     // the answers went to ssh's helper only: not in its arguments, not in the log
     CHECK(log.find("hunter2") == std::string::npos);
     CHECK(log.find("123456") == std::string::npos);
+}
+
+TEST_CASE("cluster: a command that does not answer closes the session", "[app][cluster]") {
+    FakeCluster fc;
+    if (!fc.usable()) SKIP("no Python or bash for the fake ssh");
+    ssh::Session s;
+    s.open(fc.options(), {}, std::chrono::seconds(60));
+    REQUIRE(s.isOpen());
+    CHECK_THROWS_AS(s.run("sleep 30", std::chrono::milliseconds(500)), ssh::SshError);
+    CHECK_FALSE(s.isOpen());
+    CHECK_THROWS_WITH(s.run("echo hi", std::chrono::seconds(5)), Catch::Matchers::ContainsSubstring("closed"));
+}
+
+TEST_CASE("cluster: cancelling a command closes the session", "[app][cluster]") {
+    FakeCluster fc;
+    if (!fc.usable()) SKIP("no Python or bash for the fake ssh");
+    ssh::Session s;
+    s.open(fc.options(), {}, std::chrono::seconds(60));
+    REQUIRE(s.isOpen());
+    std::atomic<bool> stop{false};
+    std::thread later([&] {
+        std::this_thread::sleep_for(std::chrono::milliseconds(200));
+        stop.store(true);
+    });
+    CHECK_THROWS_AS(s.run("sleep 30", std::chrono::seconds(10), [&] { return stop.load(); }), ssh::SshError);
+    later.join();
+    CHECK_FALSE(s.isOpen());
+    CHECK_THROWS_WITH(s.run("echo hi", std::chrono::seconds(5)), Catch::Matchers::ContainsSubstring("closed"));
 }
 
 TEST_CASE("cluster: a wrong password is one attempt, reported, never retried", "[app][cluster]") {
@@ -1815,6 +1845,15 @@ TEST_CASE("cluster: the profile of before becomes [cluster.<host>] with every va
     REQUIRE(imported.size() == 1);
     CHECK(imported[0].name == "uni");
     CHECK(imported[0].toJson() == second.toJson());
+    CHECK(imported[0].sshProgram.empty());
+    CHECK(one.find("ssh =") == std::string::npos);
+    bool ignoredSsh = false;
+    const std::string withSsh = "[cluster.uni]\nhost = 'hpc.example'\nimage = ''\nssh = 'C:/evil.exe'\n";
+    const std::vector<cluster::Profile> dropped = cluster::importProfiles(withSsh, &ignoredSsh);
+    CHECK(ignoredSsh);
+    REQUIRE(dropped.size() == 1);
+    CHECK(dropped[0].sshProgram.empty());
+    CHECK(dropped[0].host == "hpc.example");
     CHECK_THROWS_AS(cluster::importProfiles("not = [toml"), std::runtime_error);
     CHECK_THROWS_AS(cluster::importProfiles("[worker]\npython = 'x'\n"), std::runtime_error);
 }
@@ -3252,6 +3291,29 @@ TEST_CASE("cluster: one of the user's own jobs is taken up, its worker runs in i
     session.disconnect(true);
     CHECK(readAll(fc.slurm / "cancelled").find("5001") == std::string::npos);
     setEnv("FAKE_CONTAINER_SITE", "");
+}
+
+TEST_CASE("cluster: an array job id is not globbed by the login shell", "[app][cluster]") {
+    FakeCluster fc;
+    if (!fc.usable()) SKIP("no Python or bash for the fake ssh");
+    const std::string id = "12345_[1-10]";
+    ownJob(fc, id, "jupyter|gpu-a100|gres/gpu:a100=1|4|8G|fakenode");
+    std::ofstream(fc.home / "12345_1") << "decoy\n";   // matches the unquoted glob 12345_[1-10]
+    cluster::Session session;
+    session.setPollInterval(std::chrono::milliseconds(200), std::chrono::milliseconds(500));
+    const cluster::Profile p = containerProfile(fc, "");
+    session.logIn(p);
+    REQUIRE(waitFor([&] { return settled(session) && session.status().sshUp; }, std::chrono::seconds(120)));
+    session.adoptJob(p, id);
+    REQUIRE(waitFor([&] { return settled(session); }, std::chrono::seconds(120)));
+    const cluster::Status st = session.status();
+    INFO(st.reason << "\n"
+                   << st.remoteOutput);
+    CHECK(st.jobId == id);
+    // An unquoted squeue -j globs the decoy file and the job never becomes ready.
+    CHECK((st.state == cluster::State::JobReady || st.state == cluster::State::Connected));
+    CHECK(st.steps[static_cast<int>(cluster::Step::Queue)].status != cluster::StepStatus::Failed);
+    session.disconnect(false);
 }
 
 // --- the engine's Python child comes up after the hello ----------------------------------------

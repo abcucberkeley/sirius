@@ -537,18 +537,69 @@ TEST_CASE("A 2D stack reconstructs at the default settings", "[reconstruction][2
     SIMParameters p = params2d();
     REQUIRE(p.no_kz0);
     REQUIRE(p.resolvedOrders() == 2);
-    const Buffer<double> raw = test::syntheticSim2d(p, 128);
+    std::vector<double> object;
+    const Buffer<double> raw = test::syntheticSim2d(p, 128, 0.8, &object);
     const OTFRadiallyAveraged otf = idealOTF(p, /*threeD=*/false);
 
     SECTION("library defaults") {}
     SECTION("the order-0 damping on") { p.dampen_order0 = true; }
     SECTION("no_kz0 off gives the same pattern") { p.no_kz0 = false; }
+    SECTION("forced modulation amplitudes replace the fit") { p.force_mod_amp = std::vector<double>{1.0, 0.42}; }
 
     SimReconstructor recon(p, otf, Device::cpu(), PlanRigor::Estimate);
     const Buffer<double> out = recon.reconstruct(raw.view());
     REQUIRE(out.shape() == Shape({1, 256, 256}));
     CHECK(nonFinite(out) == 0);
     checkPattern2d(recon.lastFit(), p);
+    if (p.force_mod_amp) {
+        for (const auto& amps : recon.lastFit().amps) {
+            REQUIRE(amps.size() == 2);
+            CHECK(std::abs(amps[0] - 1.0) < 1e-12);
+            CHECK(std::abs(amps[1] - 0.42) < 1e-12);
+        }
+    }
+
+    // Box-mean the zoomed reconstruction back onto the object's grid. A finite
+    // volume that is not this scene (the old test accepted any finite image
+    // with the right k0) does not correlate with it.
+    double sa = 0, sb = 0, saa = 0, sbb = 0, sab = 0;
+    constexpr int n = 128;
+    for (int y = 0; y < n; ++y)
+        for (int x = 0; x < n; ++x) {
+            double acc = 0;
+            for (int dy = 0; dy < 2; ++dy)
+                for (int dx = 0; dx < 2; ++dx)
+                    acc += out.data()[((y * 2 + dy) * (n * 2)) + (x * 2 + dx)];
+            const double a = acc * 0.25;
+            const double b = object[static_cast<std::size_t>(y) * n + x];
+            sa += a;
+            sb += b;
+            saa += a * a;
+            sbb += b * b;
+            sab += a * b;
+        }
+    const double count = static_cast<double>(n * n);
+    const double corr = (count * sab - sa * sb) / std::sqrt((count * saa - sa * sa) * (count * sbb - sb * sb));
+    INFO("correlation with the synthetic object: " << corr);
+    CHECK(corr > 0.15);
+}
+
+TEST_CASE("Unequal phaseSteps change the reconstruction", "[reconstruction][2d]") {
+    // The raw stack was mixed with equal phases. Ignoring phaseSteps and
+    // separating with 2πj/nphases reproduces that stack; using the unequal
+    // steps does not.
+    SIMParameters p = params2d();
+    const Buffer<double> raw = test::syntheticSim2d(p, 64);
+    const OTFRadiallyAveraged otf = idealOTF(p, /*threeD=*/false);
+    SimReconstructor equal(p, otf, Device::cpu(), PlanRigor::Estimate);
+    const Buffer<double> a = equal.reconstruct(raw.view());
+    p.phase_steps = std::vector<double>{0.0, 0.4, 2.5};
+    SimReconstructor shifted(p, otf, Device::cpu(), PlanRigor::Estimate);
+    const Buffer<double> b = shifted.reconstruct(raw.view());
+    REQUIRE(a.size() == b.size());
+    double diff = 0;
+    for (Index i = 0; i < a.size(); ++i) diff += std::abs(a.data()[i] - b.data()[i]);
+    CHECK(diff > 1.0);
 }
 
 TEST_CASE("Thin z stacks reconstruct at the settings of the test data", "[reconstruction][thin]") {

@@ -1311,3 +1311,15 @@ class TestGpuHardware(unittest.TestCase):
         self.assertIsInstance(caps["cuda_usable"], bool)
         self.assertIsInstance(caps["cuda_reason"], str)
         self.assertGreaterEqual(caps["cpu_threads"], 1)
+
+
+class TestOverlap(unittest.TestCase):
+    def test_scalar_overlap_is_the_same_halo_on_every_axis(self):
+        from sirius_worker.server import overlap_axes
+        from sirius_worker.steps import workbench
+
+        self.assertEqual(overlap_axes(32), (32, 32, 32))
+        self.assertEqual(overlap_axes([1, 4, 4]), (1, 4, 4))
+        self.assertEqual(overlap_axes("8, 16, 32"), (8, 16, 32))
+        # half of a 32-plane tile is 16, so a 32 halo cannot stay 32 in z
+        self.assertEqual(workbench().clamp_overlap((32, 32, 32), (32, 256, 256)), [16, 32, 32])

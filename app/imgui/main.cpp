@@ -349,7 +349,14 @@ int main(int argc, char** argv) {
             });
             if (!bridge.startRun(target)) {
                 bridge.runFinished.disconnect(id);
-                return nlohmann::json{{"ok", false}, {"error", "the run could not start (see the log)"}};
+                const RunRefusal refusal = app.wb().lastRunRefusal();
+                const std::string msg = refusal.message.empty() ? std::string("the run could not start") : refusal.message;
+                if (app.unattended() && (refusal.kind != RunRefusal::Kind::NeedsUpload || refusal.uploads.empty())) {
+                    std::fprintf(stderr, "%s\n", msg.c_str());
+                    std::fflush(stderr);
+                    if (app.exitCode() == 0) app.setExitCode(2);
+                }
+                return nlohmann::json{{"ok", false}, {"error", msg}};
             }
             app.waitUntil([&] { return done || Clock::now() >= runDeadline; });
             bridge.runFinished.disconnect(id);
@@ -509,7 +516,13 @@ int main(int argc, char** argv) {
                         done = true;
                     });
                     app.runAll();
-                    if (!bridge.running()) {   // could not start: no dataset, a validation error
+                    if (!bridge.running()) {   // could not start: no dataset, a validation error, an upload a script cannot agree to
+                        const RunRefusal refusal = app.wb().lastRunRefusal();
+                        if (refusal.kind != RunRefusal::Kind::NeedsUpload || refusal.uploads.empty()) {
+                            const std::string msg = refusal.message.empty() ? std::string("the run could not start") : refusal.message;
+                            std::fprintf(stderr, "%s\n", msg.c_str());
+                            std::fflush(stderr);
+                        }
                         app.setExitCode(2);
                     } else {
                         app.waitUntil([&] { return done || Clock::now() >= deadline; });   // never hang a headless run

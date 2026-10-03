@@ -399,7 +399,7 @@ namespace sirius::app::gui {
                     item("Delete this profile\xE2\x80\xA6", "delete", !held, held ? "Disconnect first: a job runs with this profile" : std::string());
                     ImGui::Separator();
                     item("Import\xE2\x80\xA6", "import", !held, "Add the profiles of a file a colleague exported (.toml)");
-                    item("Export\xE2\x80\xA6", "export", true, "Save this profile as a small .toml file to share (no password, no token is in it)");
+                    item("Export\xE2\x80\xA6", "export", true, "Save this profile as a small .toml file to share (no password, no token, no SSH client)");
                     ImGui::Separator();
                     item("Edit settings file\xE2\x80\xA6", "edit", true, settings().filePath());
                     item("Open settings folder", "folder", true, settings().directory());
@@ -466,9 +466,10 @@ namespace sirius::app::gui {
                     if (!*self || path.empty()) return;
                     std::string text;
                     std::vector<cluster::Profile> found;
+                    bool ignoredSsh = false;
                     try {
                         if (!platform::readFile(path, text)) throw std::runtime_error("it could not be read");
-                        found = cluster::importProfiles(text);
+                        found = cluster::importProfiles(text, &ignoredSsh);
                     } catch (const std::exception& e) {
                         app.message("Import a cluster profile", path + " was not imported: " + e.what() + ".", MessageIcon::Warning);
                         return;
@@ -483,7 +484,12 @@ namespace sirius::app::gui {
                     select(last);
                     app.cluster().saveProfiles(book_);
                     savedBook_ = bookJson(book_);
-                    app.wb().logLine("Cluster: imported " + std::to_string(found.size()) + " profile(s) from " + path);
+                    const std::string note = "Cluster: imported " + std::to_string(found.size()) + " profile(s) from " + path;
+                    app.wb().logLine(note);
+                    if (ignoredSsh)
+                        app.message("Import a cluster profile",
+                                    "Imported " + std::to_string(found.size()) + " profile(s). An ssh program in the file was ignored; SIRIUS uses the system SSH client.",
+                                    MessageIcon::Warning);
                 });
             }
 

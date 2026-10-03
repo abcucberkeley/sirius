@@ -209,6 +209,8 @@ TEST_CASE("TOML round-trip preserves every serialized field", "[params][toml]") 
     in.equalizez = true;   // default false
     in.no_kz0 = false;  // default true
     in.filter_overlaps = false;  // default true
+    in.phase_steps = std::vector<double>{0.0, 0.5, 1.0, 1.5, 2.0, 2.5, 3.0};   // length nphases
+    in.force_mod_amp = std::vector<double>{1.0, 0.4};                            // length norders
 
     TempFile tf(".toml");
     saveParameters(tf.str(), in);
@@ -247,6 +249,12 @@ TEST_CASE("TOML round-trip preserves every serialized field", "[params][toml]") 
     REQUIRE(out.k0_angles->size() == in.k0_angles->size());
     REQUIRE((*out.k0_angles)[0] == Approx((*in.k0_angles)[0]));
     REQUIRE((*out.k0_angles)[1] == Approx((*in.k0_angles)[1]));
+    REQUIRE(out.phase_steps);
+    REQUIRE(out.phase_steps->size() == in.phase_steps->size());
+    REQUIRE((*out.phase_steps)[3] == Approx((*in.phase_steps)[3]));
+    REQUIRE(out.force_mod_amp);
+    REQUIRE(out.force_mod_amp->size() == in.force_mod_amp->size());
+    REQUIRE((*out.force_mod_amp)[1] == Approx((*in.force_mod_amp)[1]));
 }
 
 TEST_CASE("loadParameters keeps defaults for absent keys", "[params][toml]") {

@@ -53,6 +53,21 @@ namespace sirius {
         if (linespacing_um <= 0.0) throw std::runtime_error("linespacing_um must be > 0");
         if (k0_angles && static_cast<int>(k0_angles->size()) != ndirs)
             throw std::runtime_error("k0_angles size must equal ndirs");
+        if (phase_steps) {
+            for (double a : *phase_steps)
+                if (!std::isfinite(a)) throw std::runtime_error("phase_steps must be finite");
+            if (static_cast<int>(phase_steps->size()) != nphases)
+                throw std::runtime_error("phase_steps length must equal nphases (" + std::to_string(nphases) + "), got " +
+                                         std::to_string(phase_steps->size()));
+        }
+        if (force_mod_amp) {
+            for (double a : *force_mod_amp)
+                if (!std::isfinite(a)) throw std::runtime_error("force_mod_amp must be finite");
+            const int n = static_cast<int>(force_mod_amp->size());
+            if (n != orders && n != ndirs * orders)
+                throw std::runtime_error("force_mod_amp length must be norders (" + std::to_string(orders) + ") or ndirs*norders (" +
+                                         std::to_string(ndirs * orders) + "), got " + std::to_string(n));
+        }
         if (na <= 0.0) throw std::runtime_error("na must be > 0");
         if (nimm <= 0.0) throw std::runtime_error("nimm must be > 0");
         // The reconstruction takes asin(na / nimm) for the OTF's axial
@@ -95,6 +110,14 @@ namespace sirius {
                 arr.push_back(a);
             optics.insert("k0_angles", std::move(arr));
         }
+        auto writeDoubles = [](toml::table& table, const char* key, const std::optional<std::vector<double>>& values) {
+            if (!values) return;
+            toml::array arr;
+            for (double a : *values) arr.push_back(a);
+            table.insert(key, std::move(arr));
+        };
+        writeDoubles(optics, "phase_steps", p.phase_steps);
+        writeDoubles(optics, "force_mod_amp", p.force_mod_amp);
 
         toml::table pixels;
         pixels.insert("dx", p.dx);
@@ -152,16 +175,19 @@ namespace sirius {
         p.nimm = optics["nimm"].value_or(p.nimm);
         p.wavelength_nm = optics["wavelength_nm"].value_or(p.wavelength_nm);
 
-        if (auto* arr = optics["k0_angles"].as_array()) {
-            std::vector<double> angles;
-            angles.reserve(arr->size());
-            for (auto& node : *arr) {
-                if (auto v = node.value<double>())
-                    angles.push_back(*v);
-            }
-            if (!angles.empty())
-                p.k0_angles = std::move(angles);
-        }
+        auto readDoubles = [](auto node) -> std::optional<std::vector<double>> {
+            auto* arr = node.as_array();
+            if (!arr) return std::nullopt;
+            std::vector<double> values;
+            values.reserve(arr->size());
+            for (auto& item : *arr)
+                if (auto v = item.value<double>()) values.push_back(*v);
+            if (values.empty()) return std::nullopt;
+            return values;
+        };
+        if (auto angles = readDoubles(optics["k0_angles"])) p.k0_angles = std::move(angles);
+        if (auto phases = readDoubles(optics["phase_steps"])) p.phase_steps = std::move(phases);
+        if (auto amps = readDoubles(optics["force_mod_amp"])) p.force_mod_amp = std::move(amps);
 
         auto pixels = tbl["pixels"];
         p.dx = pixels["dx"].value_or(p.dx);

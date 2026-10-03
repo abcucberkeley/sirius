@@ -308,13 +308,17 @@ namespace sirius::app {
                                 return static_cast<double>(work[static_cast<std::size_t>((jz * y + jy) * x + jx)]);
                             };
                             const double c = at(iz, iy, ix);
+                            // z neighbours are zAspect xy-pixels apart. The blur is already
+                            // isotropic in microns; these divisors put the curvature in the
+                            // same xy-pixel units as dxx and dyy.
+                            const double invZ = 1.0 / zAspect;
                             const double dxx = norm * (at(iz, iy, ix + 1) + at(iz, iy, ix - 1) - 2.0 * c);
                             const double dyy = norm * (at(iz, iy + 1, ix) + at(iz, iy - 1, ix) - 2.0 * c);
-                            const double dzz = z > 1 ? norm * (at(iz + 1, iy, ix) + at(iz - 1, iy, ix) - 2.0 * c) : 0.0;
+                            const double dzz = z > 1 ? norm * invZ * invZ * (at(iz + 1, iy, ix) + at(iz - 1, iy, ix) - 2.0 * c) : 0.0;
                             const double dxy = norm * 0.25 * (at(iz, iy + 1, ix + 1) + at(iz, iy - 1, ix - 1) - at(iz, iy + 1, ix - 1) - at(iz, iy - 1, ix + 1));
-                            const double dxz = z > 1 ? norm * 0.25 * (at(iz + 1, iy, ix + 1) + at(iz - 1, iy, ix - 1) - at(iz + 1, iy, ix - 1) - at(iz - 1, iy, ix + 1))
+                            const double dxz = z > 1 ? norm * 0.25 * invZ * (at(iz + 1, iy, ix + 1) + at(iz - 1, iy, ix - 1) - at(iz + 1, iy, ix - 1) - at(iz - 1, iy, ix + 1))
                                                      : 0.0;
-                            const double dyz = z > 1 ? norm * 0.25 * (at(iz + 1, iy + 1, ix) + at(iz - 1, iy - 1, ix) - at(iz + 1, iy - 1, ix) - at(iz - 1, iy + 1, ix))
+                            const double dyz = z > 1 ? norm * 0.25 * invZ * (at(iz + 1, iy + 1, ix) + at(iz - 1, iy - 1, ix) - at(iz + 1, iy - 1, ix) - at(iz - 1, iy + 1, ix))
                                                      : 0.0;
                             double v, sMag;
                             if (z > 1) {
@@ -395,13 +399,14 @@ namespace sirius::app {
                                 return static_cast<double>(work[static_cast<std::size_t>((jz * y + jy) * x + jx)]);
                             };
                             const double c = at(iz, iy, ix);
+                            const double invZ = 1.0 / zAspect;
                             const double dxx = norm * (at(iz, iy, ix + 1) + at(iz, iy, ix - 1) - 2.0 * c);
                             const double dyy = norm * (at(iz, iy + 1, ix) + at(iz, iy - 1, ix) - 2.0 * c);
-                            const double dzz = z > 1 ? norm * (at(iz + 1, iy, ix) + at(iz - 1, iy, ix) - 2.0 * c) : 0.0;
+                            const double dzz = z > 1 ? norm * invZ * invZ * (at(iz + 1, iy, ix) + at(iz - 1, iy, ix) - 2.0 * c) : 0.0;
                             const double dxy = norm * 0.25 * (at(iz, iy + 1, ix + 1) + at(iz, iy - 1, ix - 1) - at(iz, iy + 1, ix - 1) - at(iz, iy - 1, ix + 1));
-                            const double dxz = z > 1 ? norm * 0.25 * (at(iz + 1, iy, ix + 1) + at(iz - 1, iy, ix - 1) - at(iz + 1, iy, ix - 1) - at(iz - 1, iy, ix + 1))
+                            const double dxz = z > 1 ? norm * 0.25 * invZ * (at(iz + 1, iy, ix + 1) + at(iz - 1, iy, ix - 1) - at(iz + 1, iy, ix - 1) - at(iz - 1, iy, ix + 1))
                                                      : 0.0;
-                            const double dyz = z > 1 ? norm * 0.25 * (at(iz + 1, iy + 1, ix) + at(iz - 1, iy - 1, ix) - at(iz + 1, iy - 1, ix) - at(iz - 1, iy + 1, ix))
+                            const double dyz = z > 1 ? norm * 0.25 * invZ * (at(iz + 1, iy + 1, ix) + at(iz - 1, iy - 1, ix) - at(iz + 1, iy - 1, ix) - at(iz - 1, iy + 1, ix))
                                                      : 0.0;
                             const std::array<double, 3> e = symmetricEigenvalues(dxx, dxy, dxz, dyy, dyz, dzz);
                             const double trace = e[0] + e[1] + e[2];

@@ -1237,7 +1237,7 @@ namespace sirius::app::cluster {
 
         std::string finalState(const std::string& id) {
             try {
-                const ssh::CommandResult r = remote("sacct -n -X -P -j " + id + " -o State,ExitCode 2>/dev/null | head -n 1", std::chrono::seconds(30));
+                const ssh::CommandResult r = remote("sacct -n -X -P -j " + shellQuote(id) + " -o State,ExitCode 2>/dev/null | head -n 1", std::chrono::seconds(30));
                 std::string s = trim(r.out);
                 const std::size_t bar = s.find('|');
                 if (bar != std::string::npos) s = s.substr(0, bar) + " (exit " + s.substr(bar + 1) + ")";
@@ -1250,7 +1250,7 @@ namespace sirius::app::cluster {
         // The job is still in the queue or running (squeue knows it).
         bool jobRunning(const std::string& id) {
             try {
-                const std::string state = trim(remote("squeue -h -j " + id + " -o %T 2>/dev/null", std::chrono::seconds(30)).out);
+                const std::string state = trim(remote("squeue -h -j " + shellQuote(id) + " -o %T 2>/dev/null", std::chrono::seconds(30)).out);
                 return state == "RUNNING" || state == "PENDING" || state == "CONFIGURING";
             } catch (const std::exception&) {
                 return false;
@@ -1260,7 +1260,7 @@ namespace sirius::app::cluster {
         // The job's steps called `name` ("4711.0"), as squeue lists them.
         std::vector<std::string> steps(const std::string& id, const std::string& name) {
             std::vector<std::string> out;
-            const ssh::CommandResult r = remote("squeue -h -s -j " + id + " -o '%i|%j' 2>/dev/null", std::chrono::seconds(30));
+            const ssh::CommandResult r = remote("squeue -h -s -j " + shellQuote(id) + " -o '%i|%j' 2>/dev/null", std::chrono::seconds(30));
             std::istringstream in(r.out);
             std::string line;
             while (std::getline(in, line)) {
@@ -1275,7 +1275,7 @@ namespace sirius::app::cluster {
             const auto t0 = std::chrono::steady_clock::now();
             for (;;) {
                 // state, reason, node, time used and time limit
-                const ssh::CommandResult r = remote("squeue -h -j " + id + " -o '%T|%r|%N|%M|%l' 2>/dev/null", std::chrono::seconds(30));
+                const ssh::CommandResult r = remote("squeue -h -j " + shellQuote(id) + " -o '%T|%r|%N|%M|%l' 2>/dev/null", std::chrono::seconds(30));
                 const std::string line = trim(r.out);
                 if (line.empty()) {
                     const std::string fin = finalState(id);
@@ -1470,7 +1470,7 @@ namespace sirius::app::cluster {
         // The srun that runs a step of the job: one task on the job's node,
         // beside the job's own (--overlap), given the job's GPUs.
         static std::string srunLine(const std::string& id, const std::string& name, int gpus) {
-            std::string srun = "srun --jobid=" + id + " --overlap --nodes=1 --ntasks=1 --job-name=" + name;
+            std::string srun = "srun --jobid=" + shellQuote(id) + " --overlap --nodes=1 --ntasks=1 --job-name=" + name;
             if (gpus > 0) srun += " --gres=gpu:" + std::to_string(gpus);
             return srun;
         }
@@ -1614,8 +1614,8 @@ namespace sirius::app::cluster {
             // absence after that, or the job's end, means it is gone
             int missing = 0;
             for (;;) {
-                const std::string script = "echo state=$(squeue -h -j " + id + " -o %T 2>/dev/null)\n" +
-                                           "echo steps=$(squeue -h -s -j " + id + " -o '%j' 2>/dev/null | grep -c '^sirius-worker$')\n" + "[ -f " + logFile +
+                const std::string script = "echo state=$(squeue -h -j " + shellQuote(id) + " -o %T 2>/dev/null)\n" +
+                                           "echo steps=$(squeue -h -s -j " + shellQuote(id) + " -o '%j' 2>/dev/null | grep -c '^sirius-worker$')\n" + "[ -f " + logFile +
                                            " ] && grep -m1 -E '^\\{\"(port|error)\"' " + logFile + " | sed 's/^/announce=/'\ntrue\n";
                 const ssh::CommandResult r = remote(script, std::chrono::seconds(30));
                 auto kv = keyValues(r.out);
@@ -2022,7 +2022,7 @@ namespace sirius::app::cluster {
         ssh::CommandResult inJob(const std::string& id, const std::string& body, std::chrono::milliseconds timeout) {
             auto s = sshSession();
             if (!s || !s->isOpen()) throw ssh::SshError("the SSH connection is closed");
-            return s->run("srun --jobid=" + id + " --overlap --nodes=1 --ntasks=1 --job-name=sirius-probe bash -c " + shellQuote(body) + " < /dev/null 2>&1",
+            return s->run("srun --jobid=" + shellQuote(id) + " --overlap --nodes=1 --ntasks=1 --job-name=sirius-probe bash -c " + shellQuote(body) + " < /dev/null 2>&1",
                           timeout, [this] { return buildCancel.load(); });
         }
 
@@ -2105,7 +2105,7 @@ namespace sirius::app::cluster {
                 body += "[ -n \"$L\" ] || { echo 'neither apptainer nor singularity can be run here'; echo '@@rc 9'; exit 9; }\n";
                 body += "\"$L\" build --fakeroot " + remotePathWord(image) + " " + remotePathWord(d) + " 2>&1; echo \"@@rc $?\"\n";
                 std::string script = "umask 022\nS=; command -v setsid >/dev/null 2>&1 && S=setsid\n";
-                script += "$S nohup srun --jobid=" + id + " --overlap --nodes=1 --ntasks=1 --job-name=sirius-build bash -c " + shellQuote(body) + " > " +
+                script += "$S nohup srun --jobid=" + shellQuote(id) + " --overlap --nodes=1 --ntasks=1 --job-name=sirius-build bash -c " + shellQuote(body) + " > " +
                           logPath + " 2>&1 < /dev/null &\necho started=1\n";
                 if (keyValues(remote(script, std::chrono::seconds(60)).out)["started"] != "1") throw std::runtime_error("the build could not be started");
                 for (;;) {
@@ -2288,13 +2288,21 @@ namespace sirius::app::cluster {
                 if (pingFailed || now - lastJobCheck >= 2 * keepAlive) {
                     lastJobCheck = now;
                     std::string jobState;
+                    bool queryFailed = false;
                     try {
-                        jobState = trim(remote("squeue -h -j " + id + " -o %T 2>/dev/null", std::chrono::seconds(30)).out);
+                        jobState = trim(remote("squeue -h -j " + shellQuote(id) + " -o %T 2>/dev/null", std::chrono::seconds(30)).out);
                     } catch (const std::exception&) {
-                        jobState = "?";
+                        queryFailed = true;
                     }
                     if (stopKeeper.load()) return;
-                    if (jobState.empty() || (jobState != "RUNNING" && jobState != "COMPLETING" && jobState != "?")) {
+                    if (queryFailed) {
+                        // A failed squeue is not a live job. The channel may be
+                        // wedged; drop it so the badge is not Connected.
+                        if (s && s->isOpen()) s->close();
+                        lost("could not query job " + id + "; the SSH session was closed", logTail(id));
+                        return;
+                    }
+                    if (jobState.empty() || (jobState != "RUNNING" && jobState != "COMPLETING")) {
                         lost("job " + id + " ended: " + finalState(id), logTail(id), true);
                         return;
                     }
@@ -2935,7 +2943,7 @@ namespace sirius::app::cluster {
             note = "job " + id + " was yours before SIRIUS: it keeps running";
         } else if (!id.empty() && up) {
             try {
-                const ssh::CommandResult r = s->run("scancel " + id, std::chrono::seconds(30));
+                const ssh::CommandResult r = s->run("scancel " + shellQuote(id), std::chrono::seconds(30));
                 ended = r.ok();
                 note = ended ? "job " + id + " cancelled" : "scancel " + id + " failed: " + trim(r.err);
             } catch (const std::exception& e) {
@@ -3021,7 +3029,7 @@ namespace sirius::app::cluster {
                 note = "job " + id + " was yours before SIRIUS: it keeps running";
             } else if (cancelJob && s && s->isOpen()) {
                 try {
-                    const ssh::CommandResult r = s->run("scancel " + id, std::chrono::seconds(30));
+                    const ssh::CommandResult r = s->run("scancel " + shellQuote(id), std::chrono::seconds(30));
                     note = r.ok() ? "job " + id + " cancelled" : "scancel " + id + " failed: " + trim(r.err);
                     if (r.ok()) {
                         const std::lock_guard<std::mutex> g(impl_->m);

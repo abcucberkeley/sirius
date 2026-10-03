@@ -211,6 +211,38 @@ TEST_CASE("logBlobSeeds puts one seed in each blob whatever its size", "[app][tr
     CHECK(inLarge == 1);
 }
 
+TEST_CASE("logBlobSeeds finds a blob that is round in microns when dz is not dx", "[app][tracking][labels]") {
+    // zAspect 3: a ball of physical radius 4 dx is 4 voxels in x/y and about
+    // 1.3 voxels in z. The LoG used to score z curvature in voxels, so this
+    // pancake-in-voxels shape was not the blob the blur had made.
+    const Index z = 11, y = 21, x = 21;
+    const Index n = z * y * x;
+    const double zAspect = 3.0;
+    std::vector<float> values(static_cast<std::size_t>(n), 0.0f);
+    std::vector<std::uint8_t> mask(static_cast<std::size_t>(n), 1);
+    const double cz = 5, cy = 10, cx = 10, r = 4.0;
+    for (Index iz = 0; iz < z; ++iz)
+        for (Index iy = 0; iy < y; ++iy)
+            for (Index ix = 0; ix < x; ++ix) {
+                const double dz = (iz - cz) * zAspect, dy = iy - cy, dx = ix - cx;
+                const double d2 = dz * dz + dy * dy + dx * dx;
+                if (d2 <= r * r) values[static_cast<std::size_t>((iz * y + iy) * x + ix)] = 1000.0f * static_cast<float>(1.0 - d2 / (r * r));
+            }
+    std::vector<std::uint32_t> seeds(static_cast<std::size_t>(n), 0u);
+    const std::uint32_t count = logBlobSeeds(values.data(), mask.data(), z, y, x, zAspect, 1.2, 2.5, 3, seeds.data());
+    // Voxel-scaled z curvature also seeds the flattened poles. One seed, at the centre.
+    CHECK(count == 1);
+    bool nearCenter = false;
+    for (Index iz = 0; iz < z; ++iz)
+        for (Index iy = 0; iy < y; ++iy)
+            for (Index ix = 0; ix < x; ++ix) {
+                if (!seeds[static_cast<std::size_t>((iz * y + iy) * x + ix)]) continue;
+                const double dz = (iz - cz) * zAspect, dy = iy - cy, dx = ix - cx;
+                if (dz * dz + dy * dy + dx * dx <= 4.0) nearCenter = true;
+            }
+    CHECK(nearCenter);
+}
+
 TEST_CASE("Gap closing follows a chain of missed frames, not just the first link",
           "[app][tracking]") {
     // One stationary object detected in frames 0, 2 and 4 and missed in 1 and

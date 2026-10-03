@@ -226,6 +226,50 @@ TEST_CASE("fromLegacy rejects invalid apodizeoutput", "[legacy][convert]") {
     REQUIRE_THROWS_AS(fromLegacy(c), std::runtime_error);
 }
 
+TEST_CASE("fromLegacy keeps phaseSteps and forcemodamp, and rejects a bad length", "[legacy][convert]") {
+    SECTION("phase steps of length nphases become the separation phases") {
+        TempFile tf(".cfg", "nphases=5\nphaseSteps=0,0.4,1.2,2.0,3.5\n");
+        const SIMParameters p = fromLegacy(loadLegacyConfig(tf.str()));
+        REQUIRE(p.phase_steps);
+        REQUIRE(p.phase_steps->size() == 5);
+        CHECK((*p.phase_steps)[1] == Approx(0.4));
+        CHECK((*p.phase_steps)[4] == Approx(3.5));
+    }
+    SECTION("the wrong number of phase steps is an error") {
+        TempFile tf(".cfg", "nphases=5\nphaseSteps=0,1\n");
+        REQUIRE_THROWS_AS(fromLegacy(loadLegacyConfig(tf.str())), std::runtime_error);
+    }
+    SECTION("forcemodamp of length norders is kept") {
+        TempFile tf(".cfg", "nphases=5\nnorders=3\nforcemodamp=1,0.5,0.2\n");
+        const SIMParameters p = fromLegacy(loadLegacyConfig(tf.str()));
+        REQUIRE(p.force_mod_amp);
+        REQUIRE(p.force_mod_amp->size() == 3);
+        CHECK((*p.force_mod_amp)[1] == Approx(0.5));
+    }
+    SECTION("forcemodamp of length ndirs*norders is kept") {
+        TempFile tf(".cfg", "nphases=5\nndirs=2\nnorders=3\nforcemodamp=1,0.5,0.2,1,0.4,0.1\n");
+        const SIMParameters p = fromLegacy(loadLegacyConfig(tf.str()));
+        REQUIRE(p.force_mod_amp);
+        CHECK(p.force_mod_amp->size() == 6);
+    }
+    SECTION("any other forcemodamp length is an error") {
+        TempFile tf(".cfg", "nphases=5\nforcemodamp=1,0.5\n");
+        REQUIRE_THROWS_AS(fromLegacy(loadLegacyConfig(tf.str())), std::runtime_error);
+    }
+}
+
+TEST_CASE("patternFundamental divides a 3D line spacing by resolvedOrders()-1", "[params]") {
+    SIMParameters p;
+    p.nphases = 5;
+    p.linespacing_um = 0.2;
+    p.norders = 0;   // derived: 5/2+1 = 3, so divide by 2
+    CHECK(p.patternFundamental(true) == Approx((1.0 / 0.2) / 2.0));
+    CHECK(p.patternFundamental(false) == Approx(1.0 / 0.2));
+    p.norders = 2;   // explicit: divide by 1, not by (nphases/2+1)-1
+    CHECK(p.resolvedOrders() == 2);
+    CHECK(p.patternFundamental(true) == Approx(1.0 / 0.2));
+}
+
 TEST_CASE("fromLegacy validates the result", "[legacy][convert]") {
     // k0angles count (2) != ndirs (3) must fail validation inside fromLegacy.
     LegacyReconConfig c;

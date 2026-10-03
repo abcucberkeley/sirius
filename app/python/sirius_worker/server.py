@@ -1048,7 +1048,7 @@ class WorkerServer:
             model = wb.load_model(path, device)
             tile = _triple(p.get("tile"), (32, 256, 256))
             ov = p.get("overlap", 32)
-            overlap = _triple(ov, (4, 32, 32)) if isinstance(ov, (list, tuple, str)) else (max(1, int(ov) // 8), int(ov), int(ov))
+            overlap = overlap_axes(ov)
             prob = wb.tiled_inference(volume, model, tile, overlap, device, int(p.get("pad_to", 1) or 1),
                                       str(p.get("activation", "auto")), bool(p.get("normalize", True)),
                                       progress=progress, cancelled=cancelled)
@@ -1177,6 +1177,12 @@ def _tensor(tensors: Dict[str, np.ndarray], name: str, ndim: int) -> np.ndarray:
     if a.ndim != ndim:
         raise ValueError(f"tensor '{name}' must have {ndim} dimensions, got shape {a.shape}")
     return np.ascontiguousarray(a)
+
+
+def overlap_axes(ov) -> tuple:
+    """Tile halo in pixels on (z, y, x). One number applies to every axis;
+    a list is already (z, y, x). tiled_inference clamps each axis to half its tile."""
+    return _triple(ov, (4, 32, 32))
 
 
 def _triple(v, default) -> tuple:

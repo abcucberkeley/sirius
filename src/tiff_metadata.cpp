@@ -203,6 +203,7 @@ namespace sirius {
                     const Attrs a = parseAttrs(xml, nameEnd, close);
                     OmeImage& img = md.omeImages.back();
                     img.dimensionOrder = attrString(a, "DimensionOrder");
+                    if (img.dimensionOrder.empty()) img.dimensionOrder = "XYZCT";   // OME schema default
                     img.type = attrString(a, "Type");
                     img.sizeX = toCount(attrDouble(a, "SizeX"));
                     img.sizeY = toCount(attrDouble(a, "SizeY"));
@@ -368,7 +369,7 @@ namespace sirius {
                 const char l = static_cast<char>(std::toupper(static_cast<unsigned char>(ch)));
                 if ((l == 'C' || l == 'Z' || l == 'T') && order.find(l) == std::string::npos) order += l;
             }
-            for (char l : std::string("CZT"))
+            for (char l : std::string("ZCT"))   // OME default XYZCT: Z fastest after XY
                 if (order.find(l) == std::string::npos) order += l;
             auto planeOf = [&](std::uint64_t ci, std::uint64_t zi, std::uint64_t ti) {
                 std::uint64_t idx = 0, stride = 1;

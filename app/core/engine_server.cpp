@@ -28,7 +28,7 @@ namespace sirius::app {
         const std::vector<std::string>& ownMethods() {
             static const std::vector<std::string> m{"hello", "ping", "cancel", "shutdown", "dataset_info",
                                                     "dataset_read", "dataset_view", "dataset_stats", "pipeline_run", "step_preview",
-                                                    "step_validate", "output_stats", "put_file", "stat_file", "outputs_release",
+                                                    "step_validate", "output_stats", "output_labels", "put_file", "stat_file", "outputs_release",
                                                     "cache_status", "capabilities"};
             return m;
         }
@@ -319,6 +319,7 @@ namespace sirius::app {
         d.server.handle("pipeline_run", [this](const rpc::Request& req, rpc::CallContext& ctx) { return impl_->node->pipelineRun(req, ctx); }, rpc::Dispatch::Job);
         d.server.handle("step_preview", [this](const rpc::Request& req, rpc::CallContext& ctx) { return impl_->node->stepPreview(req, ctx); }, rpc::Dispatch::Concurrent);
         d.server.handle("output_stats", [this](const rpc::Request& req, rpc::CallContext& ctx) { return impl_->node->outputStats(req, ctx); }, rpc::Dispatch::Concurrent);
+        d.server.handle("output_labels", [this](const rpc::Request& req, rpc::CallContext&) { return impl_->node->outputLabels(req); }, rpc::Dispatch::Concurrent);
         d.server.handle("step_validate", [this](const rpc::Request& req, rpc::CallContext&) { return impl_->node->stepValidate(req); });
         d.server.handle("put_file", [this](const rpc::Request& req, rpc::CallContext&) { return impl_->node->putFile(req); });
         d.server.handle("stat_file", [this](const rpc::Request& req, rpc::CallContext&) { return impl_->node->statFile(req); });

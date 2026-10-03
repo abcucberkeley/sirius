@@ -22,7 +22,8 @@
 
 namespace sirius::test {
 
-    inline Buffer<double> syntheticSim2d(const SIMParameters& p, int n, double modulation = 0.8) {
+    inline Buffer<double> syntheticSim2d(const SIMParameters& p, int n, double modulation = 0.8,
+                                         std::vector<double>* objectOut = nullptr) {
         using Cplx = std::complex<double>;
         const std::size_t nn = static_cast<std::size_t>(n) * static_cast<std::size_t>(n);
 
@@ -30,6 +31,7 @@ namespace sirius::test {
         std::mt19937 rng(1);
         std::vector<double> object(nn, 0.0);
         for (int i = 0; i < 400; ++i) object[rng() % nn] += 1.0 + static_cast<double>(rng() % 1000);
+        if (objectOut) *objectOut = object;
 
         const double kc = 2.0 * p.na / (p.wavelength_nm * 1e-3);
         auto freq = [n](int i, double d) { return static_cast<double>(i < n / 2 ? i : i - n) / (n * d); };

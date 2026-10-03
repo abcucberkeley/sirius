@@ -1089,7 +1089,7 @@ namespace sirius::app::gui {
                 gap();
                 fieldLabel(s.label, formW);
                 ImGui::PushID(key.c_str());
-                pathEditor(s, params, formW, "Modelsâ¦",
+                pathEditor(s, params, formW, "Models…",
                            "Choose from the models in your models folders (sirius-app.toml [models], and the cluster's while "
                            "connected), with their tasks and what each is for",
                            [this, key] { openHub(key, true); });
@@ -1104,11 +1104,11 @@ namespace sirius::app::gui {
                 std::string why;
                 if (startsWith(model, "cluster://")) {
                     if (const std::optional<nlohmann::json> j = wb().clusterModelInfo(model, &why)) facts = modelFactsFromJson(*j, &why);
-                    else if (why.empty()) why = "Reading model.json on the clusterâ¦";
+                    else if (why.empty()) why = "Reading model.json on the cluster…";
                 } else if (pathExists(model)) {
                     facts = readModelFolder(model, &why);
                 }
-                if (facts) about = facts->title() + (facts->description.empty() ? std::string() : " â " + facts->description);
+                if (facts) about = facts->title() + (facts->description.empty() ? std::string() : " — " + facts->description);
                 else about = why;   // a folder not on this machine: the step's own warning says so
             }
             if (!about.empty()) {

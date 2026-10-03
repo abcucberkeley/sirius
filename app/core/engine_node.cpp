@@ -403,6 +403,33 @@ namespace sirius::app {
         return reply;
     }
 
+    rpc::Reply EngineNode::outputLabels(const rpc::Request& req) {
+        const std::string path = stringParam(req.params, "path");
+        if (path.empty() || !isOutputHandle(path)) throw std::runtime_error("output_labels: no step output");
+        std::shared_ptr<const StepOutput> held;
+        try {
+            held = impl_->outputOf(path);
+        } catch (const DatasetError& e) {
+            throw std::runtime_error(std::string("DatasetError: ") + e.what());
+        }
+        if (!held->labels || held->labels->empty()) throw std::runtime_error("output_labels: this result has no labels");
+        const LabelVolume& labels = *held->labels;
+        const Index plane = labels.z() * labels.y() * labels.x();
+        const std::size_t n = static_cast<std::size_t>(labels.t()) * static_cast<std::size_t>(plane);
+        rpc::Tensor tensor;
+        tensor.name = "labels";
+        tensor.dtype = "uint32";
+        tensor.shape = {labels.t(), labels.z(), labels.y(), labels.x()};
+        tensor.bytes.resize(n * sizeof(std::uint32_t));
+        auto* dst = reinterpret_cast<std::uint32_t*>(tensor.bytes.data());
+        for (Index t = 0; t < labels.t(); ++t)
+            std::copy_n(labels.volume(t), static_cast<std::size_t>(plane), dst + static_cast<std::size_t>(t) * static_cast<std::size_t>(plane));
+        rpc::Reply reply;
+        reply.result = json::object();
+        reply.tensors.push_back(std::move(tensor));
+        return reply;
+    }
+
     // --- output_stats ---------------------------------------------------------------------------------------
 
     rpc::Reply EngineNode::outputStats(const rpc::Request& req, rpc::CallContext& call) {

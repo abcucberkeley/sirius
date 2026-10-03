@@ -100,7 +100,7 @@ namespace sirius {
             // order) and the axial frequency of its interference with the
             // central beam.
             const double kex = p.nimm / (0.88 * lambda);
-            const double k1 = (1.0 / p.linespacing_um) / static_cast<double>(norders - 1);
+            const double k1 = p.patternFundamental(true);
             const double kz1 = k1 < kex ? kex - std::sqrt(kex * kex - k1 * k1) : kex;
             const double dkzotf = 1.0 / (nzotf * dzPsf);
             const double shift = kz1 / dkzotf;   // in table planes

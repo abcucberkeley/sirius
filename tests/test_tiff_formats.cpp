@@ -628,6 +628,28 @@ TEST_CASE("parseTiffMetadata reads OME images, channels, TiffData and physical s
     CHECK(pages[2].empty());
 }
 
+TEST_CASE("omeImagePages uses XYZCT when DimensionOrder is omitted", "[tiff][ome]") {
+    // OME's default is XYZCT (Z fastest). A missing attribute used to be filled
+    // as C fastest, so FirstC=1 landed on plane 1 instead of plane SizeZ.
+    // Each (c, z) is its own IFD, stored Z-then-C: page = z + c*SizeZ.
+    // Z-fastest plane index is that same number, so the page list is 0,1,2,3.
+    // C-fastest would put (c=1,z=0) at plane 1 and the list would be 0,2,1,3.
+    const std::string xml =
+        R"(<OME><Image><Pixels SizeX="4" SizeY="4" SizeZ="2" SizeC="2" SizeT="1">)"
+        R"(<TiffData IFD="0" FirstC="0" FirstZ="0" PlaneCount="1"/>)"
+        R"(<TiffData IFD="1" FirstC="0" FirstZ="1" PlaneCount="1"/>)"
+        R"(<TiffData IFD="2" FirstC="1" FirstZ="0" PlaneCount="1"/>)"
+        R"(<TiffData IFD="3" FirstC="1" FirstZ="1" PlaneCount="1"/>)"
+        R"(</Pixels></Image></OME>)";
+    const TiffMetadata md = parseTiffMetadata(xml);
+    CHECK(md.dimensionOrder == "XYZCT");
+    REQUIRE(md.omeImages.size() == 1);
+    CHECK(md.omeImages[0].dimensionOrder == "XYZCT");
+    const auto pages = omeImagePages(md, 4);
+    REQUIRE(pages.size() == 1);
+    CHECK(pages[0] == std::vector<std::uint32_t>{0, 1, 2, 3});
+}
+
 TEST_CASE("omeImagePages follows TiffData plane order and images without TiffData follow on", "[tiff][ome]") {
     const std::string xml =
         R"(<OME><Image><Pixels DimensionOrder="XYCZT" SizeZ="2" SizeC="2" SizeT="1">)"

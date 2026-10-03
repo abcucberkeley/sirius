@@ -3536,6 +3536,11 @@ def _activation(out: np.ndarray, activation: str) -> np.ndarray:
     return out
 
 
+def clamp_overlap(overlap: Sequence[int], tile: Sequence[int]) -> list:
+    """Each halo is at most half its tile, and never negative."""
+    return [int(min(max(int(o), 0), t // 2)) for o, t in zip(overlap, tile)]
+
+
 def tiled_inference(volume: np.ndarray, model, tile: Sequence[int] = (32, 256, 256),
                     overlap: Sequence[int] = (4, 32, 32), device: str = "auto", pad_to: int = 1,
                     activation: str = "auto", normalize: bool = True, progress: ProgressFn = None,
@@ -3552,7 +3557,7 @@ def tiled_inference(volume: np.ndarray, model, tile: Sequence[int] = (32, 256, 2
         volume = np.clip((volume - lo) / (hi - lo), 0.0, 1.0).astype(np.float32)
     shape = volume.shape
     tile = [int(min(max(int(t), 1), n)) for t, n in zip(tile, shape)]
-    overlap = [int(min(max(int(o), 0), t // 2)) for o, t in zip(overlap, tile)]
+    overlap = clamp_overlap(overlap, tile)
     starts = []
     for n, t, o in zip(shape, tile, overlap):
         if t >= n:

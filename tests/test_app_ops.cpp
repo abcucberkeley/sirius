@@ -36,6 +36,7 @@
 #include "core/model_folder.hpp"
 #include "core/ops/common.hpp"
 #include "core/ops/contrast.hpp"
+#include "core/ops/sim_params.hpp"
 #include "core/ops/torch_model.hpp"
 #include "core/ops/builtin.hpp"
 #include "core/pipeline.hpp"
@@ -258,6 +259,14 @@ TEST_CASE("SIM reconstructs the bundled stack from a parameter file and reports 
     REQUIRE(out.diagnostics.table);
     CHECK(out.diagnostics.table->rows.size() == 3);
     CHECK(out.diagnostics.table->header.size() == 4);
+    // k0 is in px^-1 of the raw pixel; line spacing is dx / k0, the same
+    // window the library locks against the cudasirecon fit.
+    for (const std::vector<std::string>& row : out.diagnostics.table->rows) {
+        const double k0px = std::stod(row[1]);
+        const double spacingUm = 0.08 / k0px;
+        CHECK(spacingUm > 0.40);
+        CHECK(spacingUm < 0.415);
+    }
     REQUIRE_FALSE(out.diagnostics.tabs.empty());
     CHECK(out.diagnostics.tabs.front().name == "Raw spectrum");
     CHECK(out.diagnostics.tabs.front().images.size() == 3);
@@ -308,6 +317,60 @@ TEST_CASE("SIM reconstructs the bundled stack from a parameter file and reports 
         CHECK(ideal.array->dims() == predicted.dims);
         CHECK(ideal.note.find("theoretical OTF") != std::string::npos);
     }
+}
+
+TEST_CASE("SIM From file keeps the file's OTF axial step unless the field is set", "[app][ops][sim]") {
+    const test::TempFile cfg("sim_dzpsf", ".txt");
+    {
+        std::ofstream(cfg.path) << "nphases=5\nndirs=3\nna=1.2\nnimm=1.33\nxyres=0.1\nzres=0.2\nzresPSF=0.5\nls=0.2\n";
+    }
+    DatasetMeta meta = metaFor(Dims5{1, 1, 15, 8, 8}, 0.1, 0.2);
+    meta.sim.present = true;
+    meta.sim.ndirs = 3;
+    meta.sim.nphases = 5;
+    const Operation& sim = requireOperation("sim");
+    ParamSet fromFile = sim.defaults();
+    fromFile.set("mode", std::string("From file"));
+    fromFile.set("params_file", cfg.str);
+    SIMParameters kept = simParametersFromStep(fromFile, meta);
+    CHECK_THAT(kept.dz_psf, WithinAbs(0.5, 1e-9));
+    fromFile.set("dz_psf", 0.3);
+    SIMParameters overridden = simParametersFromStep(fromFile, meta);
+    CHECK_THAT(overridden.dz_psf, WithinAbs(0.3, 1e-9));
+
+    ParamSet missing = sim.defaults();
+    missing.set("mode", std::string("From file"));
+    const test::TempFile bare("sim_dzpsf_bare", ".txt");
+    std::ofstream(bare.path) << "nphases=5\nndirs=3\nna=1.2\nnimm=1.33\nxyres=0.1\nzres=0.2\nls=0.2\n";
+    missing.set("params_file", bare.str);
+    SIMParameters fromStack = simParametersFromStep(missing, meta);
+    CHECK_THAT(fromStack.dz_psf, WithinAbs(meta.dz(), 1e-9));
+
+    // An inline table and a dotted key are both assignments the loader reads.
+    // A scanner that only looks at the first '=' on a line misses them and
+    // replaces the file's step with the stack dz.
+    const test::TempFile inlined("sim_dzpsf_inline", ".toml");
+    std::ofstream(inlined.path) << "pixels = { dx = 0.1, dy = 0.1, dz = 0.2, dz_psf = 0.55 }\n"
+                                    "[optics]\nndirs = 3\nnphases = 5\nna = 1.2\nnimm = 1.33\nlinespacing_um = 0.2\n";
+    ParamSet inlineFile = sim.defaults();
+    inlineFile.set("mode", std::string("From file"));
+    inlineFile.set("params_file", inlined.str);
+    CHECK_THAT(simParametersFromStep(inlineFile, meta).dz_psf, WithinAbs(0.55, 1e-6));
+    const test::TempFile dotted("sim_dzpsf_dotted", ".toml");
+    std::ofstream(dotted.path) << "pixels.dx = 0.1\npixels.dy = 0.1\npixels.dz = 0.2\npixels.dz_psf = 0.45\n"
+                                   "[optics]\nndirs = 3\nnphases = 5\nna = 1.2\nnimm = 1.33\nlinespacing_um = 0.2\n";
+    ParamSet dot = sim.defaults();
+    dot.set("mode", std::string("From file"));
+    dot.set("params_file", dotted.str);
+    CHECK_THAT(simParametersFromStep(dot, meta).dz_psf, WithinAbs(0.45, 1e-6));
+
+    ParamSet estimate = sim.defaults();
+    estimate.set("mode", std::string("Estimate"));
+    SIMParameters stacked = simParametersFromStep(estimate, meta);
+    CHECK_THAT(stacked.dz_psf, WithinAbs(0.2, 1e-9));
+    estimate.set("dz_psf", 0.3);
+    SIMParameters estimateOverride = simParametersFromStep(estimate, meta);
+    CHECK_THAT(estimateOverride.dz_psf, WithinAbs(0.3, 1e-9));
 }
 
 TEST_CASE("SIM reconstructs a 2D stack with the step's defaults", "[app][ops][sim][2d]") {
@@ -778,19 +841,45 @@ TEST_CASE("Deskew shears the stack and warns when the data is not light-sheet", 
     const Operation& op = requireOperation("deskew");
     ParamSet p = op.defaults();
     p.set("rotate_to_coverslip", false);
+    p.set("interpolation", std::string("nearest"));
+    p.set("sheet_angle", 31.8);
+    p.set("stage_step_um", 0.4);
     CHECK_FALSE(op.validate(p, meta).warnings.empty());
-    CHECK(op.summary(p, meta).find("skipped") != std::string::npos);
+    // The warning says it will shear; the note must describe that shear, not claim it was skipped.
+    CHECK(op.summary(p, meta).find("skipped") == std::string::npos);
+    CHECK(op.summary(p, meta).find("31.8") != std::string::npos);
+    CHECK(op.summary(p, meta).find("shear only") != std::string::npos);
     meta.lightSheet = true;
     meta.sheetAngleDeg = 31.8;
     CHECK(op.validate(p, meta).ok());
     const DatasetMeta out = op.outputMeta(p, meta);
     CHECK(out.dims.x > dims.x);   // the shear widens x
     CHECK_FALSE(out.lightSheet);
+
+    // A marker at x = 0 of each plane lands at x = z * stageStep * cos(angle) / dx.
+    auto marked = std::make_shared<Array5>(Array5::zeros(dims));
+    for (Index z = 0; z < dims.z; ++z) marked->at(0, 0, z, 0, 0) = 1.0f;
+    DatasetMeta plain = metaFor(dims, 0.1, 0.4);   // not marked light-sheet
     Progress prog;
-    const StepOutput r = op.run(inputOf(rampArray(dims), meta), p, prog.ctx);
+    const StepOutput r = op.run(inputOf(marked, plain), p, prog.ctx);
     REQUIRE(r.array);
-    CHECK(r.array->dims() == out.dims);
-    CHECK_FALSE(r.diagnostics.images.empty());
+    CHECK(r.array->dims() == op.outputMeta(p, plain).dims);
+    CHECK(r.note.find("skipped") == std::string::npos);
+    const double shear = 0.4 * std::cos(31.8 * 3.14159265358979323846 / 180.0) / 0.1;
+    for (Index z = 0; z < dims.z; ++z) {
+        const Index expectX = static_cast<Index>(std::lround(z * shear));
+        Index argmax = 0;
+        float best = r.array->at(0, 0, z, 0, 0);
+        for (Index x = 1; x < r.array->dims().x; ++x) {
+            const float v = r.array->at(0, 0, z, 0, x);
+            if (v > best) {
+                best = v;
+                argmax = x;
+            }
+        }
+        CHECK(argmax == expectX);
+        CHECK(best > 0.5f);
+    }
 }
 
 TEST_CASE("Crop / pad cuts a box and carries labels", "[app][ops][croppad]") {
@@ -1037,14 +1126,19 @@ TEST_CASE("Stitch fuses two overlapping tile files", "[app][ops][stitch]") {
     const StepOutput r = op.run(StepInput{}, p, prog.ctx);
     REQUIRE(r.array);
     CHECK(r.array->dims().y == 24);
-    CHECK(r.array->dims().x >= 94);
-    CHECK(r.array->dims().x <= 98);
+    // nominal positions are 2 px short of the true offset 40, so a stitch that
+    // never moves the tiles is 94 wide and reports Δx = 0. The corrected mosaic
+    // is 96 wide and the pair table's Δx (measured minus nominal) is about +2.
+    CHECK(r.array->dims().x >= 95);
+    CHECK(r.array->dims().x <= 97);
     CHECK(r.diagnostics.kind == DiagnosticsKind::Alignment);
     REQUIRE(r.diagnostics.alignment);
     CHECK(r.diagnostics.alignment->tileNames.size() == 2);
     CHECK(r.diagnostics.alignment->gridCols == 2);
     REQUIRE(r.diagnostics.table);
     CHECK(r.diagnostics.table->rows.size() == 1);   // one accepted pair
+    REQUIRE(r.diagnostics.table->rows[0].size() >= 5);
+    CHECK_THAT(std::stod(r.diagnostics.table->rows[0][4]), WithinAbs(2.0, 1.0));
 }
 
 // --- segmentation ---------------------------------------------------------------
@@ -2577,8 +2671,21 @@ TEST_CASE("Deconvolve runs Richardson-Lucy with a theoretical PSF", "[app][ops][
     CHECK(r.array->dims() == dims);
     CHECK(r.diagnostics.kind == DiagnosticsKind::Deconvolve);
     REQUIRE(r.diagnostics.curves.size() == 1);
+    CHECK(r.diagnostics.curves[0].y.size() >= 2);
     CHECK(r.diagnostics.curves[0].y.size() <= 5);
-    CHECK_FALSE(r.diagnostics.curves[0].y.empty());
+    CHECK(r.diagnostics.curves[0].y.back() < r.diagnostics.curves[0].y.front());
+    double changed = 0.0;
+    float inPeak = 0.0f, outPeak = 0.0f;
+    for (Index z = 0; z < dims.z; ++z)
+        for (Index y = 0; y < dims.y; ++y)
+            for (Index x = 0; x < dims.x; ++x) {
+                const float a = data->at(0, 0, z, y, x), b = r.array->at(0, 0, z, y, x);
+                changed += std::abs(a - b);
+                inPeak = std::max(inPeak, a);
+                outPeak = std::max(outPeak, b);
+            }
+    CHECK(changed > 1.0);          // a delta PSF, or the input returned unchanged, fails
+    CHECK(outPeak > inPeak);       // the blob gets sharper
     CHECK_FALSE(r.diagnostics.images.empty());
     SECTION("a missing PSF file is an error") {
         p.set("psf", std::string("/nonexistent/psf.tif"));
@@ -2790,6 +2897,47 @@ TEST_CASE("Every preset names real parameters and leaves the step runnable", "[a
 }
 
 // --- regressions ----------------------------------------------------------------
+
+TEST_CASE("Frangi and Meijering find a line along x and along z when dz is not dx", "[app][ops][classic]") {
+    // dz = 3 dx. A filament along x is a few voxels thick in z; the same
+    // filament along z is that many voxels thick in x and y. Voxel curvature
+    // without the spacing scale reads the first as a sheet.
+    const Dims5 dims{1, 1, 24, 48, 48};
+    DatasetMeta meta = metaFor(dims, 0.1, 0.3);
+    auto data = std::make_shared<Array5>(Array5::zeros(dims));
+    for (Index x = 4; x < 44; ++x)
+        for (Index y = 10; y <= 16; ++y)
+            for (Index z = 5; z <= 7; ++z) data->at(0, 0, z, y, x) = 1000.0f;   // along x, ~0.7 um across
+    for (Index z = 2; z < 22; ++z)
+        for (Index y = 30; y <= 36; ++y)
+            for (Index x = 30; x <= 36; ++x) data->at(0, 0, z, y, x) = 1000.0f;  // along z
+    const Operation& op = requireOperation("classic");
+    ParamSet p = op.defaults();
+    p.set("enhance_sigma", 1.5);
+    p.set("enhance_sigma_max", 3.0);
+    p.set("enhance_scales", std::int64_t{3});
+    p.set("sigma", 0.0);
+    p.set("opening", std::int64_t{0});
+    p.set("fill_holes", false);
+    p.set("method", std::string("Manual"));
+    // Unscaled z curvature (dz = 3 dx) leaves the x-line's vesselness near 0.07,
+    // under this cut. The scaled Hessian clears it. Meijering stays above either way;
+    // it uses the same derivatives, checked on the x-line at the lower cut.
+    p.set("value", 0.05);
+    p.set("post", std::string("Connected components"));
+    p.set("min_voxels", std::int64_t{8});
+    Progress prog;
+    for (const char* enhance : {"Tubes (Frangi)", "Neurites (Meijering)"}) {
+        p.set("enhance", std::string(enhance));
+        p.set("value", std::string(enhance) == "Tubes (Frangi)" ? 0.12 : 0.05);
+        const StepOutput r = op.run(inputOf(data, meta), p, prog.ctx);
+        REQUIRE(r.labels);
+        INFO(enhance);
+        CHECK(r.labels->at(0, 6, 13, 24) != 0);   // middle of the line along x
+        CHECK(r.labels->at(0, 12, 33, 33) != 0);  // middle of the line along z
+        CHECK(r.labels->at(0, 6, 2, 2) == 0);
+    }
+}
 
 TEST_CASE("Frangi finds a line on a single plane", "[app][ops][classic]") {
     // One plane: the 3D measure's third eigenvalue is identically zero and it

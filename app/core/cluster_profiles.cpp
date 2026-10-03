@@ -125,7 +125,9 @@ namespace sirius::app::cluster {
                   {"def_file", defFile},
                   {"job", {{"partition", partition}, {"account", account}, {"qos", qos}, {"time", time}, {"gpus", gpus}, {"cpus", cpus}, {"mem", mem}}},
                   {"partitions", parts}};
-        if (!sshProgram.empty()) j["ssh"] = sshProgram;
+        // sshProgram is how tests stand in for ssh. It is not a setting: a
+        // shared profile that named a program would be started with the
+        // password helper's environment.
         if (!models.empty()) j["models"] = models;
         if (!perHost.empty()) {
             json hosts = json::object();
@@ -171,7 +173,6 @@ namespace sirius::app::cluster {
         num(job, "cpus", p.cpus);
         str(job, "mem", p.mem);
         num(j, "port", p.port);
-        str(j, "ssh", p.sshProgram);
         if (j.contains("engine") && j["engine"].is_boolean()) p.engine = j["engine"].get<bool>();
         str(j, "engineBin", p.engineBin);
         str(j, "engine_bin", p.engineBin);
@@ -462,18 +463,28 @@ namespace sirius::app::cluster {
         flat[profileKey(p.displayName())] = p.toJson();
         return "# A SIRIUS cluster profile. Import it with Process > Connect to cluster... >\n"
                "# ... > Import..., or paste it into your settings file (Preferences > Edit settings file...).\n"
-               "# It holds no password and no token.\n" +
+               "# It holds no password, no token and no SSH client.\n" +
                settings_toml::toToml(flat, false);
     }
 
-    std::vector<Profile> importProfiles(const std::string& text) {
+    std::vector<Profile> importProfiles(const std::string& text, bool* ignoredSshProgram) {
         const settings_toml::ParseResult r = settings_toml::fromToml(text);
         if (!r.ok)
             throw std::runtime_error("this is not a TOML file" +
                                      (r.line > 0 ? " (line " + std::to_string(r.line) + ", column " + std::to_string(r.column) + ": " + r.error + ")"
                                                  : " (" + r.error + ")"));
+        bool ignoredSsh = false;
+        if (r.flat.is_object()) {
+            for (auto it = r.flat.begin(); it != r.flat.end(); ++it) {
+                if (!it.value().is_object() || !it.value().contains("ssh")) continue;
+                const json& ssh = it.value()["ssh"];
+                if (ssh.is_string() && !trim(ssh.get<std::string>()).empty()) ignoredSsh = true;
+            }
+        }
+        if (ignoredSshProgram) *ignoredSshProgram = ignoredSsh;
         ProfileBook b = ProfileBook::fromSettings(r.flat);
         if (b.profiles.empty()) throw std::runtime_error("it holds no cluster profile (a [cluster.<name>] table with a host)");
+        for (Profile& p : b.profiles) p.sshProgram.clear();
         return b.profiles;
     }
 
@@ -607,6 +618,8 @@ namespace sirius::app::cluster {
                     warn(at(base, "image"), "No worker image yet: the worker cannot start until image names one (Connect to cluster can build it).");
                 for (const char* k : {"host", "image", "checkout", "launcher", "python_path", "engine_builds", "engine_bin", "cache", "def_file", "ssh", "models"})
                     string(p, base, k, "a name or a path");
+                if (p.contains("ssh") && p["ssh"].is_string() && !trim(p["ssh"].get<std::string>()).empty())
+                    warn(at(base, "ssh"), "ssh names a program, and a shared profile must not: it is ignored, and SIRIUS uses the system SSH client.");
                 strings(p, base, "images", "worker images used before");
                 strings(p, base, "binds", "folders on the cluster the image sees");
                 if (p.contains("bind_sets")) {

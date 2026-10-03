@@ -376,6 +376,8 @@ namespace sirius::app::ssh {
                                       "-o", "ForwardX11=no",
                                       // no command of the ssh config's choosing runs here
                                       "-o", "PermitLocalCommand=no",
+                                      // the user's ssh config must not turn host-key checking off
+                                      "-o", "StrictHostKeyChecking=yes",
                                       "-o", "BatchMode=no",
                                       // a wrong password costs one attempt, never three
                                       "-o", "NumberOfPasswordPrompts=1",
@@ -492,7 +494,10 @@ namespace sirius::app::ssh {
                 }
                 throw SshError("the SSH connection ended");
             }
-            if (cancelled && cancelled()) throw SshError("cancelled");
+            if (cancelled && cancelled()) {
+                close();   // the remote eval is still reading this channel
+                throw SshError("cancelled");
+            }
             if (std::chrono::steady_clock::now() > deadline) return false;
         }
     }
@@ -518,7 +523,13 @@ namespace sirius::app::ssh {
         text += "printf '%s %d\\n' '" + exitMark + "' \"$__sirius_rc\"\n";
         if (!child_ || !child_->writeInput(text)) throw SshError("the SSH connection is closed");
         const auto deadline = std::chrono::steady_clock::now() + timeout;
-        auto timedOut = [&] { return SshError("no answer from " + host_ + " within " + std::to_string(timeout.count() / 1000) + " s"); };
+        // A command that does not finish owns this channel until it does.
+        // Closing ssh SIGHUPs the remote shell, so the next command cannot
+        // be written behind it.
+        auto timedOut = [&]() -> SshError {
+            close();
+            return SshError("no answer from " + host_ + " within " + std::to_string(timeout.count() / 1000) + " s");
+        };
         std::string line;
         // anything before the begin marker (a login banner, a late answer) is not ours
         for (;;) {
