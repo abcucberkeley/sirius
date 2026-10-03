@@ -2323,10 +2323,31 @@ namespace sirius::app::cluster {
             }
         }
         if (note) {
+            // Say why each build was passed over: a build whose operations match
+            // but whose bin/sirius-cli cannot be run is a broken install, not a
+            // different version, and the fix is a different one.
+            std::size_t notRunnable = 0, unreadable = 0, mismatched = 0;
+            std::string firstBroken;
+            for (const EngineBuild& b : builds) {
+                if (!b.readable) ++unreadable;
+                else if (!engineMismatch(app, b.info).empty()) ++mismatched;
+                else if (!b.runnable) {
+                    ++notRunnable;
+                    if (firstBroken.empty()) firstBroken = b.dir.substr(0, 12);
+                }
+            }
             if (builds.empty()) *note = "The engine builds folder holds no build (<commit>/BUILD.json and bin/sirius-cli).";
-            else
+            else if (notRunnable > 0)
+                *note = "Engine build " + firstBroken + " matches this application but its bin/sirius-cli cannot be run (missing or not "
+                                                        "executable on the cluster): reinstall that build" +
+                        (notRunnable + unreadable + mismatched > 1 ? " (" + std::to_string(builds.size()) + " builds checked)." : std::string("."));
+            else if (mismatched == builds.size())
                 *note = "None of the " + std::to_string(builds.size()) + (builds.size() == 1 ? " engine build" : " engine builds") +
                         " fits this application (" + app.build + "): their operations or engine API differ.";
+            else
+                *note = "None of the " + std::to_string(builds.size()) + (builds.size() == 1 ? " engine build" : " engine builds") +
+                        " can be used: " + std::to_string(unreadable) + " with an unreadable BUILD.json, " + std::to_string(mismatched) +
+                        " for other operations or engine API.";
         }
         return -1;
     }

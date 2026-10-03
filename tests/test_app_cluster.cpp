@@ -2028,7 +2028,11 @@ TEST_CASE("cluster: the engine build of this application, or one of the same ope
     CHECK(note == "the same operations as this build");
     // never one that cannot run, cannot be read, or has other operations
     CHECK(cluster::pickEngineBuild({found[2], found[3], found[4]}, app, &note) == -1);
-    CHECK(note.find("None of the 3 engine builds") != std::string::npos);
+    // a matching build that cannot be run is named first: its fix is a reinstall, not a new build
+    CHECK(note.find("cannot be run") != std::string::npos);
+    CHECK(note.find("3 builds checked") != std::string::npos);
+    CHECK(cluster::pickEngineBuild({found[3], found[4]}, app, &note) == -1);
+    CHECK(note.find("None of the 2 engine builds can be used") != std::string::npos);
     CHECK(cluster::pickEngineBuild({}, app, &note) == -1);
     CHECK(note.find("holds no build") != std::string::npos);
     CHECK(cluster::engineBuildsScript("~/engines").find("BUILD.json") != std::string::npos);
@@ -2782,6 +2786,10 @@ TEST_CASE("cluster: BUILD.json's schema hash under either key, the python column
     changed["schema_hash"] = "0000";
     CHECK(cluster::pickEngineBuild(cluster::parseEngineBuilds("@@build 8368aab yes yes " + changed.dump() + "\n"), app, &note) == -1);
     CHECK(note.find("their operations or engine API differ") != std::string::npos);
+    // the same operations, but bin/sirius-cli cannot be run: a broken install, said as such
+    CHECK(cluster::pickEngineBuild(cluster::parseEngineBuilds("@@build 8368aab4582f no yes " + onlyNew.dump() + "\n"), app, &note) == -1);
+    CHECK(note.find("8368aab4582f matches this application but its bin/sirius-cli cannot be run") != std::string::npos);
+    CHECK(note.find("operations or engine API differ") == std::string::npos);
     const std::string fix = cluster::engineBuildFix("/clusterfs/me/sirius-builds", app);
     CHECK(fix.find("/clusterfs/me/sirius-builds/" + app.commit) != std::string::npos);
     CHECK(fix.find("build_sirius_engine.sbatch") != std::string::npos);
