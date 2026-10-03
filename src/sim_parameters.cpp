@@ -181,7 +181,7 @@ namespace sirius {
             std::vector<double> values;
             values.reserve(arr->size());
             for (auto& item : *arr)
-                if (auto v = item.value<double>()) values.push_back(*v);
+                if (auto v = item.template value<double>()) values.push_back(*v);
             if (values.empty()) return std::nullopt;
             return values;
         };
