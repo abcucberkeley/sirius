@@ -8,7 +8,32 @@
 # $FAKE_SLURM_DIR/apptainer.args; with $FAKE_APPTAINER_DRY=1 nothing is run.
 set -u
 [ -n "${FAKE_SLURM_DIR:-}" ] && printf '%s %s\n' "$(basename "$0")" "$*" >> "$FAKE_SLURM_DIR/apptainer.args"
-[ "${1:-}" = exec ] || { echo "fake apptainer: only exec is played" >&2; exit 2; }
+if [ "${1:-}" = build ]; then
+    # `apptainer build [--fakeroot] OUT DEF`: a small file at OUT, a few lines
+    # of progress. $FAKE_APPTAINER_NO_FAKEROOT=1 (or a file no_fakeroot in
+    # $FAKE_SLURM_DIR) refuses --fakeroot as a site without subuid mappings does.
+    shift
+    fakeroot=0
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --fakeroot) fakeroot=1; shift ;;
+            -*) shift ;;
+            *) break ;;
+        esac
+    done
+    out="${1:?}" def="${2:?}"
+    if [ "$fakeroot" = 1 ] && { [ "${FAKE_APPTAINER_NO_FAKEROOT:-0}" = 1 ] || [ -f "${FAKE_SLURM_DIR:-/nonexistent}/no_fakeroot" ]; }; then
+        echo "FATAL:   could not use fakeroot: no mapping entry found in /etc/subuid for ${USER:-you}" >&2
+        exit 255
+    fi
+    [ -f "$def" ] || { echo "FATAL:   Unable to build from $def: no such file" >&2; exit 255; }
+    echo "INFO:    Starting build..."
+    echo "INFO:    Creating SIF file..."
+    printf 'fake image built from %s\n' "$def" > "$out" || exit 255
+    echo "INFO:    Build complete: $out"
+    exit 0
+fi
+[ "${1:-}" = exec ] || { echo "fake apptainer: only exec and build are played" >&2; exit 2; }
 shift
 while [ $# -gt 0 ]; do
     case "$1" in

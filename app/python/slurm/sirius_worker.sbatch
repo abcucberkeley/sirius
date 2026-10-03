@@ -1,31 +1,39 @@
 #!/bin/bash
 #SBATCH --job-name=sirius-worker
-#SBATCH --partition=abc_a100
-#SBATCH --account=velatkilic
-#SBATCH --qos=abc_debug
 #SBATCH --gres=gpu:1
 #SBATCH --cpus-per-task=8
 #SBATCH --mem=64G
 #SBATCH --time=01:00:00
 #SBATCH --output=sirius-worker-%j.log
 #
-# Runs the SIRIUS compute worker on a cluster node for the application's HPC
-# backend. sirius-app submits it for you (Process > Connect to cluster...:
-# one SSH login, then this script with the profile's partition, account, QoS,
-# time and resources on the sbatch command line, the token in a private file
-# whose name is $SIRIUS_TOKEN_FILE and the log in ~/.sirius/run). By hand,
-# submit with a shared secret in a file only you can read -- the worker reads
-# it and deletes it -- rather than in $SIRIUS_TOKEN, which Slurm's accounting
-# may store with the job's environment (AccountingStoreFlags=job_env):
+# Runs the SIRIUS compute worker -- SIRIUS's engine, or the Python worker
+# alone -- in its container image on a cluster node, for the application's
+# HPC backend.
+#
+# sirius-app starts it for you (Process > Connect to cluster...), in two
+# steps: Connect gets a job that only holds the allocation (sbatch --wrap
+# with the profile's partition, account, QoS, time and resources), then
+# Start worker runs this script inside that job as a step,
+#
+#     srun --jobid=<job> --overlap --ntasks=1 [--gres=gpu:N] bash app/python/slurm/sirius_worker.sbatch
+#
+# from the SIRIUS checkout, with the image, the data folders and the token
+# file in its environment and its log in ~/.sirius/run. A new image or new
+# data folders restart only this step; the job stays.
+#
+# By hand it can be submitted as a job of its own. Give the shared secret in
+# a file only you can read -- the worker reads it and deletes it -- rather
+# than in $SIRIUS_TOKEN, which Slurm's accounting may store with the job's
+# environment (AccountingStoreFlags=job_env):
 #
 #     umask 077; mkdir -p ~/.sirius/run
 #     TOKEN=$(openssl rand -hex 16); printf '%s' "$TOKEN" > ~/.sirius/run/token
-#     SIRIUS_TOKEN_FILE=~/.sirius/run/token sbatch \
+#     SIRIUS_CONTAINER=/path/sirius-worker.sif SIRIUS_TOKEN_FILE=~/.sirius/run/token sbatch \
 #         --output="$HOME/.sirius/run/sirius-worker-%j.log" app/python/slurm/sirius_worker.sbatch
 #
-# The partition, account and QoS above are fiona's test GPUs (abc_debug: one
-# hour at most); give your own on the command line elsewhere, which overrides
-# them: sbatch --partition=... --account=... --qos=... --time=...
+# No partition, account or QoS is named above: Slurm's defaults for you apply
+# unless you give them on the command line, which also overrides the lines
+# above: sbatch --partition=... --account=... --qos=... --time=...
 #
 # then read the node name and the port from the log (the worker takes a free
 # port: the {"port": N, ...} line) and tunnel it to your machine:
@@ -40,29 +48,14 @@ set -euo pipefail
 # whatever the job writes is its owner's alone
 umask 077
 
-# --- environment (Fiona; adapt the modules to your cluster) -----------------
-# SIRIUS_CONTAINER names an Apptainer/Singularity image that holds the
-# compiled sirius package, numpy and torch: the worker then runs in it (see
-# "worker" below) and none of this environment is used.
+# --- the image -----------------------------------------------------------------
+# The worker always runs in a container image (SIRIUS_CONTAINER, below): the
+# node needs nothing installed but apptainer (or singularity), and the worker
+# runs against exactly the libraries the image was built with.
 if [[ -z "${SIRIUS_CONTAINER:-}" ]]; then
-module load python
-module load cmake 2>/dev/null || true
-module load nvhpc 2>/dev/null || true
-fi
-# A Python with numpy (and torch for segmentation models); the sirius wheel
-# enables SIM reconstruction on the node. Install what the worker needs into
-# that environment once, before submitting (share/sirius/python/ in an
-# installed tree):
-#     pip install -r app/python/requirements.txt          # numpy
-#     pip install -r app/python/requirements-extra.txt    # optional: scipy, scikit-image
-# Without numpy the worker exits with code 3 and a missing_packages line in
-# the log. Uncomment for a venv/conda (or SIRIUS's own environment, which
-# `sirius-cli worker setup` makes under ~/.local/share/sirius/python-env):
-# source "$HOME/venvs/sirius/bin/activate"
-# SIRIUS_VENV names one to activate without editing this file.
-if [[ -n "${SIRIUS_VENV:-}" && -z "${SIRIUS_CONTAINER:-}" ]]; then
-    # shellcheck disable=SC1091
-    source "${SIRIUS_VENV}/bin/activate"
+    echo "SIRIUS_CONTAINER is not set: the worker runs in a container image (an Apptainer/Singularity .sif holding the" \
+         "compiled sirius package, numpy and torch); see app/python/slurm/README.md" >&2
+    exit 1
 fi
 
 # --- worker ------------------------------------------------------------------
@@ -91,7 +84,7 @@ fi
 export PYTHONPATH="${WORKER_DIR}${PYTHONPATH:+:$PYTHONPATH}"
 
 echo "sirius worker on $(hostname) (device ${SIRIUS_DEVICE}), job ${SLURM_JOB_ID:-?}; its port is in the {\"port\": ...} line below"
-echo "tunnel:  ssh -N -L 7645:$(hostname):<port> <login-node>   (fiona: fiona.abc.berkeley.edu)"
+echo "tunnel:  ssh -N -L 7645:$(hostname):<port> <login-node>"
 
 # No --allow-install: on a shared node the worker must not run pip or conda
 # on a client's request (see ../SECURITY.md). Install the model packages into
@@ -111,20 +104,22 @@ ARGS=(--host 0.0.0.0 --port "${SIRIUS_PORT}" --device "${SIRIUS_DEVICE}" --max-c
 # the application shows them (at screen size) or downloads them. The engine
 # starts the Python worker as its child on 127.0.0.1 (torch models, plugins).
 # SIRIUS_ENGINE_BIN names the executable: /opt/sirius/bin/sirius-cli in the
-# container image by default, sirius-cli on PATH without one. The engine reads
+# container image by default. SIRIUS_ENGINE_DIR, when set, is a per-commit
+# engine build (<engine_builds>/<commit>, with bin/sirius-cli and BUILD.json),
+# bound into the image so the image stays a stable runtime. The engine reads
 # the same token file and prints the same {"port": N} line.
 CMD=(python -m sirius_worker "${ARGS[@]}")
 if [[ "${SIRIUS_ENGINE:-0}" == 1 ]]; then
     ENGINE_BIN="${SIRIUS_ENGINE_BIN:-}"
     if [[ -z "${ENGINE_BIN}" ]]; then
-        if [[ -n "${SIRIUS_CONTAINER:-}" ]]; then ENGINE_BIN=/opt/sirius/bin/sirius-cli; else ENGINE_BIN=sirius-cli; fi
+        if [[ -n "${SIRIUS_ENGINE_DIR:-}" ]]; then ENGINE_BIN="${SIRIUS_ENGINE_DIR}/bin/sirius-cli"; else ENGINE_BIN=/opt/sirius/bin/sirius-cli; fi
     fi
     CMD=("${ENGINE_BIN}" serve "${ARGS[@]}" --python python --worker-dir "${WORKER_DIR}")
     [[ -n "${SIRIUS_ENGINE_SCRATCH:-}" ]] && CMD+=(--scratch "${SIRIUS_ENGINE_SCRATCH}")
     echo "SIRIUS engine: ${ENGINE_BIN} serve (the Python worker beside it, from ${WORKER_DIR})"
 fi
 
-# --- a container instead of a venv -------------------------------------------
+# --- the container -------------------------------------------------------------
 # SIRIUS_CONTAINER=<image.sif> runs the worker inside that image. This is the
 # practical way to serve a model on a cluster: torch, scipy and scikit-image
 # are already in the image the models were trained in, so the node needs no
@@ -144,7 +139,7 @@ fi
 # --env SIRIUS_TOKEN=...` would put the shared secret in argv, where every
 # user of the node can read it. A token given as $SIRIUS_TOKEN is written to a
 # 0600 file first and passed by path; the worker reads that file and deletes it.
-if [[ -n "${SIRIUS_CONTAINER:-}" ]]; then
+{
     # SIRIUS_LAUNCHER (the application sets it from the profile): apptainer by
     # default; a module of that name is loaded when it is not on PATH, and the
     # other runtime is tried when it still cannot be found.
@@ -154,7 +149,7 @@ if [[ -n "${SIRIUS_CONTAINER:-}" ]]; then
     fi
     RUNTIME="$(command -v "${RUNTIME}" || command -v apptainer || command -v singularity || true)"
     if [[ -z "${RUNTIME}" ]]; then
-        echo "SIRIUS_CONTAINER is set but neither ${SIRIUS_LAUNCHER:-apptainer} nor singularity can be run here (module load was tried)" >&2; exit 1
+        echo "neither ${SIRIUS_LAUNCHER:-apptainer} nor singularity can be run here (module load was tried)" >&2; exit 1
     fi
     if [[ ! -r "${SIRIUS_CONTAINER}" ]]; then
         echo "SIRIUS_CONTAINER=${SIRIUS_CONTAINER} is not readable" >&2; exit 1
@@ -184,7 +179,15 @@ if [[ -n "${SIRIUS_CONTAINER:-}" ]]; then
     # checkout or run folder elsewhere is bound, or the worker's code and its
     # token file would not be there inside.
     CHECKOUT="${WORKER_DIR%/app/python}"
-    for d in "${CHECKOUT}" "${RUNDIR}"; do
+    # the engine's node cache folder (SIRIUS_ENGINE_SCRATCH) too, made first,
+    # and the per-commit engine build it runs (SIRIUS_ENGINE_DIR)
+    SCRATCH=()
+    if [[ "${SIRIUS_ENGINE:-0}" == 1 && -n "${SIRIUS_ENGINE_SCRATCH:-}" ]]; then
+        mkdir -p "${SIRIUS_ENGINE_SCRATCH}" || { echo "cannot make the node cache folder ${SIRIUS_ENGINE_SCRATCH}" >&2; exit 1; }
+        SCRATCH=("${SIRIUS_ENGINE_SCRATCH}")
+    fi
+    [[ "${SIRIUS_ENGINE:-0}" == 1 && -n "${SIRIUS_ENGINE_DIR:-}" ]] && SCRATCH+=("${SIRIUS_ENGINE_DIR}")
+    for d in "${CHECKOUT}" "${RUNDIR}" ${SCRATCH[@]+"${SCRATCH[@]}"}; do
         case "$(cd "$d" && pwd -P)/" in "$(cd "$HOME" && pwd -P)/"*) ;; *) BIND+=(--bind "$d") ;; esac
     done
     EXTRA=(); [[ -n "${SIRIUS_CONTAINER_ARGS:-}" ]] && read -r -a EXTRA <<< "${SIRIUS_CONTAINER_ARGS}"
@@ -194,6 +197,4 @@ if [[ -n "${SIRIUS_CONTAINER:-}" ]]; then
     exec "${RUNTIME}" exec "${GPU[@]}" --cleanenv "${BIND[@]}" "${EXTRA[@]}" \
         --env-file "${ENV_FILE}" --pwd "${WORKER_DIR}" \
         "${SIRIUS_CONTAINER}" "${CMD[@]}"
-fi
-
-exec "${CMD[@]}"
+}

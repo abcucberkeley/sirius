@@ -191,9 +191,17 @@ sirius_core_unit(build_info        HEADERS build_info.hpp    SOURCES build_info.
                                    PUBLIC_LINK nlohmann_json::nlohmann_json)
 target_include_directories(sirius_core_build_info PRIVATE ${_sirius_build_info_dir})
 add_dependencies(sirius_core_build_info sirius_build_info_header)
-# The Slurm session (after build_info: an engine of other operations is refused at its hello).
-sirius_core_unit(cluster           HEADERS cluster.hpp       SOURCES cluster.cpp
-                                   DEPENDS remote_host rpc cancel errors build_info
+# The application's settings file: TOML (sirius-app.toml) <-> the "group/name"
+# keys the settings are held by in memory, and the store that reads, merges
+# and writes it (sirius-app's Settings; sirius-cli does not use it).
+sirius_core_unit(settings_toml     HEADERS settings_toml.hpp SOURCES settings_toml.cpp
+                                   PUBLIC_LINK nlohmann_json::nlohmann_json LINK tomlplusplus::tomlplusplus)
+sirius_core_unit(settings_store    HEADERS settings_store.hpp SOURCES settings_store.cpp
+                                   DEPENDS host settings_toml PUBLIC_LINK nlohmann_json::nlohmann_json)
+# The Slurm session (after build_info: an engine of other operations is refused
+# at its hello), and the cluster profiles as the settings file keeps them.
+sirius_core_unit(cluster           HEADERS cluster.hpp cluster_profiles.hpp SOURCES cluster.cpp cluster_profiles.cpp
+                                   DEPENDS remote_host rpc cancel errors build_info settings_toml
                                    PUBLIC_LINK nlohmann_json::nlohmann_json LINK Threads::Threads)
 # Arrays on the wire: zstd (the build's own, cmake/Dependencies.cmake) or zlib,
 # over shuffled bytes, as the client accepts.

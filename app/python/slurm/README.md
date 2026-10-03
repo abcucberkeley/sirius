@@ -4,85 +4,133 @@ The application's **HPC** backend sends steps to a running `sirius_worker`.
 On a cluster the worker runs once per session as a Slurm job, and the
 application reaches it through SSH.
 
-## From the application (the usual way)
+## Connect to your cluster (the usual way)
 
-*Process ▸ Connect to cluster…* in `sirius-app` does all of the below in one
-window, with one SSH login:
+SIRIUS works with any Slurm cluster you can reach with `ssh` and that runs
+Apptainer (or Singularity). Nothing is installed into your home directory:
+the worker runs in a container image, and the only other thing it needs is a
+SIRIUS checkout on the cluster (its `app/python` is the worker's code).
 
-- **Profile**: the SSH host (an alias of your `~/.ssh/config`, e.g. `fiona`,
-  ProxyJump and all), the SIRIUS checkout on the cluster (default
-  `~/dev/sirius`), a container image to run the worker in (see *In a
-  container* below; empty by default) or else the Python environment to
-  activate (default `~/venvs/sirius`), and the job's partition, account,
-  QoS, time, GPUs, CPUs and memory (fiona's test GPUs by default:
-  `abc_a100`, `velatkilic`, `abc_debug`, one hour). It is remembered, and so
-  are the partition, account, QoS and time last used on each host.
-- **Partitions**: once logged in (*Log in* under the Slurm fields logs in
-  and lists without submitting anything; Connect lists them too), the
-  Partition field is a list of the cluster's partitions -- those you have an
-  association for first, the others greyed with "no association" -- each
-  with its nodes (how many are idle), GPUs per node and time limit. Picking
-  one fills the account and QoS from your association (a list when there
-  are several) and keeps the time, GPUs, CPUs and memory within what its
-  nodes and the QoS allow; anything can still be typed by hand. A partition
-  whose jobs take whole nodes (`OverSubscribe=EXCLUSIVE` in `scontrol`) or
-  whose name says DGX (the GPUs of fiona's `dgx` are not isolated per job:
-  the worker takes all eight A100s from the whole group) shows a warning.
-  The commands, fixed text with the user name resolved on the cluster:
-  `sinfo -h -o '%P|%a|%l|%D|%t|%G|%c|%m'`,
-  `sacctmgr -n -P show assoc user="$USER" format=partition,account,qos,defaultqos`,
-  `sacctmgr -n -P show qos format=name,maxwall` and
-  `scontrol -o show partition` (only sinfo has to answer). *Refresh* asks
-  again.
-- **Connect** starts the system's OpenSSH once
-  (`ssh -T -o NumberOfPasswordPrompts=1 -o BatchMode=no -D 127.0.0.1:<port> <host> bash -l -s`):
-  a password or one-time code prompt is shown in the application and handed
-  to ssh only (never stored); the same connection then serves as the command
-  channel (checks, `sbatch --parsable`, `squeue`, `scancel`, folder
-  listings) and as a SOCKS proxy through which the application reaches the
-  worker on the compute node -- no `ssh -L`, no node name to copy.
-- The checklist shows each step: login, checks (sbatch, the checkout, the
-  venv and numpy in it, with the command that fixes what is missing),
-  submit, the queue (state, reason, time waited), the node, and the
-  worker's hello (version, device, steps).
-- The status bar keeps saying whether it is connected; a job that ends
-  (TIMEOUT, CANCELLED) or a connection that drops is reported with the
-  reason. *Disconnect…* (and quitting) asks whether to `scancel` the job.
-- *Cluster device: GPU | CPU*, beside the backend tiles when HPC is
-  selected (and in *Preferences ▸ Compute*; `sirius-cli --hpc-device`,
-  `set_backend`'s `hpc_device`), says where the worker computes. Every step
-  and every dataset read carries it as `"device": "cuda"` / `"cpu"`, and the
-  worker honours it per request over its own `--device`, so switching needs
-  no new job. A job without a GPU (GPUs 0, so `SIRIUS_DEVICE=cpu`, or no
-  CUDA on the node) greys out GPU; a GPU asked of it anyway fails with
-  "this worker job has no GPU; choose CPU or reconnect with GPUs >= 1".
+1. **Once, on the cluster**: clone this repository (the same version as the
+   application) — `git clone <this repository> ~/sirius` — and have a worker
+   image (`.sif`). Someone at your site may have one; otherwise the
+   application builds it (step 4).
+2. **In the application**: the *Cluster* button in the title bar (or
+   *Process ▸ Connect to cluster…*), *Cluster profile ▸ New cluster…*, and
+   *Cluster (SSH host)*: an alias of your `~/.ssh/config` (with its user,
+   ProxyJump and keys) or `user@login.example.org`.
+3. **Connect** (*1 The job*): one SSH login — a password or one-time code
+   is asked in the application and handed to ssh only, never stored — then a
+   job that only holds a node, with the profile's partition, account, QoS,
+   time and resources:
 
-Install once, on the cluster: the checkout at the profile's path (the same
-version as the application), and in the venv
-`pip install -r app/python/requirements.txt` and the `sirius` package built
-from the checkout, `pip install ~/dev/sirius` (the checkout's path: it
-compiles SIRIUS's C++ TIFF reader, which the worker reads TIFF / OME-TIFF
-datasets for *File ▸ Open from cluster…* with -- there is no other TIFF
-reader, so without it only `.npy` datasets open; on a GPU node add
-`--config-settings=cmake.define.SIRIUS_ENABLE_CUDA=ON` to decode with nvTIFF
-on the GPU; hello's `tiff_reader` says which it got), and torch for
-segmentation models. The job runs this directory's `sirius_worker.sbatch`
-with the profile's options on the `sbatch` command line and `SIRIUS_VENV`,
-`SIRIUS_PORT=0` and `SIRIUS_MAX_CLIENTS` in its environment. The token is not
-there (Slurm's accounting may store a job's environment): the application
-writes it over the SSH session to a private file in `~/.sirius/run` (a `0700`
-directory, the file `0600`) and the job gets only the file's name in
-`SIRIUS_TOKEN_FILE`; the worker deletes the file as it starts. The job's log
-is `~/.sirius/run/sirius-worker-<jobid>.log`, and the worker takes a free port,
-which it announces there (`../SECURITY.md`).
+   ```
+   sbatch --parsable --job-name=sirius --output=$HOME/.sirius/run/sirius-job-%j.log \
+       [--partition=... --account=... --qos=... --time=...] --gres=gpu:N --cpus-per-task=C --mem=M \
+       --wrap='... while :; do sleep 300 & wait $!; done'
+   ```
+
+   The login fills what the profile leaves empty from the cluster itself:
+   the default partition (`sinfo`'s `*`), your account and QoS for it
+   (`sacctmgr`), the checkout as `<home>/sirius`. The checklist follows the
+   queue (state, reason, time waited) until the job runs on its node.
+4. **Worker image** and **Data folders**: pick the image with *Browse…*
+   (the cluster's files), and the folders your datasets live in with
+   *Add folder…* (they are bound into the image; your home folder always is).
+   No image yet: *Build an image* runs `apptainer build --fakeroot` inside the
+   job, after checking with a tiny test build that the cluster allows
+   unprivileged builds (it says so plainly when it does not — then use an
+   image someone built).
+5. **Start worker** (*2 The worker*): the checks (srun, the checkout, the
+   image there and readable, `import sirius, numpy` inside it, the launcher
+   — `module load apptainer` is tried — each data folder, the engine build,
+   the node cache folder), then the worker as a step of the held job:
+
+   ```
+   srun --jobid=<job> --overlap --nodes=1 --ntasks=1 --job-name=sirius-worker [--gres=gpu:N] \
+       bash app/python/slurm/sirius_worker.sbatch
+   ```
+
+   which runs SIRIUS's engine (`sirius-cli serve`, with the Python worker as
+   its child) in the image: `<launcher> exec [--nv] --cleanenv --bind ...
+   <image> sirius-cli serve ...`. The application reaches it through the SSH
+   connection itself (a SOCKS proxy on `ssh -D`): no `ssh -L`, no node name
+   to copy.
+
+Once connected the title bar says *g0003 · GPU* (or *· CPU*); its tooltip
+has the host, the job, the node and the time left. A worker that stops
+leaves the job held (*no worker yet*); a job that ends (TIMEOUT, CANCELLED)
+or a connection that drops is said in red, with the reason. *Disconnect…*
+(and quitting) asks whether to `scancel` the job; one left running is taken
+up again — with its worker, and what that holds — by the next *Connect*.
+
+Changes while connected: another image, other data folders or software
+settings restart only the worker step, in the same job; another partition,
+account, QoS, time or size needs a new job (the dialog asks before
+cancelling the running one).
+
+**Advanced settings** (each field has a tooltip): the job's partition,
+account, QoS and time limit are dropdowns — the profile's own choices first,
+then what the cluster reports (`sinfo -h -o '%P|%a|%l|%D|%t|%G|%c|%m'`,
+`sacctmgr -n -P show assoc user="$USER" format=partition,account,qos,defaultqos`,
+`sacctmgr -n -P show qos format=name,maxwall`, `scontrol -o show partition`;
+only sinfo has to answer), marked *from the cluster*, with *Add … to my
+settings*; a partition whose jobs take whole nodes, or whose GPUs a group
+shares (a DGX), shows a warning. Then the SIRIUS checkout, the launcher, an
+extra `PYTHONPATH`, the C++ engine and its builds folder (below), and the
+node cache folder (the engine's `--scratch`: a node's local disk is fastest;
+empty is the node's temporary folder).
+
+*Cluster device: GPU | CPU*, beside the backend tiles when HPC is selected
+(and in *Preferences ▸ Compute*; `sirius-cli --hpc-device`, `set_backend`'s
+`hpc_device`), says where the worker computes. Every step and every dataset
+read carries it as `"device": "cuda"` / `"cpu"`, so switching needs no new
+job. A job without a GPU greys out GPU; a GPU asked of it anyway fails with
+"this worker job has no GPU; choose CPU or reconnect with GPUs >= 1".
+
+### The profiles in the settings file
+
+Each cluster is a `[cluster.<name>]` table in the application's settings file
+(`sirius-app.toml`; *Preferences ▸ Edit settings file…* edits it, checked as
+you type), with the partitions its dropdowns offer as
+`[[cluster.<name>.partitions]]` — `docs/clusters.example.toml` is a commented
+example. *Import…* / *Export…* in the dialog share one profile as a small
+`.toml` file. No password and no token is ever written there: ssh asks for
+the password and forgets it, and the worker's token is made anew for each
+worker, written over the SSH session to a private file in `~/.sirius/run` (a
+`0700` directory, the file `0600`) whose name is all the step is given; the
+worker deletes it as it starts. The logs are
+`~/.sirius/run/sirius-job-<job>.log` and `sirius-worker-<job>-<n>.log`, and
+the worker takes a free port, which it announces there (`../SECURITY.md`).
+
+### Engine builds
+
+The image is a stable runtime (Python, numpy, torch, the compiled `sirius`
+package); SIRIUS's engine changes with every commit. With *Engine builds
+folder* set, the engine comes from `<folder>/<commit>/bin/sirius-cli`, each
+build with its `<folder>/<commit>/BUILD.json` (`{"build", "commit",
+"ops_schema", "api", ...}`, what `sirius-cli --version --json` prints). The
+checks list the builds there and pick the one of the application's own
+commit, else the newest whose operations and engine API are the same
+(`core/build_info.hpp`'s `engineMismatch`); that folder is bound into the
+image. When none fits, the checks say so and name the application's commit.
+Building one (a placeholder until the cluster's build command is settled):
+
+```
+# on the cluster, in the SIRIUS checkout at the application's commit
+#   <build command for <folder>/<commit>, see the cluster's SIRIUS notes>
+```
+
+Empty, the engine inside the image (`/opt/sirius/bin/sirius-cli`) is used;
+*Engine executable* names one outright (testing a build of your own).
 
 ### In a container
 
-With a **container image** in the profile (an Apptainer/Singularity `.sif`
-holding the compiled `sirius` package with CUDA/nvTIFF, numpy and torch;
-*Browse…* picks one among the cluster's files) the venv is not used: the job
-gets `SIRIUS_CONTAINER=<image>` and `SIRIUS_LAUNCHER` (default `apptainer`),
-and `sirius_worker.sbatch` runs
+The **worker image** (an Apptainer/Singularity `.sif` holding the compiled
+`sirius` package with CUDA/nvTIFF, numpy and torch) is required: there is no
+Python environment mode on the cluster. The worker step gets
+`SIRIUS_CONTAINER=<image>` and `SIRIUS_LAUNCHER` (default `apptainer`), and
+`sirius_worker.sbatch` runs
 
 ```
 apptainer exec --nv --bind <checkout> --bind ~/.sirius/run <image> python -m sirius_worker ...
@@ -100,7 +148,8 @@ step makes sure the image is there and runs
 when that fails, the image itself has to be rebuilt (or the current one
 asked for): nothing is installed into it from the application.
 
-By hand: `SIRIUS_CONTAINER=/path/sirius-worker.sif SIRIUS_TOKEN_FILE=... sbatch ... app/python/slurm/sirius_worker.sbatch`.
+By hand: `SIRIUS_CONTAINER=/path/sirius-worker.sif SIRIUS_TOKEN_FILE=... sbatch ... app/python/slurm/sirius_worker.sbatch`
+(the script refuses to start without `SIRIUS_CONTAINER`).
 
 The manual way follows: for `sirius-cli`, or a cluster the dialog does not fit.
 
@@ -110,7 +159,7 @@ The manual way follows: for `sirius-cli`, or a cluster the dialog does not fit.
 umask 077; mkdir -p ~/.sirius/run
 TOKEN=$(openssl rand -hex 16)             # keep this: the app needs it
 printf '%s' "$TOKEN" > ~/.sirius/run/token
-SIRIUS_TOKEN_FILE=~/.sirius/run/token sbatch \
+SIRIUS_CONTAINER=/path/sirius-worker.sif SIRIUS_TOKEN_FILE=~/.sirius/run/token sbatch \
     --output="$HOME/.sirius/run/sirius-worker-%j.log" app/python/slurm/sirius_worker.sbatch
 ```
 
@@ -118,9 +167,9 @@ The worker reads the token file and deletes it. `SIRIUS_TOKEN=... sbatch`
 works too, but then the token is in the job's environment, which Slurm's
 accounting may store (`AccountingStoreFlags=job_env`).
 
-The template asks for one GPU and eight cores; edit the `#SBATCH` lines and
-the `module load` block for your cluster. It refuses to start without a
-token, since the port is open to every user of the node -- and so does the
+The template asks for one GPU and eight cores (give `--partition`,
+`--account`, `--qos` and `--time` on the command line, or edit the `#SBATCH`
+lines). It refuses to start without an image or a token, since the port is open to every user of the node -- and so does the
 worker itself: `--host 0.0.0.0` with an empty token is refused at startup
 (`../SECURITY.md`). The log
 (`sirius-worker-<jobid>.log`) prints the node name and the tunnel command;
@@ -128,28 +177,12 @@ the worker takes a free port (`SIRIUS_PORT` to fix one, at the risk of
 another user of the node taking it first) and announces it in the log's
 `{"port": N, ...}` line.
 
-The worker needs a Python with `numpy`; `torch` for segmentation models and
-the `sirius` wheel (`pip install .` from this repository) for SIM
-reconstruction on the node. Everything else in the pipeline runs where it is
-implemented -- see the list the worker prints in its `hello` reply. Install
-what the worker needs into the job's environment (the venv or conda
-environment the script activates) once, before you submit:
-
-```
-pip install -r app/python/requirements.txt                    # numpy: what it cannot start without
-pip install -r app/python/requirements-extra.txt              # optional: scipy, scikit-image
-```
-
-From an installed tree the files are `share/sirius/python/requirements*.txt`.
-A worker started without numpy prints a `missing_packages` line and exits
-with code 3, so the log says at once what is missing
+The image holds what the worker needs: a Python with `numpy`, `torch` for
+segmentation models and the compiled `sirius` package (SIRIUS's TIFF reader,
+SIM reconstruction on the node); nothing is installed on the cluster. A
+worker started without numpy prints a `missing_packages` line and exits with
+code 3, so the log says at once what the image lacks
 (`../README.md`, *What it needs to start*).
-
-When `sirius-cli` is built on the cluster, it can make that environment
-instead: `sirius-cli worker setup --yes` creates SIRIUS's own Python
-environment under `~/.local/share/sirius/python-env`, or wherever
-`SIRIUS_PYTHON_ENV` points (a project directory, when the home quota is
-small); point the script's `source .../bin/activate` line at it.
 
 The template passes `--max-clients ${SIRIUS_MAX_CLIENTS:-8}` to the worker,
 so the application can keep a connection for its status and one for the
@@ -201,7 +234,7 @@ Locally `sirius-app` and `sirius-cli` start one themselves, in SIRIUS's own
 Python environment unless an interpreter is named (see
 `app/python/README.md`, which also says when).
 
-## A container instead of a venv
+## The container
 
 `SIRIUS_CONTAINER=<image.sif>` runs the worker inside that image (apptainer or
 singularity). This is the practical way to serve a trained model on a cluster:
@@ -224,9 +257,10 @@ worker reads that file and deletes it. `PYTHONUNBUFFERED=1` goes in too, because
 a container's stdout is a pipe and the `{"port": N}` line the application waits
 for would otherwise sit in python's buffer while the worker is already serving.
 
-Verified end to end on fiona's dgx on 2026-10-02: the worker started in the
-latents image on an A100, answered the handshake, loaded a `.ltb` bundle, and
-returned a prompted mask in 3.6 s.
+An example from one cluster (fiona's dgx, verified end to end on 2026-10-02:
+the worker started in the latents image on an A100, answered the handshake,
+loaded a `.ltb` bundle, and returned a prompted mask in 3.6 s); the paths,
+partition, account and QoS are that site's, yours will differ:
 
     umask 077; mkdir -p ~/.sirius/run
     TOKEN=$(openssl rand -hex 16); printf '%s' "$TOKEN" > ~/.sirius/run/token

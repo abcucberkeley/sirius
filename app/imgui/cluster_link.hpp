@@ -4,7 +4,8 @@
 // The window's side of a cluster session (core/cluster.hpp): one per
 // application, owned by App.
 //
-//   * the profile, remembered in the settings ("cluster/profile");
+//   * the cluster profiles, kept in the settings file ([cluster.<name>],
+//     core/cluster_profiles.hpp; the single profile of before migrated once);
 //   * ssh's prompts: the session's askpass relay asks on a thread of its
 //     own, and this shows the prompt in a modal password box on the GUI
 //     thread (the answer is handed to ssh and forgotten: never stored,
@@ -28,6 +29,7 @@
 #include <imgui.h>
 
 #include "core/cluster.hpp"
+#include "core/cluster_profiles.hpp"
 #include "core/remote_source.hpp"
 #include "core/workbench.hpp"
 
@@ -58,10 +60,33 @@ namespace sirius::app::gui {
         bool connected() const { return session_.connected(); }
         bool sshUp() const { return session_.sshUp(); }
 
+        // The profiles as the settings file has them (the single profile of
+        // before migrated into it the first time), and the one in use.
+        cluster::ProfileBook profiles() const;
+        // Writes `book` to the settings: its profiles, the current one, and
+        // the removal of profiles it no longer has.
+        void saveProfiles(const cluster::ProfileBook& book);
+        // `profile` stored in the book (under its name) as the current one.
+        void saveProfile(const cluster::Profile& profile);
         cluster::Profile storedProfile() const;
-        void connect(const cluster::Profile& profile);   // saves the profile
+
+        // Step 1, the job: the SSH login, then a job that holds the
+        // allocation (saves the profile).
+        void connectJob(const cluster::Profile& profile);
+        // Step 2, the worker in that job (saves the profile); restarts a
+        // running worker in the same job.
+        void startWorker(const cluster::Profile& profile);
+        // Both steps (scripted runs).
+        void connect(const cluster::Profile& profile);
         // The SSH login and the cluster's partitions only, no job; saves the profile.
         void logIn(const cluster::Profile& profile);
+        // Off the GUI thread: the worker step ends, the job stays.
+        void stopWorker();
+        // Off the GUI thread: the job cancelled, then a new one with `profile`
+        // (and its worker, when one ran). Asks first.
+        void newJobAsking(const cluster::Profile& profile);
+        // Builds a worker image in the held job (the cluster's paths).
+        void buildImage(const cluster::Profile& profile, const std::string& defFile, const std::string& image);
         // Off the GUI thread (scancel takes a moment); `cancelJob` scancels.
         void disconnect(bool cancelJob);
         // Asks whether to cancel the job too (default yes), then disconnects.
@@ -75,6 +100,8 @@ namespace sirius::app::gui {
         // "HPC: n0123 · GPU" (the session's HPC device), its colour; "" while
         // there was never a session.
         std::string indicator(ImU32& color) const;
+        // The title bar's button (cluster::connectionBadge with the session's device).
+        cluster::ConnectionBadge badge() const;
 
         // Whether the HPC device's GPU can be chosen; else `why` says what
         // stops it: the connected worker reports no CUDA, or the profile
@@ -104,7 +131,9 @@ namespace sirius::app::gui {
         std::shared_ptr<RemoteDatasets> datasets_;
         cluster::State lastState_ = cluster::State::Idle;
         std::shared_ptr<std::atomic<bool>> alive_;
-        std::thread disconnecting_;
+        std::thread disconnecting_;   // a disconnect, stop or new job, off the GUI thread
+        // Runs `fn` on disconnecting_ (after the one before it).
+        void offThread(std::function<void()> fn);
     };
 
     // The modal box for one ssh prompt (dialogs/cluster_dialog.cpp).

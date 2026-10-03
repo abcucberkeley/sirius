@@ -670,6 +670,7 @@ namespace sirius::app::gui {
         add("File", "Export figure (current view)\xE2\x80\xA6", {ImGuiMod_Ctrl | ImGuiMod_Alt | ImGuiKey_E}, [this] { self.exportFigureImage(); });
         separator();
         add("File", "Preferences\xE2\x80\xA6", {ImGuiMod_Ctrl | ImGuiKey_Comma}, [this] { self.preferences(); });
+        add("File", "Edit settings file\xE2\x80\xA6", {}, [this] { self.showDialog(makeSettingsEditor(self)); }, "Everything SIRIUS remembers, one TOML file, in SIRIUS's editor: checked as you type, used once saved");
         separator();
         add("File", "Quit", {ImGuiMod_Ctrl | ImGuiKey_Q}, [this] { self.requestClose(); });
 
@@ -785,7 +786,14 @@ namespace sirius::app::gui {
         // scripting (--action): Connect with the stored profile, as the dialog's button does
         add("", "Connect to cluster (stored profile)", {}, [this] { self.cluster().connect(self.cluster().storedProfile()); });
         add("", "Log in to cluster (stored profile)", {}, [this] { self.cluster().logIn(self.cluster().storedProfile()); });
-        add("", "Wait for the cluster", {}, [this] { self.waitUntil([this] { return self.cluster().status().state != cluster::State::Connecting; }); });
+        add("", "Get a cluster job (stored profile)", {}, [this] { self.cluster().connectJob(self.cluster().storedProfile()); });
+        add("", "Start the cluster worker (stored profile)", {}, [this] { self.cluster().startWorker(self.cluster().storedProfile()); });
+        add("", "Wait for the cluster", {}, [this] {
+            self.waitUntil([this] {
+                const cluster::State s = self.cluster().status().state;
+                return s != cluster::State::Connecting && s != cluster::State::Starting;
+            });
+        });
         add("Process", "Connect to cluster\xE2\x80\xA6", {}, [this] { self.clusterDialog(); }, "One SSH login: the worker job, the HPC backend through it, the cluster's datasets");
 
         // Segment
@@ -1324,10 +1332,16 @@ namespace sirius::app::gui {
             for (const cluster::NodeDevice& d : node) comboW = std::max(comboW, theme::textSize(d.label, 13).x + px(44));
             comboW = std::min(comboW, px(300));
             const float buttonW = theme::textSize("Assistant", 12, Weight::ExtraBold).x + px(40);
-            const float nameRoom = std::max(px(40), width - ImGui::GetCursorPosX() - comboW - buttonW - px(14) - 3 * px(18));
+            // the cluster button, left of the Assistant's: its state in a word or two
+            // (an icon alone in a narrow window, the rest in its tooltip)
+            const cluster::ConnectionBadge badge = self.cluster().badge();
+            const bool clusterNarrow = width < px(1180);
+            const std::string clusterLabel = clusterNarrow ? std::string() : widgets::elideText(badge.label, px(230), 12, Weight::ExtraBold);
+            const float clusterW = clusterNarrow ? px(36) : theme::textSize(clusterLabel, 12, Weight::ExtraBold).x + px(40);
+            const float nameRoom = std::max(px(40), width - ImGui::GetCursorPosX() - comboW - buttonW - clusterW - px(14) - 3 * px(18) - px(8));
             const std::string shown = widgets::elideText(name, std::min(nameRoom, px(320)), 12);
             const float nameW = theme::textSize(shown, 12).x;
-            float x = width - px(14) - buttonW - px(18) - comboW - px(18) - nameW;
+            float x = width - px(14) - buttonW - px(8) - clusterW - px(18) - comboW - px(18) - nameW;
             if (x > ImGui::GetCursorPosX()) {
                 widgets::drawTextIn(dl, ImVec2(origin.x + x, origin.y), ImVec2(origin.x + x + nameW, origin.y + height), shown, 12,
                                     theme::kNeutral600, Weight::Regular, 0.0f, 0.5f);
@@ -1363,8 +1377,41 @@ namespace sirius::app::gui {
                 ImGui::PopStyleVar();
                 x += comboW + px(18);
 
-                // "Assistant" toggle: 26 px, 1.5 px border, accent fill when open
+                // the cluster: as the Assistant's button, the state's colour on its icon and text
                 const float bh = theme::snap(px(26));
+                {
+                    const ImVec2 cmin(origin.x + x, theme::snap(origin.y + (height - bh) * 0.5f)), cmax(cmin.x + clusterW, cmin.y + bh);
+                    ImGui::SetCursorScreenPos(cmin);
+                    if (ImGui::InvisibleButton("##cluster", ImVec2(clusterW, bh))) self.defer([this] { self.clusterDialog(); });
+                    const bool hov = ImGui::IsItemHovered();
+                    if (hov) ImGui::SetMouseCursor(ImGuiMouseCursor_Hand);
+                    widgets::tooltip((clusterNarrow ? badge.label + "\n\n" : std::string()) + badge.tooltip);
+                    ImU32 ink = theme::kText;
+                    switch (badge.kind) {
+                        case cluster::ConnectionBadge::Kind::Connected: ink = theme::rgb(0x2e, 0x7d, 0x32); break;
+                        case cluster::ConnectionBadge::Kind::Failed:
+                        case cluster::ConnectionBadge::Kind::Lost: ink = theme::kAccentText; break;
+                        case cluster::ConnectionBadge::Kind::JobReady: ink = theme::rgb(0xb2, 0x6a, 0x00); break;
+                        case cluster::ConnectionBadge::Kind::Connecting: ink = theme::kNeutral700; break;
+                        case cluster::ConnectionBadge::Kind::Off: break;
+                    }
+                    const bool alarm = badge.kind == cluster::ConnectionBadge::Kind::Failed || badge.kind == cluster::ConnectionBadge::Kind::Lost;
+                    widgets::crispRect(dl, cmin, cmax, hov ? theme::kAccent : (alarm ? theme::kAccentText : theme::kText), theme::kBorder);
+                    if (badge.kind == cluster::ConnectionBadge::Kind::Connecting) {
+                        // how far it got: a bar along the bottom edge, and the frames keep coming
+                        const float done = std::clamp(badge.progress, 0.05f, 1.0f);
+                        dl->AddRectFilled(ImVec2(cmin.x + px(2), cmax.y - px(4)), ImVec2(cmin.x + px(2) + (clusterW - px(4)) * done, cmax.y - px(2)), theme::kAccent);
+                        self.requestRedraw(2);
+                    }
+                    const float iconX = clusterNarrow ? cmin.x + (clusterW - px(14)) * 0.5f : cmin.x + px(10);
+                    drawIcon(dl, ImVec2(iconX, cmin.y + (bh - px(14)) * 0.5f), ImVec2(iconX + px(14), cmin.y + (bh + px(14)) * 0.5f), Icon::Server, ink);
+                    if (!clusterNarrow)
+                        widgets::drawTextIn(dl, ImVec2(cmin.x + px(29), cmin.y), ImVec2(cmax.x - px(10), cmax.y), clusterLabel, 12, ink, Weight::ExtraBold,
+                                            0.0f, 0.5f);
+                    x += clusterW + px(8);
+                }
+
+                // "Assistant" toggle: 26 px, 1.5 px border, accent fill when open
                 const ImVec2 bmin(origin.x + x, theme::snap(origin.y + (height - bh) * 0.5f)), bmax(bmin.x + buttonW, bmin.y + bh);
                 ImGui::SetCursorScreenPos(bmin);
                 if (ImGui::InvisibleButton("##assistant", ImVec2(buttonW, bh))) self.setAssistantVisible(!showAssistant);
@@ -2472,6 +2519,17 @@ namespace sirius::app::gui {
         bridge_.labelsChanged.connect([this](StepId) { requestRedraw(); });
 
         d.savedRevision = wb().history().revision();
+        // a settings file that does not read: said once, the file left for the user to fix
+        if (const std::string bad = settings().loadError(); !bad.empty()) {
+            wb().logLine("Settings: " + settings().filePath() + " does not read (" + bad + "); running with the defaults, the file is left as it is.");
+            if (!d.unattended)
+                defer([this, bad] {
+                    ask("Settings file", "The settings file could not be read (" + bad + "). SIRIUS runs with its defaults and leaves the file as it is: "
+                                                                                         "nothing is saved until it reads again.",
+                        {"Later", "Edit settings file\xE2\x80\xA6"}, [this](int answer) {
+                            if (answer == 1) showDialog(makeSettingsEditor(*this)); }, 1);
+                });
+        }
         if (d.visible) {
             if (!d.unattended && !options.sizeGiven && settings().getBool("window/maximized", false)) glfwMaximizeWindow(d.window);
             glfwShowWindow(d.window);

@@ -1,15 +1,39 @@
 #!/bin/bash
-# Fake scancel: stops the fake job's worker (the whole process tree on Windows).
+# Fake scancel: `scancel <id>` cancels the fake job and stops its steps;
+# `scancel <id>.<n>` stops that step only (the whole process tree on Windows).
 set -u
 dir="${FAKE_SLURM_DIR:?}"
 id="$1"
+
+stop() {   # a step, or a job's own process (files <prefix>.winpid / .pid)
+    local s="$1"
+    if [ -f "$s.winpid" ]; then
+        taskkill //F //T //PID "$(cat "$s.winpid")" > /dev/null 2>&1
+    elif [ -f "$s.detached" ]; then
+        kill "$(cat "$s.detached")" 2>/dev/null
+    elif [ -f "$s.pid" ]; then
+        kill "$(cat "$s.pid")" 2>/dev/null
+    fi
+}
+
+case "$id" in
+    *.*)
+        job="${id%%.*}"
+        s="$dir/$job.step${id#*.}"
+        [ -f "$s.name" ] || { echo "scancel: error: Kill job error on job id $id: Invalid job id specified" >&2; exit 1; }
+        stop "$s"
+        rm -f "$s".*
+        echo "$id" >> "$dir/cancelled_steps"
+        exit 0
+        ;;
+esac
 [ -f "$dir/$id.state" ] || { echo "scancel: error: Invalid job id specified" >&2; exit 1; }
-if [ -f "$dir/$id.winpid" ]; then
-    taskkill //F //T //PID "$(cat "$dir/$id.winpid")" > /dev/null 2>&1
-    rm -f "$dir/$id.winpid"
-else
-    kill "$(cat "$dir/$id.pid")" 2>/dev/null
-    rm -f "$dir/$id.ospid"
-fi
+for f in "$dir/$id".step*.name; do
+    [ -f "$f" ] || continue
+    stop "${f%.name}"
+    rm -f "${f%.name}".*
+done
+stop "$dir/$id"
+rm -f "$dir/$id.winpid" "$dir/$id.ospid"
 echo CANCELLED > "$dir/$id.state"
 echo "$id" >> "$dir/cancelled"

@@ -1,4 +1,4 @@
-#include "imgui/settings.hpp"
+#include "core/settings_store.hpp"
 
 #include <chrono>
 #include <cstdint>
@@ -9,9 +9,11 @@
 #include <optional>
 
 #include "core/host.hpp"
-#include "imgui/platform.hpp"
+#include "core/settings_toml.hpp"
 
-namespace sirius::app::gui {
+namespace sirius::app {
+
+    namespace platform = host;
 
     namespace {
 
@@ -95,9 +97,13 @@ namespace sirius::app::gui {
         // The failure is said on stderr once, until a write succeeds again.
         // Guarded by saveMutex.
         bool failing = false;
-        // sirius-imgui.json, read at start-up because sirius-app.json was not
-        // there: deleted once its settings are written under the new name.
+        // sirius-app.json (or sirius-imgui.json), read at start-up because
+        // sirius-app.toml was not there: renamed to <name>.migrated once its
+        // settings are written as TOML.
         std::string legacyFile;
+        // The file as last read did not parse: what toml++ said, and where.
+        // It is not written over while this is set.
+        std::string loadError;
     };
 
     Settings& Settings::instance() {
@@ -111,9 +117,37 @@ namespace sirius::app::gui {
     }
 
     namespace {
+        constexpr const char* kFileName = "sirius-app.toml";
+
         std::string defaultDirectory() {
             const std::string base = platform::configDirectory();
             return base.empty() ? std::string("sirius") : base + "/sirius";
+        }
+
+        std::string errorText(const settings_toml::ParseResult& r) {
+            if (r.line <= 0) return r.error;
+            return "line " + std::to_string(r.line) + ", column " + std::to_string(r.column) + ": " + r.error;
+        }
+
+        // The secrets/ entries of a JSON file of before (Windows' DPAPI
+        // blobs, base64) into secrets.json beside it, whose entries the
+        // secret store reads by the same names; never into the TOML file.
+        // An entry already there stays.
+        bool moveSecretsOut(const std::string& dir, const nlohmann::json& old) {
+            nlohmann::json secrets = nlohmann::json::object();
+            for (auto it = old.begin(); it != old.end(); ++it)
+                if (it.key().rfind("secrets/", 0) == 0 && it.value().is_string()) secrets[it.key().substr(8)] = it.value();
+            if (secrets.empty()) return true;
+            const std::string path = dir + "/secrets.json";
+            std::string text;
+            nlohmann::json store = nlohmann::json::object();
+            if (platform::readFile(path, text) && !text.empty()) {
+                store = nlohmann::json::parse(text, nullptr, false);
+                if (!store.is_object()) return false;   // never written over
+            }
+            for (auto it = secrets.begin(); it != secrets.end(); ++it)
+                if (!store.contains(it.key())) store[it.key()] = it.value();
+            return platform::writeFileAtomic(path, store.dump(4) + "\n", true);
         }
     } // namespace
 
@@ -128,6 +162,8 @@ namespace sirius::app::gui {
         st.seen.reset();
         st.checkAfter = {};
         st.retryAfter = {};
+        st.legacyFile.clear();
+        st.loadError.clear();
     }
 
     std::string Settings::directory() const {
@@ -136,7 +172,7 @@ namespace sirius::app::gui {
         return st.dir.empty() ? defaultDirectory() : st.dir;
     }
 
-    std::string Settings::filePath() const { return directory() + "/sirius-app.json"; }
+    std::string Settings::filePath() const { return directory() + "/" + kFileName; }
 
     std::string Settings::layoutPath() const { return directory() + "/imgui.ini"; }
 
@@ -149,7 +185,7 @@ namespace sirius::app::gui {
         if (st.loaded && (st.saving || now < st.checkAfter)) return;
         st.checkAfter = now + std::chrono::seconds(1);
         const std::string dir = st.dir.empty() ? defaultDirectory() : st.dir;
-        const std::string path = dir + "/sirius-app.json";
+        const std::string path = dir + "/" + kFileName;
         const Stamp stamp = stampOf(path);
         if (st.loaded && st.seen && *st.seen == stamp) return;
         st.seen = stamp;
@@ -162,29 +198,47 @@ namespace sirius::app::gui {
             if (host::writableByOthers(dir, &why))
                 std::fprintf(stderr, "settings: WARNING: %s is not private (%s); run chmod 700 on it\n", dir.c_str(), why.c_str());
             if (platform::readFile(path, text)) {
-                const nlohmann::json j = nlohmann::json::parse(text, nullptr, false);
-                if (j.is_object()) st.data = j;
+                const settings_toml::ParseResult r = settings_toml::fromToml(text);
+                if (r.ok) {
+                    st.data = r.flat;
+                } else {
+                    // the defaults, and the file left as it is for the user to fix
+                    st.loadError = errorText(r);
+                    std::fprintf(stderr, "settings: %s does not read (%s); starting with the defaults, the file is left as it is\n",
+                                 path.c_str(), st.loadError.c_str());
+                }
                 return;
             }
             if (stamp.exists) return;   // there, but not readable: nothing is taken from elsewhere
-            // sirius-imgui.json: the name the file had before the application
-            // took over sirius-app's name. Its settings become this process's
-            // changes, so the first save writes them under the new name, and
-            // the old file is deleted then.
-            const std::string legacy = dir + "/sirius-imgui.json";
-            if (!platform::readFile(legacy, text)) return;
-            const nlohmann::json j = nlohmann::json::parse(text, nullptr, false);
-            if (!j.is_object()) return;
-            st.data = j;
-            for (auto it = j.begin(); it != j.end(); ++it) st.pending.try_emplace(it.key(), *it);
-            st.dirty = true;
-            st.legacyFile = legacy;
+            // The JSON file of before (sirius-app.json, or sirius-imgui.json
+            // before the application took sirius-app's name). Its settings
+            // become this process's changes, so the first save writes them as
+            // TOML, and the old file is renamed to <name>.migrated then.
+            for (const char* name : {"sirius-app.json", "sirius-imgui.json"}) {
+                const std::string legacy = dir + "/" + name;
+                if (!platform::readFile(legacy, text)) continue;
+                const nlohmann::json j = nlohmann::json::parse(text, nullptr, false);
+                if (!j.is_object()) continue;
+                if (!moveSecretsOut(dir, j))
+                    std::fprintf(stderr, "settings: could not move the secrets of %s into secrets.json\n", legacy.c_str());
+                st.data = j;
+                for (auto it = j.begin(); it != j.end(); ++it) st.pending.try_emplace(it.key(), *it);
+                st.dirty = true;
+                st.legacyFile = legacy;
+                return;
+            }
             return;
         }
-        // A file that is gone or does not parse leaves the settings as they are.
+        // A file that is gone leaves the settings as they are; one that does
+        // not parse too, and is said.
         if (!platform::readFile(path, text)) return;
-        nlohmann::json j = nlohmann::json::parse(text, nullptr, false);
-        if (j.is_object()) st.data = merged(std::move(j), st.data, st.pending);
+        const settings_toml::ParseResult r = settings_toml::fromToml(text);
+        if (!r.ok) {
+            st.loadError = errorText(r);
+            return;
+        }
+        st.loadError.clear();
+        st.data = merged(r.flat, st.data, st.pending);
     }
 
     bool Settings::contains(const std::string& key) const {
@@ -347,7 +401,7 @@ namespace sirius::app::gui {
             const std::lock_guard<std::mutex> g(st.mutex);
             if (!st.dirty) return true;
             dir = st.dir.empty() ? defaultDirectory() : st.dir;
-            path = dir + "/sirius-app.json";
+            path = dir + "/" + kFileName;
             // The file as it is now, which another instance may have written
             // since this one read it, with this process's own changes on top.
             // Writing back the copy read at start-up instead erased whatever
@@ -364,9 +418,18 @@ namespace sirius::app::gui {
                     st.failing = true;
                     return false;
                 }
-                file = nlohmann::json::parse(onDisk, nullptr, false);
-                // a file that does not parse is replaced by what this process knows
-                if (!file.is_object()) file = st.data;
+                const settings_toml::ParseResult r = settings_toml::fromToml(onDisk);
+                if (!r.ok) {
+                    // A hand edit that does not parse is the user's to fix: never written over.
+                    st.loadError = errorText(r);
+                    st.retryAfter = std::chrono::steady_clock::now() + std::chrono::seconds(1);
+                    if (!st.failing)
+                        std::fprintf(stderr, "settings: %s does not read (%s); not saved until it does\n", path.c_str(), st.loadError.c_str());
+                    st.failing = true;
+                    return false;
+                }
+                st.loadError.clear();
+                file = r.flat;
             }
             // A missing file (removed to reset the settings) starts from
             // nothing: only this process's own changes are written, not the
@@ -376,13 +439,13 @@ namespace sirius::app::gui {
             // replace: a string that is not UTF-8 (a Linux file name among the
             // recent datasets) is written with U+FFFD where the strict
             // default threw out of the frame and ended the application.
-            text = all.dump(2, ' ', false, nlohmann::json::error_handler_t::replace);
+            text = settings_toml::toToml(all);
             st.data = std::move(all);
             written.swap(st.pending);
             st.dirty = false;
             st.saving = true;
         }
-        const bool ok = platform::makePath(dir) && platform::writeFileAtomic(path, text + "\n");
+        const bool ok = platform::makePath(dir) && platform::writeFileAtomic(path, text);
         const std::lock_guard<std::mutex> g(st.mutex);
         st.saving = false;
         // Written or not, the next look reads the file: another instance may
@@ -391,8 +454,10 @@ namespace sirius::app::gui {
         if (ok) {
             st.failing = false;
             if (!legacy.empty() && legacy == st.legacyFile) {
+                // kept beside it under another name: a downgrade can take it back
                 std::error_code ec;
-                std::filesystem::remove(std::filesystem::u8path(legacy), ec);
+                std::filesystem::rename(std::filesystem::u8path(legacy), std::filesystem::u8path(legacy + ".migrated"), ec);
+                if (ec) std::fprintf(stderr, "settings: could not rename %s to %s.migrated\n", legacy.c_str(), legacy.c_str());
                 st.legacyFile.clear();
             }
             return true;
@@ -407,4 +472,46 @@ namespace sirius::app::gui {
         return false;
     }
 
-} // namespace sirius::app::gui
+    std::string Settings::loadError() const {
+        State& st = state();
+        const std::lock_guard<std::mutex> g(st.mutex);
+        load();
+        return st.loadError;
+    }
+
+    bool Settings::adoptText(const std::string& text, std::string* error) {
+        State& st = state();
+        const settings_toml::ParseResult r = settings_toml::fromToml(text);
+        if (!r.ok) {
+            if (error) *error = errorText(r);
+            return false;
+        }
+        const std::lock_guard<std::mutex> saving(st.saveMutex);
+        std::string dir, path;
+        {
+            const std::lock_guard<std::mutex> g(st.mutex);
+            dir = st.dir.empty() ? defaultDirectory() : st.dir;
+            path = dir + "/" + kFileName;
+        }
+        if (!platform::makePath(dir) || !platform::writeFileAtomic(path, text)) {
+            if (error) *error = "could not write " + path;
+            return false;
+        }
+        const std::lock_guard<std::mutex> g(st.mutex);
+        // What is not in the file stays: the secrets of a migration, in
+        // memory until the secret store moves them. The rest is the text's.
+        nlohmann::json data = r.flat;
+        for (auto it = st.data.begin(); it != st.data.end(); ++it)
+            if (it.key().rfind("secrets/", 0) == 0 && !data.contains(it.key())) data[it.key()] = it.value();
+        st.data = std::move(data);
+        st.pending.clear();
+        st.dirty = false;
+        st.loadError.clear();
+        st.failing = false;
+        st.retryAfter = {};
+        st.seen = stampOf(path);
+        st.checkAfter = std::chrono::steady_clock::now() + std::chrono::seconds(1);
+        return true;
+    }
+
+} // namespace sirius::app

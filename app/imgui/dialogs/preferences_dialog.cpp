@@ -184,6 +184,27 @@ namespace sirius::app::gui {
                     if (tab_ == 0) drawCompute(app);
                     else drawAssistant();
                 }
+                widgets::vspace(4);
+                // the one settings file, to read or edit as text
+                widgets::rule(theme::kHairline);
+                widgets::text("Settings file: " + settings().filePath(), 11, theme::kNeutral600);
+                {
+                    widgets::ButtonOpts b;
+                    b.small = true;
+                    b.tooltip = "Open sirius-app.toml in SIRIUS's editor: checked as you type, used as soon as it is saved";
+                    // Preferences is modal: it closes first, the editor takes its place
+                    if (widgets::button("Edit settings file\xE2\x80\xA6", b)) {
+                        close();
+                        app.defer([&app] { app.showDialog(makeSettingsEditor(app)); });
+                    }
+                    ImGui::SameLine(0.0f, px(8));
+                    b.tooltip = "Show the folder of the settings file in the file manager";
+                    if (widgets::button("Open settings folder", b)) platform::openInFileManager(settings().directory());
+                }
+                if (const std::string bad = settings().loadError(); !bad.empty())
+                    note("The settings file does not read (" + bad + "): SIRIUS runs with its defaults and leaves the file as it is until it is "
+                                                                     "fixed. Edit settings file\xE2\x80\xA6 says where.",
+                         theme::kAccentText);
                 widgets::vspace(6);
                 switch (actionRow("Save", true)) {
                     case Action::Cancel: close(); break;

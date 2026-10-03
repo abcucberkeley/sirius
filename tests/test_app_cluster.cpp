@@ -1,10 +1,10 @@
 // The cluster connection (core/remote_host, core/cluster, core/remote_source)
 // against a local stand-in: tests/tools/fake_ssh.py plays OpenSSH's ssh
 // (prompts through SSH_ASKPASS, a SOCKS5 proxy on -D, `bash -s` as the
-// remote shell), tests/tools/fake_slurm plays sbatch / squeue / sacct /
-// scancel / sinfo / sacctmgr / scontrol / apptainer and starts the real
-// worker (app/python) on 127.0.0.1. No real ssh is run and no host but this
-// one is contacted.
+// remote shell), tests/tools/fake_slurm plays sbatch / srun / squeue / sacct /
+// scancel / sinfo / sacctmgr / scontrol / apptainer: the job holds nothing
+// here, its worker step starts the real worker (app/python) or engine on
+// 127.0.0.1. No real ssh is run and no host but this one is contacted.
 //
 // Needs a Python ($SIRIUS_PYTHON, else host::findPython) and bash
 // ($SIRIUS_TEST_BASH, else Git's bash on Windows, bash on PATH elsewhere);
@@ -31,6 +31,8 @@
 
 #include "core/build_info.hpp"
 #include "core/cluster.hpp"
+#include "core/cluster_profiles.hpp"
+#include "core/settings_toml.hpp"
 #include "core/errors.hpp"
 #include "core/host.hpp"
 #include "core/process.hpp"
@@ -123,7 +125,7 @@ namespace {
             // the tools as LF scripts, whatever the checkout's line endings, and
             // executable: a file written here is 0644 on POSIX, and bash finds a
             // non-executable one on PATH all the same, then fails "Permission denied"
-            for (const char* tool : {"sbatch", "squeue", "sacct", "scancel", "sinfo", "sacctmgr", "scontrol", "apptainer"}) {
+            for (const char* tool : {"sbatch", "srun", "squeue", "sacct", "scancel", "sinfo", "sacctmgr", "scontrol", "apptainer"}) {
                 std::string text = readAll(fs::path(SIRIUS_TEST_FAKE_SLURM_DIR) / tool);
                 std::string lf;
                 for (char c : text)
@@ -148,6 +150,7 @@ namespace {
             setEnv("USER", "tester");
             setEnv("FAKE_CONTAINER_SITE", "");
             setEnv("FAKE_APPTAINER_DRY", "0");
+            setEnv("FAKE_APPTAINER_NO_FAKEROOT", "0");
             setEnv("SIRIUS_WORKBENCH_PY", std::string(SIRIUS_TEST_SOURCE_DIR) + "/bindings/python/sirius/workbench.py");
         }
         ~FakeCluster() {
@@ -209,6 +212,20 @@ namespace {
             std::this_thread::sleep_for(std::chrono::milliseconds(50));
         }
         return done();
+    }
+
+    // Neither getting the job nor starting the worker.
+    bool settled(const cluster::Session& s) {
+        const cluster::State st = s.status().state;
+        return st != cluster::State::Connecting && st != cluster::State::Starting;
+    }
+
+    // A stand-in for the image's packages: a sirius that imports.
+    fs::path imageSite(const fs::path& root) {
+        const fs::path site = root / "image-site";
+        fs::create_directories(site / "sirius");
+        std::ofstream(site / "sirius" / "__init__.py") << "__version__ = '0-test'\n";
+        return site;
     }
 
 } // namespace
@@ -613,12 +630,16 @@ TEST_CASE("cluster: connect submits the worker, waits, says hello and serves a d
         const std::lock_guard<std::mutex> g(logMutex);
         logLines.push_back(l);
     });
+    std::ofstream(fc.home / "w.sif") << "image\n";
+    setEnv("FAKE_CONTAINER_SITE", imageSite(fc.root).string());
     cluster::Profile p;
     p.host = "fakecluster";
     p.sshProgram = fc.python;
     p.sshProgramArgs = {SIRIUS_TEST_FAKE_SSH};
     p.checkout = "~/sirius";
-    p.venv = "";
+    p.container = "~/w.sif";
+    p.engine = false;
+    p.partition = "abc_a100";
     p.port = ssh::freeLocalPort();
     bool sawPending = false;
     session.setChanged([&] {
@@ -626,7 +647,7 @@ TEST_CASE("cluster: connect submits the worker, waits, says hello and serves a d
         if (st.steps[static_cast<int>(cluster::Step::Queue)].detail.find("PENDING") != std::string::npos) sawPending = true;
     });
     session.connect(p);
-    REQUIRE(waitFor([&] { return session.status().state != cluster::State::Connecting; }, std::chrono::seconds(180)));
+    REQUIRE(waitFor([&] { return settled(session); }, std::chrono::seconds(180)));
     cluster::Status st = session.status();
     INFO(st.reason << "\n"
                    << st.remoteOutput);
@@ -662,9 +683,10 @@ TEST_CASE("cluster: connect submits the worker, waits, says hello and serves a d
     CHECK(env.find("SIRIUS_TOKEN=<set>") == std::string::npos);
     CHECK(env.find("SIRIUS_PORT=0") != std::string::npos);
     const fs::path run = fc.home / ".sirius" / "run";
-    CHECK(fs::exists(run / "sirius-worker-4711.log"));
+    CHECK(fs::exists(run / "sirius-job-4711.log"));       // the job's
+    CHECK(fs::exists(run / "sirius-worker-4711-1.log"));  // its first worker step's
     for (const auto& entry : fs::directory_iterator(run)) CHECK(entry.path().filename().string().rfind("token.", 0) != 0);
-    CHECK(readAll(run / "sirius-worker-4711.log").find(session.endpoint().token) == std::string::npos);
+    CHECK(readAll(run / "sirius-worker-4711-1.log").find(session.endpoint().token) == std::string::npos);
 #ifndef _WIN32
     CHECK((fs::status(run).permissions() & (fs::perms::group_all | fs::perms::others_all)) == fs::perms::none);
     CHECK(readAll(fc.slurm / "4711.tokenmode").rfind("600", 0) == 0);
@@ -673,8 +695,14 @@ TEST_CASE("cluster: connect submits the worker, waits, says hello and serves a d
     CHECK(session.endpoint().port > 0);
     CHECK(args.find("--parsable") != std::string::npos);
     CHECK(args.find("--partition=abc_a100") != std::string::npos);
+    CHECK(args.find("--wrap=") != std::string::npos);   // the job only holds the node
     CHECK(args.find(session.endpoint().token) == std::string::npos);
     CHECK(fc.sshLog().find(session.endpoint().token) == std::string::npos);
+    // the worker: a step of that job
+    const std::string steps = readAll(fc.slurm / "srun.args");
+    CHECK(steps.find("--jobid=4711 --overlap") != std::string::npos);
+    CHECK(steps.find("sirius_worker.sbatch") != std::string::npos);
+    CHECK(steps.find(session.endpoint().token) == std::string::npos);
 
     // the cluster's file system
     const cluster::Listing l = session.list("~");
@@ -739,6 +767,7 @@ TEST_CASE("cluster: connect submits the worker, waits, says hello and serves a d
     CHECK(session.status().state == cluster::State::Disconnected);
     CHECK(readAll(fc.slurm / "cancelled").find("4711") != std::string::npos);
     CHECK_FALSE(session.sshUp());
+    setEnv("FAKE_CONTAINER_SITE", "");
 }
 
 TEST_CASE("cluster: a job that dies is noticed and named", "[app][cluster]") {
@@ -753,15 +782,19 @@ TEST_CASE("cluster: a job that dies is noticed and named", "[app][cluster]") {
     setEnv("FAKE_SLURM_PENDING_POLLS", "0");
     cluster::Session session;
     session.setPollInterval(std::chrono::milliseconds(200), std::chrono::milliseconds(300));
+    std::ofstream(fc.home / "w.sif") << "image\n";
+    setEnv("FAKE_CONTAINER_SITE", imageSite(fc.root).string());
     cluster::Profile p;
     p.host = "fakecluster";
     p.sshProgram = fc.python;
     p.sshProgramArgs = {SIRIUS_TEST_FAKE_SSH};
     p.checkout = "~/sirius";
-    p.venv = "";
+    p.container = "~/w.sif";
+    p.engine = false;
+    p.gpus = 0;
     p.port = ssh::freeLocalPort();
     session.connect(p);
-    REQUIRE(waitFor([&] { return session.status().state != cluster::State::Connecting; }, std::chrono::seconds(180)));
+    REQUIRE(waitFor([&] { return settled(session); }, std::chrono::seconds(180)));
     INFO(session.status().reason);
     REQUIRE(session.connected());
     // the job ends behind the application's back (a wall-time limit, an admin)
@@ -771,7 +804,10 @@ TEST_CASE("cluster: a job that dies is noticed and named", "[app][cluster]") {
     CHECK(st.reason.find("4711") != std::string::npos);
     CHECK(st.reason.find("CANCELLED") != std::string::npos);
     CHECK(st.sshUp);   // the login is kept: browsing goes on, Connect submits anew
+    CHECK(st.dropped);
+    CHECK(cluster::connectionBadge(st, false, std::chrono::steady_clock::now()).label == "Cluster: lost");
     session.disconnect(false);
+    setEnv("FAKE_CONTAINER_SITE", "");
 }
 
 // --- the partitions -----------------------------------------------------------------------
@@ -1068,13 +1104,7 @@ namespace {
                      fs::copy_options::recursive | fs::copy_options::skip_existing);
     }
 
-    // A stand-in for the image's packages: a sirius that imports.
-    fs::path containerSite(const FakeCluster& fc) {
-        const fs::path site = fc.root / "image-site";
-        fs::create_directories(site / "sirius");
-        std::ofstream(site / "sirius" / "__init__.py") << "__version__ = '0-test'\n";
-        return site;
-    }
+    fs::path containerSite(const FakeCluster& fc) { return imageSite(fc.root); }
 
     cluster::Profile containerProfile(const FakeCluster& fc, const std::string& image) {
         cluster::Profile p;
@@ -1082,17 +1112,30 @@ namespace {
         p.sshProgram = fc.python;
         p.sshProgramArgs = {SIRIUS_TEST_FAKE_SSH};
         p.checkout = "~/sirius";
-        p.venv = "~/no-such-venv";   // ignored with a container
         p.container = image;
+        p.engine = false;
+        p.gpus = 0;
         p.port = ssh::freeLocalPort();
         return p;
     }
 
     cluster::Status connectUntilSettled(cluster::Session& session, const cluster::Profile& p) {
         session.connect(p);
-        waitFor([&] { return session.status().state != cluster::State::Connecting; }, std::chrono::seconds(180));
+        waitFor([&] { return settled(session); }, std::chrono::seconds(180));
         return session.status();
     }
+
+    // The worker (again) in the job the session holds.
+    cluster::Status workerUntilSettled(cluster::Session& session, const cluster::Profile& p) {
+        session.startWorker(p);
+        waitFor([&] { return session.status().state != cluster::State::JobReady && session.status().state != cluster::State::Connected; },
+                std::chrono::seconds(5));
+        waitFor([&] { return settled(session); }, std::chrono::seconds(180));
+        return session.status();
+    }
+
+    // No worker step was started (srun.args names none).
+    bool noWorkerStarted(const FakeCluster& fc) { return readAll(fc.slurm / "srun.args").find("sirius_worker.sbatch") == std::string::npos; }
 } // namespace
 
 TEST_CASE("cluster: the profile keeps the container image and its launcher", "[app][cluster]") {
@@ -1132,6 +1175,7 @@ TEST_CASE("cluster: the profile keeps the container's binds and Python path, per
     CHECK(q.containerPythonPath.empty());
     // a host remembered before binds were kept leaves the profile's as they are
     nlohmann::json old = q.toJson();
+    old.erase("last_used");
     old["perHost"] = {{"fiona", {{"partition", "dgx"}, {"account", "a"}, {"qos", "q"}, {"time", "01:00:00"}}}};
     cluster::Profile r = cluster::Profile::fromJson(old);
     REQUIRE(r.recall("fiona"));
@@ -1154,8 +1198,8 @@ TEST_CASE("cluster: the bind list's host paths, the empty-bind warning and paths
     CHECK(cluster::emptyBindWarning(p).empty());   // no container: nothing to bind
     p.container = "~/w.sif";
     const std::string w = cluster::emptyBindWarning(p);
-    CHECK(w.find("only the image and your home folder") != std::string::npos);
-    CHECK(w.find("add them under Bind") != std::string::npos);
+    CHECK(w.find("only itself and your home folder") != std::string::npos);
+    CHECK(w.find("add those folders under Data folders") != std::string::npos);
     p.bind = "/clusterfs";
     CHECK(cluster::emptyBindWarning(p).empty());
 
@@ -1169,7 +1213,7 @@ TEST_CASE("cluster: the bind list's host paths, the empty-bind warning and paths
     // elsewhere: said, with the top folder to add
     std::string m = cluster::unboundPathMessage(p, home, "/global/scratch/u/a.tif");
     CHECK(m.find("not bound into the worker's container") != std::string::npos);
-    CHECK(m.find("add it under Bind") != std::string::npos);
+    CHECK(m.find("add its folder under Data folders") != std::string::npos);
     CHECK(m.find("/global") != std::string::npos);
     // a prefix of a name is not a parent folder
     CHECK_FALSE(cluster::unboundPathMessage(p, home, "/clusterfs2/a.tif").empty());
@@ -1194,20 +1238,29 @@ TEST_CASE("cluster: the checks of a container image say what is wrong and never 
     std::ofstream(fc.home / "empty.sif") << "an image without sirius\n";
     cluster::Session session;
     session.setPollInterval(std::chrono::milliseconds(200), std::chrono::milliseconds(500));
+    // a failed check leaves the job held, for the next try in it
     auto checksFailed = [](const cluster::Status& st) {
-        return st.state == cluster::State::Disconnected && st.steps[static_cast<int>(cluster::Step::Checks)].status == cluster::StepStatus::Failed;
+        return st.state == cluster::State::JobReady && st.steps[static_cast<int>(cluster::Step::Checks)].status == cluster::StepStatus::Failed;
     };
 
-    // no image there
-    cluster::Status st = connectUntilSettled(session, containerProfile(fc, "~/missing.sif"));
+    // no image at all: said, with where one comes from
+    cluster::Status st = connectUntilSettled(session, containerProfile(fc, ""));
     INFO(st.reason);
     CHECK(checksFailed(st));
-    CHECK(st.reason.find("no container image at ~/missing.sif") != std::string::npos);
-    CHECK(st.fix.find("Build the SIRIUS worker image") != std::string::npos);
+    CHECK(st.reason.find("No worker image is set") != std::string::npos);
+    CHECK(st.fix.find("Worker image") != std::string::npos);
+    CHECK(st.jobId == "4711");   // the job came first, and stays
+
+    // no image there
+    st = workerUntilSettled(session, containerProfile(fc, "~/missing.sif"));
+    INFO(st.reason);
+    CHECK(checksFailed(st));
+    CHECK(st.reason.find("no worker image at ~/missing.sif") != std::string::npos);
+    CHECK(st.fix.find("Build the worker image") != std::string::npos);
     CHECK(st.fix.find("pip") == std::string::npos);
 
     // an image that does not open
-    st = connectUntilSettled(session, containerProfile(fc, "~/broken.sif"));
+    st = workerUntilSettled(session, containerProfile(fc, "~/broken.sif"));
     CHECK(checksFailed(st));
     CHECK(st.reason.find("cannot run the worker") != std::string::npos);
     CHECK(st.remoteOutput.find("squashfs") != std::string::npos);
@@ -1221,7 +1274,7 @@ TEST_CASE("cluster: the checks of a container image say what is wrong and never 
     // through a file: the fake ssh session is already open, so a new environment
     // variable would not reach the fake apptainer
     std::ofstream(fc.slurm / "container_site") << numpyOnly.string();
-    st = connectUntilSettled(session, containerProfile(fc, "~/empty.sif"));
+    st = workerUntilSettled(session, containerProfile(fc, "~/empty.sif"));
     fs::remove(fc.slurm / "container_site");
     CHECK(checksFailed(st));
     CHECK(st.reason.find("sirius and numpy do not import") != std::string::npos);
@@ -1234,11 +1287,12 @@ TEST_CASE("cluster: the checks of a container image say what is wrong and never 
 
     // neither apptainer nor singularity
     fs::remove(fc.bin / "apptainer");
-    st = connectUntilSettled(session, containerProfile(fc, "~/empty.sif"));
+    st = workerUntilSettled(session, containerProfile(fc, "~/empty.sif"));
     CHECK(checksFailed(st));
     CHECK(st.reason.find("Neither apptainer nor singularity") != std::string::npos);
-    CHECK_FALSE(fs::exists(fc.slurm / "next"));   // nothing was submitted
-    session.disconnect(false);
+    CHECK(noWorkerStarted(fc));         // the checks stopped every try before the worker
+    CHECK_FALSE(fs::exists(fc.slurm / "4712.args"));   // all in the one job
+    session.disconnect(true);
 }
 
 TEST_CASE("cluster: the job template runs the worker in the container", "[app][cluster]") {
@@ -1297,7 +1351,7 @@ TEST_CASE("cluster: connect runs the worker in the container image", "[app][clus
     const std::string checks = st.steps[static_cast<int>(cluster::Step::Checks)].detail;
     CHECK(checks.find("apptainer") != std::string::npos);
     CHECK(checks.find("sirius, numpy") != std::string::npos);
-    // the job was told the image and the launcher, not the venv
+    // the worker step was told the image and the launcher
     const std::string env = readAll(fc.slurm / "4711.env");
     CHECK(env.find("SIRIUS_CONTAINER=") != std::string::npos);
     CHECK(env.find("sirius-worker.sif") != std::string::npos);
@@ -1314,7 +1368,7 @@ TEST_CASE("cluster: connect runs the worker in the container image", "[app][clus
     setEnv("FAKE_CONTAINER_SITE", "");
 }
 
-TEST_CASE("cluster: the checks fail on a bind path that is not there, before anything is submitted", "[app][cluster]") {
+TEST_CASE("cluster: the checks fail on a data folder that is not there, before the worker starts", "[app][cluster]") {
     FakeCluster fc;
     if (!fc.usable()) SKIP("no Python or bash for the fake ssh");
     copyCheckout(fc.home / "sirius");
@@ -1326,16 +1380,16 @@ TEST_CASE("cluster: the checks fail on a bind path that is not there, before any
     p.bind = "~/data:/data,~/missing:/m";
     const cluster::Status st = connectUntilSettled(session, p);
     INFO(st.reason);
-    CHECK(st.state == cluster::State::Disconnected);
+    CHECK(st.state == cluster::State::JobReady);   // the job holds on
     CHECK(st.steps[static_cast<int>(cluster::Step::Checks)].status == cluster::StepStatus::Failed);
     CHECK(st.reason.find("~/missing") != std::string::npos);
     CHECK(st.reason.find("~/data") == std::string::npos);   // the one that is there is not named
-    CHECK(st.fix.find("Bind") != std::string::npos);
-    CHECK_FALSE(fs::exists(fc.slurm / "next"));   // nothing was submitted
-    session.disconnect(false);
+    CHECK(st.fix.find("Data folders") != std::string::npos);
+    CHECK(noWorkerStarted(fc));
+    session.disconnect(true);
 }
 
-TEST_CASE("cluster: no bind is a warning; the binds and the Python path reach the job", "[app][cluster]") {
+TEST_CASE("cluster: no data folder is a warning; the data folders and the Python path reach the worker", "[app][cluster]") {
     FakeCluster fc;
     if (!fc.usable()) SKIP("no Python or bash for the fake ssh");
     if (!pythonHas(fc.python, "numpy")) SKIP("no numpy in " + fc.python + " for the image check");
@@ -1343,21 +1397,22 @@ TEST_CASE("cluster: no bind is a warning; the binds and the Python path reach th
     std::ofstream(fc.home / "w.sif") << "image\n";
     fs::create_directories(fc.home / "data");
     setEnv("FAKE_CONTAINER_SITE", containerSite(fc).string());
-    // sbatch refuses every job once it has recorded its environment: no worker is started
-    std::ofstream(fc.slurm / "sbatch.fail") << "1\n";
+    // srun refuses every worker step once it has recorded its environment: no worker is started
+    std::ofstream(fc.slurm / "srun.fail") << "1\n";
     cluster::Session session;
     session.setPollInterval(std::chrono::milliseconds(200), std::chrono::milliseconds(500));
     cluster::Profile p = containerProfile(fc, "~/w.sif");
 
-    // no bind: the checks pass with a warning, and the job is submitted all the same
+    // no data folder: the checks pass with a warning, and the worker is started all the same
     cluster::Status st = connectUntilSettled(session, p);
     INFO(st.reason << "\n"
                    << st.remoteOutput);
     const cluster::StepState checks = st.steps[static_cast<int>(cluster::Step::Checks)];
     CHECK(checks.status == cluster::StepStatus::Warning);
-    CHECK(checks.detail.find("only the image and your home folder") != std::string::npos);
-    CHECK(checks.detail.find("add them under Bind") != std::string::npos);
-    CHECK(st.steps[static_cast<int>(cluster::Step::Submit)].status == cluster::StepStatus::Failed);
+    CHECK(checks.detail.find("only itself and your home folder") != std::string::npos);
+    CHECK(checks.detail.find("add those folders under Data folders") != std::string::npos);
+    CHECK(st.steps[static_cast<int>(cluster::Step::Start)].status == cluster::StepStatus::Failed);
+    CHECK(st.state == cluster::State::JobReady);
     CHECK_FALSE(st.home.empty());   // the checks said where $HOME is
     std::string env = readAll(fc.slurm / "4711.env");
     CHECK(env.find("SIRIUS_CONTAINER=") != std::string::npos);
@@ -1368,12 +1423,12 @@ TEST_CASE("cluster: no bind is a warning; the binds and the Python path reach th
     fs::remove(fc.slurm / "apptainer.args");
     p.bind = "~/data:/data, /tmp";
     p.containerPythonPath = "/opt/extra";
-    st = connectUntilSettled(session, p);
+    st = workerUntilSettled(session, p);
     const cluster::StepState checks2 = st.steps[static_cast<int>(cluster::Step::Checks)];
     INFO(checks2.detail);
     CHECK(checks2.status == cluster::StepStatus::Done);
-    CHECK(checks2.detail.find("binds 2") != std::string::npos);
-    env = readAll(fc.slurm / "4712.env");
+    CHECK(checks2.detail.find("2 data folders") != std::string::npos);
+    env = readAll(fc.slurm / "4711.env");   // the same job's next step
     INFO(env);
     CHECK(env.find("SIRIUS_CONTAINER_BIND=") != std::string::npos);
     CHECK(env.find("/data:/data,/tmp\n") != std::string::npos);
@@ -1383,7 +1438,7 @@ TEST_CASE("cluster: no bind is a warning; the binds and the Python path reach th
     // the image was tried with the same binds
     CHECK(readAll(fc.slurm / "apptainer.args").find("--bind ") != std::string::npos);
     CHECK(readAll(fc.slurm / "apptainer.args").find("/data:/data,/tmp") != std::string::npos);
-    session.disconnect(false);
+    session.disconnect(true);
     setEnv("FAKE_CONTAINER_SITE", "");
 }
 
@@ -1409,12 +1464,14 @@ namespace {
     }
 
     cluster::Profile engineProfile(const FakeCluster& fc) {
+        std::ofstream(fc.home / "w.sif") << "image\n";
+        setEnv("FAKE_CONTAINER_SITE", imageSite(fc.root).string());
         cluster::Profile p;
         p.host = "fakecluster";
         p.sshProgram = fc.python;
         p.sshProgramArgs = {SIRIUS_TEST_FAKE_SSH};
         p.checkout = "~/sirius";
-        p.venv = "";
+        p.container = "~/w.sif";
         p.port = ssh::freeLocalPort();
         p.engine = true;
         p.engineBin = SIRIUS_TEST_CLI;
@@ -1456,16 +1513,18 @@ namespace {
     };
 } // namespace
 
-TEST_CASE("cluster: the profile keeps the engine, on by default with a container image", "[app][cluster]") {
+TEST_CASE("cluster: the profile keeps the engine, on by default", "[app][cluster]") {
     cluster::Profile p;
-    CHECK_FALSE(p.engine);
-    p.engine = true;
+    CHECK(p.engine);
+    p.engine = false;
     p.engineBin = "/opt/sirius/bin/sirius-cli";
+    p.engineBuilds = "/shared/sirius-engines";
     const cluster::Profile back = cluster::Profile::fromJson(p.toJson());
-    CHECK(back.engine);
+    CHECK_FALSE(back.engine);
     CHECK(back.engineBin == "/opt/sirius/bin/sirius-cli");
+    CHECK(back.engineBuilds == "/shared/sirius-engines");
     CHECK(cluster::Profile::fromJson(nlohmann::json{{"container", "~/w.sif"}}).engine);
-    CHECK_FALSE(cluster::Profile::fromJson(nlohmann::json{{"container", ""}}).engine);
+    CHECK(cluster::Profile::fromJson(nlohmann::json{{"container", ""}}).engine);
     CHECK_FALSE(cluster::Profile::fromJson(nlohmann::json{{"container", "~/w.sif"}, {"engine", false}}).engine);
 }
 
@@ -1571,6 +1630,7 @@ TEST_CASE("cluster: connect starts SIRIUS's engine; a pipeline runs there and st
     // disconnect, leaving the job: connect again reattaches to it, no new job
     session.disconnect(false);
     REQUIRE(session.status().state == cluster::State::Disconnected);
+    CHECK_FALSE(session.status().dropped);   // asked for: not a drop
     st = connectUntilSettled(session, p);
     INFO(st.reason << "\n"
                    << st.remoteOutput);
@@ -1578,6 +1638,8 @@ TEST_CASE("cluster: connect starts SIRIUS's engine; a pipeline runs there and st
     CHECK(st.jobId == "4711");
     CHECK_FALSE(fs::exists(fc.slurm / "4712.args"));
     CHECK(st.steps[static_cast<int>(cluster::Step::Submit)].detail.find("reattached") != std::string::npos);
+    CHECK(st.steps[static_cast<int>(cluster::Step::Checks)].detail.find("still runs") != std::string::npos);   // its worker too
+    CHECK(countOf(readAll(fc.slurm / "srun.args"), "sirius_worker.sbatch") == 1);   // no second worker
     CHECK(st.caps.engine.value("session", std::string()) == session1);
     // the engine kept what it computed: the same handle draws again, through the new tunnel
     ViewRequest other = req;
@@ -1598,6 +1660,7 @@ TEST_CASE("cluster: connect starts SIRIUS's engine; a pipeline runs there and st
     datasets->uninstall();
     setEnv("FAKE_SLURM_KILL_ON_EXIT", "1");
     setEnv("FAKE_SLURM_DETACH", "0");
+    setEnv("FAKE_CONTAINER_SITE", "");
 }
 
 TEST_CASE("cluster: an engine of other operations is refused at its hello, in words", "[app][cluster][engine]") {
@@ -1611,10 +1674,468 @@ TEST_CASE("cluster: an engine of other operations is refused at its hello, in wo
     session.setPollInterval(std::chrono::milliseconds(200), std::chrono::milliseconds(500));
     const cluster::Status st = connectUntilSettled(session, engineProfile(fc));
     setEnv("SIRIUS_TEST_ENGINE_BUILD", "");
+    setEnv("FAKE_CONTAINER_SITE", "");
     INFO(st.reason);
-    CHECK(st.state == cluster::State::Disconnected);
+    CHECK(st.state == cluster::State::JobReady);   // the job holds on for another engine
     CHECK(st.steps[static_cast<int>(cluster::Step::Hello)].status == cluster::StepStatus::Failed);
     CHECK(st.reason.find("0.0.9+gdeadbee") != std::string::npos);
     CHECK(st.reason.find("their operations differ") != std::string::npos);
+    session.disconnect(true);
+}
+
+// --- the profiles in the settings file ----------------------------------------------------
+
+TEST_CASE("cluster: a new profile has nothing of any site in it", "[app][cluster]") {
+    const cluster::Profile p;
+    CHECK(p.host.empty());
+    CHECK(p.checkout.empty());
+    CHECK(p.container.empty());
+    CHECK(p.bind.empty());
+    CHECK(p.partition.empty());
+    CHECK(p.account.empty());
+    CHECK(p.qos.empty());
+    CHECK(p.engineBuilds.empty());
+    CHECK(p.scratch.empty());
+    CHECK(p.choices.empty());
+    CHECK(p.images.empty());
+    CHECK(p.launcher == "apptainer");
+    CHECK(p.engine);
+    const std::string all = p.toJson().dump();
+    for (const char* site : {"fiona", "abc_", "velatkilic", "co_abc", "clusterfs", "venvs", "dev/sirius"}) {
+        INFO(site);
+        CHECK(all.find(site) == std::string::npos);
+    }
+    // no settings, no profile: nobody's cluster is assumed
+    CHECK(cluster::ProfileBook::fromSettings(nlohmann::json::object()).profiles.empty());
+    CHECK(cluster::ProfileBook::fromSettings(nlohmann::json::object()).currentProfile().host.empty());
+}
+
+TEST_CASE("cluster: the profile of before becomes [cluster.<host>] with every value; several profiles go through the settings file and back",
+          "[app][cluster]") {
+    const nlohmann::json legacy = {
+        {"host", "login.example.org"}, {"checkout", "~/src/sirius"}, {"venv", "~/v"}, {"container", "/img/w.sif"}, {"launcher", "singularity"}, {"bind", "/data,/scratch:/s:ro"}, {"containerPythonPath", "/opt/x"}, {"partition", "gpu"}, {"account", "lab"}, {"qos", "normal"}, {"time", "02:00:00"}, {"gpus", 2}, {"cpus", 16}, {"mem", "32G"}, {"port", 7645}, {"engine", true}, {"engineBin", "/opt/e"}, {"perHost", {{"other", {{"partition", "p2"}, {"account", "a2"}, {"qos", ""}, {"time", "00:30:00"}}}}}};
+    const nlohmann::json flat = {{"cluster/profile", legacy}, {"cluster/recentFolders", {"/data"}}};
+    bool migrated = false;
+    cluster::ProfileBook b = cluster::ProfileBook::fromSettings(flat, &migrated);
+    CHECK(migrated);
+    REQUIRE(b.profiles.size() == 1);
+    const cluster::Profile m = b.profiles[0];
+    CHECK(m.name == "login.example.org");
+    CHECK(b.current == m.name);
+    CHECK(m.host == "login.example.org");
+    CHECK(m.checkout == "~/src/sirius");
+    CHECK(m.container == "/img/w.sif");
+    CHECK(m.launcher == "singularity");
+    CHECK(m.bind == "/data,/scratch:/s:ro");
+    CHECK(m.containerPythonPath == "/opt/x");
+    CHECK(m.partition == "gpu");
+    CHECK(m.account == "lab");
+    CHECK(m.qos == "normal");
+    CHECK(m.time == "02:00:00");
+    CHECK(m.gpus == 2);
+    CHECK(m.cpus == 16);
+    CHECK(m.mem == "32G");
+    CHECK(m.engine);
+    CHECK(m.engineBin == "/opt/e");
+    REQUIRE(m.perHost.count("other"));
+    CHECK(m.perHost.at("other").partition == "p2");
+    // its partition, account and QoS: the dropdowns' first choice; its image the first in its list
+    REQUIRE(m.choices.size() == 1);
+    CHECK(m.choices[0].name == "gpu");
+    CHECK(m.choices[0].isDefault);
+    CHECK(m.choices[0].accounts == std::vector<std::string>{"lab"});
+    CHECK(m.choices[0].qos == std::vector<std::string>{"normal"});
+    CHECK(m.images == std::vector<std::string>{"/img/w.sif"});
+    // once there is a profile, the one of before is not read again
+    nlohmann::json both = flat;
+    for (const auto& [k, v] : b.toSettings()) both[k] = v;
+    bool again = true;
+    CHECK(cluster::ProfileBook::fromSettings(both, &again).profiles.size() == 1);
+    CHECK_FALSE(again);
+
+    // a second cluster, with the choices its dropdowns offer
+    cluster::Profile second;
+    second.name = "uni";
+    second.host = "hpc.uni.example";
+    second.container = "/sw/sirius.sif";
+    cluster::PartitionChoice c;
+    c.name = "short";
+    c.accounts = {"a", "b"};
+    c.maxTime = "04:00:00";
+    c.times = {"01:00:00", "04:00:00"};
+    c.maxGpus = 4;
+    c.maxMem = "500G";
+    second.choices.push_back(c);
+    b.put(second);
+    CHECK(b.current == "uni");
+    const std::map<std::string, nlohmann::json> keys = b.toSettings();
+    const std::string text = settings_toml::toToml(nlohmann::json(keys));
+    INFO(text);
+    CHECK(text.find("login.example.org") != std::string::npos);
+    CHECK(text.find("[[cluster.uni.partitions]]") != std::string::npos);
+    CHECK(text.find("[cluster.uni.job]") != std::string::npos);
+    CHECK(text.find("venv") == std::string::npos);   // the Python environment mode is gone
+    const settings_toml::ParseResult back = settings_toml::fromToml(text);
+    REQUIRE(back.ok);
+    cluster::ProfileBook b2 = cluster::ProfileBook::fromSettings(back.flat);
+    REQUIRE(b2.profiles.size() == 2);
+    CHECK(b2.current == "uni");
+    for (const cluster::Profile& p : b.profiles) {
+        REQUIRE(b2.find(p.name));
+        CHECK(b2.find(p.name)->toJson() == p.toJson());
+    }
+    CHECK(cluster::checkClusterSettings(back.flat).empty());
+
+    // names
+    CHECK_FALSE(b2.nameProblem("current").empty());
+    CHECK_FALSE(b2.nameProblem("a/b").empty());
+    CHECK_FALSE(b2.nameProblem("uni").empty());
+    CHECK(b2.nameProblem("uni", "uni").empty());
+    CHECK(b2.uniqueName("uni") == "uni 2");
+    CHECK(b2.uniqueName("current") == "current 2");
+    REQUIRE(b2.rename("uni", "university"));
+    CHECK(b2.current == "university");
+    CHECK(b2.staleKeys(back.flat) == std::vector<std::string>{"cluster/uni"});
+    CHECK(b2.remove("university"));
+    CHECK(b2.current == "login.example.org");
+
+    // one profile as a small file, and back
+    const std::string one = cluster::exportProfile(second);
+    const std::vector<cluster::Profile> imported = cluster::importProfiles(one);
+    REQUIRE(imported.size() == 1);
+    CHECK(imported[0].name == "uni");
+    CHECK(imported[0].toJson() == second.toJson());
+    CHECK_THROWS_AS(cluster::importProfiles("not = [toml"), std::runtime_error);
+    CHECK_THROWS_AS(cluster::importProfiles("[worker]\npython = 'x'\n"), std::runtime_error);
+}
+
+TEST_CASE("cluster: the title bar's button says where the session is", "[app][cluster]") {
+    using Kind = cluster::ConnectionBadge::Kind;
+    const auto now = std::chrono::steady_clock::now();
+    cluster::Status st;
+    cluster::ConnectionBadge b = cluster::connectionBadge(st, true, now);
+    CHECK(b.kind == Kind::Off);
+    CHECK(b.label == "Cluster");
+
+    st.state = cluster::State::Connecting;
+    st.host = "login.example.org";
+    st.steps[0].status = cluster::StepStatus::Done;
+    st.steps[1] = cluster::StepState{cluster::StepStatus::Running, "sbatch"};
+    b = cluster::connectionBadge(st, true, now);
+    CHECK(b.kind == Kind::Connecting);
+    CHECK(b.label == "Connecting\xE2\x80\xA6");
+    CHECK(std::abs(b.progress - 1.0f / 6.0f) < 1e-6f);
+    CHECK(b.tooltip.find("Ask for a job") != std::string::npos);
+
+    st.state = cluster::State::JobReady;
+    for (int i = 0; i < cluster::kJobStepCount; ++i) st.steps[static_cast<std::size_t>(i)].status = cluster::StepStatus::Done;
+    st.node = "g0003.abc0";
+    st.jobId = "4238701";
+    st.jobLimitSeconds = 3600;
+    st.jobStarted = now - std::chrono::minutes(10);
+    b = cluster::connectionBadge(st, true, now);
+    CHECK(b.kind == Kind::JobReady);
+    CHECK(b.label == "g0003 \xC2\xB7 job 4238701 \xC2\xB7 no worker yet");
+    CHECK(b.tooltip.find("50 min left of 1 h 00 min") != std::string::npos);
+
+    st.state = cluster::State::Starting;
+    b = cluster::connectionBadge(st, true, now);
+    CHECK(b.kind == Kind::Connecting);
+    CHECK(b.label == "Starting worker\xE2\x80\xA6");
+    CHECK(std::abs(b.progress - 0.5f) < 1e-6f);
+
+    st.state = cluster::State::Connected;
+    st.caps.gpus = {GpuInfo{"NVIDIA A100-SXM4-80GB", 81920}};
+    st.caps.cpuThreads = 16;
+    b = cluster::connectionBadge(st, true, now);
+    CHECK(b.kind == Kind::Connected);
+    CHECK(b.label == "g0003 \xC2\xB7 GPU");
+    for (const char* part : {"login.example.org", "4238701", "g0003.abc0", "A100", "50 min left"}) {
+        INFO(part);
+        CHECK(b.tooltip.find(part) != std::string::npos);
+    }
+    b = cluster::connectionBadge(st, false, now);
+    CHECK(b.label == "g0003 \xC2\xB7 CPU");
+    CHECK(b.tooltip.find("16 threads") != std::string::npos);
+    st.jobLimitSeconds = -1;
+    CHECK(cluster::connectionBadge(st, false, now).tooltip.find("No time limit") != std::string::npos);
+
+    st.state = cluster::State::Disconnected;
+    st.dropped = true;
+    st.reason = "the SSH connection to login.example.org ended";
+    b = cluster::connectionBadge(st, true, now);
+    CHECK(b.kind == Kind::Lost);
+    CHECK(b.label == "Cluster: lost");
+    CHECK(b.tooltip.find("SSH connection") != std::string::npos);
+    st.dropped = false;
+    st.steps[3] = cluster::StepState{cluster::StepStatus::Failed, "No worker image is set"};
+    st.reason = "No worker image is set";
+    CHECK(cluster::connectionBadge(st, true, now).label == "Cluster: failed");
+    for (cluster::StepState& s : st.steps) s = cluster::StepState{};
+    st.reason = "disconnected (job 4238701 left running)";
+    CHECK(cluster::connectionBadge(st, true, now).label == "Cluster");
+
+    CHECK(cluster::durationText(59) == "1 min");
+    CHECK(cluster::durationText(3600) == "1 h 00 min");
+    CHECK(cluster::durationText(90061) == "1 d 1 h");
+    CHECK(cluster::durationText(-1).empty());
+}
+
+TEST_CASE("cluster: what a change takes, a new job or only a new worker", "[app][cluster]") {
+    cluster::Profile a;
+    a.host = "h";
+    a.container = "/a.sif";
+    a.partition = "gpu";
+    a.bind = "/x,/y";
+    cluster::Profile b = a;
+    b.bind = " /x , /y";   // the same folders
+    CHECK(cluster::profileChange(a, b).fields.empty());
+    b.container = "/b.sif";
+    b.bind = "/data";
+    cluster::ProfileChange c = cluster::profileChange(a, b);
+    CHECK(c.newWorker);
+    CHECK_FALSE(c.newJob);
+    CHECK(c.fields == std::vector<std::string>{"worker image", "data folders"});
+    b.partition = "dgx";
+    b.gpus = 4;
+    c = cluster::profileChange(a, b);
+    CHECK(c.newJob);
+    CHECK(std::find(c.fields.begin(), c.fields.end(), "partition") != c.fields.end());
+    CHECK(std::find(c.fields.begin(), c.fields.end(), "GPUs") != c.fields.end());
+    // what only the dropdowns offer changes nothing that runs
+    b = a;
+    b.choices.push_back(cluster::PartitionChoice{});
+    b.name = "renamed";
+    CHECK(cluster::profileChange(a, b).fields.empty());
+}
+
+TEST_CASE("cluster: the login fills what a new profile leaves empty; the dropdowns' choices", "[app][cluster]") {
+    const cluster::ClusterInfo info = cluster::parseClusterInfo(std::string("@@home /home/tester\n") + kInfoOutput);
+    CHECK(info.home == "/home/tester");
+    cluster::Profile p;
+    const std::vector<std::string> filled = cluster::fillFromCluster(p, info);
+    CHECK(p.checkout == "/home/tester/sirius");
+    CHECK(p.partition == "cpu");        // sinfo's default
+    CHECK(p.gpus == 0);                 // it has none, others have
+    CHECK(p.account == "velatkilic");   // the user's association with it
+    CHECK(p.qos.empty());               // which names no QoS
+    CHECK(filled.size() == 4);
+    // what the profile has stays
+    cluster::Profile q;
+    q.partition = "abc_a100";
+    q.account = "abc_lab";
+    q.checkout = "/opt/s";
+    cluster::fillFromCluster(q, info);
+    CHECK(q.partition == "abc_a100");
+    CHECK(q.account == "abc_lab");
+    CHECK(q.qos == "abc_normal");
+    CHECK(q.checkout == "/opt/s");
+    CHECK(q.gpus == 1);
+
+    // a partition the cluster reports, kept as a choice
+    const cluster::PartitionChoice a100 = cluster::choiceFromCluster(info, "abc_a100");
+    CHECK(a100.accounts == std::vector<std::string>{"velatkilic", "abc_lab"});
+    CHECK(a100.qos == std::vector<std::string>{"abc_debug", "abc_normal"});
+    CHECK(a100.maxTime == "3-00:00:00");
+    CHECK(a100.maxGpus == 1);
+    CHECK(a100.maxCpus == 32);
+    CHECK(a100.maxMem == "488G");
+    CHECK_FALSE(a100.isDefault);
+    const cluster::PartitionChoice cpu = cluster::choiceFromCluster(info, "cpu");
+    CHECK(cpu.isDefault);
+    CHECK(cpu.gpus == 0);
+    // picking it from the profile's choices
+    cluster::Profile r;
+    r.account = "someone";
+    r.gpus = 4;
+    r.time = "5-00:00:00";
+    const std::vector<std::string> changed = cluster::applyChoice(r, a100);
+    CHECK(r.partition == "abc_a100");
+    CHECK(r.account == "velatkilic");
+    CHECK(r.qos == "abc_debug");
+    CHECK(r.gpus == 1);
+    CHECK(r.time == "3-00:00:00");
+    CHECK_FALSE(changed.empty());
+    // the time limits offered
+    using V = std::vector<std::string>;
+    CHECK(cluster::timeChoices(&a100, "", "01:00:00") ==
+          V{"00:30:00", "01:00:00", "02:00:00", "04:00:00", "08:00:00", "12:00:00", "1-00:00:00", "2-00:00:00", "3-00:00:00"});
+    CHECK(cluster::timeChoices(&a100, "01:00:00", "00:45:00") == V{"00:30:00", "00:45:00", "01:00:00"});
+    cluster::PartitionChoice own = a100;
+    own.times = {"02:00:00"};
+    CHECK(cluster::timeChoices(&own, "", "") == V{"02:00:00"});
+    CHECK(cluster::timeChoices(nullptr, "", "").size() == 10);
+}
+
+TEST_CASE("cluster: the engine build of this application, or one of the same operations, from the builds folder", "[app][cluster]") {
+    BuildInfo app = buildInfo();
+    app.commit = "1234abcd";
+    const nlohmann::json mine = toJson(app);
+    nlohmann::json same = mine;
+    same["commit"] = "0000other";
+    same["build"] = "0.1.0+gother";
+    nlohmann::json other = mine;
+    other["ops_schema"] = "ffff";
+    const std::string out = "builds=yes\n@@build 1234abcd yes " + mine.dump() + "\n@@build 0000other yes " + same.dump() + "\n@@build broken no " +
+                            mine.dump() + "\n@@build bad yes {not json\n@@build different yes " + other.dump() + "\n";
+    const std::vector<cluster::EngineBuild> found = cluster::parseEngineBuilds(out);
+    REQUIRE(found.size() == 5);
+    CHECK(found[0].dir == "1234abcd");
+    CHECK(found[0].runnable);
+    CHECK(found[0].readable);
+    CHECK_FALSE(found[2].runnable);
+    CHECK_FALSE(found[3].readable);
+    std::string note;
+    CHECK(cluster::pickEngineBuild(found, app, &note) == 0);
+    CHECK(note == "this build");
+    // without its own: the newest of the same operations
+    const std::vector<cluster::EngineBuild> rest(found.begin() + 1, found.end());
+    CHECK(cluster::pickEngineBuild(rest, app, &note) == 0);
+    CHECK(note == "the same operations as this build");
+    // never one that cannot run, cannot be read, or has other operations
+    CHECK(cluster::pickEngineBuild({found[2], found[3], found[4]}, app, &note) == -1);
+    CHECK(note.find("None of the 3 engine builds") != std::string::npos);
+    CHECK(cluster::pickEngineBuild({}, app, &note) == -1);
+    CHECK(note.find("holds no build") != std::string::npos);
+    CHECK(cluster::engineBuildsScript("~/engines").find("BUILD.json") != std::string::npos);
+}
+
+// --- two steps: the job, then the worker in it ---------------------------------------------
+
+TEST_CASE("cluster: the job first, then the worker in it; a new image restarts only the worker; another partition takes a new job",
+          "[app][cluster]") {
+    FakeCluster fc;
+    if (!fc.usable()) SKIP("no Python or bash for the fake ssh");
+    if (!pythonHas(fc.python, "numpy")) SKIP("no numpy in " + fc.python + " for the worker");
+    copyCheckout(fc.home / "sirius");
+    std::ofstream(fc.home / "w.sif") << "image\n";
+    std::ofstream(fc.home / "w2.sif") << "image\n";
+    setEnv("FAKE_CONTAINER_SITE", containerSite(fc).string());
+    setEnv("FAKE_SLURM_PENDING_POLLS", "0");
+    cluster::Session session;
+    session.setPollInterval(std::chrono::milliseconds(200), std::chrono::milliseconds(500));
+    const cluster::Profile p = containerProfile(fc, "~/w.sif");
+
+    // step 1: the job, nothing of SIRIUS run in it yet
+    session.connectJob(p);
+    REQUIRE(waitFor([&] { return settled(session); }, std::chrono::seconds(120)));
+    cluster::Status st = session.status();
+    INFO(st.reason << "\n"
+                   << st.remoteOutput);
+    REQUIRE(st.state == cluster::State::JobReady);
+    CHECK(st.jobId == "4711");
+    CHECK(st.node == "fakenode");
+    CHECK(st.jobLimitSeconds == 3600);   // squeue's %l
+    for (int i = 0; i < cluster::kStepCount; ++i)
+        CHECK(st.steps[static_cast<std::size_t>(i)].status == (i < cluster::kJobStepCount ? cluster::StepStatus::Done : cluster::StepStatus::Pending));
+    CHECK(noWorkerStarted(fc));
+    CHECK(cluster::connectionBadge(st, false, std::chrono::steady_clock::now()).label == "fakenode \xC2\xB7 job 4711 \xC2\xB7 no worker yet");
+    CHECK(session.hasJobRunning());
+    CHECK_FALSE(session.connected());
+    // Connect while it holds: no second job
+    session.connectJob(p);
+    std::this_thread::sleep_for(std::chrono::milliseconds(300));
+    CHECK(session.status().state == cluster::State::JobReady);
+    CHECK_FALSE(fs::exists(fc.slurm / "4712.args"));
+
+    // step 2: the worker, as a step of that job
+    st = workerUntilSettled(session, p);
+    INFO(st.reason << "\n"
+                   << st.remoteOutput);
+    REQUIRE(st.state == cluster::State::Connected);
+    CHECK(st.jobId == "4711");
+    const std::string steps = readAll(fc.slurm / "srun.args");
+    CHECK(countOf(steps, "sirius_worker.sbatch") == 1);
+    CHECK(steps.find("--jobid=4711 --overlap") != std::string::npos);
+
+    // a new image: the worker again, in the same job
+    cluster::Profile q = p;
+    q.container = "~/w2.sif";
+    const cluster::ProfileChange change = cluster::profileChange(session.profile(), q);
+    CHECK(change.newWorker);
+    CHECK_FALSE(change.newJob);
+    st = workerUntilSettled(session, q);
+    INFO(st.reason);
+    REQUIRE(st.state == cluster::State::Connected);
+    CHECK(st.jobId == "4711");
+    CHECK_FALSE(fs::exists(fc.slurm / "4712.args"));
+    CHECK(countOf(readAll(fc.slurm / "srun.args"), "sirius_worker.sbatch") == 2);
+    CHECK(readAll(fc.slurm / "cancelled_steps").find("4711.") != std::string::npos);   // the first worker's step ended
+    CHECK(readAll(fc.slurm / "4711.env").find("w2.sif") != std::string::npos);
+    CHECK(fs::exists(fc.home / ".sirius" / "run" / "sirius-worker-4711-2.log"));
+
+    // the worker stopped: the job stays
+    session.stopWorker();
+    st = session.status();
+    CHECK(st.state == cluster::State::JobReady);
+    CHECK(st.jobId == "4711");
+    CHECK(session.hasJobRunning());
+
+    // another partition: a new job, once the old one is let go
+    cluster::Profile r = q;
+    r.partition = "dgx";
+    CHECK(cluster::profileChange(session.profile(), r).newJob);
+    session.disconnect(true);
+    CHECK(readAll(fc.slurm / "cancelled").find("4711") != std::string::npos);
+    session.connectJob(r);
+    REQUIRE(waitFor([&] { return settled(session); }, std::chrono::seconds(120)));
+    st = session.status();
+    CHECK(st.state == cluster::State::JobReady);
+    CHECK(st.jobId == "4712");
+    CHECK(readAll(fc.slurm / "4712.args").find("--partition=dgx") != std::string::npos);
+    session.disconnect(true);
+    setEnv("FAKE_CONTAINER_SITE", "");
+}
+
+TEST_CASE("cluster: an image is built in the held job where the cluster allows it, and refused in words where not", "[app][cluster]") {
+    FakeCluster fc;
+    if (!fc.usable()) SKIP("no Python or bash for the fake ssh");
+    copyCheckout(fc.home / "sirius");
+    fs::create_directories(fc.home / "sirius" / "containers");
+    std::ofstream(fc.home / "sirius" / "containers" / "sirius-worker.def") << "Bootstrap: docker\nFrom: python:3.12\n";
+    setEnv("FAKE_SLURM_PENDING_POLLS", "0");
+    cluster::Session session;
+    session.setPollInterval(std::chrono::milliseconds(200), std::chrono::milliseconds(500));
+    session.connectJob(containerProfile(fc, ""));
+    REQUIRE(waitFor([&] { return settled(session); }, std::chrono::seconds(120)));
+    REQUIRE(session.status().state == cluster::State::JobReady);
+    REQUIRE(session.clusterInfo());
+    const std::string home = session.clusterInfo()->home;
+    REQUIRE_FALSE(home.empty());
+    const cluster::Profile p = session.profile();
+    auto buildSettled = [&] {
+        const cluster::BuildStatus::Phase ph = session.status().build.phase;
+        return ph != cluster::BuildStatus::Phase::Probing && ph != cluster::BuildStatus::Phase::Building;
+    };
+
+    // from the checkout's definition file, as a step of the job
+    session.buildImage(p, "", home + "/new.sif");
+    REQUIRE(waitFor([&] { return session.status().build.phase != cluster::BuildStatus::Phase::None && buildSettled(); }, std::chrono::seconds(120)));
+    cluster::BuildStatus b = session.status().build;
+    INFO(b.error << "\n"
+                 << b.log << "\n"
+                 << b.why);
+    CHECK(b.phase == cluster::BuildStatus::Phase::Done);
+    REQUIRE(b.supported);
+    CHECK(*b.supported);
+    CHECK(b.image == home + "/new.sif");
+    CHECK(readAll(fc.home / "new.sif").find("sirius-worker.def") != std::string::npos);
+    CHECK(b.log.find("Build complete") != std::string::npos);
+    CHECK(readAll(fc.slurm / "srun.args").find("--jobid=4711") != std::string::npos);
+    // an existing file is never written over
+    session.buildImage(p, "", home + "/new.sif");
+    REQUIRE(waitFor([&] { return session.status().build.phase == cluster::BuildStatus::Phase::Failed; }, std::chrono::seconds(120)));
+    CHECK(session.status().build.error.find("already") != std::string::npos);
+
+    // a cluster without fakeroot: said, and nothing built
+    std::ofstream(fc.slurm / "no_fakeroot") << "1\n";
+    session.buildImage(p, "", home + "/other.sif");
+    REQUIRE(waitFor([&] { return session.status().build.supported.has_value() && !*session.status().build.supported && buildSettled(); },
+                    std::chrono::seconds(120)));
+    b = session.status().build;
+    CHECK(b.phase == cluster::BuildStatus::Phase::Failed);
+    CHECK(b.error.find("does not let you build images") != std::string::npos);
+    CHECK(b.why.find("fakeroot") != std::string::npos);
+    CHECK_FALSE(fs::exists(fc.home / "other.sif"));
     session.disconnect(true);
 }

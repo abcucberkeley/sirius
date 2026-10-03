@@ -81,10 +81,54 @@ namespace sirius::app::gui::secrets {
             return dir;
         }
 
+        // --- the file store: { "<key>": "<base64>" } ---------------------------------
+
+#ifdef _WIN32
+        // Beside the settings file (its DPAPI blobs are this user's on this
+        // machine whatever folder they are in).
+        std::string storeDir() { return storeDirectory().empty() ? settings().directory() : storeDirectory(); }
+#else
+        std::string storeDir() { return storeDirectory().empty() ? platform::homeDirectory() + "/.sirius" : storeDirectory(); }
+#endif
+        std::string storePath() { return storeDir() + "/secrets.json"; }
+
+        // The store as it is on disk: an empty object when there is no file
+        // (or an empty one). False when the file is there but cannot be read
+        // or parsed -- a write would then replace every secret in it with
+        // the one being written, so the callers refuse instead.
+        bool loadStore(nlohmann::json& obj) {
+            obj = nlohmann::json::object();
+            if (!pathExists(storePath())) return true;
+            std::string text;
+            if (!platform::readFile(storePath(), text)) return false;
+            if (trimmed(text).empty()) return true;
+            const nlohmann::json j = nlohmann::json::parse(text, nullptr, false);
+            if (!j.is_object()) return false;
+            obj = j;
+            return true;
+        }
+
+        bool saveStore(const nlohmann::json& obj) {
+            // Only a directory the store owns is closed to everyone else:
+            // ~/.sirius, or one created here. A --settings directory is the
+            // user's (a shared lab folder, ".") and keeps its mode; the file
+            // itself is 0600 either way.
+            const std::string dir = storeDir();
+            const bool created = !pathExists(dir);
+            platform::makePath(dir);
+#ifndef _WIN32
+            if (storeDirectory().empty() || created) ::chmod(dir.c_str(), S_IRWXU);
+#else
+            (void)created;
+#endif
+            return platform::writeFileAtomic(storePath(), obj.dump(4) + "\n", true);
+        }
+
 #ifdef _WIN32
 
-        // The settings subtree the DPAPI blobs live in, next to (but not on
-        // top of) the plaintext key the migration reads.
+        // Where the DPAPI blobs were before they moved out of the settings
+        // (which are a TOML file now, and never hold a secret): read once,
+        // moved into the file store, removed from the settings.
         std::string settingsKey(const std::string& key) { return "secrets/" + key; }
 
         DATA_BLOB blobOf(std::string& bytes) {
@@ -118,28 +162,44 @@ namespace sirius::app::gui::secrets {
         }
 
         std::string readBackend(const std::string& key) {
-            const std::string blob = fromBase64(settings().getString(settingsKey(key)));
-            if (blob.empty()) return std::string();
-            return unprotect(blob, key);
+            nlohmann::json obj;
+            const bool readable = loadStore(obj);
+            const auto it = obj.find(key);
+            std::string encoded = it != obj.end() && it->is_string() ? it->get<std::string>() : std::string();
+            if (encoded.empty()) {
+                // a blob the settings held before: into the file store, out of the settings
+                encoded = settings().getString(settingsKey(key));
+                if (encoded.empty()) return std::string();
+                if (readable) {
+                    obj[key] = encoded;
+                    if (saveStore(obj)) {
+                        settings().remove(settingsKey(key));
+                        settings().save();
+                    }
+                }
+            }
+            const std::string blob = fromBase64(encoded);
+            return blob.empty() ? std::string() : unprotect(blob, key);
         }
 
-        // True only once the settings file holds the change: a value kept in
-        // memory alone is gone at the next launch. A change the file would not
-        // take is taken back (commit), so a later save neither keeps what the
-        // caller is told was not stored nor writes it over another instance's
-        // token, and a plaintext value being migrated is tried again instead
-        // of being saved beside its blob, where read() would never remove it.
         bool writeBackend(const std::string& key, const std::string& value) {
             const std::string blob = protect(value, key);
             if (blob.empty()) return false;   // DPAPI refused; better no value than a plaintext one
-            return settings().commit(settingsKey(key), toBase64(blob));
+            nlohmann::json obj;
+            if (!loadStore(obj)) return false;
+            obj[key] = toBase64(blob);
+            if (!saveStore(obj)) return false;
+            if (settings().contains(settingsKey(key))) settings().remove(settingsKey(key));
+            return true;
         }
 
         bool removeBackend(const std::string& key) {
-            // Nothing stored, nothing to write: a save failing over some other
-            // setting is no reason to report this removal as failed.
-            if (!settings().contains(settingsKey(key))) return true;
-            return settings().commit(settingsKey(key), std::nullopt);
+            if (settings().contains(settingsKey(key))) settings().remove(settingsKey(key));
+            nlohmann::json obj;
+            if (!loadStore(obj)) return false;
+            if (!obj.contains(key)) return true;
+            obj.erase(key);
+            return saveStore(obj);
         }
 
 #else
@@ -152,37 +212,6 @@ namespace sirius::app::gui::secrets {
             for (std::size_t i = 0; i < out.size(); ++i)
                 out[i] = static_cast<char>(out[i] ^ salt[i % salt.size()] ^ static_cast<char>(i & 0xff));
             return out;
-        }
-
-        std::string storeDir() { return storeDirectory().empty() ? platform::homeDirectory() + "/.sirius" : storeDirectory(); }
-        std::string storePath() { return storeDir() + "/secrets.json"; }
-
-        // The store as it is on disk: an empty object when there is no file
-        // (or an empty one). False when the file is there but cannot be read
-        // or parsed -- a write would then replace every secret in it with
-        // the one being written, so the callers refuse instead.
-        bool loadStore(nlohmann::json& obj) {
-            obj = nlohmann::json::object();
-            if (!pathExists(storePath())) return true;
-            std::string text;
-            if (!platform::readFile(storePath(), text)) return false;
-            if (trimmed(text).empty()) return true;
-            const nlohmann::json j = nlohmann::json::parse(text, nullptr, false);
-            if (!j.is_object()) return false;
-            obj = j;
-            return true;
-        }
-
-        bool saveStore(const nlohmann::json& obj) {
-            // Only a directory the store owns is closed to everyone else:
-            // ~/.sirius, or one created here. A --settings directory is the
-            // user's (a shared lab folder, ".") and keeps its mode; the file
-            // itself is 0600 either way.
-            const std::string dir = storeDir();
-            const bool created = !pathExists(dir);
-            platform::makePath(dir);
-            if (storeDirectory().empty() || created) ::chmod(dir.c_str(), S_IRWXU);
-            return platform::writeFileAtomic(storePath(), obj.dump(4) + "\n", true);
         }
 
         std::string readBackend(const std::string& key) {

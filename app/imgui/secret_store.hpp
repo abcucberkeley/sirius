@@ -7,8 +7,10 @@
 // and "assistant/apiKey".
 //
 // Windows: DPAPI (CryptProtectData) with the key name as entropy, base64 in
-// the settings under secrets/<key>. Only this user on this machine can read
-// it back, and only under the key it was written for.
+// secrets.json beside the settings file (never in the settings file
+// itself). Only this user on this machine can read it back, and only under
+// the key it was written for. A blob the settings held before (secrets/<key>)
+// moves there when it is first read.
 //
 // Everywhere else: ~/.sirius/secrets.json, created 0600. The values in that
 // file are obfuscated, NOT encrypted: the file mode is the actual

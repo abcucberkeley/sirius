@@ -67,6 +67,11 @@ namespace sirius::app::gui {
     std::shared_ptr<Dialog> makePreferencesDialog(App& app);
     // Applies the stored preferences to a fresh workbench at start-up.
     void applyStoredPreferences(Workbench& wb);
+    // Preferences ▸ Edit settings file…: sirius-app.toml in the code editor,
+    // checked as TOML and for what the cluster profiles may hold (line and
+    // column of each problem), saved only without an error, then used at
+    // once. Not modal. (settings_editor_dialog.cpp)
+    std::shared_ptr<Dialog> makeSettingsEditor(App& app);
 
     // What "Set up Python for SIRIUS" is opened for: a worker that could not
     // start (`failure`), or a button of Preferences ▸ Compute, which names

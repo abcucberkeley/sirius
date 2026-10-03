@@ -1,0 +1,130 @@
+# Cluster profiles for SIRIUS: a commented example.
+#
+# The profiles live in SIRIUS's settings file, sirius-app.toml in your
+# configuration folder (%APPDATA%\sirius on Windows, ~/.config/sirius
+# elsewhere). Process > Connect to cluster... edits them; so does
+# Preferences > Edit settings file..., which checks each change. Tables of
+# this shape can be pasted there, or imported with Connect to cluster... >
+# Import... (one profile per [cluster.<name>] table).
+#
+# Nothing here is secret, and nothing secret belongs here: ssh asks for
+# passwords itself and they are never kept; the worker's token is made anew
+# for each worker.
+
+[cluster]
+# The profile Connect to cluster opens with.
+current = "mycluster"
+
+# --- a cluster ------------------------------------------------------------------
+# One table per cluster; the name after "cluster." is the profile's name.
+[cluster.mycluster]
+# The login node, as you would type it after `ssh`: an alias from your
+# ~/.ssh/config (its user, ProxyJump and keys are used), or user@host.
+host = "mycluster"
+# The worker image: an Apptainer/Singularity .sif with SIRIUS's worker
+# environment, on the cluster. Required to start a worker; "" while you have
+# none (Connect to cluster can build one where the cluster allows it).
+image = "/shared/images/sirius-worker.sif"
+# Images used before: the Worker image dropdown.
+images = ["/shared/images/sirius-worker.sif"]
+# Data folders: folders on the cluster your datasets live in, made visible
+# inside the image (apptainer --bind; "src", "src:dst" or "src:dst:ro").
+# Your home folder always is.
+binds = ["/data/mylab"]
+# Sets of data folders used before: the Data folders dropdown.
+bind_sets = [["/data/mylab"]]
+# The SIRIUS checkout on the cluster (the worker's code comes from its
+# app/python). "" = <your home>/sirius, filled in at the login.
+checkout = "~/sirius"
+# apptainer, singularity, or a full path; `module load` of it is tried.
+launcher = "apptainer"
+# Extra entries for PYTHONPATH inside the image, ':' separated. Usually "".
+python_path = ""
+# Run SIRIUS's C++ engine on the node (every step there); false = the
+# Python worker alone.
+engine = true
+# A folder of engine builds, one per SIRIUS commit: <commit>/bin/sirius-cli
+# and <commit>/BUILD.json. The checks pick the build of the application's
+# commit, or one with the same operations. "" = the image's own engine.
+engine_builds = ""
+# An engine named outright (overrides engine_builds). Usually "".
+engine_bin = ""
+# The node cache folder: where the engine keeps the steps' results on the
+# node. "" = the node's temporary folder; a node's local disk is fastest.
+cache = ""
+# The definition file "Build an image" builds from. "" =
+# <checkout>/containers/sirius-worker.def.
+def_file = ""
+
+# The job Connect asks for. Empty strings leave it to Slurm (your default
+# partition, account and QoS).
+[cluster.mycluster.job]
+partition = "gpu"
+account = "mylab"
+qos = "normal"
+time = "02:00:00"   # Slurm's forms: "90" (minutes), "01:30:00", "2-00:00:00"
+gpus = 1
+cpus = 8
+mem = "64G"         # "500M", "64G", "1T"
+
+# What the Partition, Account, QoS and Time limit dropdowns offer, one table
+# per partition. After a login the dialog adds what the cluster reports
+# (marked "from the cluster"); "Add ... to my settings" writes such a table.
+[[cluster.mycluster.partitions]]
+name = "gpu"
+default = true                  # the partition a new job uses
+accounts = ["mylab"]            # the first is picked with the partition
+qos = ["normal", "long"]        # the first is picked with the partition
+max_time = "3-00:00:00"         # the longest a job there may run
+times = ["01:00:00", "04:00:00", "1-00:00:00"]   # the Time limit dropdown ([] = the usual ones up to max_time)
+gpus = 1                        # what picking it sets (leave out to keep the job's)
+cpus = 8
+mem = "64G"
+max_gpus = 4                    # a node's: the GPUs and CPUs fields stop there
+max_cpus = 64
+max_mem = "500G"
+
+[[cluster.mycluster.partitions]]
+name = "cpu"
+accounts = ["mylab"]
+qos = ["normal"]
+max_time = "7-00:00:00"
+gpus = 0                        # no GPU there: picking it asks for none
+
+# --- another site, as one user there set it up ---------------------------------
+# (fiona, a cluster at one lab; its names are that site's own)
+[cluster.fiona]
+host = "fiona"
+image = "/clusterfs/nvme2/Users/me/containers/sirius-worker.sif"
+binds = ["/clusterfs/vast/me", "/clusterfs/nvme2/Users/me"]
+checkout = "~/dev/sirius"
+launcher = "apptainer"
+python_path = ""
+engine = true
+engine_builds = ""
+engine_bin = ""
+cache = ""
+
+[cluster.fiona.job]
+partition = "abc_a100"
+account = "me"
+qos = "abc_debug"
+time = "01:00:00"
+gpus = 1
+cpus = 8
+mem = "64G"
+
+[[cluster.fiona.partitions]]
+name = "abc_a100"
+default = true
+accounts = ["me"]
+qos = ["abc_debug", "abc_normal"]
+max_time = "3-00:00:00"
+max_gpus = 1
+max_cpus = 32
+
+[[cluster.fiona.partitions]]
+name = "dgx"
+accounts = ["co_abc"]
+qos = ["abc_high"]
+max_time = "1-00:00:00"

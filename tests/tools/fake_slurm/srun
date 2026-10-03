@@ -1,0 +1,134 @@
+#!/bin/bash
+# Fake srun for tests/test_app_cluster.cpp: `srun --jobid=<id> --overlap ...
+# <command>` runs <command> here as a step of the fake job <id>, which must be
+# RUNNING, in the foreground as srun does. The step is
+# $FAKE_SLURM_DIR/<id>.step<n>.{name,gres,pid,ospid|winpid}: squeue -s lists
+# it while it runs, scancel <id>.<n> (or <id>) stops it. Every command line is
+# appended to srun.args.
+#
+# The worker's step (`bash app/python/slurm/sirius_worker.sbatch`) is played,
+# not run: SIRIUS's worker -- or with $SIRIUS_ENGINE=1 the engine,
+# $SIRIUS_ENGINE_BIN serve, without its Python child unless
+# $FAKE_ENGINE_PYTHON=1 -- on 127.0.0.1 (never 0.0.0.0) with the token file
+# the application wrote, through the launcher ($SIRIUS_LAUNCHER, the fake
+# apptainer) as the script starts it. What reached its environment goes to
+# <id>.env (the token only as "set"). With $FAKE_SLURM_DETACH=1 the engine
+# outlives the ssh session that started it, as a real step does: on POSIX in
+# a session of its own, on Windows started by WMI, outside the job object
+# the application's ssh runs in. A file srun.fail in $FAKE_SLURM_DIR refuses
+# the worker's step once its environment is recorded. Any other command (a
+# probe, a build) is run.
+set -u
+dir="${FAKE_SLURM_DIR:?FAKE_SLURM_DIR is not set}"
+printf '%s\n' "$*" >> "$dir/srun.args"
+id="" name="" gres=""
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --jobid=*) id="${1#--jobid=}" ;;
+        --job-name=*) name="${1#--job-name=}" ;;
+        --gres=*) gres="${1#--gres=}" ;;
+        -*) ;;
+        *) break ;;
+    esac
+    shift
+done
+if [ "$(cat "$dir/$id.state" 2>/dev/null)" != RUNNING ]; then
+    echo "srun: error: Unable to confirm allocation for job $id: Invalid job id specified" >&2
+    exit 1
+fi
+n=$(cat "$dir/$id.nextstep" 2>/dev/null || echo 0)
+echo $((n + 1)) > "$dir/$id.nextstep"
+step="$dir/$id.step$n"
+echo "${name:-bash}" > "$step.name"
+[ -n "$gres" ] && echo "$gres" > "$step.gres"
+
+case " $* " in
+    *sirius_worker.sbatch*) ;;
+    *)
+        "$@" &
+        pid=$!
+        echo "$pid" > "$step.pid"
+        wait "$pid"
+        rc=$?
+        rm -f "$step".*
+        exit $rc
+        ;;
+esac
+
+# --- the worker's step --------------------------------------------------------
+env | grep -E '^SIRIUS_(PORT|VENV|DEVICE|MAX_CLIENTS|CONTAINER|CONTAINER_BIND|CONTAINER_PYTHONPATH|LAUNCHER|ENGINE|ENGINE_BIN|ENGINE_DIR|ENGINE_SCRATCH)=' |
+    sort > "$dir/$id.env"
+[ -n "${SIRIUS_TOKEN:-}" ] && echo "SIRIUS_TOKEN=<set>" >> "$dir/$id.env"
+[ -n "${SIRIUS_TOKEN_FILE:-}" ] && echo "SIRIUS_TOKEN_FILE=<set>" >> "$dir/$id.env"
+# the token file's mode and the umask the step inherits (POSIX meaning only)
+[ -n "${SIRIUS_TOKEN_FILE:-}" ] && stat -c %a "$SIRIUS_TOKEN_FILE" > "$dir/$id.tokenmode" 2>/dev/null
+umask > "$dir/$id.umask"
+# a file srun.fail in $FAKE_SLURM_DIR: refused, once the step's environment is recorded
+if [ -f "$dir/srun.fail" ]; then
+    echo "srun: error: Unable to create step for job $id: refused by the test" >&2
+    rm -f "$step".*
+    exit 1
+fi
+if [ -z "${SIRIUS_CONTAINER:-}" ]; then
+    echo "SIRIUS_CONTAINER is not set: the worker runs in a container image" >&2
+    rm -f "$step".*
+    exit 1
+fi
+run=("${FAKE_PYTHON:?}")
+cmd=(-m sirius_worker)
+if [ "${SIRIUS_ENGINE:-0}" = 1 ]; then
+    run=("${SIRIUS_ENGINE_BIN:?SIRIUS_ENGINE_BIN names the engine for the fake step}")
+    cmd=(serve)
+    if [ "${FAKE_ENGINE_PYTHON:-0}" = 1 ]; then cmd+=(--python "$FAKE_PYTHON" --worker-dir "$PWD/app/python"); else cmd+=(--no-python-worker); fi
+fi
+L="${SIRIUS_LAUNCHER:-apptainer}"
+command -v "$L" >/dev/null 2>&1 || L=singularity
+launch=("$L" exec)
+[ "${SIRIUS_DEVICE:-cuda}" != cpu ] && launch+=(--nv)
+[ -n "${SIRIUS_CONTAINER_BIND:-}" ] && launch+=(--bind "$SIRIUS_CONTAINER_BIND")
+[ -n "${SIRIUS_ENGINE_DIR:-}" ] && launch+=(--bind "$SIRIUS_ENGINE_DIR")
+launch+=(--bind "$PWD" --bind "$HOME/.sirius/run" "$SIRIUS_CONTAINER")
+if [ "${SIRIUS_ENGINE:-0}" = 1 ]; then run=("${launch[@]}" "${SIRIUS_ENGINE_BIN}"); else run=("${launch[@]}" python); fi
+
+if [ "${FAKE_SLURM_DETACH:-0}" = 1 ] && [ "${SIRIUS_ENGINE:-0}" = 1 ]; then
+    # Told its token file by --token-file (a WMI process gets none of this
+    # environment), and an engine; its output to where srun's goes.
+    tf="${SIRIUS_TOKEN_FILE:?}"
+    log=$(readlink "/proc/$$/fd/1" 2>/dev/null)   # this script's stdout (not the substitution's pipe)
+    [ -n "$log" ] || log="$HOME/.sirius/run/fake-step-$id-$n.log"
+    # let go of it: Windows would not let the detached process open a file this one holds
+    exec > /dev/null 2>&1
+    printf '%s\n' "${launch[*]} (detached)" >> "$dir/apptainer.args"
+    case "$(uname -s)" in
+        MINGW* | MSYS* | CYGWIN*)
+            wbin=$(cygpath -w "$SIRIUS_ENGINE_BIN"); wtf=$(cygpath -w "$tf"); wlog=$(cygpath -w "$log"); wdir=$(cygpath -w "$PWD/app/python")
+            line="cmd.exe /c \"\"$wbin\" serve --no-python-worker --token-file \"$wtf\" --host 127.0.0.1 --port ${SIRIUS_PORT:-0} --device cpu --max-clients ${SIRIUS_MAX_CLIENTS:-8} >> \"$wlog\" 2>&1\""
+            line=${line//\'/\'\'}
+            wpid=$(powershell.exe -NoProfile -NonInteractive -Command "(Invoke-CimMethod -ClassName Win32_Process -MethodName Create -Arguments @{CommandLine='$line'; CurrentDirectory='$wdir'}).ProcessId" | tr -d '\r')
+            echo "$wpid" > "$step.winpid"
+            echo "$wpid" > "$step.detached"
+            while tasklist.exe //FI "PID eq $wpid" //NH 2>/dev/null | grep -q " $wpid "; do sleep 1; done
+            ;;
+        *)
+            ( cd app/python && exec setsid "$SIRIUS_ENGINE_BIN" serve --no-python-worker --token-file "$tf" --host 127.0.0.1 --port "${SIRIUS_PORT:-0}" \
+                  --device cpu --max-clients "${SIRIUS_MAX_CLIENTS:-8}" ) >> "$log" 2>&1 < /dev/null &
+            pid=$!
+            echo "$pid" > "$step.pid"
+            echo "$pid" > "$step.ospid"
+            echo "$pid" > "$step.detached"
+            while kill -0 "$pid" 2>/dev/null; do sleep 1; done
+            ;;
+    esac
+    rm -f "$step".*
+    exit 0
+fi
+
+( cd app/python && exec "${run[@]}" "${cmd[@]}" --host 127.0.0.1 --port "${SIRIUS_PORT:-0}" --device cpu \
+      --max-clients "${SIRIUS_MAX_CLIENTS:-8}" ) < /dev/null &
+pid=$!
+echo "$pid" > "$step.pid"
+if [ -r "/proc/$pid/winpid" ]; then cat "/proc/$pid/winpid" > "$step.winpid"; else echo "$pid" > "$step.ospid"; fi
+wait "$pid"
+rc=$?
+rm -f "$step".*
+exit $rc

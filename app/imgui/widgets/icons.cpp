@@ -229,6 +229,14 @@ namespace sirius::app::gui {
                     p.dot(12, 12, 1.6f);
                     p.dot(18.5f, 12, 1.6f);
                     break;
+                case Icon::Server:   // two stacked units, a light on each
+                    p.box(4, 4, 16, 7);
+                    p.box(4, 13, 16, 7);
+                    p.dot(7.5f, 7.5f, 1.2f);
+                    p.dot(7.5f, 16.5f, 1.2f);
+                    p.line(11.5f, 7.5f, 16.5f, 7.5f);
+                    p.line(11.5f, 16.5f, 16.5f, 16.5f);
+                    break;
                 case Icon::Help:
                     p.ring(12, 12, 9);
                     p.moveTo(8.6f, 9.4f);

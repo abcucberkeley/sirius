@@ -32,6 +32,18 @@ namespace sirius::app::gui {
     } // namespace
 
     ClusterLink::ClusterLink(App& app) : app_(app), alive_(std::make_shared<std::atomic<bool>>(true)) {
+        // the single profile of before, into the settings file's [cluster.<name>] once
+        {
+            nlohmann::json flat = nlohmann::json::object();
+            for (const std::string& k : settings().keys("cluster/")) flat[k] = settings().value(k);
+            bool migrated = false;
+            const cluster::ProfileBook book = cluster::ProfileBook::fromSettings(flat, &migrated);
+            if (migrated) {
+                saveProfiles(book);
+                settings().remove(cluster::kLegacyProfileKey);
+                app.wb().logLine("Cluster: the cluster profile is now [cluster." + book.current + "] in " + settings().filePath() + ".");
+            }
+        }
         session_.setAskpassProgram(askpassProgram());
         session_.setPrompt([this](const ssh::Prompt& p) { return ask(p); });
         Bridge& bridge = app.bridge();
@@ -52,10 +64,34 @@ namespace sirius::app::gui {
         if (datasets_) datasets_->uninstall();
     }
 
-    cluster::Profile ClusterLink::storedProfile() const {
-        Settings& s = settings();
-        if (!s.contains("cluster/profile")) return cluster::Profile{};
-        return cluster::Profile::fromJson(s.value("cluster/profile"));
+    cluster::ProfileBook ClusterLink::profiles() const {
+        nlohmann::json flat = nlohmann::json::object();
+        for (const std::string& k : settings().keys("cluster/")) flat[k] = settings().value(k);
+        return cluster::ProfileBook::fromSettings(flat);
+    }
+
+    void ClusterLink::saveProfiles(const cluster::ProfileBook& book) {
+        nlohmann::json flat = nlohmann::json::object();
+        for (const std::string& k : settings().keys("cluster/")) flat[k] = settings().value(k);
+        for (const std::string& stale : book.staleKeys(flat)) settings().remove(stale);
+        for (const auto& [key, value] : book.toSettings()) settings().set(key, value);
+    }
+
+    void ClusterLink::saveProfile(const cluster::Profile& profile) {
+        cluster::ProfileBook book = profiles();
+        book.put(profile);
+        saveProfiles(book);
+    }
+
+    cluster::Profile ClusterLink::storedProfile() const { return profiles().currentProfile(); }
+
+    void ClusterLink::connectJob(const cluster::Profile& profile) {
+        lastState_ = cluster::State::Connecting;
+        session_.connectJob(prepared(profile));
+    }
+
+    void ClusterLink::startWorker(const cluster::Profile& profile) {
+        session_.startWorker(prepared(profile));
     }
 
     void ClusterLink::connect(const cluster::Profile& profile) {
@@ -68,11 +104,38 @@ namespace sirius::app::gui {
         session_.logIn(prepared(profile));
     }
 
+    void ClusterLink::offThread(std::function<void()> fn) {
+        if (disconnecting_.joinable()) disconnecting_.join();
+        disconnecting_ = std::thread(std::move(fn));
+    }
+
+    void ClusterLink::stopWorker() {
+        offThread([this] { session_.stopWorker(); });
+    }
+
+    void ClusterLink::newJobAsking(const cluster::Profile& profile) {
+        const cluster::Status st = status();
+        const cluster::Profile p = prepared(profile);
+        const bool worker = st.state == cluster::State::Connected;
+        app_.ask("A new job", "The partition, account, QoS, time or size changed: that takes a new job. Cancel job " + st.jobId + " on " + st.host + " and ask for the new one" + (worker ? " (the worker starts again in it)" : std::string()) + "? What its worker holds is lost.", {"Keep the job", "Cancel it, new job"}, [this, p, worker](int answer) {
+                     if (answer != 1) return;
+                     lastState_ = cluster::State::Connecting;
+                     offThread([this, p, worker] {
+                         session_.disconnect(true);
+                         if (worker) session_.connect(p);
+                         else session_.connectJob(p);
+                     }); }, 0);
+    }
+
+    void ClusterLink::buildImage(const cluster::Profile& profile, const std::string& defFile, const std::string& image) {
+        session_.buildImage(prepared(profile), defFile, image);
+    }
+
     cluster::Profile ClusterLink::prepared(const cluster::Profile& profile) {
         // saved, with its Slurm choice remembered for its host
         cluster::Profile saved = profile;
         saved.remember();
-        settings().set("cluster/profile", saved.toJson());
+        saveProfile(saved);
         cluster::Profile p = saved;
         // Tests and screenshots only: $SIRIUS_TEST_SSH, a JSON list (program and
         // its first arguments), stands in for ssh -- tests/tools/fake_ssh.py.
@@ -93,8 +156,7 @@ namespace sirius::app::gui {
     }
 
     void ClusterLink::disconnect(bool cancelJob) {
-        if (disconnecting_.joinable()) disconnecting_.join();
-        disconnecting_ = std::thread([this, cancelJob] { session_.disconnect(cancelJob); });
+        offThread([this, cancelJob] { session_.disconnect(cancelJob); });
     }
 
     void ClusterLink::disconnectAsking() {
@@ -103,7 +165,7 @@ namespace sirius::app::gui {
             disconnect(false);
             return;
         }
-        app_.ask("Disconnect from " + st.host, "Cancel the worker job " + st.jobId + " on " + st.host + " as well? Left running, it keeps its GPU until its time limit, and Connect starts a new one.", {"Leave it running", "Cancel the job"}, [this](int answer) {
+        app_.ask("Disconnect from " + st.host, "Cancel job " + st.jobId + " on " + st.host + " as well? Left running, it keeps its node (and GPU) until its time limit, and Connect takes it up again.", {"Leave it running", "Cancel the job"}, [this](int answer) {
                      if (answer < 0) return;
                      disconnect(answer == 1); }, 1);
     }
@@ -228,12 +290,20 @@ namespace sirius::app::gui {
                         step = cluster::stepTitle(static_cast<cluster::Step>(i));
                 return "HPC: connecting\xE2\x80\xA6" + (step.empty() ? std::string() : " (" + step + ")");
             }
+            case cluster::State::Starting: color = theme::kNeutral700; return "HPC: job " + st.jobId + " \xC2\xB7 starting the worker\xE2\x80\xA6";
+            case cluster::State::JobReady:
+                color = theme::kNeutral700;
+                return "HPC: job " + st.jobId + " on " + st.node + " \xC2\xB7 no worker yet";
             case cluster::State::Connected:
                 color = kConnected;
                 return "HPC: " + st.node + " \xC2\xB7 " + toString(app_.wb().hpcDevice());
             case cluster::State::Disconnected: color = theme::kAccentText; return "HPC: disconnected: " + st.reason;
         }
         return {};
+    }
+
+    cluster::ConnectionBadge ClusterLink::badge() const {
+        return cluster::connectionBadge(status(), app_.wb().hpcDevice() != HpcDevice::Cpu, std::chrono::steady_clock::now());
     }
 
     bool ClusterLink::hpcGpuUsable(std::string* why) const {
@@ -272,7 +342,7 @@ namespace sirius::app::gui {
             done();
             return;
         }
-        app_.ask("Quit", "The worker job " + st.jobId + " on " + st.host + " is still running: it keeps its GPU until its time limit. Cancel it before quitting?", {"Leave it running", "Cancel the job"}, [this, done](int answer) {
+        app_.ask("Quit", "Job " + st.jobId + " on " + st.host + " is still running: it keeps its node (and GPU) until its time limit. Cancel it before quitting?", {"Leave it running", "Cancel the job"}, [this, done](int answer) {
                      if (answer < 0) return;   // the quit is called off
                      if (disconnecting_.joinable()) disconnecting_.join();
                      session_.disconnect(answer == 1);   // scancel: seconds at most

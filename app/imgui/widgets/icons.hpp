@@ -55,6 +55,7 @@ namespace sirius::app::gui {
         Recompute,
         More,
         Help,
+        Server,   // a rack of two: the cluster
     };
 
     // Draws `icon` centred in the box (min, max), scaled from the 24 x 24

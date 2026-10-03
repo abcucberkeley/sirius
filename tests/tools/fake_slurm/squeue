@@ -1,33 +1,69 @@
 #!/bin/bash
-# Fake squeue: `squeue -h -j <id> -o <format>` with %T (state), %r (reason), %N (node), %M.
+# Fake squeue: `squeue -h -j <id> -o <format>` with %T (state), %r (reason),
+# %N (node), %M (time used), %l (time limit); `-s` lists the job's running
+# steps instead (fake_slurm/srun), with %i (<id>.<n>) and %j (the step's name).
 set -u
 dir="${FAKE_SLURM_DIR:?}"
-id="" fmt="%T"
+id="" fmt="%T" steps=0
 while [ $# -gt 0 ]; do
     case "$1" in
         -j) id="$2"; shift 2 ;;
         -o) fmt="$2"; shift 2 ;;
+        -s) steps=1; shift ;;
         *) shift ;;
     esac
 done
 [ -f "$dir/$id.state" ] || exit 0
+
+alive() {   # a step's process: there, or not yet written (it is starting)
+    local s="$1"
+    if [ -f "$s.detached" ]; then
+        local w
+        w=$(cat "$s.detached")
+        case "$(uname -s)" in
+            MINGW* | MSYS* | CYGWIN*) tasklist.exe //FI "PID eq $w" //NH 2>/dev/null | grep -q " $w " ;;
+            *) kill -0 "$w" 2>/dev/null ;;
+        esac
+    elif [ -f "$s.pid" ]; then
+        kill -0 "$(cat "$s.pid")" 2>/dev/null
+    else
+        true
+    fi
+}
+
+if [ "$steps" = 1 ]; then
+    [ "$(cat "$dir/$id.state")" = RUNNING ] || exit 0
+    for f in "$dir/$id".step*.name; do
+        [ -f "$f" ] || continue
+        s="${f%.name}"
+        alive "$s" || continue
+        n="${s##*.step}"
+        out="${fmt//%i/$id.$n}"
+        out="${out//%j/$(cat "$f")}"
+        echo "$out"
+    done
+    exit 0
+fi
+
 state=$(cat "$dir/$id.state")
 if [ "$state" = RUNNING ]; then
-    if [ -f "$dir/$id.detached" ]; then
-        # a job started outside the ssh session (fake sbatch, $FAKE_SLURM_DETACH) on Windows
+    if [ -f "$dir/$id.holder" ]; then
+        :   # SIRIUS's job holds the allocation with no process of its own here
+    elif [ -f "$dir/$id.detached" ]; then
+        # a job started outside the ssh session on Windows
         wpid=$(cat "$dir/$id.detached")
         if ! tasklist.exe //FI "PID eq $wpid" //NH 2>/dev/null | grep -q " $wpid "; then echo FAILED > "$dir/$id.state"; exit 0; fi
-    else
+    elif [ -f "$dir/$id.pid" ]; then
         pid=$(cat "$dir/$id.pid")
         if ! kill -0 "$pid" 2>/dev/null; then echo FAILED > "$dir/$id.state"; exit 0; fi
     fi
     left=$(cat "$dir/$id.pending" 2>/dev/null || echo 0)
     if [ "$left" -gt 0 ]; then
         echo $((left - 1)) > "$dir/$id.pending"
-        out="${fmt//%T/PENDING}"; out="${out//%r/Priority}"; out="${out//%N/}"; out="${out//%M/0:00}"
+        out="${fmt//%T/PENDING}"; out="${out//%r/Priority}"; out="${out//%N/}"; out="${out//%M/0:00}"; out="${out//%l/1:00:00}"
         echo "$out"
         exit 0
     fi
-    out="${fmt//%T/RUNNING}"; out="${out//%r/None}"; out="${out//%N/${FAKE_SLURM_NODE:-fakenode}}"; out="${out//%M/0:01}"
+    out="${fmt//%T/RUNNING}"; out="${out//%r/None}"; out="${out//%N/${FAKE_SLURM_NODE:-fakenode}}"; out="${out//%M/0:01}"; out="${out//%l/${FAKE_SLURM_LIMIT:-1:00:00}}"
     echo "$out"
 fi

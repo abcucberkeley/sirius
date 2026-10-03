@@ -28,10 +28,10 @@ command line: `--dataset`, `--pipeline`, `--run`, `--tool`, `--action`, `--ask`,
 | `theme.hpp/.cpp` | design tokens, fonts, the ImGui / ImPlot style |
 | `widgets/controls`, `widgets/icons`, `widgets/code_editor` | the design's controls, icon set and the plugin editor |
 | `settings`, `secret_store`, `platform`, `worker_launcher`, `http`, `gl` | services: persistent settings, secrets, OS dialogs, the Python worker, HTTP(S), textures and PNG |
-| `cluster_link` | the cluster session (`core/cluster.hpp`): ssh's prompts in a box, the HPC backend and cluster datasets once connected, the status-bar indicator |
+| `cluster_link` | the cluster session (`core/cluster.hpp`): ssh's prompts in a box, the cluster profiles in the settings file (`core/cluster_profiles.hpp`), the HPC backend and cluster datasets once connected, the status-bar indicator and the title bar's Cluster button |
 | `viewer/*` | toolbar, tool strip, ortho / 3D / compare views, dims strip, the volume loader and ray caster |
 | `panels/*` | operations, parameters, diagnostics, log, help, assistant |
-| `dialogs/*` | open, folder dataset, export, training export, preferences, model hub, plugin manager, the Python environment offer (`python_env_dialog.cpp`), connect to cluster and the cluster's file browser (`cluster_dialog.cpp`) |
+| `dialogs/*` | open, folder dataset, export, training export, preferences, model hub, plugin manager, the Python environment offer (`python_env_dialog.cpp`), connect to cluster and the cluster's file browser (`cluster_dialog.cpp`), the settings file in the code editor (`settings_editor_dialog.cpp`) |
 
 Everything is in namespace `sirius::app::gui`; includes are written from `app/`
 (`"core/workbench.hpp"`, `"imgui/theme.hpp"`). The fonts and the icons are in
@@ -140,14 +140,20 @@ lines instead of crashing; CI's headless run fails on any.
 
 ## Settings
 
-`Settings` (`settings.hpp`) is one JSON object in
-`<config>/sirius/sirius-app.json` (`%APPDATA%` on Windows, `$XDG_CONFIG_HOME` or
-`~/.config` elsewhere), keyed `group/name` (`worker/python`, `recent/datasets`,
-`assistant/model`, …). Dear ImGui's window layout is `imgui.ini` beside it
+`Settings` (`core/settings_store.hpp`, spelled `settings()` here through
+`settings.hpp`) is one TOML file, `<config>/sirius/sirius-app.toml` (`%APPDATA%`
+on Windows, `$XDG_CONFIG_HOME` or `~/.config` elsewhere), held in memory as one
+JSON object keyed `group/name` (`worker/python`, `recent/datasets`,
+`cluster/<profile>`, …), which the file has as `[group]` tables
+(`core/settings_toml.hpp`). A file that does not read is never written over: the
+application starts with its defaults and says where the file is wrong;
+*Preferences ▸ Edit settings file…* (`dialogs/settings_editor_dialog.cpp`) edits it
+with the line and column of each problem. A `sirius-app.json` of before is
+converted once and renamed `sirius-app.json.migrated`. Dear ImGui's window layout is `imgui.ini` beside it
 (`Settings::layoutPath`); a layout saved when the docks hid their tabs is
 loaded with them shown again, and written back so.
-Secrets never go there as plain text: `secrets::read / write` keeps them as
-DPAPI-encrypted blobs in that file on Windows and in `~/.sirius/secrets.json`
+Secrets never go there: `secrets::read / write` keeps them as DPAPI-encrypted
+blobs in `secrets.json` beside it on Windows and in `~/.sirius/secrets.json`
 (mode 0600) elsewhere.
 
 Nothing about SIRIUS's Python environment is kept in the settings: its state

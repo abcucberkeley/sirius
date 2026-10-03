@@ -71,6 +71,10 @@ target_compile_definitions(test_app_headless_objects     PRIVATE SIRIUS_TEST_EXA
 # never a real ssh, never another host. sirius_test_askpass is ssh's askpass
 # helper there, as sirius-app and sirius-cli are it themselves.
 app_test(cluster test_app_cluster.cpp UNITS cluster remote_host remote_source array_source rpc process host workbench build_info)
+# The settings file: TOML both ways, the JSON file of before, two instances
+# writing it, a file that does not read, and the settings editor's checks.
+app_test(settings test_app_settings.cpp UNITS settings_store settings_toml cluster host)
+target_compile_definitions(test_app_settings_objects PRIVATE SIRIUS_TEST_SOURCE_DIR="${PROJECT_SOURCE_DIR}")
 sirius_unit_closure(_sirius_askpass_units sirius_core_remote_host)
 add_executable(sirius_test_askpass tools/sirius_test_askpass.cpp)
 target_link_libraries(sirius_test_askpass PRIVATE ${_sirius_askpass_units})

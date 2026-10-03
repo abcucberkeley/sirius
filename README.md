@@ -554,10 +554,12 @@ a FileChooser backend to open. It uses the system's libcurl when there is one. T
 `*-app-*` presets also turn on TensorStore (zarr / N5), whose first configure fetches and
 builds it — several minutes, about 1.5 GB, and it needs `nasm` (`conda install -c
 conda-forge nasm` when there is no system package). Add `-DSIRIUS_ENABLE_APP=ON` to a CUDA
-preset for the GPU backend. Settings live in `<config>/sirius/sirius-app.json`
-(`%APPDATA%` on Windows, `~/.config` elsewhere) with the dock layout in `imgui.ini`
-beside it; secrets are never stored as plain text (DPAPI-encrypted in that file on
-Windows, `~/.sirius/secrets.json` with mode 0600 elsewhere).
+preset for the GPU backend. Settings live in one TOML file, `<config>/sirius/sirius-app.toml`
+(`%APPDATA%` on Windows, `~/.config` elsewhere; *Preferences ▸ Edit settings file…* opens it
+in SIRIUS's own editor, which checks it as you type), with the dock layout in `imgui.ini`
+beside it; a `sirius-app.json` of an older version is converted once and kept as
+`sirius-app.json.migrated`. Secrets are never in that file (DPAPI-encrypted in
+`secrets.json` beside it on Windows, `~/.sirius/secrets.json` with mode 0600 elsewhere).
 
 ## Command line and agents (`sirius-cli`)
 
