@@ -1217,17 +1217,23 @@ namespace sirius::app {
         // the same way; the same file with another tile, page order or voxel
         // size is opened again, the way the pipeline says.
         if (source_ && datasetMeta_.sourcePath == dataset && pipeline_.at(0).params.toJson() == loadOutputParams_.toJson()) return;
-        std::filesystem::path resolved = dataset;
-        if (resolved.is_relative() && !isRemoteDatasetPath(dataset)) {
-            const std::filesystem::path beside = std::filesystem::path(path).parent_path() / resolved;
-            std::error_code ec;
-            if (std::filesystem::exists(beside, ec)) resolved = beside;
+        // A cluster path stays a string: libstdc++'s generic_string() rebuilds
+        // a path from its parts and would turn cluster://host into cluster:/host.
+        std::string resolved = dataset;
+        if (!isRemoteDatasetPath(dataset)) {
+            std::filesystem::path local = dataset;
+            if (local.is_relative()) {
+                const std::filesystem::path beside = std::filesystem::path(path).parent_path() / local;
+                std::error_code ec;
+                if (std::filesystem::exists(beside, ec)) local = beside;
+            }
+            resolved = local.generic_string();
         }
         try {
             // the pipeline's own Load parameters, not the defaults: its light-sheet
             // angle is not an open option, and must not be lost to the open
             const ParamSet wanted = pipeline_.at(0).params;
-            openDatasetAs(resolved.generic_string(), openOptionsFromLoadParams(wanted), wanted);
+            openDatasetAs(resolved, openOptionsFromLoadParams(wanted), wanted);
         } catch (const std::exception& e) {
             logLine("The pipeline's dataset could not be opened: " + std::string(e.what()));
             // The data on screen is still the previous dataset: the Load
