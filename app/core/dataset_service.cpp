@@ -24,6 +24,7 @@
 #include "core/array_source.hpp"
 #include "core/build_info.hpp"
 #include "core/host.hpp"
+#include "core/manifest.hpp"
 
 namespace sirius::app {
 
@@ -230,12 +231,14 @@ namespace sirius::app {
             return Device::cuda(index);
         }
 
-        // (page_order, c, t, z) of a request's options, as datasets.py keys them.
+        // (page_order, c, t, z) of a request's options, as datasets.py keys
+        // them, and the tile of a folder dataset.
         struct OptionsKey {
             std::optional<std::string> order;
-            Index c = 0, t = 0, z = 0;
+            Index c = 0, t = 0, z = 0, tile = 0;
             std::string text() const {
-                return (order ? "o:" + *order : std::string("-")) + "|" + std::to_string(c) + "|" + std::to_string(t) + "|" + std::to_string(z);
+                return (order ? "o:" + *order : std::string("-")) + "|" + std::to_string(c) + "|" + std::to_string(t) + "|" + std::to_string(z) +
+                       (tile > 0 ? "|tile " + std::to_string(tile) : std::string());
             }
         };
 
@@ -269,6 +272,7 @@ namespace sirius::app {
             k.c = o.contains("c") ? intOf(o["c"], 0) : 0;
             k.t = o.contains("t") ? intOf(o["t"], 0) : 0;
             k.z = o.contains("z") ? intOf(o["z"], 0) : 0;
+            k.tile = o.contains("tile") ? std::max<Index>(intOf(o["tile"], 0), 0) : 0;
             return k;
         }
 
@@ -499,9 +503,14 @@ namespace sirius::app {
                 std::error_code ec;
                 const fs::path p = fs::u8path(path_);
                 if (!fs::exists(p, ec)) throw DatasetError(path_ + ": no such file on " + hostName());
-                if (fs::is_directory(p, ec))
-                    throw DatasetError(path_ + " is a folder: open a TIFF or .npy file inside it (folder datasets and zarr stores are not read on "
-                                               "the cluster yet)");
+                // A folder dataset (its manifest, a manifest .toml, or a folder of
+                // TIFF stacks), a zarr / N5 store: opened by the core's own code
+                // (openDataset), as the application opens one on its computer,
+                // so both give the same dims and values.
+                if (fs::is_directory(p, ec) || isDatasetManifestFile(path_)) {
+                    openFolder(options);
+                    return;
+                }
                 bytesOnDisk_ = static_cast<std::uint64_t>(fs::file_size(p, ec));
                 std::string lower;
                 for (char ch : path_) lower.push_back(static_cast<char>(std::tolower(static_cast<unsigned char>(ch))));
@@ -511,18 +520,31 @@ namespace sirius::app {
             }
 
             json meta() const {
-                if (source_)
-                    return {{"name", sourceMeta_.name},
-                            {"path", path_},
-                            {"format", format_},
-                            {"dims", {c_, t_, z_, y_, x_}},
-                            {"dtype", fileDtype_},
-                            {"bytes", bytesOnDisk_},
-                            {"voxel_um", {voxel_[0], voxel_[1], voxel_[2]}},
-                            {"frame_interval_s", frameInterval_},
-                            {"channels", channels_},
-                            {"rgb", rgb_},
-                            {"dims_from_metadata", dimsFromMetadata_}};
+                if (source_) {
+                    json m = {{"name", sourceMeta_.name},
+                              {"path", path_},
+                              {"format", format_},
+                              {"dims", {c_, t_, z_, y_, x_}},
+                              {"dtype", fileDtype_},
+                              {"bytes", bytesOnDisk_},
+                              {"voxel_um", {voxel_[0], voxel_[1], voxel_[2]}},
+                              {"frame_interval_s", frameInterval_},
+                              {"channels", channels_},
+                              {"rgb", rgb_},
+                              {"dims_from_metadata", dimsFromMetadata_}};
+                    // a folder dataset's tiles, and the one served
+                    if (sourceMeta_.hasTiles()) {
+                        json tiles = json::array();
+                        for (const TileInfo& t : sourceMeta_.tiles)
+                            tiles.push_back({{"name", t.name},
+                                             {"position_um", {t.positionUm[0], t.positionUm[1], t.positionUm[2]}},
+                                             {"grid_index", {t.gridIndex[0], t.gridIndex[1], t.gridIndex[2]}}});
+                        m["tiles"] = std::move(tiles);
+                        m["tile"] = sourceMeta_.tileIndex;
+                    }
+                    if (!sourceMeta_.acquisition.empty()) m["acquisition"] = sourceMeta_.acquisition;
+                    return m;
+                }
                 std::string name = fs::u8path(path_).filename().u8string();
                 std::string lname;
                 for (char ch : name) lname.push_back(static_cast<char>(std::tolower(static_cast<unsigned char>(ch))));
@@ -701,6 +723,49 @@ namespace sirius::app {
             std::string volumeKey(Index c, Index t) const { return key_ + "|" + std::to_string(c) + "|" + std::to_string(t); }
 
             // --- opening ------------------------------------------------------------------------
+
+            // through openDataset, lazily: planes and volumes are read from the
+            // folder's files on demand, as float32
+            void openFolder(const json& options) {
+                OpenOptions o;
+                o.readAll = false;
+                const OptionsKey k = optionsKey(options);
+                o.tile = k.tile;
+                if (k.order) {
+                    PageOrder po;
+                    po.order = *k.order;
+                    po.c = k.c;
+                    po.t = k.t;
+                    po.z = k.z;
+                    o.pageOrder = po;
+                }
+                OpenResult opened;
+                try {
+                    opened = openDataset(path_, o);
+                } catch (const std::exception& e) {
+                    throw DatasetError(fs::u8path(path_).filename().u8string() + ": " + e.what());
+                }
+                source_ = opened.source;
+                sourceMeta_ = opened.meta;
+                const Dims5& d = sourceMeta_.dims;
+                c_ = d.c;
+                t_ = d.t;
+                z_ = d.z;
+                y_ = d.y;
+                x_ = d.x;
+                fileDtype_ = dtypeOf(sourceMeta_.sourceType);
+                format_ = sourceMeta_.format.empty() ? std::string("folder") : sourceMeta_.format;
+                bytesOnDisk_ = sourceMeta_.bytesOnDisk;
+                voxel_ = sourceMeta_.voxelUm;
+                frameInterval_ = std::max(sourceMeta_.frameIntervalS, 0.0);
+                rgb_ = sourceMeta_.rgb;
+                dimsFromMetadata_ = opened.dimsFromMetadata;
+                for (const ChannelInfo& ch : sourceMeta_.channels) {
+                    json e = {{"name", ch.label}};
+                    if (ch.wavelengthNm > 0.0) e["wavelength_nm"] = ch.wavelengthNm;
+                    channels_.push_back(std::move(e));
+                }
+            }
 
             void openNpy() {
                 const NpyHeader h = readNpyHeader(path_);
@@ -984,8 +1049,13 @@ namespace sirius::app {
             full = full.lexically_normal();
             const std::string path = full.u8string();
             const json opts = params.contains("options") && params["options"].is_object() ? params["options"] : json::object();
-            const fs::file_time_type stamp = fs::last_write_time(full, ec);
+            fs::file_time_type stamp = fs::last_write_time(full, ec);
             if (ec) throw DatasetError(given + ": no such file on " + hostName());
+            // a folder's own time does not move when a file in it is written anew: its manifest's does
+            if (std::error_code mec; fs::is_directory(full, mec)) {
+                const fs::file_time_type m = fs::last_write_time(full / DatasetManifest::kFileName, mec);
+                if (!mec) stamp = m;
+            }
             // The file's time is part of the key, so the volumes of a file
             // written anew are not served from the cache.
             const std::string key = path + "\n" + optionsKey(opts).text() + "\n" + std::to_string(stamp.time_since_epoch().count());

@@ -51,6 +51,7 @@
 #include "core/errors.hpp"
 #include "core/host.hpp"
 #include "core/local_worker.hpp"
+#include "core/manifest.hpp"
 #include "core/operation.hpp"
 #include "core/ops/builtin.hpp"
 #include "core/ops/schema.hpp"
@@ -1138,4 +1139,196 @@ TEST_CASE("engine: dataset replies equal the Python worker's on the same files",
         CHECK(plugins.contains("plugins"));
         CHECK_THROWS_WITH(w->call("no_such_method", json::object()), "worker: unknown method 'no_such_method'");
     }
+}
+
+// --- folder datasets on the cluster ----------------------------------------------------------------
+
+namespace {
+
+    // One uint16 stack (z, y, x) whose voxel is (seed * 101 + z * 37 + y * 5 + x * 3) % 3001.
+    void writeFolderStack(const fs::path& path, Index z, Index y, Index x, int seed) {
+        Buffer<std::uint16_t> s(Shape{z, y, x});
+        for (Index k = 0; k < z; ++k)
+            for (Index r = 0; r < y; ++r)
+                for (Index c = 0; c < x; ++c) s.data()[(k * y + r) * x + c] = static_cast<std::uint16_t>((seed * 101 + k * 37 + r * 5 + c * 3) % 3001);
+        writeTiffStack<std::uint16_t>(path.string(), s.view(), TiffWriteOptions{});
+    }
+
+    // A folder of stacks with its manifest: two channels, two time points, two tiles.
+    fs::path manifestFolder(const fs::path& root) {
+        const fs::path f = root / "acq";
+        fs::create_directories(f);
+        DatasetManifest m;
+        m.name = "acq";
+        m.voxelUm = {0.2, 0.2, 0.5};
+        ChannelInfo a, b;
+        a.label = "488";
+        a.wavelengthNm = 488.0;
+        b.label = "561";
+        b.wavelengthNm = 561.0;
+        m.channels = {a, b};
+        TileInfo t0, t1;
+        t0.name = "tile_x0";
+        t1.name = "tile_x1";
+        t1.positionUm = {0.0, 0.0, 3.6};
+        t1.gridIndex = {0, 0, 1};
+        m.tiles = {t0, t1};
+        int seed = 0;
+        for (const TileInfo& tile : m.tiles)
+            for (const ChannelInfo& ch : m.channels)
+                for (Index t = 0; t < 2; ++t) {
+                    const std::string name = tile.name + "_c" + ch.label + "_t" + std::to_string(t) + ".tif";
+                    writeFolderStack(f / name, 3, 24, 20, ++seed);
+                    ManifestFile file;
+                    file.path = name;
+                    file.channel = ch.label;
+                    file.t = t;
+                    file.tile = tile.name;
+                    m.files.push_back(file);
+                }
+        m.save(f / DatasetManifest::kFileName);
+        return f;
+    }
+
+    // A folder of TIFF stacks and nothing else: f1, f2, f10 (read in that order).
+    fs::path plainFolder(const fs::path& root) {
+        const fs::path f = root / "frames";
+        fs::create_directories(f);
+        writeFolderStack(f / "f10.tif", 4, 16, 12, 10);
+        writeFolderStack(f / "f1.tif", 4, 16, 12, 1);
+        writeFolderStack(f / "f2.tif", 4, 16, 12, 2);
+        return f;
+    }
+
+    // Every plane of `a` and `b` equal, and their meta as this computer's open says it.
+    void sameDataset(ArraySource& local, ArraySource& remote) {
+        const DatasetMeta& l = local.meta();
+        const DatasetMeta& r = remote.meta();
+        CHECK(r.dims.toString() == l.dims.toString());
+        CHECK(r.sourceType == l.sourceType);
+        CHECK(r.format == "cluster " + l.format);
+        for (std::size_t k = 0; k < 3; ++k) CHECK(r.voxelUm[k] == l.voxelUm[k]);
+        REQUIRE(r.channels.size() == l.channels.size());
+        for (std::size_t k = 0; k < l.channels.size(); ++k) CHECK(r.channels[k].label == l.channels[k].label);
+        CHECK(r.tiles.size() == (l.hasTiles() ? l.tiles.size() : 0u));
+        CHECK(r.tileIndex == l.tileIndex);
+        const Dims5& d = l.dims;
+        std::vector<float> a(static_cast<std::size_t>(d.planeSize())), b(a.size());
+        for (Index c = 0; c < d.c; ++c)
+            for (Index t = 0; t < d.t; ++t)
+                for (Index z = 0; z < d.z; ++z) {
+                    CAPTURE(c, t, z);
+                    local.readPlane(c, t, z, a.data());
+                    remote.readPlane(c, t, z, b.data());
+                    CHECK(std::memcmp(a.data(), b.data(), a.size() * sizeof(float)) == 0);
+                }
+    }
+
+    OpenOptions lazy(Index tile = 0) {
+        OpenOptions o;
+        o.readAll = false;
+        o.tile = tile;
+        return o;
+    }
+
+} // namespace
+
+TEST_CASE("engine: folder datasets open on the node as on this computer: the manifest, its tiles, a folder of TIFFs", "[app][engine]") {
+    TempDir dir;
+    const fs::path withManifest = manifestFolder(dir.path);
+    const fs::path frames = plainFolder(dir.path);
+    LoopbackEngine le(quietEngine());
+    auto datasets = std::make_shared<RemoteDatasets>("enginehost", [&] { return le.connect(); });
+    datasets->install();
+
+    SECTION("a folder with its manifest, each tile") {
+        for (Index tile = 0; tile < 2; ++tile) {
+            CAPTURE(tile);
+            OpenResult local = openDataset(withManifest.generic_string(), lazy(tile));
+            OpenResult remote = openDataset(makeClusterPath("enginehost", withManifest.generic_string()), lazy(tile));
+            REQUIRE(local.source);
+            REQUIRE(remote.source);
+            CHECK(local.meta.dims.toString() == "c2 t2 z3 y24 x20");
+            CHECK(local.meta.format == "folder");
+            sameDataset(*local.source, *remote.source);
+            CHECK(remote.meta.tiles.size() == 2);
+            CHECK(remote.meta.tiles[1].name == "tile_x1");
+            CHECK(remote.meta.tiles[1].gridIndex[2] == 1);
+        }
+        // the manifest file named instead of its folder: the same
+        const std::string toml = (withManifest / DatasetManifest::kFileName).generic_string();
+        OpenResult byFile = openDataset(makeClusterPath("enginehost", toml), lazy());
+        CHECK(byFile.meta.dims.toString() == "c2 t2 z3 y24 x20");
+    }
+    SECTION("a folder of TIFF stacks without a manifest: one stack per file, in reading order") {
+        OpenResult local = openDataset(frames.generic_string(), lazy());
+        OpenResult remote = openDataset(makeClusterPath("enginehost", frames.generic_string()), lazy());
+        REQUIRE(local.source);
+        REQUIRE(remote.source);
+        CHECK(local.meta.dims.toString() == "c1 t3 z4 y16 x12");
+        sameDataset(*local.source, *remote.source);
+        // f1, f2, f10: t = 2 is f10's stack (seed 10)
+        std::vector<float> p(16 * 12);
+        remote.source->readPlane(0, 2, 1, p.data());
+        CHECK(p[5 * 12 + 4] == static_cast<float>((10 * 101 + 1 * 37 + 5 * 5 + 4 * 3) % 3001));
+        CHECK_FALSE(fs::exists(frames / DatasetManifest::kFileName));   // nothing written into the data
+    }
+    SECTION("views and the display window of a folder, through the protocol") {
+        auto w = le.connect();
+        const json info = w->call("dataset_info", {{"path", withManifest.generic_string()}, {"options", json::object()}}).result;
+        CHECK(info["format"] == "folder");
+        CHECK(info["dtype"] == "uint16");
+        CHECK(info["dims"] == json::array({2, 2, 3, 24, 20}));
+        CHECK(info["tiles"].size() == 2);
+        const json stats = w->call("dataset_stats", {{"path", withManifest.generic_string()}, {"c", 1}, {"t", 1}}).result;
+        CHECK(stats["hi"].get<double>() > stats["lo"].get<double>());
+        std::vector<Index> shape;
+        const std::vector<float> mip = decoded(w->call("dataset_view", {{"path", withManifest.generic_string()}, {"kind", "mip"}, {"c", 0}, {"t", 0}}), shape);
+        CHECK(shape == std::vector<Index>{24, 20});
+        CHECK_FALSE(mip.empty());
+        // a folder that holds no dataset says so
+        fs::create_directories(dir.path / "empty");
+        CHECK_THROWS_WITH(w->call("dataset_info", {{"path", (dir.path / "empty").generic_string()}}), Catch::Matchers::ContainsSubstring("no TIFF files"));
+    }
+    datasets->uninstall();
+}
+
+TEST_CASE("engine: sirius-cli serve opens a folder dataset as this computer does", "[app][engine]") {
+    TempDir dir;
+    const fs::path withManifest = manifestFolder(dir.path);
+    const fs::path frames = plainFolder(dir.path);
+    const std::string tokenFile = dir.file("token.engine");
+    {
+        std::ofstream(fs::u8path(tokenFile)) << "folder-token-7\n";
+        fs::permissions(fs::u8path(tokenFile), fs::perms::owner_read | fs::perms::owner_write, fs::perm_options::replace);
+    }
+    ChildProcess p;
+    ChildProcess::Options o;
+    o.program = SIRIUS_TEST_CLI;
+    o.arguments = {"serve", "--port", "0", "--no-python-worker", "--device", "cpu", "--exit-with-parent"};
+    o.environment = {{"SIRIUS_TOKEN_FILE", tokenFile}};
+    o.killTree = true;
+    REQUIRE(p.start(o));
+    std::string line;
+    REQUIRE(p.readLine(line, 60000));
+    const json a = json::parse(line);
+    REQUIRE(a.contains("port"));
+    const int port = a["port"].get<int>();
+    auto datasets = std::make_shared<RemoteDatasets>("realengine", [&] { return RemoteWorker::connect("127.0.0.1", port, "folder-token-7"); });
+    datasets->install();
+    for (const fs::path& folder : {withManifest, frames}) {
+        CAPTURE(folder.filename().string());
+        OpenResult local = openDataset(folder.generic_string(), lazy());
+        OpenResult remote = openDataset(makeClusterPath("realengine", folder.generic_string()), lazy());
+        REQUIRE(local.source);
+        REQUIRE(remote.source);
+        sameDataset(*local.source, *remote.source);
+    }
+    OpenResult tile1 = openDataset(makeClusterPath("realengine", withManifest.generic_string()), lazy(1));
+    OpenResult localTile1 = openDataset(withManifest.generic_string(), lazy(1));
+    sameDataset(*localTile1.source, *tile1.source);
+    datasets->uninstall();
+    datasets.reset();
+    RemoteWorker::connect("127.0.0.1", port, "folder-token-7")->call("shutdown", json::object());
+    CHECK(p.waitForExit(20000));
 }

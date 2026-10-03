@@ -7,6 +7,7 @@
 #include "core/ops/builtin.hpp"
 
 #include <algorithm>
+#include <cctype>
 #include <cstdio>
 #include <filesystem>
 #include <map>
@@ -122,8 +123,8 @@ namespace sirius::app {
 
         bool axesGiven(const ParamSet& p) { return p.getInt("c") > 0 || p.getInt("t") > 0 || p.getInt("z") > 0; }
 
-        std::string axesNotAppliedError(const std::string& path) {
-            return isManifestDataset(path)
+        std::string axesNotAppliedError(const std::string& path, const std::string& format = {}) {
+            return isManifestDataset(path) || format.find("folder") != std::string::npos
                        ? "A multi-file folder takes its channels, time points and planes from its manifest: set Channels, Time points and Planes to 0."
                        : "A zarr / N5 store names its own axes: set Channels, Time points and Planes to 0.";
         }
@@ -222,7 +223,7 @@ namespace sirius::app {
                     v.errors.push_back("Tile " + std::to_string(tile) + " is out of range: the dataset has " +
                                        std::to_string(tileCountOf(plain)) + (tileCountOf(plain) == 1 ? " tile." : " tiles."));
                 if (axesGiven(params) && !pagedFormat(plain)) {
-                    v.errors.push_back(axesNotAppliedError(path));
+                    v.errors.push_back(axesNotAppliedError(path, plain.format));
                     return v;
                 }
                 DatasetMeta meta;
@@ -323,6 +324,21 @@ namespace sirius::app {
         }
         o.tile = std::max<Index>(0, p.getInt("tile", 0));
         return o;
+    }
+
+    bool loadSourceIsFolder(const std::string& path) {
+        if (path.empty()) return false;
+        if (isRemoteDatasetPath(path)) {
+            if (path.back() == '/') return true;
+            const std::string name = path.substr(path.find_last_of('/') + 1);
+            const std::size_t dot = name.find_last_of('.');
+            if (dot == std::string::npos || dot == 0) return true;
+            std::string ext = name.substr(dot);
+            for (char& ch : ext) ch = static_cast<char>(std::tolower(static_cast<unsigned char>(ch)));
+            return ext == ".zarr" || ext == ".n5" || ext == ".toml";
+        }
+        std::error_code ec;
+        return std::filesystem::is_directory(std::filesystem::u8path(path), ec) || isDatasetManifestFile(path);
     }
 
     std::unique_ptr<Operation> makeLoadOperation() { return std::make_unique<LoadOperation>(); }

@@ -865,14 +865,14 @@ namespace sirius::app {
             return std::to_string(n) + " " + noun + (n == 1 ? "" : "s");
         }
 
-        // Load and validate the manifest; dims from the manifest plus one probed
-        // file of the tile being opened. `path` is the TIFF folder or the toml.
-        FolderProbe probeFolder(const fs::path& path, const OpenOptions* options) {
+        // Validate a manifest; dims from it plus one probed file of the tile
+        // being opened. `path` is what was opened (the folder or the toml),
+        // `folder` where the manifest's files are.
+        FolderProbe probeManifest(DatasetManifest manifest, const fs::path& folder, const fs::path& path, const OpenOptions* options) {
             FolderProbe p;
             std::error_code ec;
-            const fs::path manifestPath = fs::is_directory(path, ec) ? path / DatasetManifest::kFileName : path;
-            p.manifest = DatasetManifest::load(manifestPath);
-            p.folder = p.manifest.filesRoot(manifestPath);
+            p.manifest = std::move(manifest);
+            p.folder = folder;
             const std::vector<std::string> problems = p.manifest.validate(p.folder);
             if (!problems.empty()) {
                 std::string msg = DatasetManifest::kFileName + std::string(": ") + problems.front();
@@ -920,6 +920,37 @@ namespace sirius::app {
             return p;
         }
 
+        // Load the manifest and probe: `path` is the TIFF folder or the toml.
+        FolderProbe probeFolder(const fs::path& path, const OpenOptions* options) {
+            std::error_code ec;
+            const fs::path manifestPath = fs::is_directory(path, ec) ? path / DatasetManifest::kFileName : path;
+            DatasetManifest m = DatasetManifest::load(manifestPath);
+            const fs::path folder = m.filesRoot(manifestPath);
+            return probeManifest(std::move(m), folder, path, options);
+        }
+
+        // A folder of TIFF files without a manifest: one stack per file, a
+        // time point each, in the order a person reads the names
+        // (manifestOfOneStack), held in memory -- nothing is written into the
+        // folder. A folder that is neither this nor a zarr / N5 store is refused.
+        FolderProbe probePlainFolder(const fs::path& path, const OpenOptions* options) {
+            DatasetManifest m = manifestOfOneStack(path);
+            if (m.files.empty())
+                throw std::runtime_error("no TIFF files in " + path.string() + ", and it is not a zarr / N5 store: a folder dataset needs TIFF stacks (or a " +
+                                         std::string(DatasetManifest::kFileName) + " that describes them)");
+            // the voxel size the first file states, where it states one
+            try {
+                const TiffDatasetProbe first = probeTiff((path / fs::u8path(m.files.front().path)).string(), nullptr);
+                for (std::size_t k = 0; k < 3; ++k)
+                    if (first.fileVoxelUm[k] > 0.0) m.voxelUm[k] = first.fileVoxelUm[k];
+            } catch (const std::exception&) {
+                // probeManifest names the file that does not read
+            }
+            FolderProbe p = probeManifest(std::move(m), path, path, options);
+            p.summary = plural(p.manifest.files.size(), "TIFF file") + " · one stack per file, a time point each";
+            return p;
+        }
+
     } // namespace
 
     TiffDatasetProbe probeTiffDataset(const std::string& path, const TiffInfo& info, const OpenOptions* options) {
@@ -962,7 +993,7 @@ namespace sirius::app {
             if (!fs::exists(path, ec)) throw std::runtime_error("no such file or directory: " + path);
             if (isManifestDataset(path)) return probeFolder(path, options).meta;
             if (fs::is_directory(path, ec)) {
-                if (!isZarrStore(path)) throw std::runtime_error("not a zarr / N5 store: " + path);
+                if (!isZarrStore(path)) return probePlainFolder(path, options).meta;
                 return probeZarr(path, options).meta;
             }
             return probeTiff(path, options).meta;
@@ -1008,8 +1039,12 @@ namespace sirius::app {
             r.source = std::make_shared<FolderArraySource>(p.folder, p.manifest, p.meta);
             r.metadataSummary = p.summary;
             r.dimsFromMetadata = true;
+        } else if (fs::is_directory(path, ec) && !isZarrStore(path)) {
+            FolderProbe p = probePlainFolder(path, &options);
+            r.source = std::make_shared<FolderArraySource>(p.folder, p.manifest, p.meta);
+            r.metadataSummary = p.summary;
+            r.dimsFromMetadata = true;
         } else if (fs::is_directory(path, ec)) {
-            if (!isZarrStore(path)) throw std::runtime_error("not a zarr / N5 store: " + path);
             ZarrProbe p = probeZarr(path, &options);
             auto src = std::make_shared<ZarrArraySource>(path, p.meta, p.map);
             src->setYxLast(p.yxLast);

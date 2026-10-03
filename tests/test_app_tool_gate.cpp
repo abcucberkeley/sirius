@@ -302,6 +302,29 @@ TEST_CASE("tool gate: every failure carries an error_kind", "[app][tool_gate]") 
         CHECK(kindOf(r) == "unsupported");
         CHECK_FALSE(r.contains("ok"));
     }
+    SECTION("run on HPC without SIRIUS's engine is refused up front, with the reason, and nothing runs") {
+        bool ran = false;
+        api.setRunHook([&ran](int) {
+            ran = true;
+            return json{{"ok", true}, {"error", ""}, {"seconds", 0.1}};
+        });
+        b.wb.setBackend(Backend::Hpc);
+        RemoteConfig rc;
+        rc.known = true;   // the window knows: no engine answers
+        rc.noEngine = "HPC: the cluster job ended, and its engine with it \xE2\x80\x94 open Cluster to fix";
+        b.wb.setRemoteConfig(rc);
+        const json r = api.call("run", json::object());
+        CHECK(kindOf(r) == "no_engine");
+        CHECK(r.value("error", std::string()) == rc.noEngine);
+        CHECK_THAT(r.value("hint", std::string()), ContainsSubstring("set_backend CPU or CUDA"));
+        CHECK_FALSE(ran);
+        // the engine answers: the run goes ahead
+        rc.engine = json{{"build", "x"}};
+        b.wb.setRemoteConfig(rc);
+        CHECK(b.wb.runGate().enabled);
+        CHECK_FALSE(api.call("run", json::object()).contains("error_kind"));
+        CHECK(ran);
+    }
     SECTION("export_training_data of a step that has not run") {
         const json r = api.call("export_training_data", {{"step", 2}, {"directory", b.scratch.dir.string()}});
         CHECK(kindOf(r) == "not_computed");

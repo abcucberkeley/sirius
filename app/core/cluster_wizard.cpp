@@ -88,7 +88,8 @@ namespace sirius::app::cluster::wizard {
                 if (st.state == State::Connecting) return {false, "Waiting for the job to start on a node\xE2\x80\xA6"};
                 return {false, "Start the job first: Next is enabled once Slurm gives it a node"};
             case Page::Worker:
-                if (st.state == State::Connected) return {true, {}};
+                if (engineReady(st)) return {true, {}};
+                if (st.state == State::Connected) return {false, "No SIRIUS engine runs in this job, so nothing would run on the cluster: see the report"};
                 if (st.state == State::Starting) return {false, "The worker is starting\xE2\x80\xA6"};
                 if (st.state == State::JobReady && workerStepFailed(st)) return {false, "The worker did not start: see the report"};
                 return {false, "Start the worker first: Finish is enabled once it answers"};
@@ -101,7 +102,7 @@ namespace sirius::app::cluster::wizard {
         switch (page) {
             case Page::Connect: return loggedIn(st, host);
             case Page::Job: return jobHeld(st) && st.host == host;
-            case Page::Worker: return st.state == State::Connected;
+            case Page::Worker: return engineReady(st);
             case Page::Summary: return false;
         }
         return false;
@@ -109,7 +110,7 @@ namespace sirius::app::cluster::wizard {
 
     Page openingPage(const Status& st, const std::string& host) {
         switch (st.state) {
-            case State::Connected: return Page::Summary;
+            case State::Connected: return engineReady(st) ? Page::Summary : Page::Worker;
             case State::Starting: return Page::Worker;
             case State::JobReady: return workerStepFailed(st) ? Page::Worker : Page::Job;
             case State::Connecting: return step(st, Step::Login).status == StepStatus::Running ? Page::Connect : Page::Job;
@@ -262,6 +263,7 @@ namespace sirius::app::cluster::wizard {
                 }
                 row(s == Step::Checks ? "Image checks" : (s == Step::Start ? "Worker start" : "Connection"), v, m);
             }
+            if (st.noEngine) row("C++ engine", "not found" + (st.fix.empty() ? std::string() : kDot + st.fix), Mark::Fail);
             if (jobHeld(st)) {
                 row("Node", st.node + kDot + "job " + st.jobId, Mark::Info);
                 if (const std::string left = timeLeftText(st, now); !left.empty()) row("Job time left", left, Mark::Info);
@@ -319,8 +321,13 @@ namespace sirius::app::cluster::wizard {
             v += kDot + (st.engineBuild.empty() ? std::string("the image's own") : "from " + st.engineBuild);
             row("C++ engine", v, m);
         } else {
-            row("C++ engine", p.engine ? std::string("not running: only the Python steps run on the node") : std::string("off: only the Python steps run on the node"),
-                warn(Mark::Warn));
+            // not a usable state: the HPC backend runs nothing without the engine
+            const std::string fix = p.engine ? noEngineFix({})
+                                             : std::string("Turn on \"Run SIRIUS's C++ engine on the node\" (Job \xE2\x96\xB8 More options), then Restart worker.");
+            row("C++ engine", (p.engine ? std::string("not running") : std::string("off")) + kDot + fix, Mark::Fail);
+            r.verdict = HealthReport::Verdict::Failed;
+            r.headline = "Not ready: no SIRIUS C++ engine runs in this job, so nothing can run on the cluster";
+            r.fix = fix;
         }
         // the job's size
         row("CPU threads", (c.cpuThreads > 0 ? std::to_string(c.cpuThreads) + " on the node" : std::string("not said")) + kDot + "the job asked for " + std::to_string(p.cpus),
@@ -340,9 +347,34 @@ namespace sirius::app::cluster::wizard {
         }
         row("Job time left", left.empty() ? std::string("not known") : left, left.empty() ? Mark::Info : lm);
 
+        if (r.verdict == HealthReport::Verdict::Failed) return r;
         r.verdict = HealthReport::Verdict::Ready;
         r.headline = warnings == 0 ? std::string("Ready") : "Ready, with " + std::to_string(warnings) + (warnings == 1 ? " warning" : " warnings");
         return r;
+    }
+
+    // --- the HPC backend without an engine -------------------------------------------------
+
+    bool engineReady(const Status& st) { return st.state == State::Connected && hasEngine(st.caps); }
+
+    std::string hpcNoEngineReason(const Status& st) {
+        const std::string tail = " \xE2\x80\x94 open Cluster to fix";
+        switch (st.state) {
+            case State::Connected:
+                if (hasEngine(st.caps)) return {};
+                return "HPC: the worker on " + shortNodeName(st.node) + " has no SIRIUS engine" + tail;
+            case State::JobReady:
+                if (st.noEngine) return "HPC: no SIRIUS engine in job " + st.jobId + tail;
+                return "HPC: no SIRIUS engine runs yet (job " + st.jobId + " has no worker)" + tail;
+            case State::Starting:
+            case State::Connecting: return "HPC: SIRIUS's engine on the cluster is not up yet \xE2\x80\x94 wait, or open Cluster";
+            case State::Disconnected:
+                if (st.jobEnded) return "HPC: the cluster job ended, and its engine with it" + tail;
+                if (st.dropped) return "HPC: the connection to the cluster was lost" + tail;
+                break;
+            case State::Idle: break;
+        }
+        return "HPC: no SIRIUS engine on the cluster" + tail;
     }
 
 } // namespace sirius::app::cluster::wizard

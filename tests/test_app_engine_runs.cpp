@@ -39,6 +39,7 @@
 
 #include "core/build_info.hpp"
 #include "core/ops/contrast.hpp"
+#include "core/ops/load.hpp"
 #include "core/engine_node.hpp"
 #include "core/engine_server.hpp"
 #include "core/errors.hpp"
@@ -403,15 +404,46 @@ TEST_CASE("engine runs: no engine, another engine, files of this computer: refus
     buildPipeline(wb, flat);
     wb.setBackend(Backend::Hpc);
 
-    // a job that runs the Python worker only: the built-in steps are refused
+    // a job without SIRIUS's engine: nothing runs, refused up front (the gate)
+    // and, asked anyway, the first built-in step named with the fix
     RemoteConfig plain = engineConfig(ep);
     plain.engine = nullptr;
     wb.setRemoteConfig(plain);
+    CHECK_FALSE(wb.runGate().enabled);
+    CHECK(wb.runGate().why == kHpcNoEngine);
     CHECK_FALSE(wb.createRun());
     CHECK(wb.lastRunRefusal().kind == RunRefusal::Kind::NoEngine);
     CHECK(wb.lastRunRefusal().step == 1);
-    CHECK_THAT(wb.lastRunRefusal().message, Catch::Matchers::ContainsSubstring("runs the Python worker only (no SIRIUS engine)"));
-    CHECK_THAT(wb.lastRunRefusal().message, Catch::Matchers::ContainsSubstring("choose CPU/CUDA to run on this computer"));
+    CHECK(wb.lastRunRefusal().message == "Step " + Step::number(1) + " " + wb.pipeline().at(1).name +
+                                             " needs SIRIUS's C++ engine on the cluster, and this job has none: open Cluster \xE2\x96\xB8 Job \xE2\x96\xB8 More "
+                                             "options, set Engine builds folder, then Restart worker.");
+    CHECK(noEngineRefusal(1, "Contrast") ==
+          "Step 02 Contrast needs SIRIUS's C++ engine on the cluster, and this job has none: open Cluster \xE2\x96\xB8 Job \xE2\x96\xB8 More options, set "
+          "Engine builds folder, then Restart worker.");
+    CHECK(wb.lastRunRefusal().message.find("reconnect with an engine image") == std::string::npos);
+    // the window's words for why (the cluster session's state) reach every caller
+    plain.noEngine = "HPC: the connection to the cluster was lost \xE2\x80\x94 open Cluster to fix";
+    wb.setRemoteConfig(plain);
+    CHECK(wb.runGate().why == plain.noEngine);
+    // only Python steps to run: no step to name, the gate's reason
+    {
+        TempDir s2;
+        Workbench py(s2.path / "wb");
+        py.openDataset(data);
+        while (py.pipeline().size() > 1) py.removeStep(1);
+        py.setBackend(Backend::Hpc);
+        py.setRemoteConfig(plain);
+        CHECK_FALSE(py.createRun());
+        CHECK(py.lastRunRefusal().kind == RunRefusal::Kind::NoEngine);
+        CHECK(py.lastRunRefusal().message == plain.noEngine);
+        // another backend runs here; an endpoint not known yet (sirius-cli --hpc) finds out when it connects
+        py.setBackend(Backend::Cpu);
+        CHECK(py.runGate().enabled);
+        py.setBackend(Backend::Hpc);
+        RemoteConfig unknown;
+        py.setRemoteConfig(unknown);
+        CHECK(py.runGate().enabled);
+    }
 
     // an engine whose operations are another SIRIUS's
     RemoteConfig other = engineConfig(ep);
@@ -461,7 +493,11 @@ TEST_CASE("engine runs: no engine, another engine, files of this computer: refus
     folder.setRemoteConfig(engineConfig(ep));
     folder.setBackend(Backend::Hpc);
     buildPipeline(folder, makeClusterPath("enginehost", flat));
-    folder.setStepParam(0, "path", dir.path.generic_string());
+    // a folder of stacks (it opens here, one stack per file)
+    const fs::path frames = dir.path / "frames";
+    fs::create_directories(frames);
+    fs::copy_file(fs::u8path(data), frames / "raw.tif");
+    folder.setStepParam(0, "path", frames.generic_string());
     CHECK_FALSE(folder.createRun());
     CHECK(folder.lastRunRefusal().kind == RunRefusal::Kind::NeedsUpload);
     CHECK_THAT(folder.lastRunRefusal().message, Catch::Matchers::ContainsSubstring("a folder is not uploaded"));
@@ -725,5 +761,91 @@ TEST_CASE("engine runs: a run on the node is cancelled from here, and the node s
     REQUIRE(again);
     INFO(again->error());
     CHECK(again->succeeded());
+    datasets->uninstall();
+}
+
+// --- a folder as the dataset, on the node and here ------------------------------------------------
+
+TEST_CASE("engine runs: Load of a folder on the cluster runs on the node and equals this computer's; Folder mode survives the pipeline file",
+          "[app][engine][hpc]") {
+    TempDir dir;
+    // a folder of stacks without a manifest: f1, f2, f10 -- three time points, read in that order
+    const fs::path frames = dir.path / "frames";
+    fs::create_directories(frames);
+    for (const char* name : {"f1.tif", "f2.tif", "f10.tif"}) writeStack((frames / name).generic_string(), 1, 6, 40, 36);
+    LoopbackEngine le(quietEngine());
+    auto ep = std::make_shared<Endpoint>();
+    ep->engine = &le;
+    auto datasets = std::make_shared<RemoteDatasets>("enginehost", [ep] { return ep->connect(); });
+    datasets->install();
+    const std::string remotePath = makeClusterPath("enginehost", frames.generic_string());
+
+    TempDir scratch;
+    Workbench node(scratch.path / "node");
+    node.openDataset(remotePath);
+    REQUIRE(node.hasDataset());
+    CHECK(node.dataset().dims.t == 3);
+    CHECK(node.dataset().dims.z == 6);
+    CHECK(node.dataset().format == "cluster folder");
+    node.setRemoteConfig(engineConfig(ep));
+    node.setBackend(Backend::Hpc);
+    node.setHpcDevice(HpcDevice::Cpu);
+    while (node.pipeline().size() > 1) node.removeStep(1);
+    node.addStep("contrast", -1, false);
+    node.setStepCache(1, CachePolicy::Memory);
+    CHECK(node.runGate().enabled);
+    std::shared_ptr<RunJob> remote = run(node);
+    REQUIRE(remote);
+    INFO(remote->error());
+    REQUIRE(remote->succeeded());
+    CHECK(remote->ranOnEngine());
+
+    Workbench here(scratch.path / "here");
+    here.openDataset(frames.generic_string());
+    REQUIRE(here.hasDataset());
+    CHECK(here.dataset().dims.toString() == node.dataset().dims.toString());
+    here.setBackend(Backend::Cpu);
+    while (here.pipeline().size() > 1) here.removeStep(1);
+    here.addStep("contrast", -1, false);
+    here.setStepCache(1, CachePolicy::Memory);
+    std::shared_ptr<RunJob> local = run(here);
+    REQUIRE(local);
+    INFO(local->error());
+    REQUIRE(local->succeeded());
+    std::shared_ptr<const StepOutput> a = here.output(1), b = node.output(1);
+    REQUIRE(a);
+    REQUIRE(b);
+    REQUIRE(a->array);
+    CHECK(a->meta.dims.toString() == b->meta.dims.toString());
+    auto* handle = dynamic_cast<const NodeOutputSource*>(b->source.get());
+    REQUIRE(handle);
+    auto w = ep->connect();
+    for (Index t = 0; t < a->meta.dims.t; ++t) {
+        const std::vector<float> v = nodeVolume(*w, handle->handle(), 0, t);
+        const Index n = a->meta.dims.z * a->meta.dims.planeSize();
+        REQUIRE(static_cast<Index>(v.size()) == n);
+        CHECK(std::memcmp(v.data(), a->array->plane(0, t, 0), static_cast<std::size_t>(n) * sizeof(float)) == 0);
+    }
+
+    // the Source field's Folder mode is what the pipeline file names: a folder, here and on the cluster
+    CHECK(loadSourceIsFolder(frames.generic_string()));
+    CHECK(loadSourceIsFolder(remotePath));
+    CHECK(loadSourceIsFolder(makeClusterPath("enginehost", "/data/store.zarr")));
+    CHECK(loadSourceIsFolder(makeClusterPath("enginehost", "/data/acq/sirius-dataset.toml")));
+    CHECK_FALSE(loadSourceIsFolder(makeClusterPath("enginehost", "/data/raw.tif")));
+    CHECK_FALSE(loadSourceIsFolder((frames / "f1.tif").generic_string()));
+    CHECK_FALSE(loadSourceIsFolder(""));
+    for (Workbench* wb : {&here, &node}) {
+        const std::string file = (scratch.path / (wb == &here ? "here.sirius.toml" : "node.sirius.toml")).generic_string();
+        const std::string source = wb->pipeline().at(0).params.getString("path");
+        wb->savePipeline(file);
+        Workbench back(scratch.path / (wb == &here ? "back-here" : "back-node"));
+        back.loadPipeline(file);
+        CHECK(back.pipeline().at(0).params.getString("path") == source);
+        CHECK(loadSourceIsFolder(back.pipeline().at(0).params.getString("path")));
+        REQUIRE(back.hasDataset());   // the folder opened again from the file
+        CHECK(back.dataset().dims.toString() == here.dataset().dims.toString());
+        CHECK(back.pipeline().size() == 2);
+    }
     datasets->uninstall();
 }

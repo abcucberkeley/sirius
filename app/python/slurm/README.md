@@ -40,21 +40,37 @@ SIRIUS checkout on the cluster (its `app/python` is the worker's code).
    job, after checking with a tiny test build that the cluster allows
    unprivileged builds (it says so plainly when it does not — then use an
    image someone built).
-5. **Start worker** (page *3 Worker*): the checks (srun, the checkout, the
-   image there and readable, `import sirius, numpy` inside it, the launcher
-   — `module load apptainer` is tried — each data folder, the engine build,
-   the node cache folder), then the worker as a step of the held job:
+5. **Start worker** (page *3 Worker*): the checks (srun, the worker's code,
+   the image there and readable, `import sirius, numpy` inside it, the
+   launcher — `module load apptainer` is tried — each data folder, SIRIUS's
+   engine, the node cache folder), then the worker as a step of the held job:
 
    ```
    srun --jobid=<job> --overlap --nodes=1 --ntasks=1 --job-name=sirius-worker [--gres=gpu:N] \
-       bash app/python/slurm/sirius_worker.sbatch
+       bash ~/.sirius/run/sirius_worker-<build>.sbatch
    ```
 
-   which runs SIRIUS's engine (`sirius-cli serve`, with the Python worker as
+   The script is **the application's own** `sirius_worker.sbatch`, compiled
+   into it and written over the SSH session to `~/.sirius/run` (`0700`,
+   named by the application's build) before every start: the copy in a
+   checkout on the cluster may be older than the application and is never
+   run. It runs SIRIUS's engine (`sirius-cli serve`, with the Python worker as
    its child) in the image: `<launcher> exec [--nv] --cleanenv --bind ...
    <image> sirius-cli serve ...`. The application reaches it through the SSH
    connection itself (a SOCKS proxy on `ssh -D`): no `ssh -L`, no node name
    to copy.
+
+   **The engine is never optional when it is asked for.** The checks make
+   sure it will be there inside the image (the engine build picked from the
+   *Engine builds folder*, the *Engine executable*, or the image's own
+   `/opt/sirius/bin/sirius-cli`, tested with `<launcher> exec <image> test
+   -x ...`) and fail otherwise, with what to set; the launch script stops
+   with `{"error": "engine_missing", ...}` rather than start the Python
+   worker alone; and a worker whose hello has no engine is a failed *Connect
+   to the worker*, not a connection. Without the engine the *Worker* page
+   says *Not ready*, the HPC backend is not chosen, and every Run button is
+   disabled with the reason (*HPC: no SIRIUS engine on the cluster — open
+   Cluster to fix*).
 
 Once connected the title bar says *g0003 · GPU* (or *· CPU*); its tooltip
 has the host, the job, the node and the time left. A worker that stops
@@ -112,13 +128,28 @@ build with its `<folder>/<commit>/BUILD.json` (`{"build", "commit",
 checks list the builds there and pick the one of the application's own
 commit, else the newest whose operations and engine API are the same
 (`core/build_info.hpp`'s `engineMismatch`); that folder is bound into the
-image. When none fits, the checks say so and name the application's commit.
-Building one (a placeholder until the cluster's build command is settled):
+image. `BUILD.json` may name the schema hash `ops_schema` or `schema_hash`
+(or both). When none fits, the checks say so and name the application's
+commit. The build's `python/` folder (the `sirius_worker` package of that
+commit) is the worker's code, so the checkout on the cluster is not needed
+then; its `lib/` (nvTIFF, nvCOMP) goes in front of the image's library path.
+Building one, inside the worker image on a node (latents'
+`scripts/build_sirius_engine.sbatch` does exactly this for a commit):
 
 ```
-# on the cluster, in the SIRIUS checkout at the application's commit
-#   <build command for <folder>/<commit>, see the cluster's SIRIUS notes>
+git -C <checkout> archive <commit> | tar -x -C <scratch>/src     # never a working tree
+cmake -S <scratch>/src -B <scratch>/build -G Ninja -DCMAKE_BUILD_TYPE=Release \
+    -DSIRIUS_ENABLE_CLI=ON -DSIRIUS_ENABLE_APP=OFF -DSIRIUS_ENABLE_CUDA=ON -DCMAKE_CUDA_ARCHITECTURES="80;90" \
+    -DSIRIUS_ENABLE_PYTHON_BINDINGS=OFF -DSIRIUS_ENABLE_TENSORSTORE=OFF -DSIRIUS_ENABLE_TESTS=OFF \
+    -DSIRIUS_BUILD_COMMIT=<commit> -DSIRIUS_BUILD_DIRTY=OFF
+cmake --build <scratch>/build --target sirius-cli
+# then <folder>/<commit>/: bin/sirius-cli, lib/ (its shared libraries), python/ (app/python),
+# help/, and BUILD.json = the "build" object of `bin/sirius-cli version`
 ```
+
+A build of another commit serves the application as long as the operation
+schema and the engine API are the same: a new build is needed only when
+they changed.
 
 Empty, the engine inside the image (`/opt/sirius/bin/sirius-cli`) is used;
 *Engine executable* names one outright (testing a build of your own).

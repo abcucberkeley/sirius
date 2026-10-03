@@ -23,6 +23,7 @@
 #include "core/labels.hpp"
 #include "core/ops/common.hpp"
 #include "core/ops/contrast.hpp"
+#include "core/ops/load.hpp"
 #include "core/workbench.hpp"
 #include "imgui/app.hpp"
 #include "imgui/cluster_link.hpp"
@@ -193,6 +194,9 @@ namespace sirius::app::gui {
         std::map<std::string, bool> moreOpen;
         // a path field's Browse, chosen by hand: this computer (0) or the cluster (1)
         std::map<std::pair<StepId, std::string>, int> pathWhere;
+        // The Load step's Source: 0 a file, 1 a folder dataset, as chosen by
+        // hand (per step and field); else what the value names (loadSourceIsFolder).
+        std::map<std::pair<StepId, std::string>, int> pathKind;
         // derived once per form
         bool haveUpstream = false;
         double dataMin = 0.0, dataMax = 1.0;   // contrast: the input's intensity range
@@ -450,6 +454,13 @@ namespace sirius::app::gui {
             });
         }
 
+        // The Load step's Source: File or Folder, as chosen, else as the value says.
+        int sourceKind(const std::string& key, const std::string& value) {
+            const auto it = pathKind.find({selectedId(), key});
+            if (it != pathKind.end()) return it->second;
+            return loadSourceIsFolder(value) ? 1 : 0;
+        }
+
         void pathEditor(const ParamSpec& s, const ParamSet& params, float width, const char* extraLabel = nullptr,
                         const std::string& extraTip = {}, std::function<void()> extra = {}, bool opensDataset = false) {
             const std::string key = s.key;
@@ -465,20 +476,34 @@ namespace sirius::app::gui {
             // cluster, as the Open dataset dialog's switch does
             const bool clusterUp = app.cluster().sshUp();
             int where = clusterUp ? browseWhere(key, b.s) : 0;
-            if (clusterUp) {
+            // the Load step's Source: one file, or a folder as one dataset
+            // (its manifest, or the folder dialog that writes one; on the
+            // cluster the engine opens it there)
+            int kind = opensDataset ? sourceKind(key, b.s) : 0;
+            if (clusterUp || opensDataset) {
                 widgets::SegmentedOpts so;
                 so.enabled = !s.readOnly && formEnabled;
-                so.tooltips = {"Browse this computer's files",
-                               "Browse the cluster's files (" + app.cluster().status().host + "): the step reads the file there"};
-                if (widgets::segmented("##where", {"This computer", "Cluster"}, &where, so)) pathWhere[{selectedId(), key}] = where;
+                if (clusterUp) {
+                    so.tooltips = {"Browse this computer's files",
+                                   "Browse the cluster's files (" + app.cluster().status().host + "): the step reads the file there"};
+                    if (widgets::segmented("##where", {"This computer", "Cluster"}, &where, so)) pathWhere[{selectedId(), key}] = where;
+                }
+                if (opensDataset) {
+                    if (clusterUp) ImGui::SameLine(0.0f, px(10));
+                    so.tooltips = {"One file: a TIFF / OME-TIFF stack",
+                                   "A folder as one dataset: TIFF stacks per channel, time point and tile (its manifest, or the folder dialog makes "
+                                   "one), or a zarr / N5 store"};
+                    if (widgets::segmented("##kind", {"File", "Folder"}, &kind, so)) pathKind[{selectedId(), key}] = kind;
+                }
                 at.y += theme::snap(px(26)) + px(6);
                 place(at.x, at.y);
             }
+            const bool pickDir = s.directory || kind == 1;
             widgets::FieldOpts fo;
             fo.width = dp(editW);
             fo.enabled = formEnabled;
             fo.readOnly = s.readOnly;
-            fo.hint = s.directory ? "directory…" : "file…";
+            fo.hint = pickDir ? (opensDataset ? "folder…" : "directory…") : "file…";
             widgets::inputText("##edit", &b.s, fo);
             b.active = ImGui::IsItemActive();
             if (ImGui::IsItemDeactivatedAfterEdit() && b.s != params.getString(key)) {
@@ -499,7 +524,26 @@ namespace sirius::app::gui {
             if (where == 1) bo.tooltip = "The cluster's files, through the SSH session";
             const bool browse = widgets::button("Browse##browse", bo);
             if (browse && where == 1) {
-                browseCluster(key, b.s, s.directory, opensDataset);
+                browseCluster(key, b.s, pickDir, opensDataset);
+            } else if (browse && opensDataset && kind == 1) {
+                // a folder on this computer: described already (a manifest, a
+                // zarr / N5 store) it is the Source; else the folder dialog
+                // builds its manifest and opens it, as File ▸ Open folder as dataset does
+                App* a = &app;
+                const std::string current = b.s;
+                const StepId forStep = selectedId();
+                a->defer([this, a, key, current, forStep] {
+                    const std::string start = current.empty() ? a->lastDir() : (isDirectory(current) ? current : parentPath(current));
+                    const std::string path = platform::pickFolderDialog("Choose the dataset's folder", start);
+                    if (path.empty() || selectedId() != forStep) return;
+                    a->setLastDir(path);
+                    bufs.erase(key);
+                    bool store = false;
+                    for (const char* marker : {".zarray", ".zgroup", "zarr.json", "attributes.json"})
+                        if (pathExists(path + "/" + marker)) store = true;
+                    if (wb().hasDataset() && (isFolderDataset(path) || store)) wb().setStepParam(index(), key, path);
+                    else a->openDatasetPath(path);
+                });
             } else if (browse) {
                 App* a = &app;
                 const bool dir = s.directory;
@@ -1676,17 +1720,16 @@ namespace sirius::app::gui {
 
             // --- the fixed sections' metrics: backend, cache, footer ---
             std::string backendNote;
+            // the HPC backend without SIRIUS's engine runs nothing: the one reason, here too
+            const RunGate gate = w.runGate();
             if (st && w.backend() == Backend::Hpc) {
-                // With SIRIUS's engine in the job every step runs on the node;
-                // a job of the Python worker alone runs only what it implements
-                // (OpInfo::remoteCapable), and the rest is refused, never run here.
+                // With SIRIUS's engine in the job every step runs on the node.
                 const RemoteConfig& rc = w.remoteConfig();
                 if (rc.hasEngine())
                     backendNote = "Runs on the cluster node" + (rc.where.empty() ? std::string() : " (" + rc.where + ")") +
                                   ", by SIRIUS's engine; the result stays there.";
-                else if (rc.known && !st->op().info().remoteCapable)
-                    backendNote = st->op().info().name + " needs SIRIUS's engine on the cluster, and this job runs the Python worker only: it is "
-                                                         "refused on HPC. Choose CPU/CUDA to run it on this computer.";
+                else if (!gate.enabled)
+                    backendNote = gate.why + ". Nothing runs on HPC until SIRIUS's engine answers; choose CPU/CUDA to run on this computer.";
                 else
                     backendNote = "Runs on the HPC worker.";
             }
@@ -1778,7 +1821,7 @@ namespace sirius::app::gui {
             }
             if (!backendNote.empty()) {
                 place(x, y + px(8));
-                widgets::textWrapped(backendNote, 12, theme::kNeutral600, Weight::Regular, width);
+                widgets::textWrapped(backendNote, 12, gate.enabled ? theme::kNeutral600 : theme::kAccentText, Weight::Regular, width);
                 y += px(8) + wrappedHeight(backendNote, 12, width);
             }
             y += px(16);
@@ -1831,9 +1874,9 @@ namespace sirius::app::gui {
                 widgets::ButtonOpts run;
                 run.kind = widgets::ButtonKind::Primary;
                 run.width = dp(runW);
-                run.enabled = st && !busy && w.hasDataset();
+                run.enabled = st && !busy && w.hasDataset() && gate.enabled;
                 if (widgets::button("Run step##run", run)) a->defer([a] { a->runSelectedStep(); });
-                tip(widgets::withShortcut("Run this step; its input has to be computed already", shortcutText(keys::runSelected)));
+                tip(gate.enabled ? widgets::withShortcut("Run this step; its input has to be computed already", shortcutText(keys::runSelected)) : gate.why);
                 place(x + runW + px(8), by);
                 widgets::ButtonOpts view;
                 view.enabled = st != nullptr;

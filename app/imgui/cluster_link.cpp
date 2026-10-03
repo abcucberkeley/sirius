@@ -6,6 +6,7 @@
 
 #include <nlohmann/json.hpp>
 
+#include "core/cluster_wizard.hpp"
 #include "core/host.hpp"
 #include "core/errors.hpp"
 #include "core/secure_wipe.hpp"
@@ -200,6 +201,14 @@ namespace sirius::app::gui {
             rc.engine = st.caps.engine;
             rc.where = st.host + " \xC2\xB7 " + st.node + (st.jobId.empty() ? std::string() : " \xC2\xB7 job " + st.jobId);
         }
+        // The window runs nothing on HPC without SIRIUS's engine answering in
+        // this session (none started, missing, gone, the job ended, the
+        // connection lost): known to have none, and why.
+        if (!rc.hasEngine()) {
+            rc.known = true;
+            rc.engine = nullptr;
+            rc.noEngine = cluster::wizard::hpcNoEngineReason(st);
+        }
         return rc;
     }
 
@@ -240,6 +249,12 @@ namespace sirius::app::gui {
         // the cluster's datasets are decoded where the session computes
         // (nvTIFF on the job's GPU), switched with the HPC device
         if (datasets_) datasets_->setDevice(app_.wb().hpcDevice() == HpcDevice::Cpu ? "cpu" : "cuda");
+        // the HPC backend's engine (or why there is none), as the session is now
+        if (const std::string why = cluster::wizard::hpcNoEngineReason(session_.status()); !synced_ || why != syncedWhy_) {
+            synced_ = true;
+            syncedWhy_ = why;
+            app_.wb().setRemoteConfig(remoteConfig());
+        }
         const cluster::State now = session_.status().state;
         if (now == lastState_) return;
         const cluster::State before = lastState_;
@@ -277,14 +292,15 @@ namespace sirius::app::gui {
         if (!wb.engineSession().empty() && wb.engineSession() != session)
             wb.nodeOutputsGone(wb.engineSession(), "held by an earlier cluster job, which has ended");
         wb.setRemoteConfig(remoteConfig());
-        wb.setBackend(Backend::Hpc);
-        if (st.caps.engine.is_object())
+        if (cluster::hasEngine(st.caps)) {
+            wb.setBackend(Backend::Hpc);
             wb.logLine("HPC: SIRIUS's engine on " + st.node + " (" + st.caps.device + ", job " + st.jobId +
                        ") runs every step there; its results stay there until shown or exported. Cluster datasets open from " + st.host);
-        else
-            wb.logLine("HPC: the Python worker on " + st.node + " (" + st.caps.device + ") runs the Python steps (no SIRIUS engine in this job: "
-                                                                                        "built-in steps are refused on HPC); cluster datasets open from " +
-                       st.host);
+        } else {
+            // not a usable state: the backend is not switched, and HPC runs nothing
+            wb.logLine("HPC: the worker on " + st.node + " has no SIRIUS engine, so nothing runs on the cluster: open Cluster \xE2\x96\xB8 Job \xE2\x96\xB8 "
+                                                         "More options, set Engine builds folder, then Restart worker.");
+        }
     }
 
     std::string ClusterLink::indicator(ImU32& color) const {
@@ -312,7 +328,11 @@ namespace sirius::app::gui {
     }
 
     cluster::ConnectionBadge ClusterLink::badge() const {
-        return cluster::connectionBadge(status(), app_.wb().hpcDevice() != HpcDevice::Cpu, std::chrono::steady_clock::now());
+        const cluster::Status st = status();
+        const cluster::ConnectionBadge b = cluster::connectionBadge(st, app_.wb().hpcDevice() != HpcDevice::Cpu, std::chrono::steady_clock::now());
+        // the HPC backend chosen and nothing can run: red, whatever the session
+        const RunGate gate = app_.wb().runGate();
+        return gate.enabled ? b : cluster::noEngineBadge(b, st, gate.why);
     }
 
     bool ClusterLink::hpcGpuUsable(std::string* why) const {

@@ -17,22 +17,31 @@
 //            job runs on a node.
 //
 // The worker (startWorker), inside that job:
-//   Checks   the SIRIUS checkout (app/python, the worker's code), the
-//            container image (there, readable, sirius and numpy import in
-//            it), the launcher, the data folders, the engine build that fits
-//            this application (Profile::engineBuilds), the node cache folder:
-//            what is missing comes back with what to do about it
-//   Start    srun --jobid=<job> --overlap starts app/python/slurm/
-//            sirius_worker.sbatch as a step of the job: SIRIUS's engine (or
-//            the Python worker) in the image. The token is made here and
-//            written over the command channel to a 0600 file in ~/.sirius/run
-//            whose name is all the step is given: never an argument, never
-//            the job's environment. The step's log says when the worker
-//            listens and on which port (it takes a free one).
+//   Checks   the worker's code (the engine build's python/ folder, else the
+//            checkout's app/python), the container image (there, readable,
+//            sirius and numpy import in it), the launcher, the data folders,
+//            SIRIUS's engine when the profile runs it -- the engine build
+//            that fits this application (Profile::engineBuilds), the named
+//            executable, or the image's own, each made sure of: never a
+//            silent fall back to the Python worker alone -- and the node
+//            cache folder: what is missing comes back with what to do about it
+//   Start    the application's own launch script (sirius_worker.sbatch as
+//            compiled into it, workerLaunchScript) is written over the
+//            command channel to ~/.sirius/run/<workerLaunchScriptName()>
+//            (0700), and srun --jobid=<job> --overlap runs it as a step of
+//            the job: SIRIUS's engine (or the Python worker) in the image. The
+//            checkout's copy of the script is never run: it may be older than
+//            the application. The token is made here and written over the
+//            command channel to a 0600 file in ~/.sirius/run whose name is all
+//            the step is given: never an argument, never the job's
+//            environment. The step's log says when the worker listens and on
+//            which port (it takes a free one).
 //   Hello    the application connects through the SSH session's SOCKS proxy
-//            and the worker says what it is (version, device, steps); SIRIUS's
-//            engine whose operations are not this application's is refused
-//            here (core/build_info.hpp)
+//            and the worker says what it is (version, device, steps): a
+//            protocol or version other than this application's, SIRIUS's
+//            engine whose operations are not this application's
+//            (core/build_info.hpp), and a worker without the engine the
+//            profile asked for are refused here, each with its fix
 //
 // A new image, new data folders or another engine only restart the worker
 // step in the same job (startWorker again); another partition, account, QoS,
@@ -307,6 +316,9 @@ namespace sirius::app::cluster {
     // Whether the session's GPU can compute on `caps`'s worker (its CUDA,
     // not only its hardware).
     bool gpuUsable(const WorkerCapabilities& caps);
+    // Whether `caps`'s worker is SIRIUS's C++ engine (its hello's "engine"
+    // block): what every run on the HPC backend needs.
+    bool hasEngine(const WorkerCapabilities& caps);
     // Why the GPU of the worker on `node` cannot be chosen, a sentence; ""
     // when it can. A GPU the node has but the worker cannot use is named,
     // with the worker's reason ("no CUDA library in the worker's environment: ...").
@@ -385,6 +397,10 @@ namespace sirius::app::cluster {
         std::string jobId, node, jobState;
         // The engine build the checks picked ("" the image's own), and in words.
         std::string engineBuild, engineBuildNote;
+        // The worker step did not start, or was refused at its hello, because
+        // SIRIUS's engine is not there (none found, or a worker without it):
+        // `reason` and `fix` say which and what to do.
+        bool noEngine = false;
         // Disconnected because the job ended (it was cancelled, timed out,
         // failed): what its engine held went with it.
         bool jobEnded = false;
@@ -420,6 +436,11 @@ namespace sirius::app::cluster {
     };
     // `gpu`: the session computes on the node's GPU (else its CPU).
     ConnectionBadge connectionBadge(const Status& st, bool gpu, std::chrono::steady_clock::time_point now);
+    // The badge while the HPC backend is chosen and can run nothing (`why`,
+    // core/workbench.hpp's RunGate): red "no engine" in place of "Cluster" or
+    // "no worker yet"; a connect under way, a lost or failed one stay as
+    // they are.
+    ConnectionBadge noEngineBadge(ConnectionBadge badge, const Status& st, const std::string& why);
 
     struct Entry {
         std::string name;
@@ -439,6 +460,17 @@ namespace sirius::app::cluster {
     // The bash script that lists `path` (exposed for tests).
     std::string listingScript(const std::string& path, int maxEntries);
 
+    // --- the worker's launch script -------------------------------------------------
+    //
+    // app/python/slurm/sirius_worker.sbatch as this application was built
+    // with it (cmake/EmbedText.cmake), and the name it is written under in
+    // ~/.sirius/run: sirius_worker-<build id>.sbatch.
+    const std::string& workerLaunchScript();
+    std::string workerLaunchScriptName();
+    // The shell lines that write it there (0700, through a temporary file),
+    // exposed for tests; they set LS to its path.
+    std::string uploadLaunchScript();
+
     // --- the engine builds ----------------------------------------------------------
     //
     // <Profile::engineBuilds>/<commit>/BUILD.json and bin/sirius-cli, as the
@@ -449,6 +481,7 @@ namespace sirius::app::cluster {
         std::string dir;          // the folder's name (a commit)
         bool runnable = false;    // bin/sirius-cli is there and executable
         bool readable = false;    // BUILD.json parses
+        bool python = false;      // python/sirius_worker is there: the worker's code of that commit
         BuildInfo info;
     };
     std::string engineBuildsScript(const std::string& folder);
@@ -456,6 +489,14 @@ namespace sirius::app::cluster {
     // The index of the build to use, or -1; `note` says which and why ("this
     // build", "the same operations as this build"), or why none fits.
     int pickEngineBuild(const std::vector<EngineBuild>& builds, const BuildInfo& app, std::string* note);
+    // What to do when no engine build fits (or there is none): build one of
+    // this application's commit into `folder` ("" = not set yet), with the
+    // command that does it.
+    std::string engineBuildFix(const std::string& folder, const BuildInfo& app);
+    // What to do when the profile asks for the engine and none is found:
+    // set the Engine builds folder; `hint` is a builds folder the checks
+    // found on the cluster ("" none).
+    std::string noEngineFix(const std::string& hint);
 
     class Session {
     public:

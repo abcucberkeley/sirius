@@ -6,8 +6,9 @@
 # it while it runs, scancel <id>.<n> (or <id>) stops it. Every command line is
 # appended to srun.args.
 #
-# The worker's step (`bash app/python/slurm/sirius_worker.sbatch`) is played,
-# not run: SIRIUS's worker -- or with $SIRIUS_ENGINE=1 the engine,
+# The worker's step (`bash <...>/sirius_worker[-<build>].sbatch`, the launch
+# script the application wrote to ~/.sirius/run) is played, not run: its path
+# goes to <id>.script and its text to <id>.script.txt, then SIRIUS's worker -- or with $SIRIUS_ENGINE=1 the engine,
 # $SIRIUS_ENGINE_BIN serve, without its Python child unless
 # $FAKE_ENGINE_PYTHON=1 -- on 127.0.0.1 (never 0.0.0.0) with the token file
 # the application wrote, through the launcher ($SIRIUS_LAUNCHER, the fake
@@ -43,7 +44,7 @@ echo "${name:-bash}" > "$step.name"
 [ -n "$gres" ] && echo "$gres" > "$step.gres"
 
 case " $* " in
-    *sirius_worker.sbatch*) ;;
+    *sirius_worker*.sbatch*) ;;
     *)
         "$@" &
         pid=$!
@@ -56,7 +57,12 @@ case " $* " in
 esac
 
 # --- the worker's step --------------------------------------------------------
-env | grep -E '^SIRIUS_(PORT|VENV|DEVICE|MAX_CLIENTS|CONTAINER|CONTAINER_BIND|CONTAINER_PYTHONPATH|LAUNCHER|ENGINE|ENGINE_BIN|ENGINE_DIR|ENGINE_SCRATCH)=' |
+script="${*: -1}"
+printf '%s\n' "$script" > "$dir/$id.script"
+cp "$script" "$dir/$id.script.txt" 2>/dev/null
+# the worker's code: where the application said it is (else the checkout's, as before)
+wdir="${SIRIUS_WORKER_DIR:-$PWD/app/python}"
+env | grep -E '^SIRIUS_(PORT|VENV|DEVICE|MAX_CLIENTS|CONTAINER|CONTAINER_BIND|CONTAINER_PYTHONPATH|LAUNCHER|ENGINE|ENGINE_BIN|ENGINE_DIR|ENGINE_SCRATCH|WORKER_DIR)=' |
     sort > "$dir/$id.env"
 [ -n "${SIRIUS_TOKEN:-}" ] && echo "SIRIUS_TOKEN=<set>" >> "$dir/$id.env"
 [ -n "${SIRIUS_TOKEN_FILE:-}" ] && echo "SIRIUS_TOKEN_FILE=<set>" >> "$dir/$id.env"
@@ -79,7 +85,7 @@ cmd=(-m sirius_worker)
 if [ "${SIRIUS_ENGINE:-0}" = 1 ]; then
     run=("${SIRIUS_ENGINE_BIN:?SIRIUS_ENGINE_BIN names the engine for the fake step}")
     cmd=(serve)
-    if [ "${FAKE_ENGINE_PYTHON:-0}" = 1 ]; then cmd+=(--python "$FAKE_PYTHON" --worker-dir "$PWD/app/python"); else cmd+=(--no-python-worker); fi
+    if [ "${FAKE_ENGINE_PYTHON:-0}" = 1 ]; then cmd+=(--python "$FAKE_PYTHON" --worker-dir "$wdir"); else cmd+=(--no-python-worker); fi
 fi
 L="${SIRIUS_LAUNCHER:-apptainer}"
 command -v "$L" >/dev/null 2>&1 || L=singularity
@@ -87,7 +93,7 @@ launch=("$L" exec)
 [ "${SIRIUS_DEVICE:-cuda}" != cpu ] && launch+=(--nv)
 [ -n "${SIRIUS_CONTAINER_BIND:-}" ] && launch+=(--bind "$SIRIUS_CONTAINER_BIND")
 [ -n "${SIRIUS_ENGINE_DIR:-}" ] && launch+=(--bind "$SIRIUS_ENGINE_DIR")
-launch+=(--bind "$PWD" --bind "$HOME/.sirius/run" "$SIRIUS_CONTAINER")
+launch+=(--bind "$wdir" --bind "$HOME/.sirius/run" "$SIRIUS_CONTAINER")
 if [ "${SIRIUS_ENGINE:-0}" = 1 ]; then run=("${launch[@]}" "${SIRIUS_ENGINE_BIN}"); else run=("${launch[@]}" python); fi
 
 if [ "${FAKE_SLURM_DETACH:-0}" = 1 ] && [ "${SIRIUS_ENGINE:-0}" = 1 ]; then
@@ -101,16 +107,16 @@ if [ "${FAKE_SLURM_DETACH:-0}" = 1 ] && [ "${SIRIUS_ENGINE:-0}" = 1 ]; then
     printf '%s\n' "${launch[*]} (detached)" >> "$dir/apptainer.args"
     case "$(uname -s)" in
         MINGW* | MSYS* | CYGWIN*)
-            wbin=$(cygpath -w "$SIRIUS_ENGINE_BIN"); wtf=$(cygpath -w "$tf"); wlog=$(cygpath -w "$log"); wdir=$(cygpath -w "$PWD/app/python")
+            wbin=$(cygpath -w "$SIRIUS_ENGINE_BIN"); wtf=$(cygpath -w "$tf"); wlog=$(cygpath -w "$log"); wwdir=$(cygpath -w "$wdir")
             line="cmd.exe /c \"\"$wbin\" serve --no-python-worker --token-file \"$wtf\" --host 127.0.0.1 --port ${SIRIUS_PORT:-0} --device cpu --max-clients ${SIRIUS_MAX_CLIENTS:-8} >> \"$wlog\" 2>&1\""
             line=${line//\'/\'\'}
-            wpid=$(powershell.exe -NoProfile -NonInteractive -Command "(Invoke-CimMethod -ClassName Win32_Process -MethodName Create -Arguments @{CommandLine='$line'; CurrentDirectory='$wdir'}).ProcessId" | tr -d '\r')
+            wpid=$(powershell.exe -NoProfile -NonInteractive -Command "(Invoke-CimMethod -ClassName Win32_Process -MethodName Create -Arguments @{CommandLine='$line'; CurrentDirectory='$wwdir'}).ProcessId" | tr -d '\r')
             echo "$wpid" > "$step.winpid"
             echo "$wpid" > "$step.detached"
             while tasklist.exe //FI "PID eq $wpid" //NH 2>/dev/null | grep -q " $wpid "; do sleep 1; done
             ;;
         *)
-            ( cd app/python && exec setsid "$SIRIUS_ENGINE_BIN" serve --no-python-worker --token-file "$tf" --host 127.0.0.1 --port "${SIRIUS_PORT:-0}" \
+            ( cd "$wdir" && exec setsid "$SIRIUS_ENGINE_BIN" serve --no-python-worker --token-file "$tf" --host 127.0.0.1 --port "${SIRIUS_PORT:-0}" \
                   --device cpu --max-clients "${SIRIUS_MAX_CLIENTS:-8}" ) >> "$log" 2>&1 < /dev/null &
             pid=$!
             echo "$pid" > "$step.pid"
@@ -123,7 +129,7 @@ if [ "${FAKE_SLURM_DETACH:-0}" = 1 ] && [ "${SIRIUS_ENGINE:-0}" = 1 ]; then
     exit 0
 fi
 
-( cd app/python && exec "${run[@]}" "${cmd[@]}" --host 127.0.0.1 --port "${SIRIUS_PORT:-0}" --device cpu \
+( cd "$wdir" && exec "${run[@]}" "${cmd[@]}" --host 127.0.0.1 --port "${SIRIUS_PORT:-0}" --device cpu \
       --max-clients "${SIRIUS_MAX_CLIENTS:-8}" ) < /dev/null &
 pid=$!
 echo "$pid" > "$step.pid"

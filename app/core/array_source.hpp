@@ -169,6 +169,13 @@ namespace sirius::app {
     void setRemoteDatasetOpener(RemoteDatasetOpener opener);
     bool isRemoteDatasetPath(const std::string& path);
 
+    // A folder opens as a dataset by its manifest (sirius-dataset.toml in it,
+    // or a manifest .toml named instead), as a zarr / N5 store, or -- a folder
+    // of TIFF files and nothing to describe it -- one stack per file, a time
+    // point each (manifestOfOneStack, held in memory, nothing written). The
+    // same code serves a folder on this computer and one the engine on a
+    // cluster node opens (core/dataset_service.hpp).
+    //
     // Probe a path without reading pixels: dims (as far as the metadata goes),
     // dtype, size, channels. Throws std::runtime_error when unreadable.
     DatasetMeta probeDataset(const std::string& path);

@@ -674,12 +674,8 @@ namespace sirius::app::gui {
                 wb.setCudaDevice(device);
                 // a GPU the job does not have stays the stored default only
                 if (hpcDevice == HpcDevice::Cpu || app.cluster().hpcGpuUsable()) wb.setHpcDevice(hpcDevice);
-                RemoteConfig rc;
-                rc.host = trimmed(host_);
-                rc.port = static_cast<int>(port_);
-                rc.token = token_;
-                // a connected cluster session keeps the backend on its tunnel
-                wb.setRemoteConfig(app.cluster().connected() ? app.cluster().remoteConfig() : rc);
+                // the cluster session decides where HPC runs (its engine, or why there is none)
+                wb.setRemoteConfig(app.cluster().remoteConfig());
                 // The local worker's launcher reads "worker/python" itself each time
                 // it starts the worker, after $SIRIUS_PYTHON: handing it the field
                 // here would put the setting above the environment.

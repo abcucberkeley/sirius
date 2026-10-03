@@ -13,7 +13,7 @@ $$
 
 | Parameter | Explanation |
 |---|---|
-| **Source** <br> file or directory | A multi-page TIFF / OME-TIFF / ImageJ hyperstack (decoded on the GPU by nvTIFF when possible) or a zarr / N5 store. Plain TIFFs without dimension metadata ask how the pages map onto channels, time points and z planes. |
+| **Source** <br> File · Folder | *File*: a multi-page TIFF / OME-TIFF / ImageJ hyperstack (decoded on the GPU by nvTIFF when possible). Plain TIFFs without dimension metadata ask how the pages map onto channels, time points and z planes. *Folder*: a folder as one dataset — its `sirius-dataset.toml`, the folder dialog that writes one (below), or a zarr / N5 store. With a cluster session, *This computer · Cluster* says where Browse looks; a folder on the cluster is opened there by SIRIUS's engine. |
 | **Tile** <br> index | Multi-file datasets only: which tile of the folder is viewed and processed. *Stitch* with no tile files fuses all of them, whatever this is set to. |
 | **Read as** <br> full · lazy | Full load (the default) reads the current tile into RAM once — faster scrubbing, needs the whole volume in memory. Lazy reads planes on demand and keeps a bounded RAM cache. |
 | **SIM layout** <br> directions × phases | For raw structured-illumination stacks: how many pattern directions and phase steps the z axis interleaves, so the SIM step can unmix them. $Z_{\text{file}} = N_{\text{dir}} \cdot N_{\text{phase}} \cdot Z$ |
@@ -27,6 +27,8 @@ tile_x(?P<x>\d+)_y(?P<y>\d+)_ch(?P<channel>\d+)_t(?P<t>\d+)\.tif
 ```
 
 The manifest lists the channels with their names, the tiles with their nominal origins, the voxel size and, per file, the (tile, channel, t) it holds. It can be edited by hand.
+
+The Load step's *Source* in *Folder* mode does the same: Browse picks a folder; one with its manifest (or a zarr / N5 store) is the source as it is, one without opens the folder dialog to describe it. On the cluster (*Cluster* beside *Folder*) the cluster's browser picks the folder and SIRIUS's engine on the node opens it with the same code as this computer: the folder's manifest and its tiles, or — a folder of TIFF stacks with nothing to describe it — one stack per file, a time point each, in the order the names read (`f2` before `f10`). Nothing is written into the folder for that.
 
 ## Note
 

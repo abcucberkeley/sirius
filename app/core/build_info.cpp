@@ -1,5 +1,7 @@
 #include "core/build_info.hpp"
 
+#include <cstdlib>
+
 #include "sirius_build_info_generated.hpp"
 
 namespace sirius::app {
@@ -35,9 +37,15 @@ namespace sirius::app {
         b.build = text("build");
         b.version = text("version");
         b.commit = text("commit");
+        // sirius-cli calls it ops_schema; a BUILD.json may carry it as schema_hash too (or only)
         b.opsSchema = text("ops_schema");
+        if (b.opsSchema.empty()) b.opsSchema = text("schema_hash");
         if (auto it = j.find("dirty"); it != j.end() && it->is_boolean()) b.dirty = it->get<bool>();
-        if (auto it = j.find("api"); it != j.end() && it->is_number_integer()) b.api = it->get<int>();
+        for (const char* key : {"api", "engine_api"})
+            if (auto it = j.find(key); it != j.end() && b.api == 0) {
+                if (it->is_number_integer()) b.api = it->get<int>();
+                else if (it->is_string()) b.api = std::atoi(it->get<std::string>().c_str());
+            }
         return b;
     }
 

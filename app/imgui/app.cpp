@@ -395,6 +395,7 @@ namespace sirius::app::gui {
         std::vector<ImGuiKeyChord> keys;          // the first one is shown
         std::function<void()> run;
         std::function<bool()> enabled;            // null = always
+        std::function<std::string()> why;         // while disabled: the tooltip that says why ("" = `tip`)
         std::function<bool()> checked;            // null = not checkable
         std::function<std::string()> label;       // null = text
         std::string tip;
@@ -757,9 +758,23 @@ namespace sirius::app::gui {
             ops->openAddMenu();
         });
         separator();
-        add("Process", "Run all enabled", {keys::runAll}, [this] { self.runAll(); }).enabled = [this] { return wb().hasDataset() && !busy(); };
-        add("Process", "Run selected step", {keys::runSelected}, [this] { self.runSelectedStep(); }, "Run just this step; its input has to be computed already").enabled = [this] { return wb().hasDataset() && !busy() && stepOk(); };
-        add("Process", "Run to selected step", {}, [this] { self.runTo(wb().selectedIndex()); }, "Run every enabled step from the top down to this one").enabled = [this] { return wb().hasDataset() && !busy() && stepOk(); };
+        // every run entry point asks the workbench's gate (the HPC backend runs nothing without SIRIUS's engine)
+        const auto runWhy = [this] { return wb().runGate().why; };
+        {
+            Action& a = add("Process", "Run all enabled", {keys::runAll}, [this] { self.runAll(); });
+            a.enabled = [this] { return wb().hasDataset() && !busy() && wb().runGate().enabled; };
+            a.why = runWhy;
+        }
+        {
+            Action& a = add("Process", "Run selected step", {keys::runSelected}, [this] { self.runSelectedStep(); }, "Run just this step; its input has to be computed already");
+            a.enabled = [this] { return wb().hasDataset() && !busy() && stepOk() && wb().runGate().enabled; };
+            a.why = runWhy;
+        }
+        {
+            Action& a = add("Process", "Run to selected step", {}, [this] { self.runTo(wb().selectedIndex()); }, "Run every enabled step from the top down to this one");
+            a.enabled = [this] { return wb().hasDataset() && !busy() && stepOk() && wb().runGate().enabled; };
+            a.why = runWhy;
+        }
         add("Process", "Cancel", {ImGuiKey_Escape}, [this] { self.cancel(); }).enabled = [this] { return busy(); };
         separator();
         {
@@ -804,11 +819,15 @@ namespace sirius::app::gui {
             a.frozenByRun = true;
         }
         add("Segment", "Download model\xE2\x80\xA6", {}, [this] { self.modelHub(); });
-        add("Segment", "Run segmentation", {}, [this] {
-            const int i = self.segmentationStep();
-            if (i < 0) wb().logLine("Run segmentation: add a segmentation step first (Process \xE2\x96\xB8 Add operation).");
-            else bridge().startRun(i);
-        });
+        {
+            Action& a = add("Segment", "Run segmentation", {}, [this] {
+                const int i = self.segmentationStep();
+                if (i < 0) wb().logLine("Run segmentation: add a segmentation step first (Process \xE2\x96\xB8 Add operation).");
+                else bridge().startRun(i);
+            });
+            a.enabled = [this] { return wb().runGate().enabled; };
+            a.why = runWhy;
+        }
         separator();
         add("Segment", "Paint labels", {ImGuiKey_B}, [this] {
             wb().setTool(ViewerTool::Paint);
@@ -1157,6 +1176,8 @@ namespace sirius::app::gui {
                                 enabled ? theme::kNeutral600 : theme::kNeutral500, Weight::Regular, 1.0f, 0.5f);
         std::string tip = a.tip;
         if (!enabled && a.frozenByRun && busy()) tip = "Not while a run or load is in progress \xE2\x80\x94 cancel it (Esc) or wait";
+        if (!enabled && a.why)
+            if (std::string why = a.why(); !why.empty()) tip = std::move(why);
         if (!tip.empty() && ImGui::IsItemHovered(ImGuiHoveredFlags_ForTooltip | ImGuiHoveredFlags_AllowWhenDisabled)) widgets::tooltip(tip);
         return clicked && enabled;
     }
@@ -1496,8 +1517,14 @@ namespace sirius::app::gui {
             // The cluster session, when there is one: connected (green), connecting, or
             // disconnected and why (red); a click opens Connect to cluster.
             ImU32 hpcColor = theme::kNeutral600;
-            if (const std::string hpc = cluster ? cluster->indicator(hpcColor) : std::string(); !hpc.empty()) {
-                const std::string shown = widgets::elideText(hpc, px(360), 11);
+            std::string hpc = cluster ? cluster->indicator(hpcColor) : std::string();
+            // the HPC backend without SIRIUS's engine: why nothing can run, in red
+            if (const RunGate gate = w.runGate(); !gate.enabled) {
+                hpc = gate.why;
+                hpcColor = theme::kAccentText;
+            }
+            if (!hpc.empty()) {
+                const std::string shown = widgets::elideText(hpc, px(460), 11);
                 const float wd = theme::textSize(shown, 11).x;
                 const float x0 = limit - wd;
                 ImGui::SetCursorScreenPos(ImVec2(x0, top));

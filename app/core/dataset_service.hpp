@@ -17,6 +17,13 @@
 //           dtype: integers rounded), or the volume reduced to a longest side
 //   stats   a display window: the 0.1 / 99.9 percentiles of a few planes and the range
 //
+// Folder datasets -- a folder with its sirius-dataset.toml, a manifest .toml,
+// a folder of TIFF stacks without one (one stack per file, a time point
+// each), a zarr / N5 store -- are opened by the core's own openDataset
+// (core/array_source.hpp, core/manifest.hpp), lazily, as the application
+// opens them on its computer: the same dims, values (float32) and tiles; the
+// request's options may name the tile ("tile").
+//
 // Readers: TIFF / OME-TIFF / ImageJ hyperstacks through SIRIUS's own TIFF
 // reader, shaped exactly as openDataset shapes them (probeTiffDataset), with
 // nvTIFF on a CUDA device when the build has it and the request's "device"

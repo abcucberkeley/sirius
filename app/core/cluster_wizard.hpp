@@ -8,7 +8,8 @@
 //
 //   1 Connect   the SSH login: Next once logged in to the field's host
 //   2 Job       the job that holds a node: Next once Slurm gave it one
-//   3 Worker    the worker in the job: Finish once it answers
+//   3 Worker    the worker in the job: Finish once SIRIUS's engine answers
+//               (a worker without the engine is not ready: nothing would run)
 //   Summary     a session set up already: where it runs, how it is
 //
 // GUI-free: the tests check it as it is.
@@ -109,6 +110,14 @@ namespace sirius::app::cluster::wizard {
     // From the status (the hello's capabilities once connected), the profile
     // the worker was started with and this application's build.
     HealthReport healthReport(const Status& st, const Profile& p, const BuildInfo& app, std::chrono::steady_clock::time_point now);
+
+    // --- the HPC backend without an engine -------------------------------------------------
+    // SIRIUS's engine answers in this session: the HPC backend may run.
+    bool engineReady(const Status& st);
+    // Why the HPC backend can run nothing now, one line for the Run buttons'
+    // tooltips, the panels and the status bar ("HPC: no SIRIUS engine on the
+    // cluster \xE2\x80\x94 open Cluster to fix"); "" when the engine answers.
+    std::string hpcNoEngineReason(const Status& st);
 
 } // namespace sirius::app::cluster::wizard
 

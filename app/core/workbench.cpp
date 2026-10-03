@@ -87,9 +87,6 @@ namespace sirius::app {
             return message;
         }
 
-        // The refusal of a built-in step on a job without SIRIUS's engine (plan 4.3).
-        const char* const kNoEngine = "The cluster job runs the Python worker only (no SIRIUS engine): built-in steps cannot run there. "
-                                      "Reconnect with an engine image, or choose CPU/CUDA to run on this computer.";
 
         std::string bytesText(std::uint64_t bytes) {
             char buf[32];
@@ -432,7 +429,7 @@ namespace sirius::app {
                 for (int i = 1; i <= target_; ++i) {
                     const Step& s = pipeline_.at(i);
                     if (!s.enabled || executor_->isFresh(pipeline_, i) || s.op().needsWorker(s.params)) continue;
-                    error_ = "Step " + Step::number(i) + " " + s.name + ": " + kNoEngine;
+                    error_ = noEngineRefusal(i, s.name);
                     break;
                 }
             }
@@ -1963,11 +1960,34 @@ namespace sirius::app {
         return nullptr;
     }
 
+    std::string noEngineRefusal(int index, const std::string& stepName) {
+        return "Step " + Step::number(index) + " " + stepName +
+               " needs SIRIUS's C++ engine on the cluster, and this job has none: open Cluster \xE2\x96\xB8 Job \xE2\x96\xB8 More options, set Engine "
+               "builds folder, then Restart worker.";
+    }
+
+    RunGate Workbench::runGate() const {
+        if (backend_ != Backend::Hpc || remote_.hasEngine()) return {};
+        // not known (sirius-cli --hpc host:port): the run finds out when it connects
+        if (!remote_.known) return {};
+        return {false, remote_.noEngine.empty() ? std::string(kHpcNoEngine) : remote_.noEngine};
+    }
+
     std::shared_ptr<RunJob> Workbench::createRun(int target) {
         lastRunRefusal_ = RunRefusal{};
         if (activeRun_) return refuseRun(RunRefusal::Kind::Running, -1, "A run is already in progress.");
-        if (!source_) return refuseRun(RunRefusal::Kind::NoDataset, -1, "Open a dataset before running.");
         if (target < 0 || target >= pipeline_.size()) target = pipeline_.size() - 1;
+        // The HPC backend runs nothing without SIRIUS's engine: the first
+        // built-in step that would run is named, else the gate's reason.
+        if (const RunGate gate = runGate(); !gate.enabled) {
+            for (int i = 1; i <= target; ++i) {
+                const Step& s = pipeline_.at(i);
+                if (!s.enabled || executor_.isFresh(pipeline_, i) || s.op().needsWorker(s.params)) continue;
+                return refuseRun(RunRefusal::Kind::NoEngine, i, noEngineRefusal(i, s.name));
+            }
+            return refuseRun(RunRefusal::Kind::NoEngine, -1, gate.why);
+        }
+        if (!source_) return refuseRun(RunRefusal::Kind::NoDataset, -1, "Open a dataset before running.");
         bool needsWorker = false;
         for (int i = 1; i <= target; ++i) {
             const Step& s = pipeline_.at(i);
@@ -2014,12 +2034,6 @@ namespace sirius::app {
                                  std::string(dataset ? "The dataset is on this computer: " : "Files of this computer: ") + names +
                                      ". The HPC backend computes on the cluster node, so " + bytesText(bytes) +
                                      " would be uploaded there first. Upload them, or open the data from the cluster (cluster://\xE2\x80\xA6).");
-            }
-        } else if (backend_ == Backend::Hpc && remote_.known) {
-            for (int i = 1; i <= target; ++i) {
-                const Step& s = pipeline_.at(i);
-                if (!s.enabled || executor_.isFresh(pipeline_, i) || s.op().needsWorker(s.params)) continue;
-                return refuseRun(RunRefusal::Kind::NoEngine, i, "Step " + Step::number(i) + " " + s.name + ": " + kNoEngine);
             }
         }
         endPaintStroke();

@@ -204,6 +204,22 @@ sirius_core_unit(cluster           HEADERS cluster.hpp cluster_profiles.hpp clus
                                    SOURCES cluster.cpp cluster_profiles.cpp cluster_wizard.cpp
                                    DEPENDS remote_host rpc cancel errors build_info settings_toml
                                    PUBLIC_LINK nlohmann_json::nlohmann_json LINK Threads::Threads)
+# The worker's launch script (app/python/slurm/sirius_worker.sbatch) compiled
+# into the session: it is sent to the cluster with every worker start, so the
+# worker never runs whatever older copy the cluster's checkout holds.
+set(_sirius_worker_script ${CMAKE_CURRENT_SOURCE_DIR}/python/slurm/sirius_worker.sbatch)
+set(_sirius_worker_script_header ${_sirius_build_info_dir}/sirius_worker_script_generated.hpp)
+set(_sirius_worker_script_command ${CMAKE_COMMAND} -DINPUT=${_sirius_worker_script} -DOUTPUT=${_sirius_worker_script_header}
+    -DNAME=kSiriusWorkerScript -P ${PROJECT_SOURCE_DIR}/cmake/EmbedText.cmake)
+execute_process(COMMAND ${_sirius_worker_script_command})   # so the header exists from the start
+add_custom_command(OUTPUT ${_sirius_worker_script_header}
+    COMMAND ${_sirius_worker_script_command}
+    DEPENDS ${_sirius_worker_script} ${PROJECT_SOURCE_DIR}/cmake/EmbedText.cmake
+    COMMENT "The worker's launch script, into the application"
+    VERBATIM)
+add_custom_target(sirius_worker_script_header DEPENDS ${_sirius_worker_script_header})
+target_include_directories(sirius_core_cluster PRIVATE ${_sirius_build_info_dir})
+add_dependencies(sirius_core_cluster sirius_worker_script_header)
 # Arrays on the wire: zstd (the build's own, cmake/Dependencies.cmake) or zlib,
 # over shuffled bytes, as the client accepts.
 sirius_core_unit(array_codec       HEADERS array_codec.hpp   SOURCES array_codec.cpp
@@ -217,7 +233,7 @@ sirius_core_unit(rpc_server        HEADERS rpc_server.hpp    SOURCES rpc_server.
                                    DEPENDS rpc cancel errors PUBLIC_LINK nlohmann_json::nlohmann_json LINK Threads::Threads)
 # dataset_info / _read / _view / _stats in C++ (sirius_worker/datasets.py's replies).
 sirius_core_unit(dataset_service   HEADERS dataset_service.hpp SOURCES dataset_service.cpp
-                                   DEPENDS rpc_server array_codec array_source build_info host lib/buffer lib/device lib/tiff_io
+                                   DEPENDS rpc_server array_codec array_source manifest build_info host lib/buffer lib/device lib/tiff_io
                                    PUBLIC_LINK nlohmann_json::nlohmann_json LINK Threads::Threads)
 # The datasets that stay on the cluster, read by the worker or the engine there.
 sirius_core_unit(remote_source     HEADERS remote_source.hpp SOURCES remote_source.cpp

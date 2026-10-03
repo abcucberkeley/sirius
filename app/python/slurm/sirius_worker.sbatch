@@ -10,16 +10,19 @@
 # alone -- in its container image on a cluster node, for the application's
 # HPC backend.
 #
-# sirius-app starts it for you (Process > Connect to cluster...), in two
-# steps: Connect gets a job that only holds the allocation (sbatch --wrap
-# with the profile's partition, account, QoS, time and resources), then
-# Start worker runs this script inside that job as a step,
+# sirius-app starts it for you (the Cluster button), in two steps: Connect
+# gets a job that only holds the allocation (sbatch --wrap with the profile's
+# partition, account, QoS, time and resources), then Start worker runs this
+# script inside that job as a step,
 #
-#     srun --jobid=<job> --overlap --ntasks=1 [--gres=gpu:N] bash app/python/slurm/sirius_worker.sbatch
+#     srun --jobid=<job> --overlap --ntasks=1 [--gres=gpu:N] bash ~/.sirius/run/sirius_worker-<build>.sbatch
 #
-# from the SIRIUS checkout, with the image, the data folders and the token
-# file in its environment and its log in ~/.sirius/run. A new image or new
-# data folders restart only this step; the job stays.
+# with the image, the data folders, the worker's code (SIRIUS_WORKER_DIR) and
+# the token file in its environment and its log in ~/.sirius/run. The
+# application sends its own copy of this script there (named by its build)
+# before every start: a checkout on the cluster may be older than the
+# application, and its copy is never run. A new image or new data folders
+# restart only this step; the job stays.
 #
 # By hand it can be submitted as a job of its own. Give the shared secret in
 # a file only you can read -- the worker reads it and deletes it -- rather
@@ -68,17 +71,22 @@ if [[ -z "${SIRIUS_TOKEN_FILE:-}" && -z "${SIRIUS_TOKEN:-}" ]]; then
     exit 1
 fi
 
-# The worker package is app/python of the checkout the job was submitted from.
-# Slurm runs a copy of this script from its spool directory, so the script's
-# own location says nothing; SIRIUS_WORKER_DIR overrides the guess.
+# The worker package (sirius_worker): SIRIUS_WORKER_DIR, which the application
+# sets (the engine build's python/ folder, else the checkout's app/python).
+# By hand: the engine build's python/ when it has one, else app/python of the
+# checkout the job was submitted from. Slurm runs a copy of this script from
+# its spool directory, so the script's own location says nothing.
 WORKER_DIR="${SIRIUS_WORKER_DIR:-}"
 if [[ -z "${WORKER_DIR}" ]]; then
-    for candidate in "${SLURM_SUBMIT_DIR:-$PWD}/app/python" "${SLURM_SUBMIT_DIR:-$PWD}"                      "$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"; do
+    ENGINE_PY=()
+    [[ "${SIRIUS_ENGINE:-0}" == 1 && -n "${SIRIUS_ENGINE_DIR:-}" ]] && ENGINE_PY=("${SIRIUS_ENGINE_DIR}/python")
+    for candidate in ${ENGINE_PY[@]+"${ENGINE_PY[@]}"} "${SLURM_SUBMIT_DIR:-$PWD}/app/python" "${SLURM_SUBMIT_DIR:-$PWD}" \
+                     "$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"; do
         if [[ -f "${candidate}/sirius_worker/__main__.py" ]]; then WORKER_DIR="${candidate}"; break; fi
     done
 fi
-if [[ -z "${WORKER_DIR}" ]]; then
-    echo "cannot find sirius_worker: submit from the sirius checkout, or set SIRIUS_WORKER_DIR=<checkout>/app/python" >&2
+if [[ -z "${WORKER_DIR}" || ! -f "${WORKER_DIR}/sirius_worker/__main__.py" ]]; then
+    echo "cannot find sirius_worker${WORKER_DIR:+ in ${WORKER_DIR}}: submit from the sirius checkout, or set SIRIUS_WORKER_DIR=<checkout>/app/python" >&2
     exit 1
 fi
 export PYTHONPATH="${WORKER_DIR}${PYTHONPATH:+:$PYTHONPATH}"
@@ -105,19 +113,43 @@ ARGS=(--host 0.0.0.0 --port "${SIRIUS_PORT}" --device "${SIRIUS_DEVICE}" --max-c
 # starts the Python worker as its child on 127.0.0.1 (torch models, plugins).
 # SIRIUS_ENGINE_BIN names the executable: /opt/sirius/bin/sirius-cli in the
 # container image by default. SIRIUS_ENGINE_DIR, when set, is a per-commit
-# engine build (<engine_builds>/<commit>, with bin/sirius-cli and BUILD.json),
-# bound into the image so the image stays a stable runtime. The engine reads
-# the same token file and prints the same {"port": N} line.
+# engine build (<engine_builds>/<commit>, with bin/sirius-cli, lib/, python/
+# and BUILD.json), bound into the image so the image stays a stable runtime;
+# its lib/ goes in front of the image's library path. The engine reads the
+# same token file and prints the same {"port": N} line. Asked for and not
+# there, nothing starts: the Python worker alone is never started instead.
 CMD=(python -m sirius_worker "${ARGS[@]}")
+ENGINE_BIN=""
+ENGINE_HOME=""
 if [[ "${SIRIUS_ENGINE:-0}" == 1 ]]; then
     ENGINE_BIN="${SIRIUS_ENGINE_BIN:-}"
     if [[ -z "${ENGINE_BIN}" ]]; then
         if [[ -n "${SIRIUS_ENGINE_DIR:-}" ]]; then ENGINE_BIN="${SIRIUS_ENGINE_DIR}/bin/sirius-cli"; else ENGINE_BIN=/opt/sirius/bin/sirius-cli; fi
     fi
+    # the build folder the executable sits in (<home>/bin/sirius-cli), when it is on this file system
+    if [[ -n "${SIRIUS_ENGINE_DIR:-}" ]]; then
+        ENGINE_HOME="${SIRIUS_ENGINE_DIR}"
+    elif [[ "${ENGINE_BIN}" != /opt/sirius/bin/sirius-cli && -d "$(dirname "$(dirname "${ENGINE_BIN}")")" ]]; then
+        ENGINE_HOME="$(cd "$(dirname "$(dirname "${ENGINE_BIN}")")" && pwd)"
+    fi
     CMD=("${ENGINE_BIN}" serve "${ARGS[@]}" --python python --worker-dir "${WORKER_DIR}")
     [[ -n "${SIRIUS_ENGINE_SCRATCH:-}" ]] && CMD+=(--scratch "${SIRIUS_ENGINE_SCRATCH}")
+    # its own libraries (nvTIFF, nvCOMP) in front of the image's, set inside the image
+    if [[ -n "${ENGINE_HOME}" && -d "${ENGINE_HOME}/lib" ]]; then
+        CMD=(/bin/sh -c 'd=$1; shift; LD_LIBRARY_PATH="$d/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"; export LD_LIBRARY_PATH; exec "$@"' \
+             sirius-engine "${ENGINE_HOME}" "${CMD[@]}")
+    fi
     echo "SIRIUS engine: ${ENGINE_BIN} serve (the Python worker beside it, from ${WORKER_DIR})"
 fi
+
+# The engine was asked for and is not there: said on stdout in the form the
+# application reads ({"error": ...}) and on stderr, and nothing is started.
+engine_missing() {
+    local msg="SIRIUS's C++ engine is not at $1 ($2): set Engine builds folder (Job > More options) to the folder holding per-commit builds, or Engine executable to one"
+    printf '{"error": "engine_missing", "path": "%s"}\n' "$1"
+    echo "${msg}" >&2
+    exit 3
+}
 
 # --- the container -------------------------------------------------------------
 # SIRIUS_CONTAINER=<image.sif> runs the worker inside that image. This is the
@@ -154,6 +186,13 @@ fi
     if [[ ! -r "${SIRIUS_CONTAINER}" ]]; then
         echo "SIRIUS_CONTAINER=${SIRIUS_CONTAINER} is not readable" >&2; exit 1
     fi
+    # the engine, when asked for, is there before anything starts: on this file
+    # system (a build folder, bound into the image) or inside the image itself
+    if [[ "${SIRIUS_ENGINE:-0}" == 1 && ! -x "${ENGINE_BIN}" ]]; then
+        [[ -n "${ENGINE_HOME}" ]] && engine_missing "${ENGINE_BIN}" "no executable file there"
+        "${RUNTIME}" exec --cleanenv "${SIRIUS_CONTAINER}" test -x "${ENGINE_BIN}" </dev/null >/dev/null 2>&1 ||
+            engine_missing "${ENGINE_BIN}" "not in the image ${SIRIUS_CONTAINER}"
+    fi
     RUNDIR="${SIRIUS_RUNDIR:-$HOME/.sirius/run}"; mkdir -p "${RUNDIR}"
     TOKEN_FILE="${SIRIUS_TOKEN_FILE:-}"
     if [[ -z "${TOKEN_FILE}" ]]; then                 # only $SIRIUS_TOKEN was given
@@ -186,7 +225,7 @@ fi
         mkdir -p "${SIRIUS_ENGINE_SCRATCH}" || { echo "cannot make the node cache folder ${SIRIUS_ENGINE_SCRATCH}" >&2; exit 1; }
         SCRATCH=("${SIRIUS_ENGINE_SCRATCH}")
     fi
-    [[ "${SIRIUS_ENGINE:-0}" == 1 && -n "${SIRIUS_ENGINE_DIR:-}" ]] && SCRATCH+=("${SIRIUS_ENGINE_DIR}")
+    [[ "${SIRIUS_ENGINE:-0}" == 1 && -n "${ENGINE_HOME}" ]] && SCRATCH+=("${ENGINE_HOME}")
     for d in "${CHECKOUT}" "${RUNDIR}" ${SCRATCH[@]+"${SCRATCH[@]}"}; do
         case "$(cd "$d" && pwd -P)/" in "$(cd "$HOME" && pwd -P)/"*) ;; *) BIND+=(--bind "$d") ;; esac
     done

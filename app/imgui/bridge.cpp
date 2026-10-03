@@ -170,6 +170,12 @@ namespace sirius::app::gui {
             wb_.logLine("Wait for " + taskLabel_ + " to finish.");
             return false;
         }
+        // The window's buttons are disabled with this reason already; a start
+        // from anywhere else (a script, the viewer) is told the same, once.
+        if (const RunGate gate = wb_.runGate(); !gate.enabled) {
+            wb_.logLine(gate.why);
+            return false;
+        }
         std::shared_ptr<RunJob> job = wb_.createRun(target);
         if (!job) {
             // files of this computer the HPC engine needs: the window asks, never the bridge

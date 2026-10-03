@@ -94,7 +94,9 @@ namespace sirius::app::gui {
         void disconnect(bool cancelJob);
         // Asks whether to cancel the job too (default yes), then disconnects.
         void disconnectAsking();
-        // The HPC endpoint while connected (through the tunnel); empty host otherwise.
+        // The HPC endpoint while connected (through the tunnel); empty host
+        // otherwise. Without SIRIUS's engine answering it is known to have
+        // none (RemoteConfig::noEngine says why): the HPC backend runs nothing.
         RemoteConfig remoteConfig() const;
 
         // Once a frame: state changes, the pending prompt.
@@ -133,6 +135,9 @@ namespace sirius::app::gui {
         cluster::Session session_;
         std::shared_ptr<RemoteDatasets> datasets_;
         cluster::State lastState_ = cluster::State::Idle;
+        // the reason the workbench's HPC config was last given (hpcNoEngineReason)
+        bool synced_ = false;
+        std::string syncedWhy_;
         std::shared_ptr<std::atomic<bool>> alive_;
         std::thread disconnecting_;   // a disconnect, stop or new job, off the GUI thread
         // Runs `fn` on disconnecting_ (after the one before it).

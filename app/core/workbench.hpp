@@ -158,6 +158,10 @@ namespace sirius::app {
         // (sirius-cli --hpc): the run finds out when it connects.
         bool known = false;
         nlohmann::json engine;
+        // Known to have no engine (`known`, a null `engine`): why, in the
+        // words the run buttons show ("HPC: no SIRIUS engine on the cluster
+        // \xE2\x80\x94 open Cluster to fix"); "" = kHpcNoEngine.
+        std::string noEngine;
         // Where the results computed there are held, for the log and the ops
         // row: "fiona · n0042 · job 4711".
         std::string where;
@@ -181,6 +185,23 @@ namespace sirius::app {
     // executes the run. It throws WorkerStartError when the worker cannot
     // start, which the run and the plugin load keep for the host.
     using LocalWorkerLauncher = std::function<std::unique_ptr<RemoteWorker>()>;
+
+    // Whether a run may start now, and when not, why: one reason for every
+    // run entry point (the Run buttons, the Process menu, the shortcuts, the
+    // assistant's and the agents' run tool), shown where the button is
+    // rather than refused after it is pressed. The HPC backend runs nothing
+    // without SIRIUS's engine on the cluster: none started, the engine
+    // missing, the engine gone, the job ended, the connection lost.
+    struct RunGate {
+        bool enabled = true;
+        std::string why;
+    };
+    inline constexpr const char* kHpcNoEngine = "HPC: no SIRIUS engine on the cluster \xE2\x80\x94 open Cluster to fix";
+    // The refusal of a built-in step on a cluster job without SIRIUS's engine:
+    // "Step 02 Contrast needs SIRIUS's C++ engine on the cluster, and this job
+    // has none: open Cluster ▸ Job ▸ More options, set Engine builds folder,
+    // then Restart worker."
+    std::string noEngineRefusal(int index, const std::string& stepName);
 
     // Why the last createRun() returned null, for a caller that answers
     // with more than the log line (the headless tools map it to an error
@@ -469,6 +490,9 @@ namespace sirius::app {
         void setHpcDevice(HpcDevice d);
         const RemoteConfig& remoteConfig() const noexcept { return remote_; }
         void setRemoteConfig(RemoteConfig c);
+        // Whether a run may start (RunGate above); createRun refuses with
+        // the same reason, so a caller that did not ask first is told so.
+        RunGate runGate() const;
         // Every result held by the engine session `session` went away (its job
         // ended: `reason` says how): the steps keep their diagnostics, are no
         // longer fresh, and say so. "" = every engine session. Returns the

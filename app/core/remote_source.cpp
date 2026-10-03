@@ -207,6 +207,8 @@ namespace sirius::app {
             j["t"] = o.pageOrder->t;
             j["z"] = o.pageOrder->z;
         }
+        // a folder dataset's tile (the engine opens folders; the first tile is the default)
+        if (o.tile > 0) j["tile"] = o.tile;
         return j;
     }
 
@@ -281,8 +283,15 @@ namespace sirius::app {
         try {
             r = call(Lane::Reads, "dataset_info", {{"path", remotePath}, {"options", opts}});
         } catch (const std::exception& e) {
+            std::string what = e.what();
+            // an engine built before folder datasets were read on the cluster
+            if (what.find("folder datasets and zarr stores are not read on the cluster yet") != std::string::npos)
+                what = remotePath + " is a folder, and the cluster's SIRIUS engine is a build from before folder datasets were opened on the cluster: "
+                                    "build the engine of this application's commit into the Engine builds folder (app/python/slurm/README.md, "
+                                    "\"Engine builds\"), then Restart worker.";
             const std::lock_guard<std::mutex> g(infoMutex_);
-            infoErrors_[key] = {std::chrono::steady_clock::now(), e.what()};
+            infoErrors_[key] = {std::chrono::steady_clock::now(), what};
+            if (what != e.what()) throw std::runtime_error(what);
             throw;
         }
         const json& j = r.result;
@@ -315,6 +324,21 @@ namespace sirius::app {
             }
         if (options.channels) m.channels = *options.channels;
         if (options.sim) m.sim = *options.sim;
+        // a folder dataset's tiles (SIRIUS's engine says them)
+        if (j.contains("tiles") && j["tiles"].is_array()) {
+            for (const json& t : j["tiles"]) {
+                if (!t.is_object()) continue;
+                TileInfo ti;
+                ti.name = t.value("name", std::string());
+                if (t.contains("position_um") && t["position_um"].is_array() && t["position_um"].size() == 3)
+                    for (std::size_t k = 0; k < 3; ++k) ti.positionUm[k] = t["position_um"][k].is_number() ? t["position_um"][k].get<double>() : 0.0;
+                if (t.contains("grid_index") && t["grid_index"].is_array() && t["grid_index"].size() == 3)
+                    for (std::size_t k = 0; k < 3; ++k) ti.gridIndex[k] = t["grid_index"][k].is_number_integer() ? t["grid_index"][k].get<Index>() : 0;
+                m.tiles.push_back(std::move(ti));
+            }
+            m.tileIndex = j.value("tile", static_cast<Index>(0));
+        }
+        if (j.contains("acquisition") && j["acquisition"].is_string() && m.acquisition.empty()) m.acquisition = j["acquisition"].get<std::string>();
         m.normalizeChannels();
         const std::lock_guard<std::mutex> g(infoMutex_);
         infos_[key] = m;

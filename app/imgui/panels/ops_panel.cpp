@@ -637,8 +637,8 @@ namespace sirius::app::gui {
                         ty += px(2);
                         place(row.min.x + px(10), ty);
                         widgets::text(widgets::elideText("needs the SIRIUS engine on HPC", textW, 11), 11, theme::kNeutral600);
-                        tip(item.name + " runs on the cluster only with SIRIUS's engine in the job; this job runs the Python worker alone, so "
-                                        "it is refused on HPC. Choose CPU/CUDA to run it here, or reconnect with an engine image.");
+                        tip(item.name + " needs SIRIUS's C++ engine on the cluster, and this job has none: open Cluster \xE2\x96\xB8 Job \xE2\x96\xB8 More "
+                                        "options, set Engine builds folder, then Restart worker. Or choose CPU/CUDA to run it here.");
                         ty += h11;
                     }
                     if (!item.blurb.empty()) {
@@ -772,7 +772,10 @@ namespace sirius::app::gui {
             // footer metrics: it keeps its place at the bottom of the dock
             const float rule = theme::crispPen(theme::kRule);
             const float btnH = buttonHeight();
-            const float footerH = rule + px(12) + btnH + px(8) + btnH + px(12);
+            // the HPC backend without SIRIUS's engine: one line above Run all says why nothing runs
+            const RunGate gate = wb.runGate();
+            const float gateH = gate.enabled ? 0.0f : theme::snap(px(8) + theme::textSize("Ag", 11).y);
+            const float footerH = rule + px(12) + gateH + btnH + px(8) + btnH + px(12);
             const float listH = std::max(px(40), avail.y - headerH - footerH);
 
             // scrolling rows + add + legend
@@ -823,17 +826,22 @@ namespace sirius::app::gui {
                 const float width = std::max(px(40), avail.x - px(28));
                 App* a = &app;
 
-                place(origin.x + px(14), y + rule + px(12));
+                if (!gate.enabled) {
+                    place(origin.x + px(14), y + rule + px(10));
+                    widgets::text(widgets::elideText(gate.why, width, 11), 11, theme::kAccentText);
+                    tip(gate.why);
+                }
+                place(origin.x + px(14), y + rule + px(12) + gateH);
                 widgets::ButtonOpts run;
                 run.kind = widgets::ButtonKind::Primary;
                 run.width = dp(width);
-                run.enabled = !busy && wb.hasDataset();
+                run.enabled = !busy && wb.hasDataset() && gate.enabled;
                 const std::string label = running ? format("Running · %d %%", static_cast<int>(bridge.runFraction() * 100.0 + 0.5))
                                                   : std::string("Run all enabled");
                 if (widgets::button((label + "##runAll").c_str(), run)) app.runAll();
-                tip(widgets::withShortcut("Run every enabled step top to bottom", shortcutText(keys::runAll)));
+                tip(gate.enabled ? widgets::withShortcut("Run every enabled step top to bottom", shortcutText(keys::runAll)) : gate.why);
 
-                place(origin.x + px(14), y + rule + px(12) + btnH + px(8));
+                place(origin.x + px(14), y + rule + px(12) + gateH + btnH + px(8));
                 widgets::ButtonOpts exp;
                 exp.width = dp(width);
                 exp.enabled = wb.hasDataset() && !busy;

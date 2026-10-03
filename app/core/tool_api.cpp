@@ -396,6 +396,9 @@ namespace sirius::app {
                  // A failure, not a value: an {"error"} result would read as
                  // a run that failed, where nothing could run at all.
                  if (!runHook_) throw ToolFailure("unsupported", "running is not available in this context");
+                 // refused up front, as the window's Run buttons are: nothing runs on HPC without the engine
+                 if (const RunGate gate = wb_.runGate(); !gate.enabled)
+                     throw ToolFailure("no_engine", gate.why, "connect to the cluster with SIRIUS's engine (the Cluster button), or set_backend CPU or CUDA");
                  const int target = a.contains("step") ? resolveStep(a) : wb_.pipeline().size() - 1;
                  json r = runHook_(target);
                  std::string text = "Ran to step " + Step::number(target) + " · " + wb_.pipeline().at(target).name;
