@@ -203,6 +203,7 @@ namespace sirius::app {
         int cpuThreads = 0;                    // 0 = not said
         std::string hostname;
         std::string python;
+        std::string torch;                     // hello's "torch": its version in the worker ("" none, or not said)
         // What dataset_read / dataset_view replies may be compressed with,
         // best first ("zstd", "zlib"); empty for a worker without them.
         std::vector<std::string> encodings;

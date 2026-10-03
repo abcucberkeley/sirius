@@ -47,9 +47,10 @@ namespace sirius::app::gui {
     std::shared_ptr<Dialog> makeTrainingExportDialog(
         App& app, std::function<void(int stepIndex, const TrainingExportOptions& options)> accepted);
 
-    // Process ▸ Connect to cluster…: the profile, Connect, the checklist of
-    // the steps (SSH login, checks, submit, queue, start, hello) and what
-    // each found or why it failed; Disconnect. Not modal. (cluster_dialog.cpp)
+    // Process ▸ Connect to cluster…: a wizard of three pages (1 Connect: the
+    // login; 2 Job: the partition, the size, the image, the data folders and
+    // the job in the queue; 3 Worker: the worker started in the job and its
+    // health report), and a summary once set up. Not modal. (cluster_dialog.cpp)
     std::shared_ptr<Dialog> makeClusterDialog(App& app);
     // The cluster's files through the SSH session: path bar, Up, Home,
     // recent folders; `chosen` gets "cluster://<host>/<path>" of a file (or

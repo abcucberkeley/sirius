@@ -85,6 +85,9 @@ namespace sirius::app::gui {
         // Off the GUI thread: the job cancelled, then a new one with `profile`
         // (and its worker, when one ran). Asks first.
         void newJobAsking(const cluster::Profile& profile);
+        // Asks whether to cancel the held job (for one with other settings),
+        // then cancels it off the GUI thread; the login stays.
+        void changeJobAsking();
         // Builds a worker image in the held job (the cluster's paths).
         void buildImage(const cluster::Profile& profile, const std::string& defFile, const std::string& image);
         // Off the GUI thread (scancel takes a moment); `cancelJob` scancels.

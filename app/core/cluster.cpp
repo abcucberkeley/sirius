@@ -1126,7 +1126,7 @@ namespace sirius::app::cluster {
             auto kv = keyValues(r.out);
             if (kv["nosbatch"] == "1")
                 throw Failure{Step::Submit, "There is no sbatch on " + p.host + ": connect to the cluster's login node, the one you submit jobs from.", trim(r.err),
-                              "Set \"Cluster (SSH host)\" to the login node (ask your cluster's support which one that is)."};
+                              "Set Cluster on the Connect page to the login node (ask your cluster's support which one that is)."};
             std::string id;
             for (char c : kv["job"]) {   // "4711" or "4711;cluster"
                 if (std::isdigit(static_cast<unsigned char>(c))) id.push_back(c);
@@ -1134,7 +1134,7 @@ namespace sirius::app::cluster {
             }
             if (!r.ok() || id.empty())
                 throw Failure{Step::Submit, "sbatch refused the job.", trim(r.err.empty() ? r.out : r.err),
-                              "Check the partition, account, QoS, time limit and resources under Advanced \xE2\x96\xB8 Job (Log in lists what the cluster offers)."};
+                              "Check the partition, account, QoS, time limit and resources on the Job page (its lists are what the cluster offers)."};
             {
                 const std::lock_guard<std::mutex> g(m);
                 jobProfile = p;
@@ -1251,7 +1251,7 @@ namespace sirius::app::cluster {
                 throw Failure{Step::Checks, "No worker image is set: SIRIUS's worker runs in an Apptainer/Singularity image (.sif) on the cluster.", {}, "Pick the image under Worker image (Browse lists the cluster's files), or build one with \"Build an image\". "
                                                                                                                                                          "app/python/slurm/README.md says how images are made."};
             if (trim(p.checkout).empty())
-                throw Failure{Step::Checks, "No SIRIUS checkout on the cluster is set, and " + p.host + " did not say where your home folder is.", {}, "Set \"SIRIUS checkout on the cluster\" under Advanced \xE2\x96\xB8 Software to the folder you cloned SIRIUS into there."};
+                throw Failure{Step::Checks, "No SIRIUS checkout on the cluster is set, and " + p.host + " did not say where your home folder is.", {}, "Set \"SIRIUS checkout on the cluster\" under Job \xE2\x96\xB8 More options to the folder you cloned SIRIUS into there."};
             stepState(Step::Checks, StepStatus::Running, "the checkout, the image, the launcher");
             const std::string co = remotePathWord(p.checkout);
             std::string script;
@@ -1291,7 +1291,7 @@ namespace sirius::app::cluster {
                 throw Failure{Step::Checks, "There is no SIRIUS checkout at " + p.checkout + " on " + p.host + " (it needs app/python/sirius_worker and app/python/slurm).",
                               trim(r.err),
                               "Clone this SIRIUS repository there (the same version as this application), or set \"SIRIUS checkout on the cluster\" under "
-                              "Advanced \xE2\x96\xB8 Software to where it is."};
+                              "Job \xE2\x96\xB8 More options to where it is."};
             if (!trim(kv["home"]).empty()) update([&](Status& x) { x.home = trim(kv["home"]); });
             if (kv["image"] == "unreadable")
                 throw Failure{Step::Checks, "The worker image " + p.container + " on " + p.host + " cannot be read (test -r failed).", trim(r.err),
@@ -1306,7 +1306,7 @@ namespace sirius::app::cluster {
                               "Neither " + (p.launcher.empty() ? std::string("apptainer") : p.launcher) + " nor singularity can be run on " + p.host +
                                   " (module load was tried).",
                               trim(r.err),
-                              "Ask your cluster's support how to run apptainer there, or set \"Container launcher\" under Advanced \xE2\x96\xB8 Software to its full path."};
+                              "Ask your cluster's support how to run apptainer there, or set \"Container launcher\" under Job \xE2\x96\xB8 More options to its full path."};
             if (kv["c_rc"] != "0")
                 throw Failure{Step::Checks, "The worker image " + p.container + " cannot run the worker: sirius and numpy do not import in it.", trim(r.err), ask};
             std::string detail = "checkout \xC2\xB7 " + kv["launcher"] + " \xC2\xB7 image: python " + kv["c_pyver"] + ", sirius, numpy";
@@ -1349,7 +1349,7 @@ namespace sirius::app::cluster {
         static std::string engineBuildFix(const Profile& p) {
             return "Build the engine of this SIRIUS (commit " + buildInfo().commit.substr(0, 12) + ") into " +
                    (trim(p.engineBuilds).empty() ? std::string("the engine builds folder") : p.engineBuilds) +
-                   " -- app/python/slurm/README.md, \"Engine builds\", has the command -- or clear Engine builds under Advanced \xE2\x96\xB8 Software "
+                   " -- app/python/slurm/README.md, \"Engine builds\", has the command -- or clear Engine builds under Job \xE2\x96\xB8 More options "
                    "to use the image's own engine.";
         }
 
@@ -1376,7 +1376,7 @@ namespace sirius::app::cluster {
                       "fi\n";
             const ssh::CommandResult r = remote(script, std::chrono::seconds(30));
             const std::string s = keyValues(r.out)["scratch"];
-            const std::string where = "Choose another folder under Advanced \xE2\x96\xB8 Storage, or leave it empty to use the node's temporary folder.";
+            const std::string where = "Choose another folder under Job \xE2\x96\xB8 More options, or leave it empty to use the node's temporary folder.";
             if (s == "file") throw Failure{Step::Checks, "The node cache folder " + dir + " is a file on " + p.host + ", not a folder.", trim(r.err), where};
             if (s == "readonly") throw Failure{Step::Checks, "You cannot write to the node cache folder " + dir + " on " + p.host + ".", trim(r.err), where};
             StepState now;
@@ -2259,6 +2259,61 @@ namespace sirius::app::cluster {
         });
         impl_->say("HPC: the worker was stopped; job " + id + " is still held");
         impl_->startKeeper();
+    }
+
+    void Session::cancelJob() {
+        impl_->stopKeeperThread();
+        impl_->stopWorkerThread();
+        impl_->stopBuilderThread();
+        {
+            const std::lock_guard<std::mutex> g(impl_->controlMutex);
+            impl_->control.reset();
+        }
+        std::string id, note;
+        bool ended = false;
+        {
+            const std::lock_guard<std::mutex> g(impl_->m);
+            id = impl_->status.jobId;
+        }
+        auto s = impl_->sshSession();
+        const bool up = s && s->isOpen();
+        if (!id.empty() && up) {
+            try {
+                const ssh::CommandResult r = s->run("scancel " + id, std::chrono::seconds(30));
+                ended = r.ok();
+                note = ended ? "job " + id + " cancelled" : "scancel " + id + " failed: " + trim(r.err);
+            } catch (const std::exception& e) {
+                note = "scancel " + id + " failed: " + e.what();
+            }
+        }
+        if (ended) {
+            const std::lock_guard<std::mutex> g(impl_->m);
+            impl_->workerLog.clear();
+            impl_->workerPort = 0;
+            impl_->reattachJob.clear();
+        }
+        impl_->update([&](Status& x) {
+            x.state = up ? State::Idle : State::Disconnected;
+            x.since = std::chrono::steady_clock::now();
+            x.reason = note;
+            x.remoteOutput.clear();
+            x.fix.clear();
+            x.dropped = false;
+            x.sshUp = up;
+            x.caps = WorkerCapabilities{};
+            x.engineBuild.clear();
+            x.engineBuildNote.clear();
+            for (std::size_t i = 1; i < x.steps.size(); ++i) x.steps[i] = StepState{};
+            if (ended) {
+                x.jobId.clear();
+                x.node.clear();
+                x.jobState.clear();
+                x.jobLimitSeconds = -2;
+                x.jobStarted = {};
+                x.jobEnded = true;
+            }
+        });
+        impl_->say("HPC: " + (note.empty() ? std::string("no job to cancel") : note) + (up ? "; still logged in" : std::string()));
     }
 
     void Session::buildImage(const Profile& profile, const std::string& defFile, const std::string& image) {

@@ -459,7 +459,7 @@ namespace sirius::app::cluster {
         json flat = json::object();
         flat[profileKey(p.displayName())] = p.toJson();
         return "# A SIRIUS cluster profile. Import it with Process > Connect to cluster... >\n"
-               "# Import..., or paste it into your settings file (Preferences > Edit settings file...).\n"
+               "# ... > Import..., or paste it into your settings file (Preferences > Edit settings file...).\n"
                "# It holds no password and no token.\n" +
                settings_toml::toToml(flat, false);
     }

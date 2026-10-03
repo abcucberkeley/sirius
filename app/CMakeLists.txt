@@ -200,7 +200,8 @@ sirius_core_unit(settings_store    HEADERS settings_store.hpp SOURCES settings_s
                                    DEPENDS host settings_toml PUBLIC_LINK nlohmann_json::nlohmann_json)
 # The Slurm session (after build_info: an engine of other operations is refused
 # at its hello), and the cluster profiles as the settings file keeps them.
-sirius_core_unit(cluster           HEADERS cluster.hpp cluster_profiles.hpp SOURCES cluster.cpp cluster_profiles.cpp
+sirius_core_unit(cluster           HEADERS cluster.hpp cluster_profiles.hpp cluster_wizard.hpp
+                                   SOURCES cluster.cpp cluster_profiles.cpp cluster_wizard.cpp
                                    DEPENDS remote_host rpc cancel errors build_info settings_toml
                                    PUBLIC_LINK nlohmann_json::nlohmann_json LINK Threads::Threads)
 # Arrays on the wire: zstd (the build's own, cmake/Dependencies.cmake) or zlib,

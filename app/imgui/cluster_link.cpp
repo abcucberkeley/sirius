@@ -127,6 +127,15 @@ namespace sirius::app::gui {
                      }); }, 0);
     }
 
+    void ClusterLink::changeJobAsking() {
+        const cluster::Status st = status();
+        if (st.jobId.empty()) return;
+        const bool worker = st.state == cluster::State::Connected;
+        app_.ask("Change the job", "Cancel job " + st.jobId + " on " + st.host + " to ask for one with other settings?" + (worker ? " The worker in it stops, and what it holds is lost." : std::string()) + " You stay logged in.", {"Keep the job", "Cancel the job"}, [this](int answer) {
+                     if (answer != 1) return;
+                     offThread([this] { session_.cancelJob(); }); }, 0);
+    }
+
     void ClusterLink::buildImage(const cluster::Profile& profile, const std::string& defFile, const std::string& image) {
         session_.buildImage(prepared(profile), defFile, image);
     }

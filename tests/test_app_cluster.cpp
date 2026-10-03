@@ -32,6 +32,7 @@
 #include "core/build_info.hpp"
 #include "core/cluster.hpp"
 #include "core/cluster_profiles.hpp"
+#include "core/cluster_wizard.hpp"
 #include "core/settings_toml.hpp"
 #include "core/errors.hpp"
 #include "core/host.hpp"
@@ -2075,14 +2076,27 @@ TEST_CASE("cluster: the job first, then the worker in it; a new image restarts o
     cluster::Profile r = q;
     r.partition = "dgx";
     CHECK(cluster::profileChange(session.profile(), r).newJob);
-    session.disconnect(true);
+    // Change job: the job cancelled, the login kept (no second ssh)
+    const auto logins = countOf(fc.sshLog(), "argv ");
+    session.cancelJob();
     CHECK(readAll(fc.slurm / "cancelled").find("4711") != std::string::npos);
+    st = session.status();
+    CHECK(st.state == cluster::State::Idle);
+    CHECK(st.sshUp);
+    CHECK(st.jobId.empty());
+    CHECK(st.node.empty());
+    CHECK(st.steps[0].status == cluster::StepStatus::Done);
+    CHECK(st.steps[1].status == cluster::StepStatus::Pending);
+    CHECK(cluster::wizard::loggedIn(st, p.host));
+    CHECK(cluster::wizard::startJobGate(st, p.host).enabled);
+    CHECK_FALSE(session.hasJobRunning());
     session.connectJob(r);
     REQUIRE(waitFor([&] { return settled(session); }, std::chrono::seconds(120)));
     st = session.status();
     CHECK(st.state == cluster::State::JobReady);
     CHECK(st.jobId == "4712");
     CHECK(readAll(fc.slurm / "4712.args").find("--partition=dgx") != std::string::npos);
+    CHECK(countOf(fc.sshLog(), "argv ") == logins);   // the same login
     session.disconnect(true);
     setEnv("FAKE_CONTAINER_SITE", "");
 }
@@ -2138,4 +2152,287 @@ TEST_CASE("cluster: an image is built in the held job where the cluster allows i
     CHECK(b.why.find("fakeroot") != std::string::npos);
     CHECK_FALSE(fs::exists(fc.home / "other.sif"));
     session.disconnect(true);
+}
+
+TEST_CASE("cluster wizard: each page's Next waits for what the page is for; the dialog opens where the session is", "[app][cluster]") {
+    namespace wz = cluster::wizard;
+    using wz::Page;
+    cluster::Status st;
+    const std::string host = "fiona";
+
+    // nothing yet: page 1, Connect needs a host, Next waits for the login
+    CHECK(wz::openingPage(st, host) == Page::Connect);
+    CHECK_FALSE(wz::connectGate(st, "").enabled);
+    CHECK(wz::connectGate(st, host).enabled);
+    CHECK_FALSE(wz::nextGate(Page::Connect, st, host).enabled);
+    CHECK(wz::nextGate(Page::Connect, st, host).why.find("Connect first") != std::string::npos);
+    CHECK_FALSE(wz::startJobGate(st, host).enabled);
+    CHECK_FALSE(wz::pageDone(Page::Connect, st, host));
+
+    // logging in
+    st.state = cluster::State::Connecting;
+    st.steps[0].status = cluster::StepStatus::Running;
+    CHECK(wz::openingPage(st, host) == Page::Connect);
+    CHECK_FALSE(wz::nextGate(Page::Connect, st, host).enabled);
+    CHECK_FALSE(wz::connectGate(st, host).enabled);
+
+    // logged in (Idle again, the SSH session up for this host): Next, Start job
+    st.state = cluster::State::Idle;
+    st.steps[0].status = cluster::StepStatus::Done;
+    st.sshUp = true;
+    st.host = host;
+    CHECK(wz::nextGate(Page::Connect, st, host).enabled);
+    CHECK(wz::pageDone(Page::Connect, st, host));
+    CHECK_FALSE(wz::nextGate(Page::Connect, st, "other").enabled);   // logged in to another host
+    CHECK(wz::startJobGate(st, host).enabled);
+    CHECK_FALSE(wz::nextGate(Page::Job, st, host).enabled);
+    CHECK_FALSE(wz::startWorkerGate(st, "/x.sif").enabled);
+
+    // the job in the queue: page 2, Next waits
+    st.state = cluster::State::Connecting;
+    st.steps[1].status = cluster::StepStatus::Done;
+    st.steps[2] = cluster::StepState{cluster::StepStatus::Running, "job 4711 \xC2\xB7 PENDING (Resources) \xC2\xB7 0:42"};
+    st.jobId = "4711";
+    CHECK(wz::openingPage(st, host) == Page::Job);
+    CHECK_FALSE(wz::nextGate(Page::Job, st, host).enabled);
+    CHECK_FALSE(wz::startJobGate(st, host).enabled);
+
+    // the job runs: Next; the worker needs an image
+    st.state = cluster::State::JobReady;
+    st.steps[2] = cluster::StepState{cluster::StepStatus::Done, "job 4711 runs on g0003"};
+    st.node = "g0003";
+    CHECK(wz::openingPage(st, host) == Page::Job);   // a reattached job shows on its page
+    CHECK(wz::nextGate(Page::Job, st, host).enabled);
+    CHECK(wz::pageDone(Page::Job, st, host));
+    CHECK_FALSE(wz::startJobGate(st, host).enabled);     // Change job… instead
+    CHECK_FALSE(wz::connectGate(st, "other").enabled);   // tied to its host until disconnected
+    CHECK_FALSE(wz::startWorkerGate(st, "").enabled);
+    CHECK(wz::startWorkerGate(st, "").why.find("image") != std::string::npos);
+    CHECK(wz::startWorkerGate(st, "/x.sif").enabled);
+    CHECK_FALSE(wz::nextGate(Page::Worker, st, host).enabled);
+
+    // the worker starting, then failed: page 3, Finish waits
+    st.state = cluster::State::Starting;
+    CHECK(wz::openingPage(st, host) == Page::Worker);
+    CHECK_FALSE(wz::nextGate(Page::Worker, st, host).enabled);
+    CHECK_FALSE(wz::startWorkerGate(st, "/x.sif").enabled);
+    st.state = cluster::State::JobReady;
+    st.steps[3] = cluster::StepState{cluster::StepStatus::Failed, "No worker image is set"};
+    CHECK(wz::openingPage(st, host) == Page::Worker);
+    CHECK(wz::nextGate(Page::Worker, st, host).why.find("did not start") != std::string::npos);
+
+    // the worker answers: Finish; the dialog opens on the summary
+    st.state = cluster::State::Connected;
+    for (int i = 3; i < cluster::kStepCount; ++i) st.steps[static_cast<std::size_t>(i)].status = cluster::StepStatus::Done;
+    CHECK(wz::nextGate(Page::Worker, st, host).enabled);
+    CHECK(wz::pageDone(Page::Worker, st, host));
+    CHECK(wz::openingPage(st, host) == Page::Summary);
+
+    // a login that failed: page 1 again
+    cluster::Status failed;
+    failed.state = cluster::State::Disconnected;
+    failed.steps[0] = cluster::StepState{cluster::StepStatus::Failed, "SSH login to fiona failed"};
+    CHECK(wz::openingPage(failed, host) == Page::Connect);
+    // sbatch refused, still logged in: the job page
+    cluster::Status refused;
+    refused.state = cluster::State::Disconnected;
+    refused.sshUp = true;
+    refused.host = host;
+    refused.steps[0].status = cluster::StepStatus::Done;
+    refused.steps[1] = cluster::StepState{cluster::StepStatus::Failed, "sbatch refused the job."};
+    refused.reason = "sbatch refused the job.";
+    CHECK(wz::openingPage(refused, host) == Page::Job);
+    CHECK(wz::startJobGate(refused, host).enabled);
+}
+
+TEST_CASE("cluster wizard: the login's outcome in plain words, ssh's own output kept for Details", "[app][cluster]") {
+    namespace wz = cluster::wizard;
+    using K = wz::LoginOutcome::Kind;
+    cluster::Status st;
+    CHECK(wz::loginOutcome(st, "fiona", "").kind == K::None);
+    st.sshUp = true;
+    st.host = "fiona";
+    wz::LoginOutcome o = wz::loginOutcome(st, "fiona", "velat");
+    CHECK(o.kind == K::Ok);
+    CHECK(o.text == "Connected to fiona as velat");
+
+    st = cluster::Status{};
+    st.state = cluster::State::Disconnected;
+    st.steps[0] = cluster::StepState{cluster::StepStatus::Failed, "SSH login to fiona failed: the SSH connection ended."};
+    st.reason = st.steps[0].detail;
+    st.remoteOutput = "velat@fiona: Permission denied (keyboard-interactive).";
+    o = wz::loginOutcome(st, "fiona", "");
+    CHECK(o.kind == K::Failed);
+    CHECK(o.text.rfind("Wrong password", 0) == 0);
+    CHECK(o.details == st.remoteOutput);
+
+    const auto words = [](const std::string& out) {
+        return wz::loginFailureWords("fiona", "SSH login to fiona failed: the SSH connection ended.", out);
+    };
+    CHECK(words("ssh: Could not resolve hostname fiona: No such host is known.").rfind("Host not found", 0) == 0);
+    CHECK(words("ssh: connect to host fiona port 22: Connection timed out").rfind("No answer from fiona (timed out)", 0) == 0);
+    CHECK(words("ssh: connect to host fiona port 22: Connection refused").rfind("fiona refused the connection", 0) == 0);
+    CHECK(words("ssh: connect to host fiona port 22: Network is unreachable").find("cannot reach fiona") != std::string::npos);
+    CHECK(words("Host key verification failed.").find("host key") != std::string::npos);
+    CHECK(words("Received disconnect from 1.2.3.4: Too many authentication failures").rfind("Too many keys", 0) == 0);
+    CHECK(words("").find("closed the connection") != std::string::npos);   // the session's own words
+    CHECK(wz::loginFailureWords("fiona", "Login cancelled: nothing was sent for the prompt you closed.", "") ==
+          "Login cancelled: nothing was sent for the prompt you closed.");
+    CHECK(wz::loginFailureWords("fiona", "something else", "") == "something else");
+}
+
+TEST_CASE("cluster wizard: the job's line says queued and why, then where it runs and the time left", "[app][cluster]") {
+    namespace wz = cluster::wizard;
+    using K = wz::JobLine::Kind;
+    const auto now = std::chrono::steady_clock::now();
+    cluster::Status st;
+    CHECK(wz::jobLine(st, now).kind == K::None);
+    st.state = cluster::State::Connecting;
+    st.steps[0].status = cluster::StepStatus::Done;
+    st.steps[1] = cluster::StepState{cluster::StepStatus::Running, "sbatch"};
+    CHECK(wz::jobLine(st, now).text == "Submitting the job\xE2\x80\xA6");
+    st.steps[1].status = cluster::StepStatus::Done;
+    st.jobId = "4711";
+    st.steps[2] = cluster::StepState{cluster::StepStatus::Running, "job 4711 \xC2\xB7 PENDING (Resources) \xC2\xB7 0:42"};
+    wz::JobLine l = wz::jobLine(st, now);
+    CHECK(l.kind == K::Busy);
+    CHECK(l.text == "Job 4711 queued (waiting for Resources) \xC2\xB7 waited 0:42");
+    st.state = cluster::State::JobReady;
+    st.node = "g0003.abc0";
+    st.jobLimitSeconds = 3600;
+    st.jobStarted = now - std::chrono::minutes(10);
+    l = wz::jobLine(st, now);
+    CHECK(l.kind == K::Running);
+    CHECK(l.text == "Running on g0003.abc0 \xC2\xB7 job 4711 \xC2\xB7 50 min left");
+    st.jobLimitSeconds = -1;
+    CHECK(wz::timeLeftText(st, now) == "no time limit");
+
+    cluster::Status refused;
+    refused.state = cluster::State::Disconnected;
+    refused.steps[1] = cluster::StepState{cluster::StepStatus::Failed, "sbatch refused the job."};
+    refused.reason = "sbatch refused the job.";
+    l = wz::jobLine(refused, now);
+    CHECK(l.kind == K::Failed);
+    CHECK(l.text == "sbatch refused the job.");
+}
+
+TEST_CASE("cluster wizard: the worker's health report from its hello", "[app][cluster]") {
+    namespace wz = cluster::wizard;
+    using M = wz::Mark;
+    using V = wz::HealthReport::Verdict;
+    const auto now = std::chrono::steady_clock::now();
+    BuildInfo app;
+    app.version = "0.1.0";
+    app.build = "0.1.0+gabc";
+    app.commit = "abcdef0123456789";
+    app.opsSchema = "ops1";
+    cluster::Profile p;
+    p.gpus = 1;
+    p.cpus = 8;
+    p.mem = "64G";
+    p.bind = "/data,/scratch/me";
+    p.engine = true;
+
+    const auto find = [](const wz::HealthReport& r, const std::string& label) -> const wz::HealthRow* {
+        for (const wz::HealthRow& row : r.rows)
+            if (row.label == label) return &row;
+        return nullptr;
+    };
+
+    // no worker yet: the steps it goes through
+    cluster::Status st;
+    st.state = cluster::State::JobReady;
+    st.jobId = "4711";
+    st.node = "g0003.abc0";
+    wz::HealthReport r = wz::healthReport(st, p, app, now);
+    CHECK(r.verdict == V::None);
+    REQUIRE(find(r, "Image checks"));
+    CHECK(find(r, "Image checks")->value == "not yet");
+
+    // it failed: the reason, the fix, the cluster's words
+    st.steps[3] = cluster::StepState{cluster::StepStatus::Failed, "The worker image /x.sif is not there."};
+    st.reason = "The worker image /x.sif is not there.";
+    st.fix = "Pick the image under Worker image.";
+    st.remoteOutput = "ls: /x.sif: No such file";
+    r = wz::healthReport(st, p, app, now);
+    CHECK(r.verdict == V::Failed);
+    CHECK(r.headline == "Not ready: The worker image /x.sif is not there.");
+    CHECK(r.fix == st.fix);
+    CHECK(r.details == st.remoteOutput);
+    CHECK(find(r, "Image checks")->mark == M::Fail);
+
+    // the engine's hello
+    st = cluster::Status{};
+    st.state = cluster::State::Connected;
+    st.jobId = "4711";
+    st.node = "g0003.abc0";
+    st.jobLimitSeconds = 3600;
+    st.jobStarted = now - std::chrono::minutes(10);
+    st.engineBuild = "/home/me/engines/abcdef0";
+    st.caps.gpus = {GpuInfo{"NVIDIA A100-SXM4-80GB", 81920}};
+    st.caps.cuda = true;
+    st.caps.cudaUsable = true;
+    st.caps.device = "cuda:0 \xC2\xB7 NVIDIA A100-SXM4-80GB \xC2\xB7 80 GB";
+    st.caps.cpuThreads = 64;
+    st.caps.tiffReader = "0.1.0";
+    nlohmann::json engine = toJson(app);
+    engine["cuda"] = {{"devices", nlohmann::json::array()}, {"nvtiff", true}};
+    engine["python"] = {{"state", "ready"}, {"caps", {{"torch", "2.5.1+cu124"}}}};
+    st.caps.engine = engine;
+    r = wz::healthReport(st, p, app, now);
+    INFO(r.headline);
+    CHECK(r.verdict == V::Ready);
+    CHECK(r.headline == "Ready");
+    CHECK(find(r, "Node")->value == "g0003.abc0 \xC2\xB7 job 4711");
+    CHECK(find(r, "GPU")->value == "1\xC3\x97 A100 80 GB");
+    CHECK(find(r, "CUDA")->mark == M::Ok);
+    CHECK(find(r, "torch")->value == "2.5.1+cu124");
+    CHECK(find(r, "sirius package")->value == "0.1.0");
+    CHECK(find(r, "nvTIFF")->mark == M::Ok);
+    const wz::HealthRow* e = find(r, "C++ engine");
+    REQUIRE(e);
+    CHECK(e->mark == M::Ok);
+    CHECK(e->value.find("0.1.0+gabc (abcdef0123)") != std::string::npos);
+    CHECK(e->value.find("this application's build") != std::string::npos);
+    CHECK(e->value.find("from /home/me/engines/abcdef0") != std::string::npos);
+    CHECK(find(r, "CPU threads")->value.find("64 on the node") != std::string::npos);
+    CHECK(find(r, "Memory")->value == "64G (the job's)");
+    CHECK(find(r, "Data folders")->value == "/data, /scratch/me (and your home folder)");
+    CHECK(find(r, "Job time left")->value == "50 min left");
+
+    // another commit of the same operations; an engine of other operations
+    engine["commit"] = "1234567";
+    st.caps.engine = engine;
+    CHECK(find(wz::healthReport(st, p, app, now), "C++ engine")->value.find("compatible (same operations)") != std::string::npos);
+    engine["ops_schema"] = "ops2";
+    st.caps.engine = engine;
+    r = wz::healthReport(st, p, app, now);
+    CHECK(find(r, "C++ engine")->mark == M::Fail);
+    CHECK(r.headline == "Ready, with 1 warning");
+
+    // the Python worker alone, without CUDA, the sirius package or torch
+    st.caps = WorkerCapabilities{};
+    st.caps.gpus = {GpuInfo{"NVIDIA A100-SXM4-80GB", 81920}};
+    st.caps.cudaReason = "no CUDA library in the worker's environment";
+    st.caps.device = "cpu \xC2\xB7 8 threads";
+    r = wz::healthReport(st, p, app, now);
+    CHECK(r.verdict == V::Ready);
+    CHECK(find(r, "CUDA")->value == "not usable: no CUDA library in the worker's environment");
+    CHECK(find(r, "CUDA")->mark == M::Warn);
+    CHECK(find(r, "torch")->mark == M::Warn);
+    CHECK(find(r, "sirius package")->mark == M::Warn);
+    CHECK(find(r, "C++ engine")->mark == M::Warn);
+    CHECK(find(r, "nvTIFF")->mark == M::Info);
+    CHECK(r.headline == "Ready, with 4 warnings");
+    st.caps.torch = "2.4.0";
+    CHECK(find(wz::healthReport(st, p, app, now), "torch")->value == "2.4.0");
+    // no GPU asked for: none is not a warning
+    p.gpus = 0;
+    st.caps.gpus.clear();
+    r = wz::healthReport(st, p, app, now);
+    CHECK(find(r, "GPU")->mark == M::Info);
+    CHECK(find(r, "CUDA")->mark == M::Info);
+    // little time left
+    st.jobStarted = now - std::chrono::minutes(55);
+    CHECK(find(wz::healthReport(st, p, app, now), "Job time left")->mark == M::Warn);
 }

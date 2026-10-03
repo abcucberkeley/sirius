@@ -498,6 +498,10 @@ namespace sirius::app::cluster {
         // Ends the worker step; the job stays held (JobReady). Blocks for as
         // long as scancel takes.
         void stopWorker();
+        // Cancels the held job (scancel; its worker goes with it) and keeps
+        // the login: Idle, logged in, for a job with other settings. Blocks
+        // for as long as scancel takes.
+        void cancelJob();
         // Stops a connect in progress (the prompt included).
         void cancelConnect();
         // Closes the worker connection and ssh; with `cancelJob` scancels the

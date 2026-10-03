@@ -16,13 +16,12 @@ SIRIUS checkout on the cluster (its `app/python` is the worker's code).
    image (`.sif`). Someone at your site may have one; otherwise the
    application builds it (step 4).
 2. **In the application**: the *Cluster* button in the title bar (or
-   *Process ▸ Connect to cluster…*), *Cluster profile ▸ New cluster…*, and
-   *Cluster (SSH host)*: an alias of your `~/.ssh/config` (with its user,
-   ProxyJump and keys) or `user@login.example.org`.
-3. **Connect** (*1 The job*): one SSH login — a password or one-time code
-   is asked in the application and handed to ssh only, never stored — then a
-   job that only holds a node, with the profile's partition, account, QoS,
-   time and resources:
+   *Process ▸ Connect to cluster…*), page *1 Connect*: *Cluster*, an alias of your `~/.ssh/config` (with its user,
+   ProxyJump and keys) or `user@login.example.org`; *⋯ ▸ New cluster profile*
+   for another cluster. **Connect**: one SSH login — a password or one-time
+   code is asked in the application and handed to ssh only, never stored.
+3. **Start job** (page *2 Job*): a job that only holds a node, with the
+   node type (partition), account, QoS, time and resources chosen there:
 
    ```
    sbatch --parsable --job-name=sirius --output=$HOME/.sirius/run/sirius-job-%j.log \
@@ -32,16 +31,16 @@ SIRIUS checkout on the cluster (its `app/python` is the worker's code).
 
    The login fills what the profile leaves empty from the cluster itself:
    the default partition (`sinfo`'s `*`), your account and QoS for it
-   (`sacctmgr`), the checkout as `<home>/sirius`. The checklist follows the
+   (`sacctmgr`), the checkout as `<home>/sirius`. The job's line follows the
    queue (state, reason, time waited) until the job runs on its node.
-4. **Worker image** and **Data folders**: pick the image with *Browse…*
+4. **Worker image** and **Data folders** (page *2 Job* as well): pick the image with *Browse…*
    (the cluster's files), and the folders your datasets live in with
    *Add folder…* (they are bound into the image; your home folder always is).
-   No image yet: *Build an image* runs `apptainer build --fakeroot` inside the
+   No image yet: *More options… ▸ Build an image* runs `apptainer build --fakeroot` inside the
    job, after checking with a tiny test build that the cluster allows
    unprivileged builds (it says so plainly when it does not — then use an
    image someone built).
-5. **Start worker** (*2 The worker*): the checks (srun, the checkout, the
+5. **Start worker** (page *3 Worker*): the checks (srun, the checkout, the
    image there and readable, `import sirius, numpy` inside it, the launcher
    — `module load apptainer` is tried — each data folder, the engine build,
    the node cache folder), then the worker as a step of the held job:
@@ -62,21 +61,21 @@ has the host, the job, the node and the time left. A worker that stops
 leaves the job held (*no worker yet*); a job that ends (TIMEOUT, CANCELLED)
 or a connection that drops is said in red, with the reason. *Disconnect…*
 (and quitting) asks whether to `scancel` the job; one left running is taken
-up again — with its worker, and what that holds — by the next *Connect*.
+up again — with its worker, and what that holds — by the next *Start job*.
 
 Changes while connected: another image, other data folders or software
-settings restart only the worker step, in the same job; another partition,
-account, QoS, time or size needs a new job (the dialog asks before
-cancelling the running one).
+settings restart only the worker step, in the same job (*Restart worker*);
+another partition, account, QoS, time or size needs a new job (*Change job…*
+on page 2 asks before cancelling the running one, and keeps the login).
 
-**Advanced settings** (each field has a tooltip): the job's partition,
+**The job's choices** (each field has a tooltip): the node type (partition),
 account, QoS and time limit are dropdowns — the profile's own choices first,
 then what the cluster reports (`sinfo -h -o '%P|%a|%l|%D|%t|%G|%c|%m'`,
 `sacctmgr -n -P show assoc user="$USER" format=partition,account,qos,defaultqos`,
 `sacctmgr -n -P show qos format=name,maxwall`, `scontrol -o show partition`;
 only sinfo has to answer), marked *from the cluster*, with *Add … to my
 settings*; a partition whose jobs take whole nodes, or whose GPUs a group
-shares (a DGX), shows a warning. Then the SIRIUS checkout, the launcher, an
+shares (a DGX), shows a warning. *More options…* holds the SIRIUS checkout, the launcher, an
 extra `PYTHONPATH`, the C++ engine and its builds folder (below), and the
 node cache folder (the engine's `--scratch`: a node's local disk is fastest;
 empty is the node's temporary folder).

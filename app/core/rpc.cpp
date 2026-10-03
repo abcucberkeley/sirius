@@ -833,6 +833,7 @@ namespace sirius::app {
         parseWorkerHardware(r, caps_);
         caps_.hostname = r.value("hostname", "");
         caps_.python = r.value("python", "");
+        if (r.contains("torch") && r["torch"].is_string()) caps_.torch = r["torch"].get<std::string>();
         if (r.contains("methods") && r["methods"].is_array())
             for (const json& m : r["methods"])
                 if (m.is_string()) caps_.methods.push_back(m.get<std::string>());
