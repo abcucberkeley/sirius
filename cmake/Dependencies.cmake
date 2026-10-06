@@ -21,11 +21,18 @@ endif()
 # lives in /usr/lib before our FindCUDAToolkit runs. SOURCE_SUBDIR points at a
 # directory without a CMakeLists.txt, so FetchContent only downloads the
 # sources and we describe the target ourselves.
+# The release archive, not a git clone: gitlab.com refuses clones when it is
+# under load ("unable to handle this request due to load", three times in a
+# row on 2026-10-06, failing CI and the cluster builds alike), while the
+# archive comes from its CDN and CMake retries a download on its own. The hash
+# pins the same sources as commit 3147391d946bb4b6c68edd901f2add6ac1f31f8c
+# (the 3.4.0 tag). A machine without the network sets
+# FETCHCONTENT_SOURCE_DIR_EIGEN3 to an unpacked copy, as CMake allows for
+# every FetchContent dependency.
 FetchContent_Declare(
     Eigen3
-    GIT_REPOSITORY https://gitlab.com/libeigen/eigen.git
-    GIT_TAG        3147391d946bb4b6c68edd901f2add6ac1f31f8c   # 3.4.0
-    GIT_SHALLOW    TRUE
+    URL            https://gitlab.com/libeigen/eigen/-/archive/3.4.0/eigen-3.4.0.tar.gz
+    URL_HASH       SHA256=8586084f71f9bde545ee7fa6d00288b264a2b7ac3607b974e54d13e7162c1c72
     SOURCE_SUBDIR  cmake-not-used
 )
 FetchContent_MakeAvailable(Eigen3)
