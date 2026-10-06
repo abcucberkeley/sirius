@@ -3042,6 +3042,54 @@ def step_cleanup(a: np.ndarray, params: Dict[str, Any], meta: Dict[str, Any],
     return StepResult(a, dict(meta), labels=out, info={"labels": kept, "flags": flags})
 
 
+_IMPORT_LABELS = StepSpec(
+    "import_labels",
+    {"path": "", "min_voxels": 0, "relabel": False})
+
+
+@_step(_IMPORT_LABELS)
+def step_import_labels(a: np.ndarray, params: Dict[str, Any], meta: Dict[str, Any],
+                       labels: Optional[np.ndarray] = None) -> StepResult:
+    """Import labels (import_labels.cpp): a label TIFF becomes the labels of
+    the input, which passes through. One page per plane of the input, t * z
+    pages for a time series (what export_labels and the labels sidecar write),
+    integer pixels, 0 = background; a file holding one time point's planes is
+    used for every time point. min_voxels drops small labels on loading,
+    relabel numbers them densely (one numbering for every frame)."""
+    path = _str(params, "path", "")
+    if not path:
+        raise ValueError("Import labels: name the label TIFF to import")
+    min_voxels = _int(params, "min_voxels", 0)
+    relabel = _bool(params, "relabel", False)
+    info = _sirius_tiff().inspect_tiff(path)
+    if np.dtype(info.dtype).kind == "f":
+        raise ValueError(f"Import labels: {path} has floating-point pixels; labels are integers")
+    pages = np.asarray(_sirius_tiff().read_tiff(path, dtype=np.uint32))
+    if pages.ndim == 4:   # (pages, samples, y, x): labels have one sample
+        if pages.shape[1] != 1:
+            raise ValueError(f"Import labels: {path} has {pages.shape[1]} samples per pixel; labels have one")
+        pages = pages[:, 0]
+    nt, nz, ny, nx = int(a.shape[1]), int(a.shape[2]), int(a.shape[3]), int(a.shape[4])
+    if pages.shape[1:] != (ny, nx):
+        raise ValueError(f"Import labels: the labels file's planes are {pages.shape[2]} x {pages.shape[1]}, "
+                         f"the input's {nx} x {ny}")
+    if pages.shape[0] == nt * nz:
+        out = pages.reshape(nt, nz, ny, nx)
+    elif pages.shape[0] == nz:
+        out = np.broadcast_to(pages.reshape(1, nz, ny, nx), (nt, nz, ny, nx))
+    else:
+        raise ValueError(f"Import labels: the labels file has {pages.shape[0]} page(s); the input has {nz} plane(s)"
+                         + (f" x {nt} time points = {nt * nz} pages" if nt > 1 else ""))
+    out = np.array(out, dtype=np.uint32, copy=True)
+    if min_voxels > 0:
+        for t in range(nt):
+            out[t] = _remove_small(out[t], min_voxels, False)
+    if relabel:
+        out = _remove_small(out, 0, True)
+    kept = int(np.count_nonzero(np.unique(out)))
+    return StepResult(a, dict(meta), labels=out, info={"labels": kept, "path": path})
+
+
 # --- SIM ----------------------------------------------------------------------
 
 _sim_cache: Dict[str, Any] = {}

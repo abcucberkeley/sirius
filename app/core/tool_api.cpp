@@ -760,7 +760,8 @@ namespace sirius::app {
                                                           std::to_string(labels.y()) + ", z " + std::to_string(labels.z()) + ")");
             return v;
         };
-        const auto xyzOf = [&voxelOf](const json& a, const LabelVolume& labels) {
+        // by value: the tool lambdas below copy xyzOf and outlive this constructor's locals
+        const auto xyzOf = [voxelOf](const json& a, const LabelVolume& labels) {
             json v = json::array({a.value("x", -1), a.value("y", -1), a.value("z", -1)});
             json wrapped = {{"at", v}};
             return voxelOf(wrapped, "at", labels);
@@ -1004,8 +1005,7 @@ namespace sirius::app {
                  wb_.logLine("Labels of step " + Step::number(i) + " written to " + path);
                  wb_.recordEvent("export_labels", {{"step", i + 1}, {"path", path}});
                  actions_.push_back({ActionRecord::Kind::Run, "Labels of step " + Step::number(i) + " → " + path, "log", {}, "export_labels"});
-                 return json{{"step", i + 1}, {"path", path}, {"pages", nt * nz}, {"shape", {{"t", nt}, {"z", nz}, {"y", ny}, {"x", nx}}},
-                             {"bytes", ec ? json(nullptr) : json(static_cast<long long>(bytes))}, {"labels", labels->stats().size()}, {"max_label", labels->maxLabel()}};
+                 return json{{"step", i + 1}, {"path", path}, {"pages", nt * nz}, {"shape", {{"t", nt}, {"z", nz}, {"y", ny}, {"x", nx}}}, {"bytes", ec ? json(nullptr) : json(static_cast<long long>(bytes))}, {"labels", labels->stats().size()}, {"max_label", labels->maxLabel()}};
              }});
         add({"get_log", "The most recent lines of the workbench log.",
              obj({{"lines", {{"type", "integer"}}}}),

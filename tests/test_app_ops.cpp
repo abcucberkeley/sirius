@@ -351,14 +351,14 @@ TEST_CASE("SIM From file keeps the file's OTF axial step unless the field is set
     // replaces the file's step with the stack dz.
     const test::TempFile inlined("sim_dzpsf_inline", ".toml");
     std::ofstream(inlined.path) << "pixels = { dx = 0.1, dy = 0.1, dz = 0.2, dz_psf = 0.55 }\n"
-                                    "[optics]\nndirs = 3\nnphases = 5\nna = 1.2\nnimm = 1.33\nlinespacing_um = 0.2\n";
+                                   "[optics]\nndirs = 3\nnphases = 5\nna = 1.2\nnimm = 1.33\nlinespacing_um = 0.2\n";
     ParamSet inlineFile = sim.defaults();
     inlineFile.set("mode", std::string("From file"));
     inlineFile.set("params_file", inlined.str);
     CHECK_THAT(simParametersFromStep(inlineFile, meta).dz_psf, WithinAbs(0.55, 1e-6));
     const test::TempFile dotted("sim_dzpsf_dotted", ".toml");
     std::ofstream(dotted.path) << "pixels.dx = 0.1\npixels.dy = 0.1\npixels.dz = 0.2\npixels.dz_psf = 0.45\n"
-                                   "[optics]\nndirs = 3\nnphases = 5\nna = 1.2\nnimm = 1.33\nlinespacing_um = 0.2\n";
+                                  "[optics]\nndirs = 3\nnphases = 5\nna = 1.2\nnimm = 1.33\nlinespacing_um = 0.2\n";
     ParamSet dot = sim.defaults();
     dot.set("mode", std::string("From file"));
     dot.set("params_file", dotted.str);

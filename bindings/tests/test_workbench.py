@@ -827,6 +827,38 @@ class TestSteps(unittest.TestCase):
         self.assertEqual(r2.info["labels"], 2)
 
     @unittest.skipUnless(_HAVE_SCIPY, "label post-processing needs scipy")
+    @unittest.skipIf(tifffile is None, "tifffile writes the fixture")
+    def test_import_labels_reads_a_label_tiff_onto_the_input(self):
+        # what export_labels writes: one uint32 page per plane, t * z pages for a series
+        a = np.zeros((1, 2, 3, 8, 8), np.float32)
+        labels = np.zeros((2, 3, 8, 8), np.uint32)
+        labels[:, :, 1:4, 1:4] = 4
+        labels[:, 1:, 5:7, 5:7] = 7
+        labels[1, 2, 0, 7] = 9      # a one-voxel speck in the last frame
+        with tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, "labels.tif")
+            tifffile.imwrite(path, labels.reshape(6, 8, 8))
+            r = wb.run_step("import_labels", {"path": path}, a)
+            np.testing.assert_array_equal(r.labels, labels)
+            np.testing.assert_array_equal(r.array, a)
+            self.assertEqual(r.info["labels"], 3)
+            r = wb.run_step("import_labels", {"path": path, "min_voxels": 2, "relabel": True}, a)
+            self.assertEqual(sorted(np.unique(r.labels).tolist()), [0, 1, 2])
+            # one time point's planes serve every time point
+            tifffile.imwrite(os.path.join(d, "one.tif"), labels[0])
+            r = wb.run_step("import_labels", {"path": os.path.join(d, "one.tif")}, a)
+            np.testing.assert_array_equal(r.labels[1], labels[0])
+            # the refusals: no file, the wrong grid, floating-point pixels
+            with self.assertRaises(ValueError):
+                wb.run_step("import_labels", {}, a)
+            tifffile.imwrite(os.path.join(d, "short.tif"), labels.reshape(6, 8, 8)[:4])
+            with self.assertRaises(ValueError):
+                wb.run_step("import_labels", {"path": os.path.join(d, "short.tif")}, a)
+            tifffile.imwrite(os.path.join(d, "float.tif"), labels.reshape(6, 8, 8).astype(np.float32))
+            with self.assertRaises(ValueError):
+                wb.run_step("import_labels", {"path": os.path.join(d, "float.tif")}, a)
+
+    @unittest.skipUnless(_HAVE_SCIPY, "label post-processing needs scipy")
     def test_cleanup_numbers_every_frame_with_one_map(self):
         # track 4 in every frame, track 2 from t = 1, a speck of 3 in t = 0
         a = np.zeros((1, 3, 1, 16, 16), np.float32)
