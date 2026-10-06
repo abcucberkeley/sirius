@@ -837,7 +837,7 @@ class TestSteps(unittest.TestCase):
         labels[1, 2, 0, 7] = 9      # a one-voxel speck in the last frame
         with tempfile.TemporaryDirectory() as d:
             path = os.path.join(d, "labels.tif")
-            tifffile.imwrite(path, labels.reshape(6, 8, 8))
+            tifffile.imwrite(path, labels.reshape(6, 8, 8), photometric="minisblack")   # 3 or 4 leading planes are not RGB(A)
             r = wb.run_step("import_labels", {"path": path}, a)
             np.testing.assert_array_equal(r.labels, labels)
             np.testing.assert_array_equal(r.array, a)
@@ -845,16 +845,16 @@ class TestSteps(unittest.TestCase):
             r = wb.run_step("import_labels", {"path": path, "min_voxels": 2, "relabel": True}, a)
             self.assertEqual(sorted(np.unique(r.labels).tolist()), [0, 1, 2])
             # one time point's planes serve every time point
-            tifffile.imwrite(os.path.join(d, "one.tif"), labels[0])
+            tifffile.imwrite(os.path.join(d, "one.tif"), labels[0], photometric="minisblack")
             r = wb.run_step("import_labels", {"path": os.path.join(d, "one.tif")}, a)
             np.testing.assert_array_equal(r.labels[1], labels[0])
             # the refusals: no file, the wrong grid, floating-point pixels
             with self.assertRaises(ValueError):
                 wb.run_step("import_labels", {}, a)
-            tifffile.imwrite(os.path.join(d, "short.tif"), labels.reshape(6, 8, 8)[:4])
+            tifffile.imwrite(os.path.join(d, "short.tif"), labels.reshape(6, 8, 8)[:4], photometric="minisblack")
             with self.assertRaises(ValueError):
                 wb.run_step("import_labels", {"path": os.path.join(d, "short.tif")}, a)
-            tifffile.imwrite(os.path.join(d, "float.tif"), labels.reshape(6, 8, 8).astype(np.float32))
+            tifffile.imwrite(os.path.join(d, "float.tif"), labels.reshape(6, 8, 8).astype(np.float32), photometric="minisblack")
             with self.assertRaises(ValueError):
                 wb.run_step("import_labels", {"path": os.path.join(d, "float.tif")}, a)
 
