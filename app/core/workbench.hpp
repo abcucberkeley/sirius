@@ -626,6 +626,43 @@ namespace sirius::app {
         void acceptAllReviewed();
         std::uint32_t nextFlaggedLabel(bool forward);
 
+        // --- labels by step (what the tools drive: no view involved) ----------
+        // The viewer's edits above act on the viewed output at the viewed
+        // time point. These take the step and the time point by name, for the
+        // tools (paint_label, merge_labels, ... in core/tool_api.cpp) that a
+        // script, the assistant or sirius-cli calls, where there is no view.
+        // Same volumes, same undo entries, same statistics upkeep.
+        //
+        // The labels step `index` holds now, or null: the Load step has none,
+        // a step not yet run neither. Writing through the pointer edits that
+        // step's cached output without an undo entry: use the edits below.
+        std::shared_ptr<LabelVolume> labelsOfStep(int index) const;
+        // Every edit returns the voxels it changed: 0 when the step has no
+        // labels, when `t` is past the volume, when a run is active (logged),
+        // or when nothing changed. One undo entry each. On a tracked volume
+        // (LabelVolume::tracked) merge, delete and split follow the track
+        // through every frame, as the viewer's do.
+        // Paint a ball (radius in x/y voxels, zRadius planes) of `label`; 0 is
+        // a new object (maxLabel() + 1), reported through `painted`. `erase`
+        // paints 0 instead, over voxels of `label` only (0: any label).
+        Index paintLabelAt(int index, Index t, Index z, Index y, Index x, double radius, Index zRadius,
+                           std::uint32_t label, bool erase, std::uint32_t* painted = nullptr);
+        // Flood-fill (6-connected) the region under (z, y, x) with `label` (0: a new object).
+        Index fillLabelAt(int index, Index t, Index z, Index y, Index x, std::uint32_t label, std::uint32_t* filled = nullptr);
+        Index mergeLabelsAt(int index, Index t, const std::vector<std::uint32_t>& ids);
+        // Watershed `id` into two from the seeds (z, y, x), each snapped onto
+        // the label's nearest voxel; the new part's id comes back through
+        // `created` (0 when refused: the id is not in the frame, or both
+        // seeds landed on one voxel, which is logged).
+        Index splitLabelAt(int index, Index t, std::uint32_t id, std::array<Index, 3> a, std::array<Index, 3> b,
+                           std::uint32_t* created = nullptr);
+        Index deleteLabelAt(int index, Index t, std::uint32_t id);
+        // Every label of frame t (t < 0: of every frame) becomes 0, in one undo
+        // entry that holds every cleared voxel: on a large volume that is
+        // most of its size again in memory until the entry leaves the history.
+        Index clearLabelsAt(int index, Index t);
+        bool setLabelReviewedAt(int index, Index t, std::uint32_t id, bool reviewed);
+
         // --- history & log ---------------------------------------------------
         History& history() noexcept { return history_; }
         void undo();
@@ -674,6 +711,12 @@ namespace sirius::app {
         // The statistics describe one time point: bring them to the one on
         // screen (a time series after tracking keeps its ids across t).
         void syncLabelStats();
+        // The diffs of splitting `label` in frame t from two seeds already on
+        // it: one diff, or on a tracked volume one per frame the split travels
+        // to (splitLabel's rule). `created` gets the new part's id, 0 when
+        // the split did nothing.
+        std::vector<LabelDiff> splitDiffs(LabelVolume& labels, Index t, std::uint32_t label, std::array<Index, 3> a,
+                                          std::array<Index, 3> b, std::uint32_t* created);
         bool followSelectedTrack();              // crosshair and z onto the selected track at t; false when it is not there
         // Undo / redo of a label edit: applies `diff` to the labels of step
         // `id` if they are still the volume the edit was made on, else a

@@ -486,7 +486,9 @@ TEST_CASE("tool gate: schemas() is what the assistant always had; the hints are 
                                             "move_step", "set_step_enabled", "set_params", "apply_preset", "set_cache",
                                             "run", "view_step", "select_step", "set_view", "list_tracks", "focus_track",
                                             "get_diagnostics", "get_help", "undo", "redo", "set_backend",
-                                            "load_example_pipeline", "export_training_data", "get_log"};
+                                            "load_example_pipeline", "export_training_data", "list_labels", "paint_label",
+                                            "fill_label", "merge_labels", "split_label", "delete_label", "clear_labels",
+                                            "set_label_reviewed", "export_labels", "get_log"};
     CHECK(api.toolNames() == names);
     const json schemas = api.schemas();
     REQUIRE(schemas.size() == names.size());
@@ -504,11 +506,14 @@ TEST_CASE("tool gate: schemas() is what the assistant always had; the hints are 
 
     const std::vector<std::string> busy = {"add_step", "remove_step", "move_step", "set_step_enabled",
                                            "set_params", "apply_preset", "set_cache", "undo", "redo",
-                                           "load_example_pipeline", "export_training_data"};
+                                           "load_example_pipeline", "export_training_data", "paint_label", "fill_label",
+                                           "merge_labels", "split_label", "delete_label", "clear_labels", "set_label_reviewed",
+                                           "export_labels"};
     const std::vector<std::string> readOnly = {"get_state", "list_operations", "get_step", "list_tracks",
-                                               "get_diagnostics", "get_help", "get_log"};
-    const std::vector<std::string> idempotent = {"set_step_enabled", "set_params", "apply_preset", "set_cache", "set_backend"};
-    const std::vector<std::string> big = {"list_operations", "get_help", "get_log"};
+                                               "get_diagnostics", "get_help", "get_log", "list_labels"};
+    const std::vector<std::string> idempotent = {"set_step_enabled", "set_params", "apply_preset", "set_cache", "set_backend",
+                                                 "set_label_reviewed"};
+    const std::vector<std::string> big = {"list_operations", "get_help", "get_log", "list_labels"};
     auto in = [](const std::vector<std::string>& list, const std::string& name) {
         return std::find(list.begin(), list.end(), name) != list.end();
     };
@@ -518,7 +523,7 @@ TEST_CASE("tool gate: schemas() is what the assistant always had; the hints are 
         CHECK(t.refusedWhileRunning == in(busy, t.name));
         CHECK(t.readOnly == in(readOnly, t.name));
         CHECK(t.idempotent == in(idempotent, t.name));
-        CHECK(t.destructive == (t.name == "export_training_data"));
+        CHECK(t.destructive == (t.name == "export_training_data" || t.name == "export_labels"));
         CHECK(t.openWorld == (t.name == "run"));   // a run may download weights and use the HPC worker
         CHECK(t.meta.is_object());
         CHECK(t.meta.contains("anthropic/maxResultSizeChars") == in(big, t.name));

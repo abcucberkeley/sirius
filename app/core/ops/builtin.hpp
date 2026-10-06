@@ -45,6 +45,7 @@ namespace sirius::app {
     std::unique_ptr<Operation> makeFoundationOperation();
     std::unique_ptr<Operation> makeClassicalSegmentationOperation();
     std::unique_ptr<Operation> makeLabelCleanupOperation();
+    std::unique_ptr<Operation> makeImportLabelsOperation();
     std::unique_ptr<Operation> makeTrackOperation();
 
 } // namespace sirius::app

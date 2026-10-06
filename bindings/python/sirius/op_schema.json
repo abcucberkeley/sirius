@@ -2725,6 +2725,46 @@
     },
     {
       "group": "Segment",
+      "kind": "import_labels",
+      "name": "Import labels",
+      "needs_labels": false,
+      "params": [
+        {
+          "advanced": false,
+          "default": "",
+          "help": "A TIFF of integer labels, 0 = background: one page per plane of the input, t × z pages for a time series (what Export labels writes).",
+          "key": "path",
+          "label": "Labels file",
+          "read_only": false,
+          "type": "path"
+        },
+        {
+          "advanced": false,
+          "default": 0,
+          "help": "Drop labels smaller than this; 0 keeps every one.",
+          "key": "min_voxels",
+          "label": "Min. voxels",
+          "max": 1000000000.0,
+          "min": 0.0,
+          "read_only": false,
+          "type": "int"
+        },
+        {
+          "advanced": false,
+          "default": false,
+          "help": "Number the labels 1 … n in the order of their ids.",
+          "key": "relabel",
+          "label": "Relabel densely",
+          "read_only": false,
+          "type": "bool"
+        }
+      ],
+      "plugin": false,
+      "produces_labels": true,
+      "remote_capable": false
+    },
+    {
+      "group": "Segment",
       "kind": "track",
       "name": "Track objects",
       "needs_labels": true,

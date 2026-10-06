@@ -14,6 +14,7 @@
 #include <stdexcept>
 #include <thread>
 #include <tuple>
+#include <utility>
 
 #include "core/build_info.hpp"
 #include "core/cancel.hpp"
@@ -2744,6 +2745,34 @@ namespace sirius::app {
         }
     } // namespace
 
+    std::vector<LabelDiff> Workbench::splitDiffs(LabelVolume& labels, Index t, std::uint32_t label, std::array<Index, 3> a,
+                                                 std::array<Index, 3> b, std::uint32_t* created) {
+        if (created) *created = 0;
+        std::vector<LabelDiff> diffs;
+        LabelDiff first = labels.split(t, label, a, b);
+        if (first.empty()) return diffs;
+        const std::uint32_t part = labels.maxLabel();
+        if (created) *created = part;
+        diffs.push_back(std::move(first));
+        if (!labels.tracked() || labels.t() <= 1) return diffs;
+        // The split travels along the track: the two parts' centroids in
+        // one frame seed the same watershed of the same id in the next,
+        // forward and backward, so the new part keeps one id throughout.
+        for (const Index dir : {Index{1}, Index{-1}}) {
+            std::array<Index, 3> seedA = centroidOf(labels, t, label), seedB = centroidOf(labels, t, part);
+            for (Index f = t + dir; f >= 0 && f < labels.t(); f += dir) {
+                if (!snapToLabel(labels, f, label, seedA)) continue;   // the object is absent here
+                if (!snapToLabel(labels, f, label, seedB) || seedA == seedB) continue;
+                LabelDiff d = labels.split(f, label, seedA, seedB, part);
+                if (d.empty()) continue;
+                diffs.push_back(std::move(d));
+                seedA = centroidOf(labels, f, label);
+                seedB = centroidOf(labels, f, part);
+            }
+        }
+        return diffs;
+    }
+
     void Workbench::splitLabel(std::uint32_t label, std::array<Index, 3> a, std::array<Index, 3> b) {
         endPaintStroke();
         if (label == 0 || refuseIfRunning("split a label")) return;
@@ -2761,31 +2790,9 @@ namespace sirius::app {
             logLine("Split: pick two different points inside label " + std::to_string(label) + ".");
             return;
         }
-        if (labels->tracked() && labels->t() > 1) {
-            // The split travels along the track: the two parts' centroids in
-            // one frame seed the same watershed of the same id in the next,
-            // forward and backward, so the new part keeps one id throughout.
-            std::vector<LabelDiff> diffs;
-            LabelDiff first = labels->split(view_.t, label, a, b);
-            if (first.empty()) return;
-            const std::uint32_t part = labels->maxLabel();
-            diffs.push_back(std::move(first));
-            for (const Index dir : {Index{1}, Index{-1}}) {
-                std::array<Index, 3> seedA = centroidOf(*labels, view_.t, label), seedB = centroidOf(*labels, view_.t, part);
-                for (Index f = view_.t + dir; f >= 0 && f < labels->t(); f += dir) {
-                    if (!snapToLabel(*labels, f, label, seedA)) continue;   // the object is absent here
-                    if (!snapToLabel(*labels, f, label, seedB) || seedA == seedB) continue;
-                    LabelDiff d = labels->split(f, label, seedA, seedB, part);
-                    if (d.empty()) continue;
-                    diffs.push_back(std::move(d));
-                    seedA = centroidOf(*labels, f, label);
-                    seedB = centroidOf(*labels, f, part);
-                }
-            }
-            recordLabelDiffs("Split track " + std::to_string(label), id, labels, std::move(diffs));
-            return;
-        }
-        recordLabelDiff("Split label " + std::to_string(label), id, labels, labels->split(view_.t, label, a, b));
+        std::vector<LabelDiff> diffs = splitDiffs(*labels, view_.t, label, a, b, nullptr);
+        if (diffs.size() > 1) recordLabelDiffs("Split track " + std::to_string(label), id, labels, std::move(diffs));
+        else if (!diffs.empty()) recordLabelDiff("Split label " + std::to_string(label), id, labels, std::move(diffs.front()));
     }
 
     void Workbench::deleteLabel(std::uint32_t label) {
@@ -2815,6 +2822,196 @@ namespace sirius::app {
             if (s.id == label) s.reviewed = reviewed;
         session_.record("review", {{"step", pipeline_.indexOf(id)}, {"label", label}, {"reviewed", reviewed}});
         notifyLabels(id);
+    }
+
+    // --- labels by step ------------------------------------------------------------------------
+
+    std::shared_ptr<LabelVolume> Workbench::labelsOfStep(int index) const {
+        if (index <= 0 || index >= pipeline_.size()) return nullptr;   // Load has none
+        return executor_.lastLabels(pipeline_.at(index).id);
+    }
+
+    namespace {
+        // The voxels of one edit's diff, read before the diff is moved into the history.
+        Index diffVoxels(const LabelDiff& d) noexcept { return static_cast<Index>(d.indices.size()); }
+        Index diffsVoxels(const std::vector<LabelDiff>& ds) noexcept {
+            Index n = 0;
+            for (const LabelDiff& d : ds) n += diffVoxels(d);
+            return n;
+        }
+    } // namespace
+
+    // The volume an edit by step acts on, after the checks every edit shares;
+    // null (with a log line) when there is nothing to edit.
+    static std::shared_ptr<LabelVolume> labelsForEdit(Workbench& wb, const Pipeline& pipeline, int index, Index t, bool anyFrame,
+                                                      const char* what, StepId* id) {
+        if (index <= 0 || index >= pipeline.size()) {
+            wb.logLine(std::string("Cannot ") + what + ": step " + std::to_string(index + 1) + " is not a step with labels.");
+            return nullptr;
+        }
+        std::shared_ptr<LabelVolume> labels = wb.labelsOfStep(index);
+        if (!labels || labels->empty()) {
+            wb.logLine(std::string("Cannot ") + what + ": step " + Step::number(index) + " " + pipeline.at(index).name + " has no labels (run it first).");
+            return nullptr;
+        }
+        if (!anyFrame && (t < 0 || t >= labels->t())) {
+            wb.logLine(std::string("Cannot ") + what + ": time point " + std::to_string(t) + " is past the labels' " + std::to_string(labels->t()) + " frame(s).");
+            return nullptr;
+        }
+        *id = pipeline.at(index).id;
+        return labels;
+    }
+
+    Index Workbench::paintLabelAt(int index, Index t, Index z, Index y, Index x, double radius, Index zRadius,
+                                  std::uint32_t label, bool erase, std::uint32_t* painted) {
+        endPaintStroke();
+        if (painted) *painted = 0;
+        if (refuseIfRunning("paint labels")) return 0;
+        StepId id = 0;
+        auto labels = labelsForEdit(*this, pipeline_, index, t, false, "paint labels", &id);
+        if (!labels) return 0;
+        if (z < 0 || z >= labels->z() || y < 0 || y >= labels->y() || x < 0 || x >= labels->x()) {
+            logLine("Cannot paint labels: (" + std::to_string(x) + ", " + std::to_string(y) + ", " + std::to_string(z) + ") is outside the volume.");
+            return 0;
+        }
+        if (!erase && label == 0) label = labels->maxLabel() + 1;
+        if (painted) *painted = erase ? 0u : label;
+        LabelDiff diff = labels->paint(t, z, y, x, std::max(1.0, radius), std::max<Index>(0, zRadius), erase ? 0u : label, erase ? label : 0u);
+        const Index n = diffVoxels(diff);
+        recordLabelDiff(erase ? std::string("Erase labels") : "Paint label " + std::to_string(label), id, labels, std::move(diff));
+        return n;
+    }
+
+    Index Workbench::fillLabelAt(int index, Index t, Index z, Index y, Index x, std::uint32_t label, std::uint32_t* filled) {
+        endPaintStroke();
+        if (filled) *filled = 0;
+        if (refuseIfRunning("fill a label")) return 0;
+        StepId id = 0;
+        auto labels = labelsForEdit(*this, pipeline_, index, t, false, "fill a label", &id);
+        if (!labels) return 0;
+        if (z < 0 || z >= labels->z() || y < 0 || y >= labels->y() || x < 0 || x >= labels->x()) {
+            logLine("Cannot fill a label: (" + std::to_string(x) + ", " + std::to_string(y) + ", " + std::to_string(z) + ") is outside the volume.");
+            return 0;
+        }
+        if (label == 0) label = labels->maxLabel() + 1;
+        if (filled) *filled = label;
+        LabelDiff diff = labels->fill(t, z, y, x, label);
+        const Index n = diffVoxels(diff);
+        recordLabelDiff("Fill label " + std::to_string(label), id, labels, std::move(diff));
+        return n;
+    }
+
+    Index Workbench::mergeLabelsAt(int index, Index t, const std::vector<std::uint32_t>& ids) {
+        endPaintStroke();
+        if (ids.size() < 2 || refuseIfRunning("merge labels")) return 0;
+        StepId id = 0;
+        auto labels = labelsForEdit(*this, pipeline_, index, t, false, "merge labels", &id);
+        if (!labels) return 0;
+        if (labels->tracked() && labels->t() > 1) {
+            std::vector<LabelDiff> diffs;
+            for (Index f = 0; f < labels->t(); ++f) diffs.push_back(labels->merge(f, ids));
+            const Index n = diffsVoxels(diffs);
+            recordLabelDiffs("Merge tracks", id, labels, std::move(diffs));
+            return n;
+        }
+        LabelDiff diff = labels->merge(t, ids);
+        const Index n = diffVoxels(diff);
+        recordLabelDiff("Merge labels", id, labels, std::move(diff));
+        return n;
+    }
+
+    Index Workbench::splitLabelAt(int index, Index t, std::uint32_t label, std::array<Index, 3> a, std::array<Index, 3> b,
+                                  std::uint32_t* created) {
+        endPaintStroke();
+        if (created) *created = 0;
+        if (label == 0 || refuseIfRunning("split a label")) return 0;
+        StepId id = 0;
+        auto labels = labelsForEdit(*this, pipeline_, index, t, false, "split a label", &id);
+        if (!labels) return 0;
+        if (!snapToLabel(*labels, t, label, a) || !snapToLabel(*labels, t, label, b)) {
+            logLine("Split: label " + std::to_string(label) + " is not in frame " + std::to_string(t) + ".");
+            return 0;
+        }
+        if (a == b) {
+            logLine("Split: pick two different points inside label " + std::to_string(label) + ".");
+            return 0;
+        }
+        std::vector<LabelDiff> diffs = splitDiffs(*labels, t, label, a, b, created);
+        const Index n = diffsVoxels(diffs);
+        if (diffs.size() > 1) recordLabelDiffs("Split track " + std::to_string(label), id, labels, std::move(diffs));
+        else if (!diffs.empty()) recordLabelDiff("Split label " + std::to_string(label), id, labels, std::move(diffs.front()));
+        return n;
+    }
+
+    Index Workbench::deleteLabelAt(int index, Index t, std::uint32_t label) {
+        endPaintStroke();
+        if (label == 0 || refuseIfRunning("delete a label")) return 0;
+        StepId id = 0;
+        auto labels = labelsForEdit(*this, pipeline_, index, t, false, "delete a label", &id);
+        if (!labels) return 0;
+        if (view_.selectedLabel == label) view_.selectedLabel = 0;
+        if (labels->tracked() && labels->t() > 1) {
+            std::vector<LabelDiff> diffs;
+            for (Index f = 0; f < labels->t(); ++f) diffs.push_back(labels->remove(f, label));
+            const Index n = diffsVoxels(diffs);
+            recordLabelDiffs("Delete track " + std::to_string(label), id, labels, std::move(diffs));
+            return n;
+        }
+        LabelDiff diff = labels->remove(t, label);
+        const Index n = diffVoxels(diff);
+        recordLabelDiff("Delete label " + std::to_string(label), id, labels, std::move(diff));
+        return n;
+    }
+
+    Index Workbench::clearLabelsAt(int index, Index t) {
+        endPaintStroke();
+        if (refuseIfRunning("clear the labels")) return 0;
+        StepId id = 0;
+        auto labels = labelsForEdit(*this, pipeline_, index, t, t < 0, "clear the labels", &id);
+        if (!labels) return 0;
+        view_.selectedLabel = 0;
+        std::vector<LabelDiff> diffs;
+        const Index n = labels->volumeSize();
+        for (Index f = (t < 0 ? 0 : t); f < (t < 0 ? labels->t() : t + 1); ++f) {
+            const std::uint32_t* v = std::as_const(*labels).volume(f);   // read only: no copy-on-write detach
+            LabelDiff d;
+            d.t = f;
+            for (Index i = 0; i < n; ++i)
+                if (v[i]) {
+                    d.indices.push_back(i);
+                    d.before.push_back(v[i]);
+                    d.after.push_back(0);
+                }
+            if (d.empty()) continue;
+            labels->apply(d, true);
+            diffs.push_back(std::move(d));
+        }
+        const Index cleared = diffsVoxels(diffs);
+        if (diffs.size() > 1) recordLabelDiffs(t < 0 ? "Clear labels" : "Clear labels of t " + std::to_string(t), id, labels, std::move(diffs));
+        else if (!diffs.empty()) recordLabelDiff(t < 0 ? "Clear labels" : "Clear labels of t " + std::to_string(t), id, labels, std::move(diffs.front()));
+        return cleared;
+    }
+
+    bool Workbench::setLabelReviewedAt(int index, Index t, std::uint32_t label, bool reviewed) {
+        endPaintStroke();
+        if (label == 0 || refuseIfRunning("mark a label reviewed")) return false;
+        StepId id = 0;
+        auto labels = labelsForEdit(*this, pipeline_, index, t, false, "mark a label reviewed", &id);
+        if (!labels) return false;
+        if (labels->statsT() != t) labels->recomputeStats(t);
+        bool found = false;
+        for (LabelStats& s : labels->stats())
+            if (s.id == label) {
+                s.reviewed = reviewed;
+                found = true;
+            }
+        if (!found) {
+            logLine("Cannot mark label " + std::to_string(label) + " reviewed: it is not in frame " + std::to_string(t) + ".");
+            return false;
+        }
+        session_.record("review", {{"step", index}, {"label", label}, {"reviewed", reviewed}});
+        notifyLabels(id);
+        return true;
     }
 
     void Workbench::acceptAllReviewed() {

@@ -551,9 +551,18 @@ serve (`sirius-cli tools` prints it). Rules they share:
 | `statistics` | `step`, `t` (0 or "all"), `channels`, `percentiles` ([0.1, 1, 50, 99, 99.9]), `histogram_bins` (0), `labels` (true), `max_samples`, `run` (false) | `{step, fresh, shape, sampled, channels:[…], labels?}` | RO | |
 | `get_diagnostics` | `step`, `detail` (false) | tables, curves, images, notes | RO | |
 | `list_tracks` | `step`, `limit` (50) | the tracks | RO | |
+| `list_labels` | `step`, `t` (0), `limit` (200), `flag`, `unreviewed` | `{step, t, count, listed, max_label, tracked, shape, labels:[{id, voxels, class, confidence, flags, reviewed, bbox, centre}]}` | RO | |
 | `get_log` | `lines` (30, at most 500) | `{lines}` | RO | yes |
 | `export_result` | `path`*, `step`, `format`, `dtype` ("float32"), `scaling`, `range`, `percentiles`, `t`, `z`, `channels`, `tiff`{…}, `zarr`{…}, `include_labels`, `include_pipeline`, `labels_only`, `run` | `{path, format, dtype, shape, files, bytes, seconds}` | DE | |
 | `export_training_data` | as the GUI's training export | what it wrote | DE | |
+| `export_labels` | `path`*, `step` | `{step, path, pages, shape, bytes, labels, max_label}`: one uint32 TIFF, t*z pages, what an `import_labels` step reads back | DE | |
+| `paint_label` | `x`*, `y`*, `z`*, `step`, `t` (0), `label` (0 = new), `radius` (3), `z_radius` (0), `erase` | `{step, t, label, voxels, labels}` | | |
+| `fill_label` | `x`*, `y`*, `z`*, `step`, `t`, `label` (0 = new) | `{step, t, label, voxels, labels}` | | |
+| `merge_labels` | `ids`* (two or more), `step`, `t` | `{step, t, into, voxels, labels}` | | |
+| `split_label` | `label`*, `a`* [x, y, z], `b`* [x, y, z], `step`, `t` | `{step, t, label, created, voxels, labels}` | | |
+| `delete_label` | `label`*, `step`, `t` | `{step, t, label, voxels, labels}` | | |
+| `clear_labels` | `step`, `t` (default every time point) | `{step, t, voxels, labels: 0}` | | |
+| `set_label_reviewed` | `label`*, `step`, `t`, `reviewed` (true) | `{step, t, label, reviewed}` | ID | |
 | `export_python` | `path` | `{path}`, or `{script}` without one | DE | yes |
 | `list_plugins` | `reload` (false) | `{plugins:[{kind, name, file, error}], dirs, registered}` | RO | |
 | `worker_status` | `check` (false; true starts the worker and adds `capabilities`) | as `worker status`, + `running` | RO | yes (without `check`) |
@@ -564,6 +573,13 @@ A step, as the editing tools return it:
 `view_step`, `select_step`, `set_view` and `focus_track`, which only move the
 GUI's view, are not served: every tool here takes explicit steps and
 coordinates instead.
+
+**Label editing.** `paint_label`, `fill_label`, `merge_labels`, `split_label`, `delete_label`, `clear_labels`
+and `set_label_reviewed` are the viewer's paint tools by step and time point (default: the last computed step,
+t 0): each is one undo entry, as a stroke in the viewer is, and `list_labels` is the review table. `export_labels`
+writes a step's labels as one uint32 TIFF, and an `import_labels` step (`add_step` with `params.path`) loads such a
+file -- its own, a sidecar of `export_result`, or labels made elsewhere on the same grid -- as the labels of its
+input, which the same tools then edit. The GUI reaches the same tools through `--tool` and the assistant.
 
 **Prompt steps.** A `foundation` step (a model folder whose `model.json` tasks include `prompt`)
 or a `seg` step with a `microsam:` model, whose `task` is `"Prompt objects"`,

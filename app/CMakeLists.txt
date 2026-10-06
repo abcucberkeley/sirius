@@ -353,6 +353,7 @@ op(seg         ops/seg.cpp         DEPENDS ops_segment_common ops_torch_model rp
 op(foundation  ops/foundation.cpp  DEPENDS tracks rpc model_folder)
 op(classic     ops/classic.cpp     DEPENDS ops_segment_common lib/image_ops lib/constants)
 op(cleanup     ops/cleanup.cpp     DEPENDS labels)
+op(import_labels ops/import_labels.cpp DEPENDS labels lib/tiff_io)
 op(track       ops/track.cpp       DEPENDS tracking tracks rpc)
 
 # The list of them, and registerBuiltinOperations() that walks it: the one
@@ -388,7 +389,7 @@ sirius_core_unit(workbench
 sirius_core_unit(tool_api
     HEADERS tool_api.hpp
     SOURCES tool_api.cpp
-    DEPENDS workbench training_export worker_error cancel
+    DEPENDS workbench training_export worker_error cancel lib/tiff_io
     PUBLIC_LINK nlohmann_json::nlohmann_json)
 
 # --- headless: what sirius-cli drives --------------------------------------------

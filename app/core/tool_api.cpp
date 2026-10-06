@@ -3,11 +3,16 @@
 #include "core/cancel.hpp"
 #include "core/training_export.hpp"
 
+#include <sirius/tiff_io.hpp>
+
 #include <algorithm>
 #include <cmath>
 #include <cctype>
 #include <cstdio>
+#include <cstring>
+#include <filesystem>
 #include <stdexcept>
+#include <utility>
 
 namespace sirius::app {
 
@@ -119,6 +124,16 @@ namespace sirius::app {
             {"set_backend", "Compute backend", false, false, true, false, false, false},
             {"load_example_pipeline", "Load the example pipeline", true, false, false, false, false, false},
             {"export_training_data", "Export training data", true, false, false, true, false, false},
+            // labels by step (core/workbench.hpp "labels by step"): the viewer's paint tools, for scripts
+            {"list_labels", "List labels", false, true, false, false, false, true},
+            {"paint_label", "Paint a label", true, false, false, false, false, false},
+            {"fill_label", "Fill a label", true, false, false, false, false, false},
+            {"merge_labels", "Merge labels", true, false, false, false, false, false},
+            {"split_label", "Split a label", true, false, false, false, false, false},
+            {"delete_label", "Delete a label", true, false, false, false, false, false},
+            {"clear_labels", "Clear the labels", true, false, false, false, false, false},
+            {"set_label_reviewed", "Mark a label reviewed", true, false, true, false, false, false},
+            {"export_labels", "Export labels", true, false, false, true, false, false},
             {"get_log", "Workbench log", false, true, false, false, false, true},
         };
         // MCP's Tool._meta key for how long a result a client should keep
@@ -711,6 +726,286 @@ namespace sirius::app {
                              {"classes", r.classes},
                              {"frames", r.frames},
                              {"bytes", r.bytes}};
+             }});
+        // --- labels by step -------------------------------------------------------
+        // The viewer's paint tools (brush, fill, merge, split, delete) as tool
+        // calls that name the step and the time point, for the assistant, a
+        // script (sirius-app --tool) and sirius-cli, where there is no view.
+        // Every edit is one undo entry, the same as a stroke in the viewer.
+        const auto labelStepParam = [] {
+            return json{{"type", {"integer", "string"}},
+                        {"description", "The step whose labels to edit, by number (1 = Load) or name; default the viewed step"}};
+        };
+        const auto labelStep = [this](const json& a) { return a.contains("step") && !a["step"].is_null() ? resolveStep(a) : wb_.viewedIndex(); };
+        const auto labelsOf = [this](int i) {
+            std::shared_ptr<LabelVolume> labels = wb_.labelsOfStep(i);
+            if (!labels || labels->empty())
+                throw ToolFailure("no_labels", "step " + Step::number(i) + (i >= 0 && i < wb_.pipeline().size() ? " " + wb_.pipeline().at(i).name : std::string()) + " has no labels",
+                                  "run a segmentation step first (run), or add an import_labels step with a label TIFF");
+            return labels;
+        };
+        const auto frameOf = [](const json& a, const LabelVolume& labels) {
+            const Index t = a.contains("t") && a["t"].is_number_integer() ? a["t"].get<Index>() : Index{0};
+            if (t < 0 || t >= labels.t())
+                throw ToolFailure("invalid_argument", "t " + std::to_string(t) + " is past the labels' " + std::to_string(labels.t()) + " time point(s)");
+            return t;
+        };
+        const auto voxelOf = [](const json& a, const char* key, const LabelVolume& labels) {
+            // [x, y, z] as the caller gives it, (z, y, x) as the volume takes it
+            if (!a.contains(key) || !a[key].is_array() || a[key].size() != 3)
+                throw std::invalid_argument(std::string(key) + " must be [x, y, z]");
+            std::array<Index, 3> v{a[key][2].get<Index>(), a[key][1].get<Index>(), a[key][0].get<Index>()};
+            if (v[0] < 0 || v[0] >= labels.z() || v[1] < 0 || v[1] >= labels.y() || v[2] < 0 || v[2] >= labels.x())
+                throw ToolFailure("invalid_argument", std::string(key) + " " + a[key].dump() + " is outside the volume (x " + std::to_string(labels.x()) + ", y " +
+                                                          std::to_string(labels.y()) + ", z " + std::to_string(labels.z()) + ")");
+            return v;
+        };
+        const auto xyzOf = [&voxelOf](const json& a, const LabelVolume& labels) {
+            json v = json::array({a.value("x", -1), a.value("y", -1), a.value("z", -1)});
+            json wrapped = {{"at", v}};
+            return voxelOf(wrapped, "at", labels);
+        };
+        const auto xyz = [](const char* what) {
+            return json{{"type", "array"}, {"items", {{"type", "integer"}}}, {"description", what}};
+        };
+        const auto busy = [this] {
+            if (!wb_.canEdit()) throw ToolFailure("busy", "A run is in progress: cancel it or wait before editing labels.");
+        };
+        const auto countAfter = [](const LabelVolume& labels, Index t) {
+            return labels.statsT() == t ? json(labels.stats().size()) : json(nullptr);
+        };
+        add({"list_labels",
+             "The labels of a step at one time point: id, voxels, class, confidence, flags, reviewed, bounding box and "
+             "centre (x, y, z in voxels). Largest first; `flag` keeps only labels carrying that flag (low conf, small, "
+             "touching border, merged?), `unreviewed` only those not yet reviewed. The statistics table moves to that frame.",
+             obj({{"step", labelStepParam()},
+                  {"t", {{"type", "integer"}, {"description", "time point (default 0)"}}},
+                  {"limit", {{"type", "integer"}, {"description", "rows at most (default 200)"}}},
+                  {"flag", {{"type", "string"}}},
+                  {"unreviewed", {{"type", "boolean"}}}}),
+             [this, labelStep, labelsOf, frameOf](const json& a) {
+                 const int i = labelStep(a);
+                 std::shared_ptr<LabelVolume> labels = labelsOf(i);
+                 const Index t = frameOf(a, *labels);
+                 if (labels->statsT() != t) labels->recomputeStats(t);
+                 const int limit = std::max(1, a.value("limit", 200));
+                 const std::string flag = a.value("flag", std::string());
+                 const bool unreviewed = a.value("unreviewed", false);
+                 std::vector<const LabelStats*> rows;
+                 for (const LabelStats& s : labels->stats()) {
+                     if (!flag.empty() && std::find(s.flags.begin(), s.flags.end(), flag) == s.flags.end()) continue;
+                     if (unreviewed && s.reviewed) continue;
+                     rows.push_back(&s);
+                 }
+                 std::stable_sort(rows.begin(), rows.end(), [](const LabelStats* p, const LabelStats* q) { return p->voxels > q->voxels; });
+                 json out = json::array();
+                 for (const LabelStats* s : rows) {
+                     if (static_cast<int>(out.size()) >= limit) break;
+                     out.push_back({{"id", s->id},
+                                    {"voxels", s->voxels},
+                                    {"class", s->cls},
+                                    {"confidence", s->confidence},
+                                    {"flags", s->flags},
+                                    {"reviewed", s->reviewed},
+                                    {"bbox", {{"x0", s->bbox[4]}, {"x1", s->bbox[5]}, {"y0", s->bbox[2]}, {"y1", s->bbox[3]}, {"z0", s->bbox[0]}, {"z1", s->bbox[1]}}},
+                                    {"centre", {(s->bbox[4] + s->bbox[5]) / 2, (s->bbox[2] + s->bbox[3]) / 2, (s->bbox[0] + s->bbox[1]) / 2}}});
+                 }
+                 return json{{"step", i + 1},
+                             {"t", t},
+                             {"count", labels->stats().size()},
+                             {"listed", out.size()},
+                             {"max_label", labels->maxLabel()},
+                             {"tracked", labels->tracked()},
+                             {"shape", {{"t", labels->t()}, {"z", labels->z()}, {"y", labels->y()}, {"x", labels->x()}}},
+                             {"labels", out}};
+             }});
+        add({"paint_label",
+             "Paint a ball of one label at a voxel: radius in x/y voxels (default 3), z_radius planes above and below "
+             "(default 0). label 0 paints a new object. erase paints background instead, over that label only (0: over any). "
+             "One undo entry.",
+             obj({{"step", labelStepParam()},
+                  {"x", {{"type", "integer"}}},
+                  {"y", {{"type", "integer"}}},
+                  {"z", {{"type", "integer"}}},
+                  {"t", {{"type", "integer"}, {"description", "time point (default 0)"}}},
+                  {"label", {{"type", "integer"}, {"description", "the label to paint; 0 (default) starts a new object"}}},
+                  {"radius", {{"type", "number"}}},
+                  {"z_radius", {{"type", "integer"}}},
+                  {"erase", {{"type", "boolean"}}}},
+                 {"x", "y", "z"}),
+             [this, labelStep, labelsOf, frameOf, xyzOf, busy, countAfter](const json& a) {
+                 busy();
+                 const int i = labelStep(a);
+                 std::shared_ptr<LabelVolume> labels = labelsOf(i);
+                 const Index t = frameOf(a, *labels);
+                 const std::array<Index, 3> v = xyzOf(a, *labels);
+                 const bool erase = a.value("erase", false);
+                 std::uint32_t painted = 0;
+                 const Index n = wb_.paintLabelAt(i, t, v[0], v[1], v[2], a.value("radius", 3.0), a.value("z_radius", 0), a.value("label", 0u), erase, &painted);
+                 const std::string text = (erase ? "Erased " : "Painted label " + std::to_string(painted) + ": ") + std::to_string(n) + " voxels" + (erase ? "" : "") + " · step " + Step::number(i);
+                 actions_.push_back({ActionRecord::Kind::Edit, text, n ? "undo" : "", {}, "paint_label"});
+                 return json{{"step", i + 1}, {"t", t}, {"label", painted}, {"voxels", n}, {"labels", countAfter(*labels, t)}};
+             }});
+        add({"fill_label",
+             "Flood-fill (6-connected) the region under a voxel with one label: a hole, or a whole object re-numbered. "
+             "label 0 starts a new object. One undo entry.",
+             obj({{"step", labelStepParam()},
+                  {"x", {{"type", "integer"}}},
+                  {"y", {{"type", "integer"}}},
+                  {"z", {{"type", "integer"}}},
+                  {"t", {{"type", "integer"}, {"description", "time point (default 0)"}}},
+                  {"label", {{"type", "integer"}, {"description", "the label to fill with; 0 (default) starts a new object"}}}},
+                 {"x", "y", "z"}),
+             [this, labelStep, labelsOf, frameOf, xyzOf, busy, countAfter](const json& a) {
+                 busy();
+                 const int i = labelStep(a);
+                 std::shared_ptr<LabelVolume> labels = labelsOf(i);
+                 const Index t = frameOf(a, *labels);
+                 const std::array<Index, 3> v = xyzOf(a, *labels);
+                 std::uint32_t filled = 0;
+                 const Index n = wb_.fillLabelAt(i, t, v[0], v[1], v[2], a.value("label", 0u), &filled);
+                 actions_.push_back({ActionRecord::Kind::Edit, "Filled label " + std::to_string(filled) + ": " + std::to_string(n) + " voxels · step " + Step::number(i), n ? "undo" : "", {}, "fill_label"});
+                 return json{{"step", i + 1}, {"t", t}, {"label", filled}, {"voxels", n}, {"labels", countAfter(*labels, t)}};
+             }});
+        add({"merge_labels",
+             "Merge two or more labels into the smallest id among them (on tracked labels, in every frame). One undo entry.",
+             obj({{"step", labelStepParam()},
+                  {"ids", {{"type", "array"}, {"items", {{"type", "integer"}}}, {"description", "two or more label ids"}}},
+                  {"t", {{"type", "integer"}, {"description", "time point (default 0)"}}}},
+                 {"ids"}),
+             [this, labelStep, labelsOf, frameOf, busy, countAfter](const json& a) {
+                 busy();
+                 const int i = labelStep(a);
+                 std::shared_ptr<LabelVolume> labels = labelsOf(i);
+                 const Index t = frameOf(a, *labels);
+                 std::vector<std::uint32_t> ids;
+                 if (a.contains("ids") && a["ids"].is_array())
+                     for (const json& e : a["ids"])
+                         if (e.is_number_integer() && e.get<long long>() > 0) ids.push_back(e.get<std::uint32_t>());
+                 std::sort(ids.begin(), ids.end());
+                 ids.erase(std::unique(ids.begin(), ids.end()), ids.end());
+                 if (ids.size() < 2) throw std::invalid_argument("ids must name at least two different labels (> 0)");
+                 const Index n = wb_.mergeLabelsAt(i, t, ids);
+                 if (n == 0) throw ToolFailure("not_found", "none of the labels " + json(ids).dump() + " but one is in frame " + std::to_string(t), "list_labels shows the ids there");
+                 actions_.push_back({ActionRecord::Kind::Edit, "Merged " + std::to_string(ids.size()) + " labels into " + std::to_string(ids.front()) + " · step " + Step::number(i), "undo", {}, "merge_labels"});
+                 return json{{"step", i + 1}, {"t", t}, {"into", ids.front()}, {"voxels", n}, {"labels", countAfter(*labels, t)}};
+             }});
+        add({"split_label",
+             "Split one label into two by a watershed of its distance transform from two seed voxels a and b ([x, y, z], "
+             "each moved onto the label's nearest voxel); the part around b gets a new id (on tracked labels, the split "
+             "follows the track). One undo entry.",
+             obj({{"step", labelStepParam()},
+                  {"label", {{"type", "integer"}}},
+                  {"a", xyz("first seed [x, y, z]")},
+                  {"b", xyz("second seed [x, y, z]")},
+                  {"t", {{"type", "integer"}, {"description", "time point (default 0)"}}}},
+                 {"label", "a", "b"}),
+             [this, labelStep, labelsOf, frameOf, voxelOf, busy, countAfter](const json& a) {
+                 busy();
+                 const int i = labelStep(a);
+                 std::shared_ptr<LabelVolume> labels = labelsOf(i);
+                 const Index t = frameOf(a, *labels);
+                 const std::uint32_t label = a.value("label", 0u);
+                 if (label == 0) throw std::invalid_argument("label must be > 0");
+                 const std::array<Index, 3> sa = voxelOf(a, "a", *labels), sb = voxelOf(a, "b", *labels);
+                 std::uint32_t created = 0;
+                 const Index n = wb_.splitLabelAt(i, t, label, sa, sb, &created);
+                 if (n == 0 || created == 0)
+                     throw ToolFailure("not_split", "label " + std::to_string(label) + " was not split (get_log says why: not in this frame, or the two seeds land on one voxel)",
+                                       "pick two seeds inside the label, on different sides of the wall");
+                 actions_.push_back({ActionRecord::Kind::Edit, "Split label " + std::to_string(label) + " · new label " + std::to_string(created) + " · step " + Step::number(i), "undo", {}, "split_label"});
+                 return json{{"step", i + 1}, {"t", t}, {"label", label}, {"created", created}, {"voxels", n}, {"labels", countAfter(*labels, t)}};
+             }});
+        add({"delete_label",
+             "Delete one label (its voxels become background; on tracked labels, in every frame). One undo entry.",
+             obj({{"step", labelStepParam()},
+                  {"label", {{"type", "integer"}}},
+                  {"t", {{"type", "integer"}, {"description", "time point (default 0)"}}}},
+                 {"label"}),
+             [this, labelStep, labelsOf, frameOf, busy, countAfter](const json& a) {
+                 busy();
+                 const int i = labelStep(a);
+                 std::shared_ptr<LabelVolume> labels = labelsOf(i);
+                 const Index t = frameOf(a, *labels);
+                 const std::uint32_t label = a.value("label", 0u);
+                 if (label == 0) throw std::invalid_argument("label must be > 0");
+                 const Index n = wb_.deleteLabelAt(i, t, label);
+                 if (n == 0) throw ToolFailure("not_found", "label " + std::to_string(label) + " is not in frame " + std::to_string(t), "list_labels shows the ids there");
+                 actions_.push_back({ActionRecord::Kind::Edit, "Deleted label " + std::to_string(label) + " (" + std::to_string(n) + " voxels) · step " + Step::number(i), "undo", {}, "delete_label"});
+                 return json{{"step", i + 1}, {"t", t}, {"label", label}, {"voxels", n}, {"labels", countAfter(*labels, t)}};
+             }});
+        add({"clear_labels",
+             "Remove every label of a step's output, at one time point or (default) at all of them: the volume becomes "
+             "background, the pixels stay. One undo entry holding every cleared voxel.",
+             obj({{"step", labelStepParam()},
+                  {"t", {{"type", "integer"}, {"description", "one time point; default every time point"}}}}),
+             [this, labelStep, labelsOf, busy](const json& a) {
+                 busy();
+                 const int i = labelStep(a);
+                 std::shared_ptr<LabelVolume> labels = labelsOf(i);
+                 const Index t = a.contains("t") && a["t"].is_number_integer() ? a["t"].get<Index>() : Index{-1};
+                 if (t >= labels->t()) throw ToolFailure("invalid_argument", "t " + std::to_string(t) + " is past the labels' " + std::to_string(labels->t()) + " time point(s)");
+                 const Index n = wb_.clearLabelsAt(i, t);
+                 actions_.push_back({ActionRecord::Kind::Edit, "Cleared the labels of step " + Step::number(i) + (t < 0 ? "" : " at t " + std::to_string(t)) + " (" + std::to_string(n) + " voxels)", n ? "undo" : "", {}, "clear_labels"});
+                 return json{{"step", i + 1}, {"t", t < 0 ? json("all") : json(t)}, {"voxels", n}, {"labels", 0}};
+             }});
+        add({"set_label_reviewed",
+             "Mark a label reviewed (or not): what the export sidecar and the review queue record.",
+             obj({{"step", labelStepParam()},
+                  {"label", {{"type", "integer"}}},
+                  {"t", {{"type", "integer"}, {"description", "time point (default 0)"}}},
+                  {"reviewed", {{"type", "boolean"}, {"description", "default true"}}}},
+                 {"label"}),
+             [this, labelStep, labelsOf, frameOf, busy](const json& a) {
+                 busy();
+                 const int i = labelStep(a);
+                 std::shared_ptr<LabelVolume> labels = labelsOf(i);
+                 const Index t = frameOf(a, *labels);
+                 const std::uint32_t label = a.value("label", 0u);
+                 if (label == 0) throw std::invalid_argument("label must be > 0");
+                 const bool reviewed = a.value("reviewed", true);
+                 if (!wb_.setLabelReviewedAt(i, t, label, reviewed))
+                     throw ToolFailure("not_found", "label " + std::to_string(label) + " is not in frame " + std::to_string(t), "list_labels shows the ids there");
+                 actions_.push_back({ActionRecord::Kind::Edit, std::string(reviewed ? "Reviewed" : "Unreviewed") + " label " + std::to_string(label) + " · step " + Step::number(i), "", {}, "set_label_reviewed"});
+                 return json{{"step", i + 1}, {"t", t}, {"label", label}, {"reviewed", reviewed}};
+             }});
+        add({"export_labels",
+             "Write a step's labels as one 32-bit TIFF (one page per plane, t*z pages for a time series, Deflate), the "
+             "file an import_labels step reads back and what Segment > Export labels writes. Overwrites.",
+             obj({{"step", labelStepParam()},
+                  {"path", {{"type", "string"}, {"description", "The .tif to write (.tif is appended when missing)"}}}},
+                 {"path"}),
+             [this, labelStep, labelsOf](const json& a) {
+                 std::string path = a.value("path", std::string());
+                 if (path.empty()) throw std::invalid_argument("path is required");
+                 refuseNetworkPath(path, "path", allowNetworkPaths_);
+                 if (!wb_.canEdit()) throw ToolFailure("busy", "A run is in progress: cancel it or wait before exporting labels.");
+                 const int i = labelStep(a);
+                 std::shared_ptr<LabelVolume> labels = labelsOf(i);
+                 const std::string low = lower(path);
+                 if (low.size() < 4 || (low.compare(low.size() - 4, 4, ".tif") != 0 && (low.size() < 5 || low.compare(low.size() - 5, 5, ".tiff") != 0))) path += ".tif";
+                 const Index nt = labels->t(), nz = labels->z(), ny = labels->y(), nx = labels->x();
+                 Buffer<std::uint32_t> stack(Shape{nt * nz, ny, nx});
+                 for (Index t = 0; t < nt; ++t)
+                     for (Index z = 0; z < nz; ++z)
+                         std::memcpy(stack.data() + (t * nz + z) * ny * nx, std::as_const(*labels).plane(t, z), static_cast<std::size_t>(ny * nx) * sizeof(std::uint32_t));
+                 TiffWriteOptions w;
+                 w.compression = TiffCompression::Deflate;
+                 w.predictor = true;
+                 w.description = "SIRIUS labels · order tzyx · t" + std::to_string(nt) + " z" + std::to_string(nz);
+                 try {
+                     writeTiffStack<std::uint32_t>(path, stack.view(), w);
+                 } catch (const std::exception& e) {
+                     throw ToolFailure("io_error", std::string("cannot write ") + path + ": " + e.what());
+                 }
+                 std::error_code ec;
+                 const auto bytes = std::filesystem::file_size(std::filesystem::u8path(path), ec);
+                 if (labels->statsT() < 0) labels->recomputeStats(0);
+                 wb_.logLine("Labels of step " + Step::number(i) + " written to " + path);
+                 wb_.recordEvent("export_labels", {{"step", i + 1}, {"path", path}});
+                 actions_.push_back({ActionRecord::Kind::Run, "Labels of step " + Step::number(i) + " → " + path, "log", {}, "export_labels"});
+                 return json{{"step", i + 1}, {"path", path}, {"pages", nt * nz}, {"shape", {{"t", nt}, {"z", nz}, {"y", ny}, {"x", nx}}},
+                             {"bytes", ec ? json(nullptr) : json(static_cast<long long>(bytes))}, {"labels", labels->stats().size()}, {"max_label", labels->maxLabel()}};
              }});
         add({"get_log", "The most recent lines of the workbench log.",
              obj({{"lines", {{"type", "integer"}}}}),

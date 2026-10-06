@@ -96,10 +96,20 @@ namespace sirius::app {
                 {"statistics", "Intensity statistics", false, true, false, false, false, false, false},
                 {"get_diagnostics", "Step diagnostics", false, true, false, false, false, false, false},
                 {"list_tracks", "List tracks", false, true, false, false, false, false, false},
+                {"list_labels", "List labels", false, true, false, false, false, true, false},
                 {"get_log", "Workbench log", true, true, false, false, false, true, false},
                 // output
                 {"export_result", "Export a result", false, false, true, false, false, false, false},
                 {"export_training_data", "Export training data", false, false, true, false, false, false, false},
+                {"export_labels", "Export labels", false, false, true, false, false, false, false},
+                // label editing (the viewer's paint tools, by step and time point)
+                {"paint_label", "Paint a label", false, false, false, false, false, false, false},
+                {"fill_label", "Fill a label", false, false, false, false, false, false, false},
+                {"merge_labels", "Merge labels", false, false, false, false, false, false, false},
+                {"split_label", "Split a label", false, false, false, false, false, false, false},
+                {"delete_label", "Delete a label", false, false, false, false, false, false, false},
+                {"clear_labels", "Clear the labels", false, false, false, false, false, false, false},
+                {"set_label_reviewed", "Mark a label reviewed", false, false, false, true, false, false, false},
                 {"export_python", "Export a Python script", true, false, true, false, false, false, false},
                 // the Python worker and plugins
                 {"list_plugins", "List plugins", false, true, false, false, false, false, false},
@@ -1770,6 +1780,22 @@ namespace sirius::app {
                 json rest = a;
                 rest.erase("step");
                 return base(rest);
+            };
+            api.addTool(std::move(spec));
+        }
+        // The label tools default to the viewed step, which nothing moves here:
+        // without a step they take the one every inspecting tool takes.
+        for (const char* name : {"list_labels", "paint_label", "fill_label", "merge_labels", "split_label", "delete_label", "clear_labels",
+                                 "set_label_reviewed", "export_labels"}) {
+            const ToolSpec* s = api.findTool(name);
+            if (!s) continue;
+            ToolSpec spec = *s;
+            spec.parameters["properties"]["step"] = stepProp("The step whose labels (default: the last computed)");
+            spec.fn = [this, base = s->fn](const json& a) {
+                if (has(a, "step")) return base(a);
+                json b = a;
+                b["step"] = defaultInspectStep() + 1;
+                return base(b);
             };
             api.addTool(std::move(spec));
         }

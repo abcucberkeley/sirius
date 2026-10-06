@@ -167,7 +167,7 @@ namespace {
 TEST_CASE("headless: the tool table has no view tools and strict schemas", "[app][headless]") {
     Fixture f;
     const std::vector<agent::ToolDescriptor> tools = f.h->tools();
-    CHECK(tools.size() == 39);
+    CHECK(tools.size() == 48);
     std::vector<std::string> names;
     const std::regex name("[A-Za-z0-9_.-]{1,64}");
     for (const agent::ToolDescriptor& t : tools) {
@@ -188,7 +188,8 @@ TEST_CASE("headless: the tool table has no view tools and strict schemas", "[app
         CHECK(std::find(names.begin(), names.end(), view) == names.end());
         CHECK_FALSE(f.h->hasTool(view));
     }
-    for (const char* wanted : {"open_dataset", "load_pipeline", "render", "statistics", "run", "run_status", "export_result", "setup_worker_env"})
+    for (const char* wanted : {"open_dataset", "load_pipeline", "render", "statistics", "run", "run_status", "export_result", "setup_worker_env",
+                               "list_labels", "paint_label", "fill_label", "merge_labels", "split_label", "delete_label", "clear_labels", "export_labels"})
         CHECK(std::find(names.begin(), names.end(), wanted) != names.end());
     const auto byName = [&](const std::string& n) {
         return *std::find_if(tools.begin(), tools.end(), [&](const agent::ToolDescriptor& t) { return t.name == n; });
@@ -197,6 +198,9 @@ TEST_CASE("headless: the tool table has no view tools and strict schemas", "[app
     CHECK_FALSE(byName("set_backend").inputSchema["properties"].contains("host"));
     CHECK(byName("render").hints.readOnly);
     CHECK(byName("export_result").hints.destructive);
+    CHECK(byName("export_labels").hints.destructive);
+    CHECK(byName("list_labels").hints.readOnly);
+    CHECK_FALSE(byName("paint_label").hints.readOnly);
     CHECK(byName("setup_worker_env").hints.openWorld);
     CHECK(byName("run").hints.openWorld);
     CHECK_FALSE(byName("render").hints.openWorld);
@@ -496,6 +500,120 @@ TEST_CASE("headless: export_result writes an OME-TIFF that opens with the same d
         CHECK(f.call("export_result", {{"path", (f.scratch.path / "x.tif").u8string()}, {"z", {5, 5}}}).error.code == "invalid_argument");
         CHECK(f.call("export_result", {{"path", (f.scratch.path / "x.tif").u8string()}, {"labels_only", true}}).error.code == "invalid_argument");
     }
+}
+
+TEST_CASE("headless: labels are imported from a TIFF, edited by the label tools, exported and imported again", "[app][headless]") {
+    Fixture f;
+    const json info = f.openRaw();
+    const Index nz = info["dims"]["z"].get<Index>(), ny = info["dims"]["y"].get<Index>(), nx = info["dims"]["x"].get<Index>();
+    REQUIRE(nz >= 8);
+    REQUIRE(ny >= 32);
+    REQUIRE(nx >= 32);
+    // two objects on the dataset's grid: a cube (1) and a bar along x (2)
+    Buffer<std::uint32_t> pages(Shape{nz, ny, nx});
+    std::fill(pages.data(), pages.data() + pages.size(), 0u);
+    auto at = [&](Index z, Index y, Index x) -> std::uint32_t& { return pages.data()[(z * ny + y) * nx + x]; };
+    for (Index z = 1; z <= 3; ++z) {
+        for (Index y = 2; y <= 6; ++y)
+            for (Index x = 2; x <= 6; ++x) at(z, y, x) = 1;
+        for (Index y = 10; y <= 12; ++y)
+            for (Index x = 2; x <= 21; ++x) at(z, y, x) = 2;
+    }
+    const std::filesystem::path labelsTif = f.scratch.path / "two objects.tif";
+    writeTiffStack<std::uint32_t>(labelsTif.u8string(), pages.view(), TiffCompression::Deflate);
+
+    // before any labels exist the tools say so, by name
+    CHECK(f.call("list_labels", {{"step", 1}}).error.code == "no_labels");
+    CHECK(f.call("paint_label", {{"x", 1}, {"y", 1}, {"z", 1}}).error.code == "no_labels");
+
+    const json step = f.ok("add_step", {{"kind", "import_labels"}, {"params", {{"path", labelsTif.u8string()}}}, {"name", "Labels"}});
+    CHECK(step["step"] == 2);
+    const agent::ToolResult ran = f.call("run", {{"wait_s", -1}});
+    INFO(ran.error.code << ": " << ran.error.message);
+    REQUIRE(ran.ok);
+    CHECK(ran.value["output"]["labels"]["count"] == 2);
+
+    // list: largest first, with ids and extents in (x, y, z)
+    json listed = f.ok("list_labels");
+    REQUIRE(listed["count"] == 2);
+    REQUIRE(listed["labels"].size() == 2);
+    CHECK(listed["labels"][0]["id"] == 2);   // the bar: 3 * 3 * 20 voxels
+    CHECK(listed["labels"][0]["voxels"] == 180);
+    CHECK(listed["labels"][1]["id"] == 1);
+    CHECK(listed["labels"][1]["voxels"] == 75);
+    CHECK(listed["labels"][1]["bbox"]["x0"] == 2);
+    CHECK(listed["labels"][1]["bbox"]["x1"] == 7);
+    CHECK(listed["labels"][1]["bbox"]["z0"] == 1);
+    CHECK(listed["labels"][1]["bbox"]["z1"] == 4);
+
+    // paint a new object where there is nothing: a third label, a ball over three planes
+    const json painted = f.ok("paint_label", {{"x", 25}, {"y", 25}, {"z", 2}, {"radius", 4}, {"z_radius", 1}});
+    CHECK(painted["label"] == 3);
+    CHECK(painted["voxels"].get<Index>() > 0);
+    CHECK(painted["labels"] == 3);
+    CHECK(f.ok("probe", {{"step", 2}, {"x", 25}, {"y", 25}, {"z", 2}})["label"]["id"] == 3);
+    CHECK(f.ok("probe", {{"step", 2}, {"x", 29}, {"y", 25}, {"z", 2}})["label"]["id"] == 3);
+    // erase its centre column through the three planes: only that label goes, and what is left is
+    // one connected ring (the planes above and below hold only the centre, which goes with it)
+    const json erased = f.ok("paint_label", {{"x", 25}, {"y", 25}, {"z", 2}, {"radius", 1}, {"z_radius", 1}, {"erase", true}, {"label", 3}});
+    CHECK(erased["voxels"].get<Index>() > 0);
+    CHECK(f.ok("probe", {{"step", 2}, {"x", 25}, {"y", 25}, {"z", 2}})["label"].is_null());
+    CHECK(f.ok("list_labels")["count"] == 3);
+    // fill the rest of label 3 with label 1: 3 is gone
+    const json filled = f.ok("fill_label", {{"x", 29}, {"y", 25}, {"z", 2}, {"label", 1}});
+    CHECK(filled["label"] == 1);
+    CHECK(filled["voxels"].get<Index>() > 0);
+    CHECK(f.ok("list_labels")["count"] == 2);
+    // split the bar from its two ends: a new label 4
+    const json split = f.ok("split_label", {{"label", 2}, {"a", {3, 11, 2}}, {"b", {20, 11, 2}}});
+    CHECK(split["created"] == 4);
+    CHECK(f.ok("list_labels")["count"] == 3);
+    CHECK(f.ok("probe", {{"step", 2}, {"x", 3}, {"y", 11}, {"z", 2}})["label"]["id"] == 2);
+    CHECK(f.ok("probe", {{"step", 2}, {"x", 20}, {"y", 11}, {"z", 2}})["label"]["id"] == 4);
+    // merge them back: into the smaller id
+    const json merged = f.ok("merge_labels", {{"ids", {2, 4}}});
+    CHECK(merged["into"] == 2);
+    CHECK(merged["voxels"] == 90);   // the voxels renumbered: the half that was label 4
+    CHECK(f.ok("list_labels")["count"] == 2);
+    CHECK(f.ok("probe", {{"step", 2}, {"x", 20}, {"y", 11}, {"z", 2}})["label"]["id"] == 2);
+    // review mark, delete, and the errors for ids that are not there
+    CHECK(f.ok("set_label_reviewed", {{"label", 2}})["reviewed"] == true);
+    CHECK(f.ok("list_labels", {{"unreviewed", true}})["listed"] == 1);
+    CHECK(f.call("delete_label", {{"label", 9}}).error.code == "not_found");
+    CHECK(f.call("merge_labels", {{"ids", {7, 8}}}).error.code == "not_found");
+    CHECK(f.call("split_label", {{"label", 2}, {"a", {3, 11, 2}}, {"b", {3, 11, 2}}}).error.code == "not_split");
+    CHECK(f.call("paint_label", {{"x", nx + 5}, {"y", 1}, {"z", 1}}).error.code == "invalid_argument");
+    const json deleted = f.ok("delete_label", {{"label", 1}});
+    CHECK(deleted["voxels"].get<Index>() > 75);   // the cube plus what the fill added
+    CHECK(f.ok("list_labels")["count"] == 1);
+
+    // save, clear, undo, and read the saved file back as another step
+    const std::filesystem::path saved = f.scratch.path / "edited";   // .tif is appended
+    const json exported = f.ok("export_labels", {{"path", saved.u8string()}});
+    CHECK(exported["path"] == saved.u8string() + ".tif");
+    CHECK(exported["pages"] == nz);
+    CHECK(exported["labels"] == 1);
+    REQUIRE(std::filesystem::exists(saved.u8string() + ".tif"));
+    const json cleared = f.ok("clear_labels");
+    CHECK(cleared["voxels"] == 180);
+    CHECK(f.ok("list_labels")["count"] == 0);
+    CHECK(f.ok("undo")["ok"] == true);   // the clear is one undo entry
+    CHECK(f.ok("list_labels")["count"] == 1);
+    CHECK(f.ok("probe", {{"step", 2}, {"x", 20}, {"y", 11}, {"z", 2}})["label"]["id"] == 2);
+
+    f.ok("add_step", {{"kind", "import_labels"}, {"params", {{"path", saved.u8string() + ".tif"}}}, {"name", "Reloaded"}});
+    const agent::ToolResult again = f.call("run", {{"wait_s", -1}});
+    INFO(again.error.code << ": " << again.error.message);
+    REQUIRE(again.ok);
+    const json reloaded = f.ok("list_labels", {{"step", 3}});
+    CHECK(reloaded["count"] == 1);
+    CHECK(reloaded["labels"][0]["id"] == 2);
+    CHECK(reloaded["labels"][0]["voxels"] == 180);
+    // the import step refuses a file that is not on the grid, before running
+    std::ofstream(f.scratch.path / "not a tif.tif") << "nothing";
+    f.ok("set_params", {{"step", 3}, {"params", {{"path", (f.scratch.path / "not a tif.tif").u8string()}}}});
+    const json bad = f.ok("get_step", {{"step", 3}});
+    CHECK_FALSE(bad["errors"].empty());
 }
 
 TEST_CASE("headless: the bundled example pipeline validates with plugins off", "[app][headless]") {
