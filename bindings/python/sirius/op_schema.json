@@ -1723,6 +1723,28 @@
         },
         {
           "advanced": false,
+          "choices": [
+            "New labels",
+            "The input's labels"
+          ],
+          "default": "New labels",
+          "help": "New labels: the prompted objects are this step's output on their own. The input's labels: they are written over the labels that arrive (a segmentation, or an Import labels step), each prompted object becoming a cell of its own -- which also takes its voxels out of whatever cell held them, so a click inside a merged cell splits off the one that was swallowed. The labels that arrive keep their ids",
+          "key": "apply",
+          "label": "Apply to",
+          "read_only": false,
+          "type": "choice",
+          "visible_when": [
+            {
+              "key": "task",
+              "negate": false,
+              "values": [
+                "Prompt objects"
+              ]
+            }
+          ]
+        },
+        {
+          "advanced": false,
           "default": 0.45,
           "key": "label_opacity",
           "label": "Label opacity",

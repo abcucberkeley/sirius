@@ -88,6 +88,7 @@ computer is not uploaded, and the run says so.
 | **Channels** <br> one · all | Send the one channel the structure is in, or all of them to a model trained on several (`model.json`'s `input.channels`). A mismatch is refused before anything runs. |
 | **Threshold** <br> Segment, 0 = model's | Foreground probability cut. Lower keeps dim objects; the model's own value is the one it was scored at. |
 | **Min. voxels** <br> 0 = model's / all | Drop smaller objects. On *Segment*, 0 uses the model's own minimum; on *Prompt*, 0 keeps every mask. |
+| **Apply to** <br> New labels · The input's labels | Prompt only. New labels: the prompted objects are this step's output on their own. The input's labels: they are written over the labels that arrive (a segmentation, or an Import labels step), each prompted object becoming a cell of its own, which also takes its voxels out of whatever cell held them. A click inside a merged cell therefore splits off the cell that was swallowed, and everything else keeps its id. |
 
 The image's voxel size is compared with the one the model was trained at
 (`model.json`'s `input.voxel_um`): more than 1.5× off on an axis is said under

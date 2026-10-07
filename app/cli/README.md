@@ -600,7 +600,12 @@ re-run. Without `object`, a box, object point or scribble starts an object of
 its own and a background point joins the nearest object on its time point. An
 object with only background prompts is not sent; a time point without objects
 is left empty and costs no worker call. micro-SAM's masks are per plane, so
-all of one object's prompts must share a plane.
+all of one object's prompts must share a plane. A Prompt step whose `apply` is `The input's
+labels` writes its objects over the labels that reach it instead of answering with its own: each
+prompted object becomes a cell of its own, which takes its voxels out of whatever cell held them, so
+one click inside a merged cell splits off the one that was swallowed and every other cell keeps its
+id. That is how a label map loaded with `import_labels` is corrected by the model rather than
+replaced by it.
 
 ```
 sirius-cli --dataset raw.tif call add_step --args '{"kind": "foundation", "params": {"model": "models/coat-sam-s2/v1",

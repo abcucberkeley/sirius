@@ -3878,9 +3878,10 @@ def step_seg(a: np.ndarray, params: Dict[str, Any], meta: Dict[str, Any], progre
 _FOUNDATION = StepSpec(
     "foundation",
     {"model": "", "task": "Segment objects", "prompts": [], "channels": "Selected channel", "input_channel": 0,
-     "threshold": 0.0, "min_voxels": 0, "label_opacity": 0.45, "class_name": "object"},
+     "threshold": 0.0, "min_voxels": 0, "apply": "New labels", "label_opacity": 0.45, "class_name": "object"},
     choices={"task": ("Segment objects", _PROMPT_TASK),
-             "channels": ("Selected channel", "All channels")},
+             "channels": ("Selected channel", "All channels"),
+             "apply": ("New labels", "The input's labels")},
     aliases={"bundle": "model", "model_path": "model", "model_folder": "model", "channel": "input_channel",
              "minVoxels": "min_voxels"},
     # Python-only: the image's voxel size, [x, y, z] like the metadata's, compared
@@ -3890,8 +3891,8 @@ _FOUNDATION = StepSpec(
 
 
 @_step(_FOUNDATION)
-def step_foundation(a: np.ndarray, params: Dict[str, Any], meta: Dict[str, Any], progress: ProgressFn = None,
-                    cancelled: CancelFn = None, device: str = "auto") -> StepResult:
+def step_foundation(a: np.ndarray, params: Dict[str, Any], meta: Dict[str, Any], labels: Optional[np.ndarray] = None,
+                    progress: ProgressFn = None, cancelled: CancelFn = None, device: str = "auto") -> StepResult:
     """A trained model folder (model.py + model.json "latents-model/1", as
     latents scripts/export_model.py writes it; no latents package needed): model
     (the folder), task (Segment objects | Prompt objects, with prompts: one mask
@@ -3923,7 +3924,19 @@ def step_foundation(a: np.ndarray, params: Dict[str, Any], meta: Dict[str, Any],
         # one time point per call, as the prompt decoder takes it; a frame
         # without prompts stays empty and asks nothing of the model
         nt = a.shape[1]
-        labels = np.zeros((nt,) + a.shape[2:], np.uint32)
+        # apply: "The input's labels" writes the prompted objects over the labels that arrived, each as a
+        # cell of its own, which also takes its voxels out of whatever cell held them (foundation.cpp).
+        onto = _choice(params.get("apply"), _FOUNDATION.choices["apply"], "New labels") == "The input's labels"
+        if onto:
+            if labels is None or not np.size(labels):
+                raise ValueError("foundation: apply to the input's labels, but the step above produced none")
+            if tuple(np.shape(labels)) != (nt,) + a.shape[2:]:
+                raise ValueError("foundation: the input's labels are not on the input's grid")
+            labels = np.array(labels, dtype=np.uint32, copy=True)
+            id_base = int(labels.max())
+        else:
+            labels = np.zeros((nt,) + a.shape[2:], np.uint32)
+            id_base = 0
         scores = []
         for t in range(nt):
             objects, ids = _frame_objects(params.get("prompts"), t)
@@ -3936,7 +3949,8 @@ def step_foundation(a: np.ndarray, params: Dict[str, Any], meta: Dict[str, Any],
                                       cancelled=cancelled)
             except fm.Cancelled as e:
                 raise Cancelled("cancelled") from e
-            labels[t] = _renumber_prompt_masks(np.asarray(lab)[0], ids)
+            frame = _renumber_prompt_masks(np.asarray(lab)[0], ids)
+            labels[t] = np.where(frame > 0, frame.astype(np.uint32) + id_base, labels[t]) if id_base else frame
             scores.append([[i, v] for v, i in zip(info.get("mask_scores", []), ids)])
         return StepResult(a, dict(meta), labels=labels,
                           info={"model": path, "task": "prompt", "objects": int(labels.max()), "mask_scores": scores})
@@ -4035,7 +4049,9 @@ def run_step(kind: str, params: Dict[str, Any], array: np.ndarray, meta: Optiona
     kwargs: Dict[str, Any] = {}
     if k in ("sim", "seg", "foundation"):
         kwargs.update(progress=progress, cancelled=cancelled, device=device)
-    if spec.needs_labels:
+    # foundation takes the labels without declaring needs_labels: only its Prompt task with
+    # apply="The input's labels" reads them, and a step is not made to need labels by a parameter.
+    if spec.needs_labels or k == "foundation":
         kwargs["labels"] = labels
     res = fn(a, p, meta, **kwargs)
     # Labels a step does not make or move are carried through only while they

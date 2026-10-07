@@ -46,6 +46,11 @@ namespace sirius::app {
         constexpr const char* kSegment = kModelSegmentLabel;
         constexpr const char* kPrompt = kPromptTask;
         constexpr const char* kOneChannel = "Selected channel";
+        // Prompt: where the masks land. "New labels" is the step's own volume (what it has always
+        // done); "The input's labels" writes them onto the labels that came in, so pointing at a cell
+        // the step above got wrong corrects THAT label map instead of replacing it.
+        constexpr const char* kApplyNew = "New labels";
+        constexpr const char* kApplyInput = "The input's labels";
         constexpr const char* kAllChannels = "All channels";
 
         bool onCluster(const std::string& path) { return path.rfind("cluster://", 0) == 0; }
@@ -112,6 +117,13 @@ namespace sirius::app {
                     intParam("min_voxels", "Min. voxels", 0)
                         .range(0, 1000000000)
                         .withHelp("Drop smaller objects. 0 keeps all on Prompt and uses the model's own on Segment"),
+                    choiceParam("apply", "Apply to", {kApplyNew, kApplyInput}, kApplyNew)
+                        .visibleWhen("task", {kPrompt})
+                        .withHelp("New labels: the prompted objects are this step's output on their own. The input's labels: "
+                                  "they are written over the labels that arrive (a segmentation, or an Import labels step), "
+                                  "each prompted object becoming a cell of its own -- which also takes its voxels out of "
+                                  "whatever cell held them, so a click inside a merged cell splits off the one that was "
+                                  "swallowed. The labels that arrive keep their ids"),
                     doubleParam("label_opacity", "Label opacity", 0.45).range(0.0, 1.0, 0.05, 2),
                     stringParam("class_name", "Class", "object").asAdvanced(),
                 };
@@ -340,7 +352,24 @@ namespace sirius::app {
                 StepOutput out;
                 out.meta = meta;
                 out.array = input.materialize([&](double f, const std::string& m) { ctx.report(0.05 * f, m); });
-                auto labels = std::make_shared<LabelVolume>(d.t, d.z, d.y, d.x);
+                const bool ontoInput = p.getString("apply", kApplyNew) == kApplyInput;
+                std::shared_ptr<LabelVolume> labels;
+                if (ontoInput) {
+                    if (!input.labels || input.labels->empty())
+                        throw std::runtime_error("Apply to: the input's labels -- the step above has none. Put a segmentation "
+                                                 "or an Import labels step before this one, or apply to new labels.");
+                    if (input.labels->t() != d.t || input.labels->z() != d.z || input.labels->y() != d.y ||
+                        input.labels->x() != d.x)
+                        throw std::runtime_error("the input's labels are not on the input's grid, so the prompted masks cannot "
+                                                 "be written onto them");
+                    labels = input.labels->clone();
+                } else {
+                    labels = std::make_shared<LabelVolume>(d.t, d.z, d.y, d.x);
+                }
+                // The ids the prompted objects take when they land on the input's labels: above every id
+                // that arrived, fixed before the first frame so one object is one id in every frame.
+                const std::uint32_t idBase = ontoInput ? labels->maxLabel() : 0u;
+                std::vector<std::uint32_t> promptedMask;
 
                 if (prompted > 0) {
                     requireWorker(ctx);
@@ -415,17 +444,29 @@ namespace sirius::app {
                     if (!got) throw std::runtime_error("the worker returned no 'labels' tensor");
                     if (!oneFrame(got)) throw std::runtime_error("the worker's labels do not match the volume");
                     std::uint32_t* dst = labels->volume(t);
-                    std::copy_n(got->asUInt32(), volume, dst);
-                    applyPromptIds(dst, volume, f);
-                    labels->recomputeStats(t, oneFrame(confidence) ? confidence->asFloat32() : nullptr);
+                    if (!ontoInput) {
+                        std::copy_n(got->asUInt32(), volume, dst);
+                        applyPromptIds(dst, volume, f);
+                    } else {
+                        promptedMask.resize(static_cast<std::size_t>(volume));
+                        std::copy_n(got->asUInt32(), volume, promptedMask.data());
+                        applyPromptIds(promptedMask.data(), volume, f);
+                        for (Index i = 0; i < volume; ++i)
+                            if (const std::uint32_t id = promptedMask[static_cast<std::size_t>(i)]) dst[i] = idBase + id;
+                    }
+                    // The confidence map describes the prompted masks only, so it says nothing about the
+                    // cells that arrived: measure them without it when the two are mixed.
+                    labels->recomputeStats(t, !ontoInput && oneFrame(confidence) ? confidence->asFloat32() : nullptr);
                     // the model's own score of each object's mask, by the object's id
                     appendPromptScores(scores, f, r.result.value("mask_scores", nlohmann::json::array()), t, d.t > 1);
                     addWorkerWarnings(diag, r.result);
                     lastResult = r.result;
                     ++done;
                 }
+                if (ontoInput) labels->resetMaxLabel();   // the raw writes above handed out the ids themselves
                 const std::string className = p.getString("class_name", "object");
-                for (LabelStats& s : labels->stats()) s.cls = className;
+                for (LabelStats& s : labels->stats())
+                    if (!ontoInput || s.id > idBase) s.cls = className;   // the cells that arrived keep theirs
                 std::uint32_t total = 0;
                 for (const LabelStats& s : labels->stats()) total = std::max(total, s.id);
 
