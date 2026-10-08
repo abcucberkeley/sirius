@@ -90,6 +90,8 @@ namespace sirius {
                 {"bessel", [](auto& c, auto& k, auto& v) { c.bBessel = parseBool(k, v); }},
                 {"besselNA", [](auto& c, auto& k, auto& v) { c.BesselNA = parseFloat(k, v); }},
                 {"besselLambdaEx", [](auto& c, auto& k, auto& v) { c.BesselLambdaEx = parseFloat(k, v); }},
+                // cudasirecon's own name for the same quantity (microns); both spellings are read
+                {"besselExWave", [](auto& c, auto& k, auto& v) { c.BesselLambdaEx = parseFloat(k, v); }},
                 {"deskew", [](auto& c, auto& k, auto& v) { c.deskewAngle = parseFloat(k, v); }},
                 {"deskewshift", [](auto& c, auto& k, auto& v) { c.extraShift = parseInt(k, v); }},
                 {"noRecon", [](auto& c, auto& k, auto& v) { c.bNoRecon = parseBool(k, v); }},
@@ -107,6 +109,9 @@ namespace sirius {
                 {"napodize", [](auto& c, auto& k, auto& v) { c.napodize = parseInt(k, v); }},
                 {"searchforvector", [](auto& c, auto& k, auto& v) { c.bSearchforvector = parseInt(k, v); }},
                 {"usetime0k0", [](auto& c, auto& k, auto& v) { c.bUseTime0k0 = parseInt(k, v); }},
+                {"k0searchAll", [](auto& c, auto& k, auto& v) { c.k0searchAll = parseInt(k, v); }},
+                // a cudasirecon CLI flag (print the version); harmless in a parameter file
+                {"version", [](auto&, auto&, auto&) {}},
                 {"apodizeoutput", [](auto& c, auto& k, auto& v) { c.apodizeoutput = parseInt(k, v); }},
                 {"gammaApo", [](auto& c, auto& k, auto& v) { c.apoGamma = parseFloat(k, v); }},
                 {"nosuppress", [](auto& c, auto& k, auto& v) { c.bSuppress_singularities = parseBool(k, v) ? 0 : 1; }},

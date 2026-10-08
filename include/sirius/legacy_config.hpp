@@ -53,6 +53,10 @@ namespace sirius {
         int   napodize              = 10;
         int   bSearchforvector      = 1;
         int   bUseTime0k0           = 1;
+        // cudasirecon >= 1.1: search for k0 at every time point instead of reusing time 0's.
+        // SIRIUS reconstructs one (c, t) volume at a time and fits each, so the flag is
+        // accepted for compatibility and changes nothing here.
+        int   k0searchAll           = 0;
         int   apodizeoutput         = 2;     // 0-none 1-cosine 2-triangle
         float apoGamma              = 1.0f;
         int   bSuppress_singularities = 1;

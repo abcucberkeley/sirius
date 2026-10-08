@@ -277,3 +277,41 @@ TEST_CASE("fromLegacy validates the result", "[legacy][convert]") {
     c.k0angles = {0.1f, 0.2f};
     REQUIRE_THROWS_AS(fromLegacy(c), std::runtime_error);
 }
+
+// --------------------------------------------------------------------------
+// cudasirecon's own vocabulary (1.1.1 and 1.2.0) is read in full: the isoar
+// configuration of 2026-10-08 was refused on 'k0searchAll' while cudasirecon
+// 1.1.1 refused the same file on 'otfcutoff' -- the two parsers had drifted
+// into dialects and neither accepted the other's. These three keys were the
+// whole difference on the cudasirecon side.
+// --------------------------------------------------------------------------
+
+TEST_CASE("loadLegacyConfig reads every key cudasirecon 1.2.0 writes", "[legacy]") {
+    TempFile tf(".cfg",
+                "ndirs=1\n"
+                "nphases=3\n"
+                "angle0=1.5961\n"
+                "ls=0.491\n"
+                "na=1.35\n"
+                "nimm=1.405\n"
+                "wiener=0.001\n"
+                "otfcutoff=.006\n"
+                "background=100\n"
+                "otfPerAngle=0\n"
+                "fastSI=0\n"
+                "k0searchAll=1\n"
+                "dampenOrder0=0\n"
+                "gammaApo=1\n"
+                "xyres=0.085\n"
+                "zres=0.1\n"
+                "wavelength=604\n"
+                "besselExWave=0.488\n"
+                "version=1\n");
+    const auto c = loadLegacyConfig(tf.str());
+    REQUIRE(c.ndirs == 1);
+    REQUIRE(c.nphases == 3);
+    REQUIRE(c.k0searchAll == 1);
+    REQUIRE(c.BesselLambdaEx == Approx(0.488f));     // besselExWave is cudasirecon's spelling of besselLambdaEx
+    REQUIRE(c.otfcutoff == Approx(0.006f));
+    REQUIRE(c.wavelengthNm == Approx(604.0f));
+}
