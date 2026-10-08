@@ -183,6 +183,190 @@ class TestNpy(_Files):
                     datasets.read_ref({**ref, "c": c})
 
 
+# --- MRC / DeltaVision: the header with struct, the sections a memmap ---------------------------
+
+# the SIM test case's raw.dv / otf.dv, the same arrays as raw.tif / otf.tif beside them
+DATA = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(HERE))), "tests", "data")
+
+
+def write_mrc(path, nx=8, ny=6, planes=4, waves=1, times=1, sequence=0, mode=2, big=False,
+              wavelengths=(), voxel=(0.1, 0.1, 0.3), deltavision=True, value=None):
+    """A DeltaVision (or MRC2014) stack: the header fields the reader uses, then the
+    sections in the sequence's order; value(w, t, z, yy, xx) gives each section."""
+    import struct
+
+    e = ">" if big else "<"
+    hdr = bytearray(1024)
+    sections = planes * waves * times
+    struct.pack_into(e + "4i", hdr, 0, nx, ny, sections, mode)
+    struct.pack_into(e + "3i", hdr, 64, 1, 2, 3)
+    if deltavision:
+        struct.pack_into(e + "3i", hdr, 28, 1, 1, 1)
+        struct.pack_into(e + "3f", hdr, 40, *voxel)
+        struct.pack_into(e + "h", hdr, 96, -16224)
+        struct.pack_into(e + "2h", hdr, 128, 8, 32)
+        struct.pack_into(e + "h", hdr, 180, times)
+        struct.pack_into(e + "h", hdr, 182, sequence)
+        struct.pack_into(e + "h", hdr, 196, waves)
+        struct.pack_into(e + "5h", hdr, 198, *(list(wavelengths) + [0] * 5)[:5])
+    else:
+        struct.pack_into(e + "3i", hdr, 28, nx, ny, sections)
+        struct.pack_into(e + "3f", hdr, 40, voxel[0] * 1e4 * nx, voxel[1] * 1e4 * ny, voxel[2] * 1e4 * sections)
+        hdr[208:212] = b"MAP "
+        hdr[212:216] = bytes([0x11, 0x11, 0, 0]) if big else bytes([0x44, 0x44, 0, 0])
+    code = {0: "u1", 1: "i2", 2: "f4", 3: "i2", 4: "f4", 6: "u2", 7: "i4"}[mode]
+    width = 2 * nx if mode in (3, 4) else nx
+    data = np.zeros((sections, ny, width), dtype=np.dtype(e + code))
+    yy, xx = np.mgrid[0:ny, 0:width]
+    for k in range(sections):
+        if not deltavision or sequence == 0:          # ZTW
+            z, t, w = k % planes, (k // planes) % times, k // (planes * times)
+        elif sequence == 1:                           # WZT
+            w, z, t = k % waves, (k // waves) % planes, k // (waves * planes)
+        else:                                         # ZWT
+            z, w, t = k % planes, (k // planes) % waves, k // (planes * waves)
+        data[k] = (value or stamp)(w, t, z, yy, xx)
+    with open(path, "wb") as f:
+        f.write(hdr)
+        f.write(data.tobytes())
+
+
+def stamp(w, t, z, yy, xx):
+    """A sample that names its own (w, t, z, y, x); fits int16 for the sizes used."""
+    return w * 10000 + t * 1000 + z * 100 + yy * 10 + xx
+
+
+class TestMrc(_Files):
+    @unittest.skipUnless(os.path.exists(os.path.join(DATA, "raw.dv")), "tests/data/raw.dv is not beside this checkout")
+    def test_the_shipped_raw_dv_opens_as_the_application_does(self):
+        path = os.path.join(DATA, "raw.dv")
+        ds = datasets.open_dataset(path)
+        m = ds.meta()
+        self.assertEqual(m["name"], "raw")
+        self.assertEqual(m["format"], "deltavision")
+        self.assertEqual(m["dims"], [1, 1, 135, 64, 64])
+        self.assertEqual(m["dtype"], "float32")
+        self.assertEqual(m["bytes"], 2212864)
+        self.assertTrue(m["dims_from_metadata"])
+        self.assertFalse(m["rgb"])
+        np.testing.assert_allclose(m["voxel_um"], [0.08, 0.08, 0.125], rtol=1e-6)
+        self.assertEqual(m["channels"], [{"name": "528", "wavelength_nm": 528.0}])
+        h = datasets.mrc_header(path)
+        self.assertEqual((h["nx"], h["ny"], h["sections"], h["mode"], h["data_offset"]), (64, 64, 135, 2, 1024))
+        self.assertTrue(h["deltavision"])
+        self.assertFalse(h["big_endian"])
+        # the sections, in file order, are the (z, y, x) volume
+        raw = np.fromfile(path, dtype="<f4", offset=1024).reshape(135, 64, 64)
+        vol = ds.volume(0, 0)
+        self.assertEqual(vol.dtype.name, "float32")
+        np.testing.assert_array_equal(vol, raw)
+        np.testing.assert_array_equal(ds.plane(0, 0, 70), raw[70])
+        np.testing.assert_array_equal(ds.view("xy", 0, 0, 7, 1, [4, 2, 5, 3]), raw[7, 2:5, 4:9])
+        if HAVE_TIFFFILE:
+            # raw.tif is Bio-Formats' export of raw.dv, which reverses the rows of a
+            # DeltaVision section (MRC's origin is bottom-left); the values are the same
+            np.testing.assert_array_equal(vol, tifffile.imread(os.path.join(DATA, "raw.tif"))[:, ::-1, :])
+        # the wire form is the same array
+        desc, tensor = datasets.encode(ds.plane(0, 0, 3), ["zlib"])
+        self.assertEqual(desc["dtype"], "float32")
+        self.assertEqual(desc["shape"], [64, 64])
+
+    @unittest.skipUnless(os.path.exists(os.path.join(DATA, "otf.dv")), "tests/data/otf.dv is not beside this checkout")
+    def test_otf_dv_reads_its_complex_pairs_as_columns(self):
+        path = os.path.join(DATA, "otf.dv")
+        h = datasets.mrc_header(path)
+        self.assertEqual((h["mode"], h["nx"], h["width"], h["ny"], h["sections"]), (4, 65, 130, 129, 3))
+        self.assertTrue(h["complex"])
+        ds = datasets.open_dataset(path)
+        self.assertEqual(ds.meta()["dims"], [1, 1, 3, 129, 130])
+        self.assertEqual(ds.meta()["dtype"], "float32")
+        vol = ds.volume(0, 0)
+        np.testing.assert_array_equal(vol, np.fromfile(path, dtype="<f4", offset=1024).reshape(3, 129, 130))
+        self.assertEqual((float(vol[0, 0, 0]), float(vol[0, 0, 1])), (1.0, 0.0))   # 1 + 0i at the origin of order 0
+
+    def test_wavelengths_and_time_points_follow_the_sequence(self):
+        yy, xx = np.mgrid[0:6, 0:8]
+        for sequence in (0, 1, 2):
+            with self.subTest(sequence=sequence):
+                path = self.path(f"seq{sequence}.dv")
+                write_mrc(path, waves=2, times=3, planes=4, sequence=sequence, mode=1, wavelengths=(488, 561))
+                ds = datasets.open_dataset(path)
+                m = ds.meta()
+                self.assertEqual(m["dims"], [2, 3, 4, 6, 8])
+                self.assertEqual(m["dtype"], "int16")
+                self.assertEqual(m["format"], "deltavision")
+                self.assertTrue(m["dims_from_metadata"])
+                self.assertEqual(m["channels"], [{"name": "488", "wavelength_nm": 488.0}, {"name": "561", "wavelength_nm": 561.0}])
+                np.testing.assert_allclose(m["voxel_um"], [0.1, 0.1, 0.3], rtol=1e-6)
+                for w in range(2):
+                    for t in range(3):
+                        for z in range(4):
+                            np.testing.assert_array_equal(ds.plane(w, t, z), stamp(w, t, z, yy, xx))
+                vol = ds.volume(1, 2)
+                self.assertEqual(vol.shape, (4, 6, 8))
+                np.testing.assert_array_equal(vol[3], stamp(1, 2, 3, yy, xx))
+                np.testing.assert_array_equal(ds.view("mip", 1, 0, 0, 1), stamp(1, 0, 3, yy, xx))
+
+    def test_big_endian_uint16_reads_and_ships_little_endian(self):
+        path = self.path("be.dv")
+        write_mrc(path, mode=6, big=True, value=lambda w, t, z, yy, xx: 60000 + z * 10 + yy + xx)
+        ds = datasets.open_dataset(path)
+        self.assertEqual(ds.meta()["dtype"], "uint16")
+        self.assertEqual(int(ds.plane(0, 0, 2)[3, 4]), 60027)
+        desc, tensor = datasets.encode(ds.volume(0, 0), ["zlib"])
+        self.assertEqual(desc["dtype"], "uint16")
+        self.assertNotEqual(tensor.dtype.byteorder, ">")
+
+    def test_a_plain_mrc_file_is_one_z_stack(self):
+        path = self.path("tomo.mrc")
+        write_mrc(path, planes=5, deltavision=False, value=lambda w, t, z, yy, xx: z + yy + xx)
+        ds = datasets.open_dataset(path)
+        m = ds.meta()
+        self.assertEqual(m["name"], "tomo")
+        self.assertEqual(m["format"], "mrc")
+        self.assertEqual(m["dims"], [1, 1, 5, 6, 8])
+        self.assertFalse(m["dims_from_metadata"])
+        self.assertEqual(m["channels"], [])
+        np.testing.assert_allclose(m["voxel_um"], [0.1, 0.1, 0.3], rtol=1e-5)
+        self.assertEqual(float(ds.plane(0, 0, 4)[5, 7]), 16.0)
+
+    def test_a_page_order_from_the_application_wins_over_the_header(self):
+        path = self.path("order.dv")
+        write_mrc(path, waves=2, times=3, planes=4, sequence=0, mode=1)
+        # c and t given with the default order: the header's sequence still maps the sections
+        ds = datasets.open_dataset(path, {"page_order": "czt", "c": 2, "t": 3})
+        self.assertEqual(ds.meta()["dims"], [2, 3, 4, 6, 8])
+        self.assertFalse(ds.meta()["dims_from_metadata"])
+        yy, xx = np.mgrid[0:6, 0:8]
+        np.testing.assert_array_equal(ds.plane(1, 2, 3), stamp(1, 2, 3, yy, xx))
+        # a layout the sections do not divide into: the sections are read as z
+        odd = datasets.open_dataset(path, {"page_order": "czt", "c": 5})
+        self.assertEqual(odd.meta()["dims"], [1, 1, 24, 6, 8])
+
+    def test_files_that_are_not_stacks_say_why(self):
+        short = self.path("short.dv")
+        with open(short, "wb") as f:
+            f.write(b"DeltaVision?")
+        with self.assertRaises(datasets.DatasetError) as e:
+            datasets.open_dataset(short)
+        self.assertIn("1024 bytes", str(e.exception))
+        truncated = self.path("trunc.dv")
+        write_mrc(truncated, planes=4)
+        with open(truncated, "r+b") as f:
+            f.truncate(1024 + 100)
+        with self.assertRaises(datasets.DatasetError) as e:
+            datasets.open_dataset(truncated)
+        self.assertIn("expected, the file has 1124", str(e.exception))
+        unknown = self.path("mode.dv")
+        write_mrc(unknown, mode=2)
+        with open(unknown, "r+b") as f:
+            f.seek(12)
+            f.write((12).to_bytes(4, "little", signed=True))
+        with self.assertRaises(datasets.DatasetError) as e:
+            datasets.open_dataset(unknown)
+        self.assertIn("pixel mode 12 is not read", str(e.exception))
+
+
 # --- TIFF: SIRIUS's own reader (the sirius package) ------------------------------------------
 #
 # The worker reads TIFF only through the sirius extension. Where it is not

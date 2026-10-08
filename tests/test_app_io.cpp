@@ -9,6 +9,7 @@
 
 #include <cmath>
 #include <cstdint>
+#include <cstring>
 #include <filesystem>
 #include <fstream>
 #include <string>
@@ -23,11 +24,13 @@
 #include "sirius/tiff_io.hpp"
 #include "sirius/zarr_io.hpp"
 
+#include "mrc_fixture.hpp"
 #include "temp_path.hpp"
 
 using namespace sirius;
 using namespace sirius::app;
 namespace fs = std::filesystem;
+using Catch::Matchers::ContainsSubstring;
 using Catch::Matchers::WithinRel;
 
 namespace {
@@ -262,8 +265,147 @@ TEST_CASE("openDataset errors and extensions", "[app][io]") {
     REQUIRE_THROWS_AS(probeDataset("/nonexistent/file.tif"), std::runtime_error);
     const auto ext = readableExtensions();
     REQUIRE(std::find(ext.begin(), ext.end(), ".tif") != ext.end());
+    REQUIRE(std::find(ext.begin(), ext.end(), ".dv") != ext.end());
+    REQUIRE(std::find(ext.begin(), ext.end(), ".mrc") != ext.end());
     REQUIRE((std::find(ext.begin(), ext.end(), ".zarr") != ext.end()) == sirius::app::zarrSupported());
     REQUIRE(sirius::app::zarrSupported() == sirius::zarrSupported());
+}
+
+// --- MRC / DeltaVision ------------------------------------------------------------------
+
+TEST_CASE("openDataset reads a DeltaVision stack: raw.dv against raw.tif", "[app][io][mrc]") {
+    const std::string data = SIRIUS_TEST_DATA_DIR;
+    const DatasetMeta probed = probeDataset(data + "/raw.dv");
+    CHECK(probed.dims == Dims5{1, 1, 135, 64, 64});
+    CHECK(probed.format == "deltavision");
+    CHECK(probed.sourceType == PixelType::Float32);
+    CHECK(probed.bytesOnDisk == 2212864);
+    CHECK(probed.name == "raw");
+    CHECK_THAT(probed.voxelUm[0], WithinRel(0.08, 1e-6));
+    CHECK_THAT(probed.voxelUm[1], WithinRel(0.08, 1e-6));
+    CHECK_THAT(probed.voxelUm[2], WithinRel(0.125, 1e-6));
+    REQUIRE(probed.channels.size() == 1);
+    CHECK(probed.channels[0].label == "528");
+    CHECK(probed.channels[0].wavelengthNm == 528.0);
+    CHECK(probed.acquisition == "DeltaVision");
+
+    const OpenResult r = openDataset(data + "/raw.dv");
+    CHECK(r.dimsFromMetadata);
+    CHECK(r.meta.dims == probed.dims);
+    CHECK_THAT(r.metadataSummary, ContainsSubstring("DeltaVision"));
+    CHECK_THAT(r.metadataSummary, ContainsSubstring("135 sections"));
+    CHECK_FALSE(r.source->inMemory());
+    const std::shared_ptr<Array5> dv = r.source->readAll();
+    // raw.tif is Bio-Formats' export of raw.dv, which reverses the rows of a
+    // DeltaVision section (MRC puts the origin bottom-left); the values are the
+    // same to the bit, so page z of the TIFF is section z with its rows reversed
+    const std::shared_ptr<Array5> tif = openDataset(data + "/raw.tif").source->readAll();
+    REQUIRE(tif->dims() == dv->dims());
+    for (Index z = 0; z < 135; ++z) {
+        INFO("section " << z);
+        for (Index y = 0; y < 64; ++y)
+            REQUIRE(std::memcmp(dv->plane(0, 0, z) + y * 64, tif->plane(0, 0, z) + (63 - y) * 64, 64 * sizeof(float)) == 0);
+    }
+    // a plane and a lazy volume are the same values
+    std::vector<float> plane(64 * 64);
+    r.source->readPlane(0, 0, 70, plane.data());
+    CHECK(std::memcmp(plane.data(), dv->plane(0, 0, 70), plane.size() * sizeof(float)) == 0);
+    std::vector<float> vol(135 * 64 * 64);
+    r.source->readVolume(0, 0, vol.data());
+    CHECK(std::memcmp(vol.data(), dv->plane(0, 0, 0), vol.size() * sizeof(float)) == 0);
+    CHECK_THROWS_AS(r.source->readPlane(0, 0, 135, plane.data()), std::out_of_range);
+
+    SECTION("a full load holds it in memory") {
+        OpenOptions o;
+        o.readAll = true;
+        const OpenResult full = openDataset(data + "/raw.dv", o);
+        CHECK(full.source->inMemory());
+        CHECK(std::memcmp(full.source->readAll()->plane(0, 0, 0), dv->plane(0, 0, 0), vol.size() * sizeof(float)) == 0);
+    }
+    SECTION("otf.dv, a complex table, opens as a float32 stack of (re, im) columns") {
+        const DatasetMeta otf = probeDataset(data + "/otf.dv");
+        CHECK(otf.dims == Dims5{1, 1, 3, 129, 130});
+        CHECK(otf.sourceType == PixelType::Float32);
+        const OpenResult o = openDataset(data + "/otf.dv");
+        CHECK_THAT(o.metadataSummary, ContainsSubstring("complex"));
+        std::vector<float> row(129 * 130);
+        o.source->readPlane(0, 0, 0, row.data());
+        CHECK(row[0] == 1.f);   // 1 + 0i at the origin of order 0
+        CHECK(row[1] == 0.f);
+    }
+}
+
+TEST_CASE("openDataset maps a DeltaVision file's wavelengths and time points by its sequence", "[app][io][mrc]") {
+    const int sequence = GENERATE(0, 1, 2);
+    INFO("sequence " << sequence);
+    test::MrcSpec s;
+    s.waves = 2;
+    s.times = 3;
+    s.planes = 4;
+    s.sequence = sequence;
+    s.mode = 6;
+    s.wavelengths = {488, 561, 0, 0, 0};
+    s.pixelX = 0.065f;
+    s.pixelY = 0.065f;
+    s.pixelZ = 0.2f;
+    TempPath f(".dv");
+    const auto stamp = [](int w, int t, int z, int y, int x) { return static_cast<double>(w * 10000 + t * 1000 + z * 100 + y * 10 + x); };
+    test::writeMrc(f.str(), s, stamp);
+
+    const OpenResult r = openDataset(f.str());
+    CHECK(r.meta.dims == Dims5{2, 3, 4, 6, 8});
+    CHECK(r.dimsFromMetadata);
+    CHECK(r.meta.sourceType == PixelType::UInt16);
+    CHECK(r.meta.format == "deltavision");
+    REQUIRE(r.meta.channels.size() == 2);
+    CHECK(r.meta.channels[0].label == "488");
+    CHECK(r.meta.channels[1].label == "561");
+    CHECK(r.meta.channels[1].wavelengthNm == 561.0);
+    CHECK_THAT(r.meta.voxelUm[0], WithinRel(0.065, 1e-6));
+    CHECK_THAT(r.meta.voxelUm[2], WithinRel(0.2, 1e-6));
+    std::vector<float> plane(6 * 8);
+    for (int w = 0; w < 2; ++w)
+        for (int t = 0; t < 3; ++t)
+            for (int z = 0; z < 4; ++z) {
+                r.source->readPlane(w, t, z, plane.data());
+                CHECK(plane[3 * 8 + 5] == static_cast<float>(stamp(w, t, z, 3, 5)));
+            }
+    std::vector<float> vol(4 * 6 * 8);
+    r.source->readVolume(1, 2, vol.data());
+    CHECK(vol[(3 * 6 + 2) * 8 + 7] == static_cast<float>(stamp(1, 2, 3, 2, 7)));
+    CHECK(vol[5] == static_cast<float>(stamp(1, 2, 0, 0, 5)));
+    const std::shared_ptr<Array5> all = r.source->readAll();
+    CHECK(all->plane(1, 2, 3)[2 * 8 + 7] == static_cast<float>(stamp(1, 2, 3, 2, 7)));
+    CHECK(all->plane(0, 1, 0)[5] == static_cast<float>(stamp(0, 1, 0, 0, 5)));
+
+    SECTION("a page order given by the Load step wins over the header") {
+        OpenOptions o;
+        PageOrder po;
+        po.order = "tzc";
+        po.c = 2;
+        po.t = 3;
+        o.pageOrder = po;
+        const OpenResult given = openDataset(f.str(), o);
+        CHECK(given.meta.dims == Dims5{2, 3, 4, 6, 8});
+        CHECK_FALSE(given.dimsFromMetadata);
+    }
+    SECTION("a layout the sections do not divide into falls back to sections as z") {
+        OpenOptions o;
+        PageOrder po;
+        po.c = 5;
+        o.pageOrder = po;
+        const OpenResult odd = openDataset(f.str(), o);
+        CHECK(odd.meta.dims == Dims5{1, 1, 24, 6, 8});
+        CHECK_FALSE(odd.dimsFromMetadata);
+        CHECK_THAT(odd.metadataSummary, ContainsSubstring("reading sections as z"));
+    }
+    SECTION("the voxel size and channels given win over the header's") {
+        OpenOptions o;
+        o.voxelUm = std::array<double, 3>{0.0, 0.0, 0.5};
+        const OpenResult given = openDataset(f.str(), o);
+        CHECK_THAT(given.meta.voxelUm[0], WithinRel(0.065, 1e-6));
+        CHECK_THAT(given.meta.voxelUm[2], WithinRel(0.5, 1e-6));
+    }
 }
 
 // --- export --------------------------------------------------------------------------

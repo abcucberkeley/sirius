@@ -164,7 +164,7 @@ applied in this order, whatever order they are written in: `--pipeline`, then
 
 | option | meaning |
 | --- | --- |
-| `--dataset <path>` | the dataset (TIFF, OME-TIFF, zarr, N5, a folder with a `sirius-dataset.toml`), with the open options below |
+| `--dataset <path>` | the dataset (TIFF, OME-TIFF, DeltaVision / MRC `.dv` / `.mrc`, zarr, N5, a folder with a `sirius-dataset.toml`), with the open options below |
 | `--pipeline <file.sirius.toml>` | the pipeline, and its dataset unless `--dataset` names one |
 | `--steps <json\|@file\|->` | a JSON array of `{kind, preset?, params?, enabled?, name?}`, appended to the pipeline (a preset is applied before the params) |
 | `--set <step>.<key>=<value>` | a parameter, repeatable. `<step>` is a number (1 = Load) or a name; the value is read as JSON when it parses, else as text, then converted to the parameter's type |

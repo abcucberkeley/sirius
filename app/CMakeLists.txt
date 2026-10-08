@@ -123,7 +123,7 @@ sirius_core_unit(manifest
 sirius_core_unit(array_source
     HEADERS array_source.hpp
     SOURCES array_source.cpp
-    DEPENDS array dataset manifest lib/device lib/tiff_io lib/zarr_io)
+    DEPENDS array dataset manifest lib/device lib/tiff_io lib/zarr_io lib/mrc_io)
 
 sirius_core_unit(export
     HEADERS export.hpp
@@ -233,7 +233,7 @@ sirius_core_unit(rpc_server        HEADERS rpc_server.hpp    SOURCES rpc_server.
                                    DEPENDS rpc cancel errors PUBLIC_LINK nlohmann_json::nlohmann_json LINK Threads::Threads)
 # dataset_info / _read / _view / _stats in C++ (sirius_worker/datasets.py's replies).
 sirius_core_unit(dataset_service   HEADERS dataset_service.hpp SOURCES dataset_service.cpp
-                                   DEPENDS rpc_server array_codec array_source manifest build_info host lib/buffer lib/device lib/tiff_io
+                                   DEPENDS rpc_server array_codec array_source manifest build_info host lib/buffer lib/device lib/tiff_io lib/mrc_io
                                    PUBLIC_LINK nlohmann_json::nlohmann_json LINK Threads::Threads)
 # The datasets that stay on the cluster, read by the worker or the engine there.
 sirius_core_unit(remote_source     HEADERS remote_source.hpp SOURCES remote_source.cpp

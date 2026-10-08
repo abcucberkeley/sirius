@@ -18,6 +18,7 @@
 
 #include <sirius/buffer.hpp>
 #include <sirius/device.hpp>
+#include <sirius/mrc_io.hpp>
 #include <sirius/tiff_io.hpp>
 
 #include "core/array_codec.hpp"
@@ -516,7 +517,8 @@ namespace sirius::app {
                 for (char ch : path_) lower.push_back(static_cast<char>(std::tolower(static_cast<unsigned char>(ch))));
                 if (endsWith(lower, ".npy")) openNpy();
                 else if (endsWith(lower, ".tif") || endsWith(lower, ".tiff") || endsWith(lower, ".btf") || endsWith(lower, ".tf8")) openTiff(options);
-                else throw DatasetError(p.filename().u8string() + ": only TIFF / OME-TIFF and .npy are read on the cluster");
+                else if (endsWith(lower, ".dv") || endsWith(lower, ".mrc")) openMrc(options);
+                else throw DatasetError(p.filename().u8string() + ": only TIFF / OME-TIFF, DeltaVision / MRC (.dv, .mrc) and .npy are read on the cluster");
             }
 
             json meta() const {
@@ -548,7 +550,7 @@ namespace sirius::app {
                 std::string name = fs::u8path(path_).filename().u8string();
                 std::string lname;
                 for (char ch : name) lname.push_back(static_cast<char>(std::tolower(static_cast<unsigned char>(ch))));
-                for (const char* ext : {".ome.tiff", ".ome.tif", ".tiff", ".tif", ".npy"})
+                for (const char* ext : {".ome.tiff", ".ome.tif", ".tiff", ".tif", ".npy", ".dv", ".mrc"})
                     if (endsWith(lname, ext)) {
                         name = name.substr(0, name.size() - std::strlen(ext));
                         break;
@@ -580,6 +582,7 @@ namespace sirius::app {
                     return a;
                 }
                 if (npy_) return readNpy(c, t, z, 1, true);
+                if (mrc_) return readMrc(c, t, z, 1, true);
                 if (auto cached = cache_.get(volumeKey(c, t))) return planeOf(*cached, z);
                 return planeOf(pages(pageOf(c, t, z), 1, device, c), 0);
             }
@@ -596,7 +599,7 @@ namespace sirius::app {
                     cache_.put(key, vol);
                     return vol;
                 }
-                auto vol = std::make_shared<HostArray>(npy_ ? readNpy(c, t, 0, z_, false) : tiffVolume(c, t, device));
+                auto vol = std::make_shared<HostArray>(npy_ ? readNpy(c, t, 0, z_, false) : mrc_ ? readMrc(c, t, 0, z_, false) : tiffVolume(c, t, device));
                 cache_.put(key, vol);
                 return vol;
             }
@@ -837,6 +840,51 @@ namespace sirius::app {
                 for (const TiffLevel& lv : info.levels) levels_.push_back({static_cast<Index>(lv.width), static_cast<Index>(lv.height), static_cast<Index>(lv.ifds.size())});
             }
 
+            // An MRC / DeltaVision stack, shaped as the application's Load step
+            // shapes it (probeMrcDataset): the header's wavelengths and time
+            // points, or the page order the request gives.
+            void openMrc(const json& options) {
+                const std::string name = fs::u8path(path_).filename().u8string();
+                try {
+                    mrc_ = std::make_unique<MrcFile>(path_);
+                } catch (const std::exception& e) {
+                    throw DatasetError(name + ": " + e.what());
+                }
+                OpenOptions o;
+                if (options.is_object() && options.contains("page_order") && !options["page_order"].is_null()) {
+                    PageOrder po;
+                    po.order = options["page_order"].is_string() ? options["page_order"].get<std::string>() : std::string("czt");
+                    po.c = options.contains("c") ? intOf(options["c"], 0) : 0;
+                    po.t = options.contains("t") ? intOf(options["t"], 0) : 0;
+                    po.z = options.contains("z") ? intOf(options["z"], 0) : 0;
+                    o.pageOrder = po;
+                }
+                MrcDatasetProbe p;
+                try {
+                    p = probeMrcDataset(path_, mrc_->info(), &o);
+                } catch (const std::exception& e) {
+                    throw DatasetError(name + ": " + e.what());
+                }
+                order_ = p.order;
+                samples_ = 1;
+                c_ = p.meta.dims.c;
+                t_ = p.meta.dims.t;
+                z_ = p.meta.dims.z;
+                y_ = p.meta.dims.y;
+                x_ = p.meta.dims.x;
+                fileDtype_ = dtypeOf(mrc_->info().pixelType);
+                rgb_ = false;
+                dimsFromMetadata_ = p.dimsFromMetadata;
+                format_ = p.meta.format;
+                voxel_ = p.fileVoxelUm;
+                frameInterval_ = 0.0;
+                for (const ChannelInfo& ch : p.fileChannels) {
+                    json e = {{"name", ch.label}};
+                    if (ch.wavelengthNm > 0.0) e["wavelength_nm"] = ch.wavelengthNm;
+                    channels_.push_back(std::move(e));
+                }
+            }
+
             // --- .npy reads ---------------------------------------------------------------------------
 
             // `count` planes from (c, t, z); as (y, x) when `asPlane`, else (count, y, x)
@@ -867,6 +915,28 @@ namespace sirius::app {
                     a.dtype = h.dtype;
                     a.bytes = std::move(raw);
                 }
+                return a;
+            }
+
+            // --- MRC / DeltaVision reads --------------------------------------------------------------
+
+            // `count` planes from (c, t, z) in the file's pixel type; as (y, x) when `asPlane`, else
+            // (count, y, x). One read when the planes are consecutive sections, else one per plane.
+            HostArray readMrc(Index c, Index t, Index z, Index count, bool asPlane) const {
+                HostArray a = make(fileDtype_, asPlane ? std::vector<Index>{y_, x_} : std::vector<Index>{count, y_, x_});
+                const Index first = order_.planeOf(c, t, z);
+                const Index stride = z_ > 1 ? order_.planeOf(c, t, 1) - order_.planeOf(c, t, 0) : 1;
+                withPixelDtype(fileDtype_, [&](auto tag) {
+                    using T = decltype(tag);
+                    T* dst = as<T>(a);
+                    const std::size_t plane = static_cast<std::size_t>(y_ * x_);
+                    if (stride == 1 || count == 1) {
+                        mrc_->readSections<T>(static_cast<std::size_t>(first), static_cast<std::size_t>(count), dst);
+                        return;
+                    }
+                    for (Index k = 0; k < count; ++k)
+                        mrc_->readSections<T>(static_cast<std::size_t>(order_.planeOf(c, t, z + k)), 1, dst + static_cast<std::size_t>(k) * plane);
+                });
                 return a;
             }
 
@@ -1003,6 +1073,7 @@ namespace sirius::app {
             json channels_ = json::array();
             bool rgb_ = false, dimsFromMetadata_ = false;
             std::optional<NpyHeader> npy_;
+            std::unique_ptr<MrcFile> mrc_;
             std::unique_ptr<TiffFile> tiff_;
             PageOrder order_;
             Index samples_ = 1;

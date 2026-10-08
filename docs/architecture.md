@@ -53,6 +53,7 @@ Bottom to top; each line's unit may use the ones above it.
 | `real_fft` | `device`, `fft_common`, `tensor_util` | the real transform, FFTW and cuFFT |
 | `tiff_io` | `buffer`, `device`, `pixel_type`, `downsample`, `errors` | TIFF reading and writing, libtiff and nvTIFF; the OME-XML / ImageJ metadata parser (`tiff_metadata.hpp`) |
 | `zarr_io` | `buffer`, `pixel_type`, `downsample`, `errors` | zarr v2/v3, N5, OME-NGFF through TensorStore |
+| `mrc_io` | `buffer`, `device`, `pixel_type`, `errors` | MRC2014 and DeltaVision (`.dv`) stacks: the header, the sections, the wavelength / time layout |
 | `image_ops` | `index`, `downsample`, `constants`, `checked_math` | reductions, resampling, crop/pad, intensity, histograms |
 | `registration` | `buffer`, `device`, `real_fft`, `fft_common` | masked FFT registration |
 | `deconvolution` | `buffer`, `device`, `real_fft`, `fft_common` | Richardson–Lucy with a TV prior |
@@ -64,7 +65,7 @@ Bottom to top; each line's unit may use the ones above it.
 | `preprocess` | `sim_stages` | the public preprocessing API |
 | `separation` | `sim_stages`, `constants` | band separation |
 | `otf` | — | the radially averaged table and its resampling |
-| `otf_io` | `otf`, `sim_parameters`, `tiff_io`, `errors` | reading a measured OTF |
+| `otf_io` | `otf`, `sim_parameters`, `tiff_io`, `mrc_io`, `errors` | reading a measured OTF, from a TIFF or a DeltaVision file |
 | `otf_ideal` | `otf`, `sim_parameters`, `fft`, `buffer`, `constants` | the theoretical OTF |
 | `sim_backend` | `sim_stages`, `sim_math`, `device` | the per-device reconstruction stages |
 | `sim_reconstruction` | `sim_backend`, `separation`, `otf`, `fft`, `real_fft`, `buffer`, … | the device-agnostic driver |

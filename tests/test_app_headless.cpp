@@ -237,6 +237,38 @@ TEST_CASE("headless: the workspace starts with the Load step alone", "[app][head
     CHECK(state["running"] == false);
 }
 
+TEST_CASE("headless: open_dataset describes raw.dv as a DeltaVision stack", "[app][headless][mrc]") {
+    Fixture f;
+    const json info = f.ok("open_dataset", {{"path", (kData / "raw.dv").string()}});
+    CHECK(info["dims"]["c"].get<long long>() == 1);
+    CHECK(info["dims"]["t"].get<long long>() == 1);
+    CHECK(info["dims"]["z"].get<long long>() == 135);
+    CHECK(info["dims"]["y"].get<long long>() == 64);
+    CHECK(info["dims"]["x"].get<long long>() == 64);
+    CHECK(info["dtype"] == "float32");
+    CHECK(info["format"] == "deltavision");
+    CHECK(info["dims_from_metadata"] == true);
+    CHECK(info["bytes_on_disk"].get<long long>() == 2212864);
+    CHECK(info["float32_bytes"].get<long long>() == 135LL * 64 * 64 * 4);
+    REQUIRE(info["voxel_um"].size() == 3);
+    CHECK(std::abs(info["voxel_um"][0].get<double>() - 0.08) < 1e-6);
+    CHECK(std::abs(info["voxel_um"][1].get<double>() - 0.08) < 1e-6);
+    CHECK(std::abs(info["voxel_um"][2].get<double>() - 0.125) < 1e-6);
+    REQUIRE(info["channels"].size() == 1);
+    CHECK(info["channels"][0]["wavelength_nm"].get<double>() == 528.0);
+    CHECK(info["channels"][0]["label"] == "528");
+    CHECK(info["acquisition"] == "DeltaVision");
+    CHECK_THAT(info["metadata_summary"].get<std::string>(), ContainsSubstring("DeltaVision"));
+    CHECK_THAT(info["path"].get<std::string>(), ContainsSubstring("raw.dv"));
+    // the OTF table in the same container, probed without opening it
+    const json otf = f.ok("dataset_info", {{"path", (kData / "otf.dv").string()}});
+    CHECK(otf["dims"]["z"].get<long long>() == 3);
+    CHECK(otf["dims"]["y"].get<long long>() == 129);
+    CHECK(otf["dims"]["x"].get<long long>() == 130);
+    CHECK(otf["dtype"] == "float32");
+    CHECK(otf["format"] == "deltavision");
+}
+
 TEST_CASE("headless: open_dataset describes raw.tif", "[app][headless]") {
     Fixture f;
     const json info = f.openRaw();

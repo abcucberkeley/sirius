@@ -39,7 +39,7 @@ namespace sirius::cli {
                  R"({"name":"sirius-cli","version":"0.1.0","schema":"sirius-cli/1",
  "protocols":{"session":"sirius-session/1","mcp":["2026-07-28","2025-11-25","2025-06-18","2025-03-26","2024-11-05"]},
  "features":{"cuda":false,"cuda_devices":0,"zarr":true,"export_formats":["tiff","ome-tiff","zarr","n5","raw"],
-             "readable_extensions":["tif","tiff","zarr"]},
+             "readable_extensions":["tif","tiff","ome.tif","btf","dv","mrc","zarr"]},
  "paths":{"executable_dir":"/opt/sirius/bin","help":"/opt/sirius/share/sirius/help",
           "worker":"/opt/sirius/share/sirius/python","python_env":"/home/me/.local/share/sirius/python-env"}})",
                  "0 ok",

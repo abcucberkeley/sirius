@@ -3,3 +3,5 @@
 *.raw binary
 *.tif binary
 *.tiff binary
+*.dv binary
+*.mrc binary

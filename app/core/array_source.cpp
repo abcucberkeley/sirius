@@ -35,6 +35,7 @@
 #endif
 
 #include <sirius/device.hpp>
+#include <sirius/mrc_io.hpp>
 #include <sirius/tiff_io.hpp>
 #include <sirius/tiff_metadata.hpp>
 #include <sirius/zarr_io.hpp>
@@ -512,6 +513,166 @@ namespace sirius::app {
 
         TiffDatasetProbe probeTiff(const std::string& path, const OpenOptions* options) { return probeTiffInfo(path, inspectTiff(path), options); }
 
+        // --- MRC / DeltaVision source ------------------------------------------------
+
+        // An MRC / DeltaVision stack: `order` maps (c, t, z) onto its sections
+        // (a DeltaVision file interleaves wavelengths and time points in one of
+        // three sequences; a plain MRC file is z alone).
+        class MrcArraySource final : public ArraySource {
+        public:
+            MrcArraySource(std::string path, DatasetMeta meta, PageOrder order)
+                : file_(std::move(path)), meta_(std::move(meta)), order_(order) {
+                zFastest_ = order_.order.rfind('z', 0) == 0;
+                contiguousStack_ = order_.order == "ztc";   // the sections already are (c, t, z, y, x)
+            }
+
+            const DatasetMeta& meta() const noexcept override { return meta_; }
+
+            void readPlane(Index c, Index t, Index z, float* out) const override {
+                check(c, t, z);
+                file_.readSections<float>(static_cast<std::size_t>(order_.planeOf(c, t, z)), 1, out);
+            }
+
+            void readVolume(Index c, Index t, float* out, const ProgressFn& progress) const override {
+                const Dims5& d = meta_.dims;
+                check(c, t, 0);
+                if (zFastest_) {
+                    // the z planes of one (c, t) are consecutive sections
+                    file_.readSections<float>(static_cast<std::size_t>(order_.planeOf(c, t, 0)), static_cast<std::size_t>(d.z), out);
+                    if (progress) progress(1.0, "read");
+                    return;
+                }
+                ArraySource::readVolume(c, t, out, progress);
+            }
+
+            std::shared_ptr<Array5> readAll(const ProgressFn& progress) const override {
+                const Dims5& d = meta_.dims;
+                if (progress) progress(0.0, "reading " + fs::path(file_.path()).filename().string());
+                Buffer<float> stack = file_.readStack<float>();
+                if (contiguousStack_) {
+                    auto out = std::make_shared<Array5>(Array5::fromBuffer(std::move(stack), d));
+                    if (progress) progress(1.0, "read");
+                    return out;
+                }
+                auto out = std::make_shared<Array5>(d);
+                const std::size_t n = static_cast<std::size_t>(d.planeSize());
+                for (Index c = 0; c < d.c; ++c)
+                    for (Index t = 0; t < d.t; ++t)
+                        for (Index z = 0; z < d.z; ++z)
+                            std::memcpy(out->plane(c, t, z), stack.data() + order_.planeOf(c, t, z) * d.planeSize(), n * sizeof(float));
+                if (progress) progress(1.0, "read");
+                return out;
+            }
+
+        private:
+            void check(Index c, Index t, Index z) const {
+                const Dims5& d = meta_.dims;
+                if (c < 0 || c >= d.c || t < 0 || t >= d.t || z < 0 || z >= d.z)
+                    throw std::out_of_range("plane (c " + std::to_string(c) + ", t " + std::to_string(t) + ", z " +
+                                            std::to_string(z) + ") outside " + d.toString());
+            }
+
+            MrcFile file_;
+            DatasetMeta meta_;
+            PageOrder order_;
+            bool zFastest_ = false;
+            bool contiguousStack_ = false;
+        };
+
+        MrcDatasetProbe probeMrcInfo(const std::string& path, const MrcInfo& info, const OpenOptions* options) {
+            MrcDatasetProbe r;
+            DatasetMeta& m = r.meta;
+            m.name = fs::path(path).stem().string();
+            m.sourcePath = path;
+            m.sourceType = info.pixelType;
+            m.bytesOnDisk = info.bytesOnDisk;
+            m.dims.y = static_cast<Index>(info.height);
+            m.dims.x = static_cast<Index>(info.width);
+            m.format = info.deltaVision ? "deltavision" : "mrc";
+            const Index sections = static_cast<Index>(info.sections);
+            std::ostringstream summary;
+            summary << (info.deltaVision ? "DeltaVision" : "MRC") << " · " << sections << (sections == 1 ? " section" : " sections") << " · "
+                    << toString(info.pixelType);
+            if (info.complex) summary << " · complex, " << info.nx << " (re, im) pairs per row";
+
+            // dimensions: an explicit page order > the DeltaVision header > sections as z.
+            // The header's sequence as a page order, fastest axis first.
+            const bool described = info.deltaVision;
+            const Index hc = described ? info.waves : 1, ht = described ? info.times : 1;
+            const Index hz = described && info.planes() > 0 ? static_cast<Index>(info.planes()) : sections;
+            const std::string headerOrder = info.sequence == MrcSequence::WZT ? "czt" : info.sequence == MrcSequence::ZWT ? "zct" : "ztc";
+            Index c = hc, t = ht, z = hz;
+            std::string order = described ? headerOrder : "ztc";
+            r.dimsFromMetadata = described;
+            if (options && options->pageOrder) {
+                // as for a TIFF: an axis left at 0 is what the file says, and the
+                // default order ("czt") keeps the file's sequence
+                const PageOrder& po = *options->pageOrder;
+                c = po.c > 0 ? po.c : hc;
+                t = po.t > 0 ? po.t : ht;
+                z = po.z > 0 ? po.z : std::max<Index>(sections / std::max<Index>(c * t, 1), 1);
+                order = described && po.order == "czt" ? headerOrder : normalizeOrder(po.order);
+                r.dimsFromMetadata = described && po.c <= 0 && po.t <= 0 && po.z <= 0;
+            }
+            if (c * t * z != sections) {
+                summary << " · the header says c" << c << " t" << t << " z" << z << " (" << c * t * z << " planes) but the file has " << sections
+                        << " sections: reading sections as z";
+                c = 1;
+                t = 1;
+                z = sections;
+                order = "ztc";
+                r.dimsFromMetadata = false;
+            }
+            m.dims.c = c;
+            m.dims.t = t;
+            m.dims.z = z;
+            r.order = PageOrder::fromDims(m.dims, order);
+
+            // voxel size: the header's, within what a microscope produces (1 nm .. 100 um)
+            std::array<double, 3> voxel{0.0, 0.0, 0.0};
+            for (std::size_t k = 0; k < 3; ++k) {
+                const double v = info.voxelUm[k];
+                voxel[k] = v > 1e-3 && v < 100.0 ? v : 0.0;
+            }
+            r.fileVoxelUm = voxel;
+            if (options && options->voxelUm)
+                for (int k = 0; k < 3; ++k)
+                    if ((*options->voxelUm)[k] > 0.0) voxel[k] = (*options->voxelUm)[k];   // 0 = the file's
+            const bool knownXy = voxel[0] > 0.0 && voxel[1] > 0.0;
+            for (int k = 0; k < 2; ++k)
+                if (voxel[k] <= 0.0) voxel[k] = 0.1;
+            if (voxel[2] <= 0.0) voxel[2] = knownXy ? voxel[0] * 2.0 : 0.2;
+            m.voxelUm = voxel;
+            if (knownXy) summary << " · voxel " << m.voxelString();
+
+            // channels: the wavelengths, when the header's waves are the channels
+            if (described && c == static_cast<Index>(info.waves)) {
+                bool any = false;
+                for (int k = 0; k < info.waves; ++k) any = any || info.wavelengthsNm[static_cast<std::size_t>(k)] > 0;
+                if (any)
+                    for (int k = 0; k < info.waves; ++k) {
+                        ChannelInfo ch;
+                        const int nm = info.wavelengthsNm[static_cast<std::size_t>(k)];
+                        if (nm > 0) {
+                            ch.label = std::to_string(nm);
+                            ch.wavelengthNm = nm;
+                        }
+                        r.fileChannels.push_back(std::move(ch));
+                    }
+            }
+            m.channels = options && options->channels ? *options->channels : r.fileChannels;
+            m.normalizeChannels();
+            if (m.dims.c > 1) summary << " · " << m.dims.c << " channels";
+
+            if (options && options->sim) m.sim = *options->sim;
+            if (m.sim.present) m.acquisition = "3D-SIM raw · " + std::to_string(m.sim.sectionsPerPlane()) + " phase images per plane";
+            else m.acquisition = info.deltaVision ? "DeltaVision" : "MRC";
+            r.summary = summary.str();
+            return r;
+        }
+
+        MrcDatasetProbe probeMrc(const std::string& path, const OpenOptions* options) { return probeMrcInfo(path, inspectMrc(path), options); }
+
         // --- zarr source ------------------------------------------------------------
 
         // Map a store's axes onto (c, t, z, y, x). Named axes win; unnamed ones
@@ -957,12 +1118,16 @@ namespace sirius::app {
         return probeTiffInfo(path, info, options);
     }
 
+    MrcDatasetProbe probeMrcDataset(const std::string& path, const MrcInfo& info, const OpenOptions* options) {
+        return probeMrcInfo(path, info, options);
+    }
+
     // --- public entry points -------------------------------------------------------------
 
     bool zarrSupported() noexcept { return sirius::zarrSupported(); }
 
     std::vector<std::string> readableExtensions() {
-        std::vector<std::string> out{".tif", ".tiff", ".ome.tif", ".btf"};
+        std::vector<std::string> out{".tif", ".tiff", ".ome.tif", ".btf", ".dv", ".mrc"};
         if (zarrSupported()) {
             out.push_back(".zarr");
             out.push_back(".n5");
@@ -996,6 +1161,7 @@ namespace sirius::app {
                 if (!isZarrStore(path)) return probePlainFolder(path, options).meta;
                 return probeZarr(path, options).meta;
             }
+            if (isMrcName(path)) return probeMrc(path, options).meta;
             return probeTiff(path, options).meta;
         }
     } // namespace
@@ -1051,6 +1217,11 @@ namespace sirius::app {
             r.source = src;
             r.metadataSummary = p.summary;
             r.dimsFromMetadata = true;
+        } else if (isMrcName(path)) {
+            MrcDatasetProbe p = probeMrc(path, &options);
+            r.source = std::make_shared<MrcArraySource>(path, p.meta, p.order);
+            r.metadataSummary = p.summary;
+            r.dimsFromMetadata = p.dimsFromMetadata;
         } else {
             if (!looksLikeTiff(path)) {
                 // let libtiff decide: many microscopy files carry odd extensions

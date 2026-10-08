@@ -1,7 +1,9 @@
 #include "sirius/otf_io.hpp"
 #include "sirius/errors.hpp"
+#include "sirius/mrc_io.hpp"
 #include "sirius/tiff_io.hpp"
 
+#include <cstring>
 #include <string>
 #include <utility>
 
@@ -14,8 +16,18 @@ namespace sirius {
             using Cplx = std::complex<double>;
             using DoubleTensor = Eigen::Tensor<double, 3, Eigen::RowMajor>;
 
-            // Read raw data in any supported format and convert to double (handled by readTiffStack)
-            DoubleTensor raw_data = readTiffStack<double>(filename);
+            // Read raw data in any supported format and convert to double (handled by
+            // readTiffStack); an OTF in the DeltaVision container makeotf writes
+            // (otf.dv, complex float32) reads as the same (norders, nkr, 2 * nzotf)
+            // rows of interleaved real / imaginary parts.
+            DoubleTensor raw_data;
+            if (isMrcName(filename)) {
+                const Buffer<double> stack = MrcFile(filename).readStack<double>();
+                raw_data = DoubleTensor(stack.dim(0), stack.dim(1), stack.dim(2));
+                if (stack.size() > 0) std::memcpy(raw_data.data(), stack.data(), static_cast<std::size_t>(stack.size()) * sizeof(double));
+            } else {
+                raw_data = readTiffStack<double>(filename);
+            }
 
             if (raw_data.size() == 0)
                 throw IoError("Radial OTF is empty: " + filename);

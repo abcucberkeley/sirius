@@ -1813,7 +1813,7 @@ namespace sirius::app {
         };
 
         addTool("open_dataset",
-                "Open a microscopy dataset (TIFF, OME-TIFF, a zarr or N5 store, a folder with a manifest) as the workspace's data; it "
+                "Open a microscopy dataset (TIFF, OME-TIFF, DeltaVision / MRC, a zarr or N5 store, a folder with a manifest) as the workspace's data; it "
                 "becomes the Load step's output. Returns what it is (dimensions, pixel type, voxel size, channels, SIM layout) and the "
                 "workspace id. Planes are read when needed unless full_load is set.",
                 schema(withOpen({{"path", prop("string", "The dataset; relative paths resolve against the server's working directory")}}), {"path"}),

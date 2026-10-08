@@ -42,6 +42,8 @@ sirius_lib_test(real_fft        test_real_fft.cpp test_real_fft_cuda.cpp UNITS l
 # include tiff_internal.hpp
 sirius_lib_test(tiff_io         test_tiff_io.cpp test_tiff_file.cpp test_tiff_formats.cpp LINK TIFF::TIFF INTERNAL)
 sirius_lib_test(zarr_io         test_zarr_io.cpp)
+# the .dv fixtures are checked value for value against their TIFF twins
+sirius_lib_test(mrc_io          test_mrc_io.cpp UNITS lib/tiff_io)
 # downsample.hpp, the internal header image_ops shares with the writers, is tested here too
 sirius_lib_test(image_ops       test_image_ops.cpp INTERNAL)
 sirius_lib_test(registration    test_registration.cpp)

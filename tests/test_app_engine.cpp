@@ -62,6 +62,7 @@
 #include "core/serialize.hpp"
 #include "core/sha256.hpp"
 #include "core/tracks.hpp"
+#include "mrc_fixture.hpp"
 #include "temp_path.hpp"
 
 using namespace sirius;
@@ -881,6 +882,79 @@ TEST_CASE("engine: a TIFF hyperstack with a pyramid, read as openDataset shapes 
     CHECK(given["dims"] == json({1, 1, 24, 96, 128}));
 }
 
+TEST_CASE("engine: a DeltaVision stack, read as openDataset shapes it", "[app][engine][mrc]") {
+    const std::string path = std::string(SIRIUS_TEST_DATA_DIR) + "/raw.dv";
+    LoopbackEngine le(quietEngine());
+    auto w = le.connect();
+    const json info = w->call("dataset_info", {{"path", path}}).result;
+    CHECK(info["dims"] == json({1, 1, 135, 64, 64}));
+    CHECK(info["dtype"] == "float32");
+    CHECK(info["format"] == "deltavision");
+    CHECK(info["dims_from_metadata"] == true);
+    CHECK(info["name"] == "raw");
+    CHECK(info["bytes"] == 2212864);
+    CHECK(info["rgb"] == false);
+    CHECK(std::abs(info["voxel_um"][0].get<double>() - 0.08) < 1e-6);
+    CHECK(std::abs(info["voxel_um"][2].get<double>() - 0.125) < 1e-6);
+    json channels = json::array();
+    channels.push_back({{"name", "528"}, {"wavelength_nm", 528.0}});
+    CHECK(info["channels"] == channels);
+    // the sections as the library reads them, in file order; raw.tif (Bio-Formats'
+    // export of raw.dv) holds the same values with every row reversed
+    const ImageStack<float> tif = readTiffStack<float>(std::string(SIRIUS_TEST_DATA_DIR) + "/raw.tif");
+    std::vector<Index> shape;
+    std::vector<float> p = decoded(w->call("dataset_read", {{"path", path}, {"c", 0}, {"t", 0}, {"z", 7}, {"accept", {"zlib"}}}), shape);
+    CHECK(shape == std::vector<Index>{64, 64});
+    CHECK(p[17 * 64 + 33] == tif(7, 63 - 17, 33));
+    std::vector<float> vol = decoded(w->call("dataset_read", {{"path", path}, {"c", 0}, {"t", 0}}), shape);
+    CHECK(shape == std::vector<Index>{135, 64, 64});
+    CHECK(vol[(134 * 64 + 5) * 64 + 6] == tif(134, 63 - 5, 6));
+    CHECK(vol[(7 * 64 + 17) * 64 + 33] == tif(7, 63 - 17, 33));
+    std::vector<float> region =
+        decoded(w->call("dataset_view", {{"path", path}, {"kind", "xy"}, {"c", 0}, {"t", 0}, {"index", 2}, {"factor", 1}, {"region", {40, 20, 20, 10}}}), shape);
+    CHECK(shape == std::vector<Index>{10, 20});
+    CHECK(region[3 * 20 + 4] == tif(2, 63 - 23, 44));
+    const json stats = w->call("dataset_stats", {{"path", path}, {"c", 0}, {"t", 0}}).result;
+    CHECK(stats["min"].get<double>() >= 1.0e-5);
+    CHECK(stats["max"].get<double>() <= 0.009);
+
+    // several wavelengths and time points in the WZT sequence: (c, t, z) picks the right section
+    TempDir dir;
+    test::MrcSpec s;
+    s.waves = 2;
+    s.times = 3;
+    s.planes = 4;
+    s.sequence = 1;
+    s.mode = 6;
+    s.wavelengths = {488, 561, 0, 0, 0};
+    const std::string waves = dir.file("waves.dv");
+    const auto stamp = [](int w, int t, int z, int y, int x) { return static_cast<double>(w * 10000 + t * 1000 + z * 100 + y * 10 + x); };
+    test::writeMrc(waves, s, stamp);
+    const json wi = w->call("dataset_info", {{"path", waves}}).result;
+    CHECK(wi["dims"] == json({2, 3, 4, 6, 8}));
+    CHECK(wi["dtype"] == "uint16");
+    CHECK(wi["dims_from_metadata"] == true);
+    json two = json::array();
+    two.push_back({{"name", "488"}, {"wavelength_nm", 488.0}});
+    two.push_back({{"name", "561"}, {"wavelength_nm", 561.0}});
+    CHECK(wi["channels"] == two);
+    std::vector<float> one = decoded(w->call("dataset_read", {{"path", waves}, {"c", 1}, {"t", 2}, {"z", 3}}), shape);
+    CHECK(shape == std::vector<Index>{6, 8});
+    CHECK(one[4 * 8 + 5] == static_cast<float>(stamp(1, 2, 3, 4, 5)));
+    std::vector<float> wvol = decoded(w->call("dataset_read", {{"path", waves}, {"c", 0}, {"t", 1}}), shape);
+    CHECK(shape == std::vector<Index>{4, 6, 8});
+    CHECK(wvol[(2 * 6 + 1) * 8 + 7] == static_cast<float>(stamp(0, 1, 2, 1, 7)));
+    CHECK(wvol[5] == static_cast<float>(stamp(0, 1, 0, 0, 5)));
+    std::vector<float> mip = decoded(w->call("dataset_view", {{"path", waves}, {"kind", "mip"}, {"c", 1}, {"t", 0}}), shape);
+    CHECK(shape == std::vector<Index>{6, 8});
+    CHECK(mip[2 * 8 + 3] == static_cast<float>(stamp(1, 0, 3, 2, 3)));
+    // a page order given by the Load step wins over the header
+    const json given = w->call("dataset_info", {{"path", waves}, {"options", {{"page_order", "czt"}, {"c", 1}, {"t", 1}, {"z", 24}}}}).result;
+    CHECK(given["dims"] == json({1, 1, 24, 6, 8}));
+    CHECK(given["dims_from_metadata"] == false);
+    CHECK_THROWS_WITH(w->call("dataset_info", {{"path", dir.file("missing.dv")}}), Catch::Matchers::ContainsSubstring("no such file on"));
+}
+
 TEST_CASE("engine: requests it does not serve go to its Python worker, progress and cancel included", "[app][engine]") {
     // the Python worker is played by a C++ stand-in here; the real one is in the parity case
     TestServer python(withToken("child", 4));
@@ -1035,6 +1109,23 @@ TEST_CASE("engine: dataset replies equal the Python worker's on the same files",
     const std::string npy = dir.file("stack.npy");
     writeNpy(npy, {2, 2, 5, 37, 53});
     files.push_back(npy);
+    // DeltaVision stacks: the engine (mrc_io.cpp) and the worker (datasets.py,
+    // numpy alone) each read them with their own code
+    files.push_back(std::string(SIRIUS_TEST_DATA_DIR) + "/raw.dv");
+    {
+        test::MrcSpec s;
+        s.nx = 56;
+        s.ny = 40;
+        s.waves = 2;
+        s.times = 2;
+        s.planes = 5;
+        s.sequence = 1;   // WZT: the planes of one (c, t) are not consecutive sections
+        s.mode = 6;
+        s.wavelengths = {488, 561, 0, 0, 0};
+        const std::string waves = dir.file("waves.dv");
+        test::writeMrc(waves, s, [](int w, int t, int z, int y, int x) { return (w * 2 + t) * 1000 + z * 100 + (y * 7 + x * 3) % 100; });
+        files.push_back(waves);
+    }
     const bool pythonReadsTiff = !py->capabilities().tiffReader.empty();
     if (pythonReadsTiff) {
         const std::string tif = dir.file("hyper.tif");

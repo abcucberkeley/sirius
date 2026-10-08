@@ -15,8 +15,11 @@ the data, and sent at the resolution it is drawn at:
 
 Readers: TIFF, OME-TIFF and ImageJ hyperstacks through SIRIUS's own TIFF
 reader (the ``sirius`` package built into the worker's Python: ``pip install
-<checkout>``; without it a TIFF request fails and says so), and ``.npy``
-arrays. A TIFF is shaped exactly as the application shapes it (page order,
+<checkout>``; without it a TIFF request fails and says so), MRC / DeltaVision
+stacks (``.dv``, ``.mrc``: the 1024-byte header read here with ``struct``, the
+sections a numpy memmap, shaped by the header's wavelengths, time points and
+sequence exactly as the application's probeMrcDataset shapes them -- nothing
+to install), and ``.npy`` arrays. A TIFF is shaped exactly as the application shapes it (page order,
 OME / ImageJ dimensions and voxel size: ``sirius.workbench.tiff_dims`` /
 ``tiff_voxel``, the port of array_source.cpp's probeTiff, on the metadata
 SIRIUS's C++ reader parses; samples per pixel are channels, so an RGB TIFF
@@ -52,6 +55,7 @@ __all__ = [
     "DatasetError",
     "encode",
     "forget_all",
+    "mrc_header",
     "open_dataset",
     "read_ref",
     "reduce_blocks",
@@ -161,6 +165,92 @@ def _ceil_div(a: int, b: int) -> int:
     return -(-a // b)
 
 
+# --- MRC / DeltaVision: the header (src/mrc_io.cpp's twin, with struct) ----------------------------
+
+# pixel mode -> numpy type code; mode 0 is unsigned in a DeltaVision file (IVE), signed in MRC2014
+_MRC_MODES = {0: "u1", 1: "i2", 2: "f4", 3: "i2", 4: "f4", 6: "u2", 7: "i4"}
+_DV_MAGIC = -16224   # 0xC0A0 as an int16 at byte 96
+
+
+def _normalize_order(order: str) -> str:
+    """c, z, t each once, as the application's normalizeOrder: anything else is "czt"."""
+    out = ""
+    for ch in str(order).lower():
+        if ch in "czt" and ch not in out:
+            out += ch
+    for ch in "czt":
+        if ch not in out:
+            out += ch
+    return out
+
+
+def mrc_header(path: str) -> Dict[str, Any]:
+    """The facts of an MRC / DeltaVision header: nx, ny, sections, mode, dtype (numpy,
+    in the file's byte order), complex (a row is 2 * nx values: re, im, re, ...),
+    width, height, big_endian, deltavision, data_offset (1024 + the extended
+    header), voxel_um (x, y, z in micrometres; 0 unknown), waves, times, sequence
+    (0 ZTW, 1 WZT, 2 ZWT), wavelengths (five, nm). DatasetError when the file is
+    not one."""
+    import struct
+
+    name = os.path.basename(path)
+    with open(path, "rb") as f:
+        b = f.read(1024)
+    if len(b) < 1024:
+        raise DatasetError(f"{name}: shorter than an MRC header (1024 bytes)")
+
+    def plausible(e: str) -> bool:
+        nx, ny, nz, mode = struct.unpack_from(e + "4i", b, 0)
+        nsymbt = struct.unpack_from(e + "i", b, 92)[0]
+        return 0 < nx <= 1 << 20 and 0 < ny <= 1 << 20 and 0 < nz <= 1 << 24 and mode in _MRC_MODES and 0 <= nsymbt <= 1 << 30
+
+    # little or big: the DeltaVision magic says, else the MRC2014 machine stamp,
+    # else whichever reading is plausible (little first)
+    dv = True
+    if struct.unpack_from("<h", b, 96)[0] == _DV_MAGIC:
+        big = False
+    elif struct.unpack_from(">h", b, 96)[0] == _DV_MAGIC:
+        big = True
+    else:
+        dv = False
+        s0, s1 = b[212], b[213]
+        if s0 == 0x44 and s1 in (0x44, 0x41):
+            big = False
+        elif s0 == 0x11 and s1 == 0x11:
+            big = True
+        else:
+            big = not plausible("<") and plausible(">")
+    e = ">" if big else "<"
+    nx, ny, nz, mode = struct.unpack_from(e + "4i", b, 0)
+    if not plausible(e):
+        if mode not in _MRC_MODES and nx > 0 and ny > 0 and nz > 0:
+            raise DatasetError(f"{name}: pixel mode {mode} is not read (bytes, int16, float32, uint16, int32 and the complex modes 3 and 4 are)")
+        raise DatasetError(f"{name}: not an MRC / DeltaVision stack (nx {nx}, ny {ny}, nz {nz}, mode {mode})")
+    mx, my, mz = struct.unpack_from(e + "3i", b, 28)
+    xlen, ylen, zlen = struct.unpack_from(e + "3f", b, 40)
+    nsymbt = struct.unpack_from(e + "i", b, 92)[0]
+    code = "i1" if mode == 0 and not dv else _MRC_MODES[mode]
+    is_complex = mode in (3, 4)
+    h: Dict[str, Any] = {
+        "nx": nx, "ny": ny, "sections": nz, "mode": mode, "dtype": np.dtype(e + code), "complex": is_complex,
+        "width": 2 * nx if is_complex else nx, "height": ny, "big_endian": big, "deltavision": dv,
+        "data_offset": 1024 + nsymbt, "voxel_um": [0.0, 0.0, 0.0], "waves": 1, "times": 1, "sequence": 0,
+        "wavelengths": [0, 0, 0, 0, 0],
+    }
+    if dv:
+        # Priism / IVE: pixel sizes in micrometres, the wavelength and time axes, their sequence
+        h["voxel_um"] = [float(v) if v > 0 else 0.0 for v in (xlen, ylen, zlen)]
+        h["times"] = max(struct.unpack_from(e + "h", b, 180)[0], 1)
+        seq = struct.unpack_from(e + "h", b, 182)[0]
+        h["sequence"] = seq if seq in (1, 2) else 0
+        h["waves"] = min(max(struct.unpack_from(e + "h", b, 196)[0], 1), 5)
+        h["wavelengths"] = [int(w) for w in struct.unpack_from(e + "5h", b, 198)]
+    else:
+        # MRC2014: Angstrom per cell, the grid counts the cells
+        h["voxel_um"] = [float(ln) / g * 1e-4 if g > 0 and ln > 0 else 0.0 for ln, g in ((xlen, mx), (ylen, my), (zlen, mz))]
+    return h
+
+
 # --- the dataset -----------------------------------------------------------------------------------
 
 class Dataset:
@@ -198,8 +288,10 @@ class Dataset:
             self._open_npy()
         elif lower.endswith((".tif", ".tiff", ".btf", ".tf8")):
             self._open_tiff()
+        elif lower.endswith((".dv", ".mrc")):
+            self._open_mrc()
         else:
-            raise DatasetError(f"{os.path.basename(path)}: only TIFF / OME-TIFF and .npy are read on the cluster")
+            raise DatasetError(f"{os.path.basename(path)}: only TIFF / OME-TIFF, DeltaVision / MRC (.dv, .mrc) and .npy are read on the cluster")
 
     # --- opening ---------------------------------------------------------------------------------
 
@@ -279,6 +371,58 @@ class Dataset:
                     entry["wavelength_nm"] = float(ch["wavelength_nm"])
                 self.channels.append(entry)
 
+    def _open_mrc(self) -> None:
+        """An MRC / DeltaVision stack as a (c, t, z, y, x) memmap in the file's
+        dtype, shaped as app/core/array_source.cpp's probeMrcDataset shapes it:
+        the DeltaVision header's wavelengths and time points (in its sequence),
+        or the page order the application sent, else the sections as z."""
+        name = os.path.basename(self.path)
+        h = mrc_header(self.path)
+        item = h["dtype"].itemsize
+        need = h["data_offset"] + h["sections"] * h["height"] * h["width"] * item
+        if self.bytes_on_disk < need:
+            raise DatasetError(f"{name}: {need} bytes of header and sections expected, the file has {self.bytes_on_disk}")
+        sections = h["sections"]
+        described = h["deltavision"]
+        hc, ht = (h["waves"], h["times"]) if described else (1, 1)
+        hz = sections // (hc * ht) if sections % (hc * ht) == 0 else sections
+        header_order = {1: "czt", 2: "zct"}.get(h["sequence"], "ztc")
+        c, t, z = hc, ht, hz
+        order = header_order if described else "ztc"
+        from_meta = described
+        o = self.options
+        if o.get("page_order") is not None:
+            # as for a TIFF: an axis left at 0 is what the file says, and the
+            # default order ("czt") keeps the file's sequence
+            oc, ot, oz = (int(o.get(k) or 0) for k in ("c", "t", "z"))
+            c = oc if oc > 0 else hc
+            t = ot if ot > 0 else ht
+            z = oz if oz > 0 else max(sections // max(c * t, 1), 1)
+            given = str(o.get("page_order") or "czt")
+            order = header_order if described and given == "czt" else _normalize_order(given)
+            from_meta = described and oc <= 0 and ot <= 0 and oz <= 0
+        if c * t * z != sections:
+            c, t, z, order, from_meta = 1, 1, sections, "ztc", False
+        a = np.memmap(self.path, dtype=h["dtype"], mode="r", offset=h["data_offset"], shape=(sections, h["height"], h["width"]))
+        # the sections as (c, t, z, y, x): `order` names the fastest axis first
+        slow_to_fast = order[::-1]
+        size = {"c": c, "t": t, "z": z}
+        a = a.reshape(tuple(size[ax] for ax in slow_to_fast) + (h["height"], h["width"]))
+        self._array = a.transpose(tuple(slow_to_fast.index(ax) for ax in "ctz") + (3, 4))
+        self.dtype = h["dtype"]
+        self.c, self.t, self.z, self.y, self.x = c, t, z, h["height"], h["width"]
+        self.format = "deltavision" if described else "mrc"
+        self.dims_from_metadata = bool(from_meta)
+        # the header's pixel sizes, within what a microscope produces (1 nm .. 100 um)
+        self.voxel = [float(v) if 1e-3 < v < 100.0 else 0.0 for v in h["voxel_um"]]
+        waves = h["wavelengths"][:h["waves"]]
+        if described and c == h["waves"] and any(w > 0 for w in waves):
+            for w in waves:
+                entry: Dict[str, Any] = {"name": str(w) if w > 0 else ""}
+                if w > 0:
+                    entry["wavelength_nm"] = float(w)
+                self.channels.append(entry)
+
     def close(self) -> None:
         """Lets the file go."""
         self._array, self._tf = None, None
@@ -287,7 +431,7 @@ class Dataset:
 
     def meta(self) -> Dict[str, Any]:
         name = os.path.basename(self.path)
-        for ext in (".ome.tiff", ".ome.tif", ".tiff", ".tif", ".npy"):
+        for ext in (".ome.tiff", ".ome.tif", ".tiff", ".tif", ".npy", ".dv", ".mrc"):
             if name.lower().endswith(ext):
                 name = name[: -len(ext)]
                 break

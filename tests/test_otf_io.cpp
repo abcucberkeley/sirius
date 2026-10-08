@@ -1,8 +1,9 @@
-// loadOTF: the radially averaged OTF table read from a TIFF.
+// loadOTF: the radially averaged OTF table read from a TIFF or a .dv.
 
 #include <catch2/catch_test_macros.hpp>
 #include <catch2/matchers/catch_matchers_floating_point.hpp>
 
+#include <algorithm>
 #include <array>
 #include <cmath>
 #include <complex>
@@ -11,6 +12,7 @@
 #include <utility>
 #include <vector>
 
+#include "sirius/mrc_io.hpp"
 #include "sirius/otf_io.hpp"
 #include "sirius/tiff_io.hpp"
 
@@ -153,4 +155,50 @@ TEST_CASE("loadOTF reads cudasirecon's radially averaged OTF TIFF as cudasirecon
     REQUIRE(explicitSteps.data().dimension(2) == 65);
     CHECK(explicitSteps.data()(2, 5, 7) == d(2, 5, 7));
     CHECK(explicitSteps.dkrotf() == 0.048828);
+}
+
+TEST_CASE("loadOTF reads the DeltaVision container makeotf writes (otf.dv)", "[otf][data]") {
+    // otf.dv is what cudasirecon's makeotf writes beside otf.tif: the same
+    // 3 orders x 129 radial samples x 65 complex kz samples, mode 4 (float32
+    // complex), so its rows are the (re, im) pairs loadOTF de-interleaves.
+    // The header's cell lengths are the table's own steps, dkzotf then
+    // dkrotf, which is how cudasirecon recovers them from a .dv OTF.
+    const std::string data = SIRIUS_TEST_DATA_DIR;
+    const MrcInfo head = inspectMrc(data + "/otf.dv");
+    CHECK(head.mode == 4);
+    CHECK(head.complex);
+    CHECK(head.width == 130);      // 65 complex pairs
+    CHECK(head.height == 129);
+    CHECK(head.sections == 3);
+    CHECK_THAT(head.cell[0], WithinAbs(0.123077, 1e-6));   // dkzotf
+    CHECK_THAT(head.cell[1], WithinAbs(0.048828, 1e-6));   // dkrotf
+
+    const OTFRadiallyAveraged otf = loadOTF(data + "/otf.dv", head.cell[1], head.cell[0]);
+    const auto& d = otf.data();
+    REQUIRE(d.dimension(0) == 3);
+    REQUIRE(d.dimension(1) == 129);
+    REQUIRE(d.dimension(2) == 65);
+    CHECK_THAT(otf.dkrotf(), WithinAbs(0.048828, 1e-6));
+    CHECK_THAT(otf.dkzotf(), WithinAbs(0.123077, 1e-6));
+    // Order 0 is normalised at the origin, and in this container the DC
+    // sample is exactly 1 (otf.tif's is 0.99999994).
+    CHECK(d(0, 0, 0) == Cplx(1.0, 0.0));
+    CHECK_THAT(d(0, 0, 1).real(), WithinAbs(0.137122, 1e-6));
+    // This is a different measurement from otf.tif, not the same table in
+    // another container: its imaginary parts are ~0 throughout, where
+    // otf.tif's are not.
+    double maxImagDv = 0.0, maxImagTif = 0.0;
+    const OTFRadiallyAveraged tif = loadOTF(data + "/otf.tif", head.cell[1], head.cell[0]);
+    REQUIRE(tif.data().dimension(0) == 3);
+    REQUIRE(tif.data().dimension(1) == 129);
+    REQUIRE(tif.data().dimension(2) == 65);
+    for (Eigen::Index o = 0; o < 3; ++o)
+        for (Eigen::Index ir = 0; ir < 129; ++ir)
+            for (Eigen::Index iz = 0; iz < 65; ++iz) {
+                maxImagDv = std::max(maxImagDv, std::abs(d(o, ir, iz).imag()));
+                maxImagTif = std::max(maxImagTif, std::abs(tif.data()(o, ir, iz).imag()));
+            }
+    CHECK(maxImagDv < 1e-6);
+    CHECK(maxImagTif > 0.01);
+    CHECK_THAT(tif.data()(0, 0, 0).real(), WithinAbs(1.0, 1e-6));
 }

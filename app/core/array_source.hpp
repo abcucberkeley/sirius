@@ -4,8 +4,9 @@
 // Lazy access to a dataset on disk. The Load step hands a source, not an
 // array, down the pipeline: the viewer reads single planes through it, and
 // a step that needs the data materializes only the (c, t) volumes it works
-// on. Two backends: multi-page TIFF (libtiff / nvTIFF through TiffFile) and
-// zarr / N5 through TensorStore when the build has it.
+// on. Three backends: multi-page TIFF (libtiff / nvTIFF through TiffFile),
+// MRC / DeltaVision stacks (MrcFile) and zarr / N5 through TensorStore when
+// the build has it.
 
 #include <cstdint>
 #include <functional>
@@ -20,6 +21,7 @@
 
 namespace sirius {
     struct TiffInfo;
+    struct MrcInfo;
 }
 
 namespace sirius::app {
@@ -230,6 +232,20 @@ namespace sirius::app {
         std::string summary;
     };
     TiffDatasetProbe probeTiffDataset(const std::string& path, const TiffInfo& info, const OpenOptions* options);
+
+    // The same for an MRC / DeltaVision stack (sirius/mrc_io.hpp): a
+    // DeltaVision header's wavelengths and time points are the channels and
+    // time points, its sequence says which section holds (c, t, z), and its
+    // cell lengths are the voxel size; a plain MRC file is one z stack.
+    struct MrcDatasetProbe {
+        DatasetMeta meta;
+        PageOrder order;                         // (c, t, z) -> section
+        bool dimsFromMetadata = false;           // the DeltaVision header shaped (c, t, z)
+        std::array<double, 3> fileVoxelUm{0, 0, 0};
+        std::vector<ChannelInfo> fileChannels;   // the wavelengths the header names; empty when it names none
+        std::string summary;
+    };
+    MrcDatasetProbe probeMrcDataset(const std::string& path, const MrcInfo& info, const OpenOptions* options);
 
 } // namespace sirius::app
 
