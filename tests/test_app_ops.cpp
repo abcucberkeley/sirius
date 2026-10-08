@@ -320,14 +320,19 @@ TEST_CASE("SIM reconstructs the bundled stack from a parameter file and reports 
     }
 }
 
-TEST_CASE("SIM From file reconstructs with the file's pixel sizes, as cudasirecon does", "[app][ops][sim]") {
-    // cudasirecon reconstructs a TIFF stack with the config's xyres / zres
-    // and derives a measured OTF's radial step from xyres; the dataset's own
-    // calibration (none for a plain TIFF, or mistaken) must not stretch the
-    // OTF. On 2026-10-08 sirius-cli opened raw.tif with voxel_um handed over
-    // in z, y, x order, the step took dx = 0.125 from it, and the measured
-    // OTF's radial support ended short of the side bands: "the overlap of
-    // orders 0 and 2 holds no signal" in every mode that named otf.tif.
+TEST_CASE("SIM From file reconstructs with the file's pixel sizes", "[app][ops][sim]") {
+    // SIRIUS's rule: the pixel sizes the parameter file sets are the ones the
+    // step reconstructs with, and the stack's fill in what the file leaves
+    // out. It is not "as cudasirecon does": cudasirecon reads xyres / zres
+    // for a TIFF stack only and takes a DeltaVision stack's pixel sizes from
+    // the file's header (mrc.h), a divergence app/help/sim.md records. What
+    // both do share is that a measured OTF's radial step is derived from
+    // xyres, so the dataset's own calibration (none for a plain TIFF, or
+    // mistaken) must not stretch the OTF. On 2026-10-08 sirius-cli opened
+    // raw.tif with voxel_um handed over in z, y, x order, the step took
+    // dx = 0.125 from it, and the measured OTF's radial support ended short
+    // of the side bands: "the overlap of orders 0 and 2 holds no signal" in
+    // every mode that named otf.tif.
     DatasetMeta meta = metaFor(Dims5{1, 1, 135, 64, 64});
     meta.voxelUm = {0.125, 0.08, 0.08};
     meta.sim.present = true;
