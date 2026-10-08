@@ -66,7 +66,7 @@ Header row: "OPERATIONS · ANY ORDER" (10 px, uppercase, 0.1 em tracking, neutra
 
 **Footer**: primary "Run all enabled" (label becomes "Running · NN %"), secondary "Export result…". Buttons are full-width, labels flush left.
 
-**Default pipeline on launch**: 01 Load (pinned) + 02 Contrast (selected, viewed).
+**Default pipeline on launch**: 01 Load (pinned) alone, selected and viewed — the same pipeline `sirius-cli` and the Python front start from, so a saved pipeline means the same thing on all three. A Contrast step is added like any other and is deliberately NOT there by default: it is display-only only until the pipeline runs, and from the first run its percentile stretch is in the data every step below it reads. The launch screen's histogram comes from the Load step itself.
 
 Semantics: steps execute top-to-bottom; a skipped step passes data through unchanged; any order is legal (validation is per-op, e.g. deskew warns if not light-sheet data). Each step has a cache policy (Memory / Disk / Recompute) and a result shape.
 

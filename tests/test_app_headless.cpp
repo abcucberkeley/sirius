@@ -237,6 +237,116 @@ TEST_CASE("headless: the workspace starts with the Load step alone", "[app][head
     CHECK(state["running"] == false);
 }
 
+TEST_CASE("headless: a fresh workbench is the Load step alone, the GUI's as much as the session's", "[app][headless][parity]") {
+    // The GUI's Workbench, constructed exactly as the window constructs it and
+    // with nothing removed. Its constructor used to add a Contrast step here.
+    // That step is display-only only until the pipeline runs -- run() has no
+    // display mode -- so from the first run every step below it, the SIM
+    // reconstruction included, read a 0.2/99.8 percentile stretch of the data
+    // instead of the data.
+    Fixture f;   // first: its SIRIUS_PYTHON_ENV covers the whole case, as every case here does
+    TempDir scratch{"fresh_pipeline"};
+    Workbench gui(scratch.path);
+    REQUIRE(gui.pipeline().size() == 1);
+    CHECK(gui.pipeline().at(0).kind == "load");
+    CHECK(gui.pipeline().at(0).pinned);
+    CHECK(gui.selectedIndex() == 0);   // the Load step is what is selected and viewed
+    CHECK(gui.viewedIndex() == 0);
+    CHECK_FALSE(gui.history().canUndo());
+    // No step in it rewrites the intensities, whatever the pipeline's length.
+    for (int i = 0; i < gui.pipeline().size(); ++i) CHECK(gui.pipeline().at(i).kind != "contrast");
+
+    // and the session's, through the tool, for the same claim
+    const json steps = f.ok("get_state")["steps"];
+    REQUIRE(steps.size() == 1);
+    CHECK(steps[0]["kind"] == "load");
+}
+
+TEST_CASE("headless: the GUI's pipeline and the session's are the same pipeline for the same dataset", "[app][headless][parity]") {
+    // THE GUARD AGAINST THE TWO FRONTS DIVERGING AGAIN. A pipeline the GUI
+    // starts from and one the session starts from must be the same pipeline, or
+    // the same saved file and the same step number mean different things on the
+    // two fronts -- which they did: the GUI's SIM step was number 3 where the
+    // session's was 2, and a script asking the GUI for step 2 was reading a
+    // contrast stretch.
+    const std::string path = (kData / "raw.tif").string();
+
+    Fixture f;
+    f.ok("open_dataset", {{"path", path}});
+
+    // The same dataset through the Workbench the window drives, read through
+    // the same tool: the session's own get_state builds its steps from
+    // ToolApi::stepJson, so any difference here is a difference of pipeline and
+    // not of reporting.
+    TempDir guiScratch{"gui_pipeline"};
+    Workbench gui(guiScratch.path);
+    gui.setBackend(Backend::Cpu);
+    gui.openDataset(path);
+    ToolApi api(gui);
+
+    // What each front legitimately adds: the GUI marks which step is selected
+    // and which is viewed and numbers the rows ("02"); the session reports
+    // whether a step has a fresh output. Everything else -- which steps there
+    // are, in which order, under which name, cache and parameters -- has to be
+    // the same.
+    auto core = [](json steps) {
+        for (json& s : steps)
+            for (const char* k : {"selected", "viewed", "number", "has_output", "fresh", "output_shape"}) s.erase(std::string(k));
+        return steps;
+    };
+    const json sessionOpened = core(f.ok("get_state")["steps"]);
+    const json guiOpened = core(api.call("get_state", json::object())["steps"]);
+    INFO("session " << sessionOpened.dump(1) << "\nGUI     " << guiOpened.dump(1));
+    REQUIRE(guiOpened.size() == 1);
+    CHECK(guiOpened == sessionOpened);
+
+    SECTION("a SIM step is step 2 on both fronts, so \"step 2\" names the same step") {
+        f.ok("add_step", {{"kind", "sim"}});
+        REQUIRE_FALSE(api.call("add_step", {{"kind", "sim"}}).contains("error"));
+        const json sessionSteps = f.ok("get_state")["steps"];
+        const json guiSteps = api.call("get_state", json::object())["steps"];
+        REQUIRE(sessionSteps.size() == 2);
+        REQUIRE(guiSteps.size() == 2);
+        CHECK(sessionSteps[1]["kind"] == "sim");
+        CHECK(guiSteps[1]["kind"] == "sim");
+        CHECK(sessionSteps[1]["step"] == 2);
+        CHECK(guiSteps[1]["step"] == 2);
+        INFO("session " << core(sessionSteps).dump(1) << "\nGUI     " << core(guiSteps).dump(1));
+        CHECK(core(guiSteps) == core(sessionSteps));
+    }
+}
+
+TEST_CASE("headless: the Load step reports the histogram the launch screen used to take from a Contrast step", "[app][headless]") {
+    // Removing the default Contrast step took away the only source of the
+    // launch screen's histogram cell, which the diagnostics body draws for a
+    // Contrast step. The Load step answers it instead, so the cell no longer
+    // depends on a step the pipeline happens to hold.
+    Fixture f;   // first, for its SIRIUS_PYTHON_ENV
+    TempDir scratch{"load_histogram"};
+    Workbench gui(scratch.path);
+    gui.setBackend(Backend::Cpu);
+    gui.openDataset((kData / "raw.tif").string());
+    const Diagnostics d = gui.diagnosticsOf(0);
+    // Generic, not Contrast: Load has no window or gamma to drag, and a Generic
+    // diagnostics' histograms are drawn as extra cells, so no panel had to change.
+    CHECK(d.kind == DiagnosticsKind::Generic);
+    REQUIRE(d.histograms.size() == static_cast<std::size_t>(gui.dataset().dims.c));
+    CHECK(d.histograms[0].bins.size() == 30);
+    CHECK(d.histograms[0].binHi > d.histograms[0].binLo);
+    CHECK(d.histograms[0].lo <= d.histograms[0].hi);
+    CHECK(d.histograms[0].gamma == 1.0f);
+    // It measures the data as it was read, not a step's output: with no
+    // dataset there is nothing to measure and nothing is invented.
+    gui.closeDataset();
+    CHECK(gui.diagnosticsOf(0).histograms.empty());
+
+    // the session reports it too, so the three fronts say the same thing
+    f.openRaw();
+    const json hist = f.ok("get_diagnostics", {{"step", 1}})["histograms"];
+    REQUIRE(hist.size() == 1);
+    CHECK(hist[0]["gamma"].get<double>() == 1.0);
+}
+
 TEST_CASE("headless: open_dataset describes raw.dv as a DeltaVision stack", "[app][headless][mrc]") {
     Fixture f;
     const json info = f.ok("open_dataset", {{"path", (kData / "raw.dv").string()}});

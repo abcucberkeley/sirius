@@ -697,9 +697,16 @@ namespace sirius::app {
     Workbench::Workbench(std::filesystem::path scratchDir) : executor_(std::move(scratchDir)), engine_(std::make_shared<EngineLink>()) {
         registerBuiltinOperations();
         pipeline_ = Pipeline();
-        // Default pipeline of the design: Load + Contrast, Contrast selected and viewed.
-        if (findOperation("contrast")) pipeline_.add("contrast");
-        selected_ = viewed_ = std::min(1, pipeline_.size() - 1);
+        // The Load step alone, selected and viewed -- the pipeline the CLI and
+        // the Python front also start from. A Contrast step used to be added
+        // here, and it was display-only only until the pipeline ran: run() has
+        // no display mode, so from the first run every step below it -- the SIM
+        // reconstruction included -- saw a 0.2/99.8 percentile stretch of the
+        // data instead of the data. The window a person wants for LOOKING is
+        // the viewer's own (DisplayModel, WindowMode::Auto), which needs no
+        // step at all; a Contrast step is now added like any other, at the
+        // place in the pipeline where rewriting the intensities is meant.
+        selected_ = viewed_ = 0;
         if (!cudaAvailable()) backend_ = Backend::Cpu;
     }
 
@@ -1673,6 +1680,25 @@ namespace sirius::app {
         const Validation v = stepValidation(index);
         for (const std::string& w : v.warnings) d.warnings.push_back(w);
         for (const std::string& e : v.errors) d.warnings.push_back(e);
+        // The Load step's own histogram of the data as it was read. The launch
+        // screen used to get this cell from the Contrast step the constructor
+        // added; that step is gone, so the measurement comes from the step that
+        // is always there instead of from one the pipeline happens to hold.
+        // d.kind stays what the operation declares -- Load is Generic, and a
+        // Generic diagnostics' histograms are drawn as extra cells, so no panel
+        // knows about this -- and Load has no window or gamma to drag: these
+        // histograms say what the data is, not what a step would do to it.
+        // contrastPreview samples at most 8 planes per channel (~100 ms on
+        // 2048 squared), and previewDiagnostics is answered on a change, not per frame.
+        if (index == 0 && source_) {
+            if (const std::shared_ptr<const StepOutput> loaded = output(0); loaded && (loaded->array || loaded->source)) {
+                try {
+                    d.histograms = contrastPreview(loaded->asInput(), ParamSet{}).histograms;
+                } catch (const std::exception& e) {
+                    d.warnings.push_back(std::string("No histogram of the input: ") + e.what());
+                }
+            }
+        }
         // The operation's own live preview, when it has one and an input exists.
         if (source_ && index > 0) {
             std::shared_ptr<const StepOutput> upstream = upstreamOutput(index);

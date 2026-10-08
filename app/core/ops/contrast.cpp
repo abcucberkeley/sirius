@@ -117,10 +117,13 @@ namespace sirius::app {
                     doubleParam("gamma", "Gamma", 1.0).range(0.1, 5.0, 0.05, 2),
                     doubleParam("lo_percentile", "Auto low percentile", 0.2).range(0.0, 50.0, 0.1, 2).withUnit("%").withHelp("Auto sets Min to this percentile of the input").asAdvanced(),
                     doubleParam("hi_percentile", "Auto high percentile", 99.8).range(50.0, 100.0, 0.1, 2).withUnit("%").withHelp("Auto sets Max to this percentile of the input").asAdvanced(),
-                    boolParam("bake", "Bake into data", true)
-                        .withHelp("The step rewrites intensities into 0..1; kept for future display-only use")
-                        .asAdvanced(),
                 };
+                // There is no "bake" parameter. One was declared with default
+                // true and read nowhere: run() always rewrites the intensities,
+                // so the choice it offered did not exist. Until the step can
+                // really be display-only through the pipeline, the display
+                // window is the viewer's own (DisplayModel) and this step is
+                // what rewriting the data looks like.
             }
 
             const OpInfo& info() const noexcept override { return info_; }

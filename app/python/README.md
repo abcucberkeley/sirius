@@ -261,7 +261,7 @@ snapshot of the C++ parameter tables and
   `meant`: no parameters.
 * `contrast`: `min`, `max` (the manual window; `max <= min` means automatic,
   from `lo_percentile` / `hi_percentile`), `gamma`, `lo_percentile` (0.2),
-  `hi_percentile` (99.8), `bake`. The window is taken once over the whole
+  `hi_percentile` (99.8). The window is taken once over the whole
   input, not per channel.
 * `flatfield`: `flat`, `dark` (TIFF paths; one page, or one page per channel).
 * `bleach`: `mode` (`Match first frame` | `Match mean`), `over` (`t` | `z`).

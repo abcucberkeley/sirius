@@ -1163,6 +1163,14 @@ def step_meant(a: np.ndarray, params: Dict[str, Any], meta: Dict[str, Any]) -> S
 
 
 def _contrast_legacy(p: Dict[str, Any], meta: Optional[Dict[str, Any]]) -> None:
+    # `bake` was a declared parameter of the application's Contrast step until
+    # it was deleted for being read nowhere, so pipelines and scripts exported
+    # before then carry it. Say what happened rather than "unknown parameter".
+    if "bake" in p:
+        p.pop("bake")
+        warnings.warn("step 'contrast': bake is no longer a parameter; the step always rewrites the "
+                      "intensities into 0..1 (it never did anything else)",
+                      UnknownParameterWarning, stacklevel=5)
     if _pop_first(p, ("per_channel", "perChannel")):
         warnings.warn("step 'contrast': per_channel is not a parameter of the application's Contrast step; "
                       "one window (the extreme percentiles over every channel) applies to all channels",
@@ -1171,7 +1179,7 @@ def _contrast_legacy(p: Dict[str, Any], meta: Optional[Dict[str, Any]]) -> None:
 
 _CONTRAST = StepSpec(
     "contrast",
-    {"min": 0.0, "max": 0.0, "gamma": 1.0, "lo_percentile": 0.2, "hi_percentile": 99.8, "bake": True},
+    {"min": 0.0, "max": 0.0, "gamma": 1.0, "lo_percentile": 0.2, "hi_percentile": 99.8},
     aliases={"low": "lo_percentile", "lo": "lo_percentile", "low_percentile": "lo_percentile",
              "p_low": "lo_percentile", "percentile_low": "lo_percentile",
              "high": "hi_percentile", "hi": "hi_percentile", "high_percentile": "hi_percentile",
@@ -1199,7 +1207,8 @@ def _contrast_auto_window(a: np.ndarray, lo_pct: float, hi_pct: float, max_plane
 def step_contrast(a: np.ndarray, params: Dict[str, Any], meta: Dict[str, Any]) -> StepResult:
     """min / max: the window mapped to 0..1 (max <= min = automatic: the
     lo_percentile / hi_percentile of the input, one window for every channel);
-    gamma. `bake` is accepted (the data is always rewritten)."""
+    gamma. The data is always rewritten: there is no display-only mode here,
+    as there is none in the application."""
     lo_pct = _float(params, "lo_percentile", 0.2)
     hi_pct = _float(params, "hi_percentile", 99.8)
     if lo_pct >= hi_pct:

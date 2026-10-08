@@ -1053,15 +1053,6 @@
           "read_only": false,
           "type": "double",
           "unit": "%"
-        },
-        {
-          "advanced": true,
-          "default": true,
-          "help": "The step rewrites intensities into 0..1; kept for future display-only use",
-          "key": "bake",
-          "label": "Bake into data",
-          "read_only": false,
-          "type": "bool"
         }
       ],
       "plugin": false,

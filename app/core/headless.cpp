@@ -497,8 +497,11 @@ namespace sirius::app {
     };
 
     HeadlessWorkbench::Impl::Impl(HeadlessOptions o) : options(std::move(o)), wb(options.scratchDir), api(wb), workspace("ws_" + randomHex(12)) {
-        // A predictable start (D19): the Load step alone, nothing to undo. The
-        // workbench's default Contrast step is for a person looking at data.
+        // A predictable start (D19): the Load step alone, nothing to undo.
+        // A fresh Workbench starts there too, so this says what the session
+        // guarantees rather than undoing anything the GUI added -- it used to
+        // throw away a default Contrast step, which is why the GUI's SIM step
+        // was number 3 where the session's was 2.
         wb.replacePipeline(Pipeline(), "Start");
         wb.history().clear();
         api.setAllowNetworkPaths(options.allowNetworkPaths);
