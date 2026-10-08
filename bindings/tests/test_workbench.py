@@ -476,36 +476,59 @@ class TestSimStep(unittest.TestCase):
         self.assertEqual(p.nphases, 5)
 
     def test_sim_step_reconstructs_with_the_theoretical_otf(self):
-        # tests/test_app_ops.cpp's "the theoretical OTF works without a file",
-        # on the same stack with the same parameters: an empty `otf` means the
-        # theoretical OTF here as it does in the GUI and the CLI, and the
-        # choice is the library's one selectOTF (sirius/otf_select.hpp).
-        # Until 2026-10-08 this raised NotAvailable, which is what made every
-        # default-OTF pipeline the application exports with export_python die
-        # on its own run_pipeline (docs/findings.md 9k.50, finding 4).
+        # An empty `otf` means the theoretical OTF here as it does in the GUI
+        # and the CLI, and the choice is the library's one selectOTF
+        # (sirius/otf_select.hpp). Until 2026-10-08 this raised NotAvailable,
+        # which is what made every default-OTF pipeline the application
+        # exports with export_python die on its own run_pipeline
+        # (docs/findings.md 9k.50, finding 4).
+        #
+        # Two arms, one for each C++ case that covers the ideal OTF, asserting
+        # what each of those asserts:
+        #   * the step's own defaults, as test_app_ops.cpp's "the theoretical
+        #     OTF works without a file" has it -- the output grid and that it
+        #     ran, and no pattern (see the note below);
+        #   * the reference config's parameters, as test_reconstruction.cpp's
+        #     "Reconstruction with the ideal OTF resembles the reference" has
+        #     it -- there the pattern IS pinned and the result has to correlate
+        #     above 0.8 with cudasirecon's measured-OTF reconstruction.
         sirius = _sirius_extension()
         raw = sirius.read_tiff(str(self.DATA / "raw.tif"), dtype=np.float32)
         self.assertEqual(raw.shape, (135, 64, 64))   # 3 angles x 5 phases x 9 z
-        params = {"na": 1.42, "nimm": 1.515, "linespacing_um": 0.2035, "k0_start_angle": 46.08}
-        r = wb.run_step("sim", params, raw, {"voxel_um": [0.08, 0.08, 0.125]}, device="cpu")
+        meta = {"voxel_um": [0.08, 0.08, 0.125]}
+
+        estimate = {"na": 1.42, "nimm": 1.515, "linespacing_um": 0.2035, "k0_start_angle": 46.08}
+        r = wb.run_step("sim", estimate, raw, meta, device="cpu")
         self.assertEqual(r.array.shape, (1, 1, 9, 128, 128))   # zoomfact 2, z_zoom 1
         self.assertEqual(int(np.count_nonzero(~np.isfinite(r.array))), 0)
         self.assertGreater(float(np.max(np.abs(r.array))), 0.0)
         self.assertAlmostEqual(r.meta["voxel_um"][0], 0.04, places=9)
-        # The pattern was actually fitted. A collapsed fit is the failure this
-        # pins: given an OTF that does not match the optics, cudasirecon's own
-        # findk0 returns (0, 0) and reports "spacing=inf um" (9k.49), and the
-        # reconstruction is then just the centre band stacked. The configured
-        # line spacing puts order 1 at 1 / 0.2035 / 2 = 2.457 /um, so 0.407 um;
-        # the measured-OTF run of this stack fits 0.407 um (9k.48). Ten per
-        # cent is room for the fit to move without room for a collapse.
-        fits = r.info["fits"]
-        self.assertEqual(len(fits), 1)
-        self.assertEqual(len(fits[0]["k0"]), 3)
-        for kx, ky in fits[0]["k0"]:
-            spacing = 1.0 / float(np.hypot(kx, ky))
-            self.assertGreater(spacing, 0.407 * 0.90)
-            self.assertLess(spacing, 0.407 * 1.10)
+        self.assertEqual(len(r.info["fits"]), 1)
+        self.assertEqual(len(r.info["fits"][0]["k0"]), 3)
+        # No band on the Estimate-mode pattern, and not for want of trying.
+        # Measured on this stack (fiona job 4247382): through the theoretical
+        # OTF, directions 0 and 1 fit 0.4076 um -- the configured
+        # 1 / 0.2035 / 2 = 0.407 -- and direction 2 lands at 0.5375 um
+        # (1.861 /um, angle 172.9 deg); through otf.tif, from the same seeds,
+        # all three fit 0.406 - 0.408. So the Estimate seed is not enough for
+        # direction 2 of this stack through the theoretical OTF, and a band
+        # here would be a band around a fit that is wrong. It is not something
+        # this commit changed: the OTF the C++ builds is the same table as
+        # before, value for value (tests/test_otf_select.cpp), and job 4247383
+        # gets the same 0.5375 out of the unpatched build.
+
+        ref = {"mode": "From file", "params_file": str(self.DATA / "config.txt")}
+        q = wb.run_step("sim", ref, raw, meta, device="cpu")
+        self.assertEqual(q.array.shape, (1, 1, 9, 128, 128))
+        self.assertEqual(int(np.count_nonzero(~np.isfinite(q.array))), 0)
+        for kx, ky in q.info["fits"][0]["k0"]:
+            # 0.4075, 0.4075, 0.4076 measured; the band is half a per cent, so
+            # a plan-rigor difference cannot move it but a collapsed fit
+            # (k0 = 0, "spacing=inf um", 9k.49) or a wrong minimum must
+            self.assertAlmostEqual(1.0 / float(np.hypot(kx, ky)), 0.407, delta=0.002)
+        expected = sirius.read_tiff(str(self.DATA / "raw_proc.tif"), dtype=np.float32)
+        corr = float(np.corrcoef(q.array[0, 0].ravel(), expected.ravel())[0, 1])
+        self.assertGreater(corr, 0.8)   # 0.8169 measured; the C++ case's own threshold
 
     def test_the_theoretical_otf_follows_the_stacks_planes(self):
         # The theoretical OTF is built in 3D for a stack of several planes and
