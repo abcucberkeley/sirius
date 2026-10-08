@@ -71,7 +71,16 @@ namespace sirius {
 
         // raw: (ndirs*nphases*nz, ny, nx) camera frames on device(), in the
         // standard direction->z->phase section order (fast_si selects the
-        // z->direction->phase order instead). nx and ny must be even.
+        // z->direction->phase order instead). nx and ny must be at least
+        // kMinSimExtent; either parity reconstructs (simImageSizeProblem in
+        // sirius/sim_parameters.hpp is the condition, and the one wording the
+        // application's fronts report it with). Note on odd extents: the band
+        // assembly and the Wiener filter's mirror pass cover the whole
+        // frequency set of an odd axis, which cudasirecon's own odd path does
+        // not -- it misses -(n-1)/2 and invents +(n+1)/2, reading one element
+        // past the end of an r2c row to do it (sim_math.hpp's
+        // signedFrequency, and gpuFunctionsImpl.cu:1865-1897 there) -- so an
+        // odd stack has no bit-for-bit reference to compare against.
         // Returns the (z_zoom*nz, zoomfact*ny, zoomfact*nx) super-resolution
         // volume on device(); all enqueued work has completed on return.
         Buffer<double> reconstruct(BufferView<const double> raw);

@@ -24,6 +24,7 @@
 #include "sirius/legacy_config.hpp"
 #include "sirius/otf_ideal.hpp"
 #include "sirius/real_fft.hpp"
+#include "sirius/sim_parameters.hpp"
 #include "sirius/tiff_io.hpp"
 
 #include "temp_path.hpp"
@@ -124,14 +125,23 @@ TEST_CASE("ReconSession validates its inputs before reconstructing", "[app][sess
     CHECK_FALSE(s.usesIdealOtf());
     CHECK(s.validate().empty());
 
-    SECTION("section count must match ndirs * nphases") {
+    SECTION("section count must match ndirs * nphases, in the library's wording") {
         s.setRaw(Buffer<double>(Shape{14, 8, 8}));
         CHECK(s.inferredNz() == 0);
-        CHECK_FALSE(s.validate().empty());
+        CHECK(s.validate() == "z holds 14 sections, not a multiple of angle 3 × phase 5 = 15.");
+        CHECK(s.validate() == s.parameters().sectionCountProblem(14));
     }
-    SECTION("odd image sizes are rejected") {
-        s.setRaw(Buffer<double>(Shape{15, 7, 8}));
-        CHECK_FALSE(s.validate().empty());
+    SECTION("odd image sizes are accepted: they reconstruct") {
+        // this section asserted the refusal until 2026-10-08; the even-size
+        // guards went when the index arithmetic stopped being even-only
+        s.setRaw(Buffer<double>(Shape{15, 7, 9}));
+        CHECK(s.inferredNz() == 1);
+        CHECK(s.validate().empty());
+    }
+    SECTION("a lateral extent below the minimum is refused, in the library's wording") {
+        s.setRaw(Buffer<double>(Shape{15, 3, 8}));
+        CHECK(s.validate() == "Image size must be at least 4 × 4, got 8 × 3.");
+        CHECK(s.validate() == simImageSizeProblem(8, 3));
     }
     SECTION("invalid parameters are reported") {
         SIMParameters p = s.parameters();

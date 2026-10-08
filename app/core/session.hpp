@@ -103,9 +103,14 @@ namespace sirius::app {
         void setParameters(const SIMParameters& p);
         const SIMParameters& parameters() const noexcept;
 
-        // Empty when a reconstruction can start, otherwise the reason it cannot
-        // (missing inputs, section count not a multiple of ndirs*nphases, odd
-        // nx/ny, ...). Cheap: no I/O.
+        // Empty when a reconstruction can start, otherwise the reason it
+        // cannot (missing inputs, invalid parameters, a section count that is
+        // not a whole number of planes, a lateral extent below
+        // kMinSimExtent). The two shape reasons are worded by the library --
+        // SIMParameters::sectionCountProblem and simImageSizeProblem -- so
+        // this, the SIM step's Validation and SimReconstructor's own throw
+        // are one sentence per condition. Odd extents are NOT a reason: they
+        // reconstruct. Cheap: no I/O.
         std::string validate() const;
 
         // Section count implied by the parameters for the loaded stack (nz), or

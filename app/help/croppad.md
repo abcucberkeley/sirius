@@ -16,7 +16,6 @@ $$
 | **Origin** <br> z, y, x | Voxel of the input that becomes the output origin (negative values pad in front). |
 | **Size** <br> z, y, x | Output extent per axis; 0 keeps the input extent. |
 | **Fill** <br> value | Value written outside the input. |
-| **Even sizes** <br> on · off | Round the extents to even numbers, which FFT-based steps (SIM, deconvolution) require. |
 
 ## Note
 

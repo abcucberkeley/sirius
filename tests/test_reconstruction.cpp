@@ -654,6 +654,110 @@ TEST_CASE("CPU and GPU agree on 2D and thin stacks", "[reconstruction][cuda][2d]
     }
 }
 
+TEST_CASE("Odd and non-square lateral sizes reconstruct the pattern they were built with",
+          "[reconstruction][odd]") {
+    // Until 2026-10-08 three guards refused an odd nx or ny outright. The two
+    // index expressions that were genuinely even-only are gone (sim_math.hpp's
+    // signedFrequency for the band assembly, mirrorColumns for the Wiener
+    // filter's negative-kx pass), so the guards went with them -- and this is
+    // the test that says so with a known answer, because cudasirecon's own odd
+    // path is wrong at the outermost frequency of each axis and cannot serve
+    // as a reference (docs/findings.md 9k.50, 9k.49 for the isoar stack that
+    // motivated it).
+    SIMParameters p = params2d();
+    struct Size {
+        int nx, ny;
+        const char* what;
+    };
+    // the r2c axis odd, the full axis odd, and both -- x is the axis whose
+    // half-complex rows made an odd extent a mis-read rather than only a
+    // misplacement, so it is covered on its own
+    const Size sz = GENERATE(Size{127, 97, "both odd, non-square"}, Size{127, 96, "odd x (the r2c axis)"},
+                             Size{128, 97, "odd y"});
+    INFO(sz.what << ": " << sz.nx << " x " << sz.ny);
+    std::vector<double> object;
+    const Buffer<double> raw = test::syntheticSim2dRect(p, sz.nx, sz.ny, 0.8, &object);
+    REQUIRE(raw.shape() == Shape({9, sz.ny, sz.nx}));
+    const OTFRadiallyAveraged otf = idealOTF(p, /*threeD=*/false);
+
+    SimReconstructor recon(p, otf, Device::cpu(), PlanRigor::Estimate);
+    const Buffer<double> out = recon.reconstruct(raw.view());
+    // the grid cudasirecon computes for an odd input too: round(zoomfact * n)
+    REQUIRE(out.shape() == Shape({1, 2 * sz.ny, 2 * sz.nx}));
+    CHECK(nonFinite(out) == 0);
+    checkPattern2d(recon.lastFit(), p);
+
+    // Box-mean the zoomed reconstruction back onto the object's grid, as the
+    // even 2D case does. A finite volume with the right k0 that is not this
+    // scene would pass everything above and fail here.
+    double sa = 0, sb = 0, saa = 0, sbb = 0, sab = 0;
+    for (int y = 0; y < sz.ny; ++y)
+        for (int x = 0; x < sz.nx; ++x) {
+            double acc = 0;
+            for (int dy = 0; dy < 2; ++dy)
+                for (int dx = 0; dx < 2; ++dx) acc += out.data()[(y * 2 + dy) * (sz.nx * 2) + (x * 2 + dx)];
+            const double a = acc * 0.25;
+            const double b = object[static_cast<std::size_t>(y) * sz.nx + x];
+            sa += a;
+            sb += b;
+            saa += a * a;
+            sbb += b * b;
+            sab += a * b;
+        }
+    const double count = static_cast<double>(sz.nx) * sz.ny;
+    const double corr = (count * sab - sa * sb) / std::sqrt((count * saa - sa * sa) * (count * sbb - sb * sb));
+    INFO("correlation with the synthetic object: " << corr);
+    CHECK(corr > 0.15);
+
+    if (cudaAvailable()) {
+        // the CUDA twins of both expressions, on an odd axis: nothing else in
+        // the suite runs the mirror pass or the band assembly at odd extents
+        const Device gpu = Device::cuda(0);
+        SimReconstructor gpuRecon(p, otf, gpu, PlanRigor::Estimate);
+        Stream stream(gpu);
+        const Buffer<double> dRaw = toDevice(raw.view(), gpu, stream);
+        stream.synchronize();
+        const Buffer<double> gpuOut = gpuRecon.reconstruct(dRaw.view()).to(Device::cpu());
+        REQUIRE(gpuOut.shape() == out.shape());
+        double peak = 0.0, diff = 0.0;
+        for (Index i = 0; i < out.size(); ++i) {
+            peak = std::max(peak, std::abs(out.data()[i]));
+            diff = std::max(diff, std::abs(out.data()[i] - gpuOut.data()[i]));
+        }
+        REQUIRE(peak > 0.0);
+        INFO("max |cpu-gpu| / max |cpu| = " << diff / peak);
+        CHECK(diff / peak < 1e-6);
+    }
+}
+
+TEST_CASE("The reconstructor refuses a shape it cannot bind, in the wording every front shares",
+          "[reconstruction][validation]") {
+    // One condition used to read three ways and throw three types across the
+    // library, ReconSession::validate() and the SIM step (docs/findings.md
+    // 9k.50, finding 5). Both sentences now come from the library
+    // (sirius/sim_parameters.hpp), so a front cannot word them differently.
+    SIMParameters p = params2d();   // 3 directions x 3 phases = 9 sections per plane
+    const OTFRadiallyAveraged otf = idealOTF(p, /*threeD=*/false);
+    SimReconstructor recon(p, otf, Device::cpu(), PlanRigor::Estimate);
+    const auto refusal = [&](Index sections, Index ny, Index nx) {
+        Buffer<double> raw(Shape{sections, ny, nx});
+        try {
+            recon.reconstruct(raw.view());
+        } catch (const std::invalid_argument& e) {
+            return std::string(e.what());
+        }
+        return std::string("(no throw)");
+    };
+
+    CHECK(refusal(9, 3, 8) == "Image size must be at least 4 × 4, got 8 × 3.");
+    CHECK(refusal(9, 3, 8) == simImageSizeProblem(8, 3));
+    CHECK(refusal(10, 8, 8) == "z holds 10 sections, not a multiple of angle 3 × phase 3 = 9.");
+    CHECK(refusal(10, 8, 8) == p.sectionCountProblem(10));
+    CHECK(refusal(0, 8, 8) == "SimReconstructor: the raw stack has no sections");
+    // and the condition that is NOT refused any more
+    CHECK(simImageSizeProblem(5, 7).empty());
+}
+
 // --- output grids -----------------------------------------------------------------
 
 namespace {

@@ -403,8 +403,11 @@ namespace sirius::app {
                 if (!problem.empty()) v.errors.push_back(problem);
                 const std::optional<SimFrames> frames = problem.empty() ? std::optional<SimFrames>(bindSimLayout(layout, input.dims)) : std::nullopt;
                 const Index ny = frames ? frames->tileY : input.dims.y, nx = frames ? frames->tileX : input.dims.x;
-                if (nx % 2 != 0 || ny % 2 != 0 || nx < 4 || ny < 4)
-                    v.errors.push_back(frames && frames->storage.montage() ? "Each tile must be even and at least 4 × 4." : "Image size must be even and at least 4 × 4.");
+                // the library's condition and the library's wording, so this,
+                // ReconSession::validate() and SimReconstructor itself cannot
+                // word one condition three ways again
+                if (const std::string why = simImageSizeProblem(nx, ny, frames && frames->storage.montage()); !why.empty())
+                    v.errors.push_back(why);
                 if (frames && !layout.isShorthand() && (frames->angles != p.ndirs || frames->phases != p.nphases))
                     v.errors.push_back("The dataset's layout " + layout.text() + " holds " + std::to_string(frames->angles) + " angles × " +
                                        std::to_string(frames->phases) + " phases; the step uses " + std::to_string(p.ndirs) + " × " +

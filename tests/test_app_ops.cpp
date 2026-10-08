@@ -29,6 +29,7 @@
 #include <thread>
 
 #include <sirius/otf_io.hpp>
+#include <sirius/sim_parameters.hpp>
 #include <sirius/tiff_io.hpp>
 
 #include "core/array_source.hpp"
@@ -349,6 +350,24 @@ TEST_CASE("SIM reconstructs the bundled stack from a parameter file and reports 
         const Validation v = sim.validate(sp, bad);
         REQUIRE_FALSE(v.ok());
         CHECK(v.firstError() == "z holds 134 sections, not a multiple of angle 3 × phase 5 = 15.");
+    }
+    SECTION("a lateral extent below the minimum is rejected, in the library's wording") {
+        DatasetMeta bad = loaded.meta;
+        bad.dims.x = 3;
+        const Validation v = sim.validate(sp, bad);
+        REQUIRE_FALSE(v.ok());
+        // the same sentence SimReconstructor throws and ReconSession::validate()
+        // returns; it used to be "Image size must be even and at least 4 × 4."
+        // here, with neither the sizes nor the other fronts' wording
+        CHECK(v.firstError() == "Image size must be at least 4 × 4, got 3 × 64.");
+        CHECK(v.firstError() == simImageSizeProblem(3, 64));
+    }
+    SECTION("odd lateral extents are accepted") {
+        // the step refused them until 2026-10-08
+        DatasetMeta odd = loaded.meta;
+        odd.dims.x = 63;
+        odd.dims.y = 63;
+        CHECK(sim.validate(sp, odd).ok());
     }
     SECTION("a storage layout the dataset states has to hold the step's angles and phases") {
         DatasetMeta declared = loaded.meta;

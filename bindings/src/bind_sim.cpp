@@ -119,11 +119,20 @@ void bind_sim(nb::module_& m) {
              "number of planes. More than one plane is a 3D stack, which is what the theoretical "
              "OTF's `three_d` follows.")
         .def("resolved_orders", &SIMParameters::resolvedOrders,
-             "Orders the reconstruction separates: norders, or nphases // 2 + 1 when norders is 0.");
+             "Orders the reconstruction separates: norders, or nphases // 2 + 1 when norders is 0.")
+        .def("section_count_problem", &SIMParameters::sectionCountProblem, nb::arg("sections"),
+             "Empty when `sections` is a whole number of planes, otherwise the one sentence every "
+             "front says about it -- so the Python mirror does not keep its own copy of the wording.");
 
     nb::class_<SimFit>(m, "SimFit")
         .def_ro("k0", &SimFit::k0)
         .def_ro("amps", &SimFit::amps);
+
+    m.def("sim_image_size_problem", &simImageSizeProblem, nb::arg("nx"), nb::arg("ny"),
+          nb::arg("montage") = false,
+          "Empty when a raw SIM stack's lateral extents can be reconstructed, otherwise the one "
+          "sentence every front says about them. Either parity reconstructs; only the minimum is "
+          "refused. SimReconstructor raises this same text as a ValueError.");
 
     m.def("load_parameters", &loadParameters, nb::arg("path"));
     m.def("save_parameters", &saveParameters, nb::arg("path"), nb::arg("parameters"));

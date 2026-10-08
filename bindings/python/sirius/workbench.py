@@ -3641,13 +3641,12 @@ def step_sim(a: np.ndarray, params: Dict[str, Any], meta: Dict[str, Any], progre
     otf = _str(params, "otf")
     if otf and not os.path.exists(otf):
         raise FileNotFoundError(f"OTF file not found: {otf}")
-    sections = p.sections_per_plane()
     nz = p.planes(a.shape[2])
     if nz == 0:
-        # the words the application uses for the same arithmetic
-        # (bindSimLayout, through the SIM step's validate())
-        raise ValueError(f"z holds {a.shape[2]} sections, not a multiple of "
-                         f"angle {p.ndirs} × phase {p.nphases} = {sections}.")
+        # the sentence itself comes from the library
+        # (SIMParameters::sectionCountProblem), which is what the application's
+        # own fronts report, so there is no Python copy of the wording to drift
+        raise ValueError(p.section_count_problem(a.shape[2]))
     # No OTF file means the theoretical OTF, as it does for the GUI and the
     # CLI; the choice itself is the library's (sirius::selectOTF), reached
     # through SimReconstructor's empty otf_path, so there is one selection and

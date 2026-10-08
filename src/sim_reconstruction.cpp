@@ -182,9 +182,13 @@ namespace sirius {
 
         void bindShape(Index nxIn, Index nyIn, Index nzIn) {
             if (nxIn == nx && nyIn == ny && nzIn == nz) return;
-            if (nxIn < 4 || nyIn < 4 || nxIn % 2 != 0 || nyIn % 2 != 0)
-                throw std::invalid_argument("SimReconstructor: nx and ny must be even and >= 4, got " +
-                                            std::to_string(nxIn) + " x " + std::to_string(nyIn));
+            // Only the minimum: an odd extent reconstructs, because the two
+            // index expressions that were even-only are not any more
+            // (sim_math.hpp's signedFrequency and mirrorColumns). The wording
+            // is the fronts' shared one, so the library, the GUI/CLI session
+            // and the SIM step report this condition identically.
+            if (const std::string why = simImageSizeProblem(nxIn, nyIn); !why.empty())
+                throw std::invalid_argument(why);
             if (nzIn < 1) throw std::invalid_argument("SimReconstructor: the raw stack has no sections");
 
             // The plans and buffers below are rebuilt one after another, so a
@@ -669,12 +673,13 @@ namespace sirius {
                 throw std::invalid_argument("SimReconstructor: raw stack lives on " + toString(raw.device()) +
                                             " but the reconstructor targets " + toString(dev));
             const Index nsec = raw.dim(0);
-            const Index perZ = static_cast<Index>(p.ndirs) * p.nphases;
-            if (nsec % perZ != 0)
-                throw std::invalid_argument("SimReconstructor: " + std::to_string(nsec) +
-                                            " sections is not a multiple of ndirs*nphases = " +
-                                            std::to_string(perZ));
-            bindShape(raw.dim(2), raw.dim(1), nsec / perZ);
+            if (nsec < 1) throw std::invalid_argument("SimReconstructor: the raw stack has no sections");
+            // the fronts' shared wording again, and the arithmetic itself is
+            // SIMParameters::planes -- which also answers an ndirs or nphases
+            // of 0, where `nsec % (ndirs * nphases)` divided by zero
+            if (const std::string why = p.sectionCountProblem(nsec); !why.empty())
+                throw std::invalid_argument(why);
+            bindShape(raw.dim(2), raw.dim(1), static_cast<Index>(p.planes(nsec)));
 
             diag = SimDiagnostics{};
             if (capture) {

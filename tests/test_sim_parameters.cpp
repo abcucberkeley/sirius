@@ -178,6 +178,43 @@ TEST_CASE("validate enforces k0_angles size == ndirs", "[params]") {
 // TOML save / load
 // --------------------------------------------------------------------------
 
+TEST_CASE("the shape conditions are one wording, and odd extents are not one of them",
+          "[params][shape]") {
+    // The library owns both sentences so the GUI, the CLI, the SIM step and
+    // the Python mirror cannot word one condition four ways, which is what
+    // they did until 2026-10-08 (docs/findings.md 9k.50, finding 5).
+    SIMParameters p;   // 3 directions x 5 phases
+    REQUIRE(p.ndirs == 3);
+    REQUIRE(p.nphases == 5);
+
+    SECTION("the section count") {
+        CHECK(p.sectionCountProblem(135).empty());
+        CHECK(p.sectionCountProblem(15).empty());
+        CHECK(p.sectionCountProblem(134) == "z holds 134 sections, not a multiple of angle 3 × phase 5 = 15.");
+        // the sentence app/core/dataset.cpp's layout machinery produces for
+        // the same arithmetic, which is what the SIM step and the Python
+        // mirror report; tests/test_app_sim_layout.cpp pins that side of it
+        CHECK(p.sectionCountProblem(0) == "z holds 0 sections, not a multiple of angle 3 × phase 5 = 15.");
+        // ndirs or nphases of 0 used to divide by zero here
+        SIMParameters q = p;
+        q.nphases = 0;
+        CHECK(q.sectionCountProblem(135) == "z holds 135 sections, not a multiple of angle 3 × phase 0 = 0.");
+    }
+
+    SECTION("the lateral size: the minimum alone, either parity") {
+        CHECK(kMinSimExtent == 4);
+        CHECK(simImageSizeProblem(64, 64).empty());
+        CHECK(simImageSizeProblem(4, 4).empty());
+        // the whole point of the change: odd extents are accepted
+        CHECK(simImageSizeProblem(281, 241).empty());   // the isoar stack
+        CHECK(simImageSizeProblem(5, 7).empty());
+        CHECK(simImageSizeProblem(3, 8) == "Image size must be at least 4 × 4, got 3 × 8.");
+        CHECK(simImageSizeProblem(8, 0) == "Image size must be at least 4 × 4, got 8 × 0.");
+        CHECK(simImageSizeProblem(3, 8, /*montage=*/true) == "Each tile must be at least 4 × 4, got 3 × 8.");
+        CHECK(simImageSizeProblem(64, 64, /*montage=*/true).empty());
+    }
+}
+
 TEST_CASE("TOML round-trip preserves every serialized field", "[params][toml]") {
     SIMParameters in;
     in.ndirs = 2;

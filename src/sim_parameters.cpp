@@ -27,6 +27,25 @@ namespace sirius {
         }
     } // namespace
 
+    // ---- the shape conditions, worded once (sim_parameters.hpp) ----------
+    // The × is U+00D7, as the dataset layout's own messages already use, so
+    // the three C++ fronts and the Python mirror are one string and one
+    // punctuation rather than four near-misses.
+
+    std::string SIMParameters::sectionCountProblem(long long sections) const {
+        if (planes(sections) > 0) return {};
+        return "z holds " + std::to_string(sections) + " sections, not a multiple of angle " +
+               std::to_string(ndirs) + " × phase " + std::to_string(nphases) + " = " +
+               std::to_string(sectionsPerPlane()) + ".";
+    }
+
+    std::string simImageSizeProblem(long long nx, long long ny, bool montage) {
+        if (nx >= kMinSimExtent && ny >= kMinSimExtent) return {};
+        const std::string least = std::to_string(kMinSimExtent) + " × " + std::to_string(kMinSimExtent);
+        return std::string(montage ? "Each tile" : "Image size") + " must be at least " + least + ", got " +
+               std::to_string(nx) + " × " + std::to_string(ny) + ".";
+    }
+
     void SIMParameters::validate() const {
         // NaN passes every range check below (each comparison with it is
         // false), and an infinity overflows the cutoffs derived from these.

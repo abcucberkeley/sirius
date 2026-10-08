@@ -80,6 +80,24 @@ namespace sirius {
             return (per > 0 && sections > 0 && sections % per == 0) ? sections / per : 0;
         }
 
+        // The section-count condition, worded once. Empty when `sections` is a
+        // whole number of planes; otherwise the sentence every front says.
+        //
+        // One condition used to read a different way in each front, and three
+        // of them for the lateral size below (docs/findings.md 9k.50,
+        // finding 5): the library threw "SimReconstructor: 134 sections is
+        // not a multiple of ndirs*nphases = 15", ReconSession::validate()
+        // returned "134 sections is not a multiple of ndirs * nphases = 15."
+        // and the dataset's layout machinery -- which the SIM step and the
+        // Python mirror go through -- said "z holds 134 sections, not a
+        // multiple of angle 3 × phase 5 = 15.". This is that last wording,
+        // the one the layout machinery already produced for the same
+        // arithmetic (app/core/dataset.cpp's bindSimLayout through
+        // productText), so a front that falls back to this says what the
+        // layout would have said. A front decides only whether it throws the
+        // string, returns it or collects it into a Validation.
+        std::string sectionCountProblem(long long sections) const;
+
         // Lateral frequency of illumination order 1, in 1/um. The configured
         // line spacing is the finest order, so a 3D pattern's order 1 sits at
         // 1/linespacing/(resolvedOrders()-1). A 2D pattern's spacing is already
@@ -94,6 +112,21 @@ namespace sirius {
         // Throws std::runtime_error on invalid parameters
         void validate() const;
     };
+
+    // The smallest lateral extent SimReconstructor binds, per axis.
+    inline constexpr int kMinSimExtent = 4;
+
+    // The lateral-size condition, worded once, in the same spirit as
+    // SIMParameters::sectionCountProblem above: empty when the extents can be
+    // reconstructed, otherwise the one sentence every front says.
+    //
+    // Since 2026-10-08 that condition is the minimum alone. It used to be
+    // "even and at least 4", enforced in three places and spelt three ways;
+    // the parity half is gone because the index arithmetic is parity-general
+    // (src/sim_math.hpp's signedFrequency and mirrorColumns), so an odd stack
+    // reconstructs. `montage` words it for one tile of a montaged stack,
+    // which is the extent the SIM step actually binds there.
+    std::string simImageSizeProblem(long long nx, long long ny, bool montage = false);
 
     // TOML I/O. loadParameters starts from defaults so a partial file overrides
     // only the keys present, then validate()s before returning.

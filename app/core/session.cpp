@@ -109,7 +109,6 @@ namespace sirius::app {
         };
         std::optional<Cache> cache;
 
-        Index sectionsPerZ() const noexcept { return static_cast<Index>(params.sectionsPerPlane()); }
         Index inferredNz() const noexcept {
             return raw.empty() ? 0 : static_cast<Index>(params.planes(static_cast<long long>(raw.dim(0))));
         }
@@ -184,17 +183,19 @@ namespace sirius::app {
         }
         const Buffer<double>& raw = impl_->raw;
         const Index nx = raw.dim(2), ny = raw.dim(1);
-        if (nx < 4 || ny < 4 || nx % 2 != 0 || ny % 2 != 0)
-            return "Image size must be even and at least 4 x 4, got " + std::to_string(nx) + " x " +
-                   std::to_string(ny) + ".";
+        // the library's own condition and the library's own wording: odd
+        // extents reconstruct, only the minimum is left to refuse
+        if (const std::string why = simImageSizeProblem(nx, ny); !why.empty()) return why;
         // the stack is ndirs x nphases x nz sections on its first axis: the
         // one check every layout shares, worded as the storage layout words it
         if (inferredNz() == 0) {
             const std::string why = simLayoutProblem(SimLayout::shorthand(impl_->params.ndirs, impl_->params.nphases, impl_->params.fast_si),
                                                      Dims5{1, 1, raw.dim(0), ny, nx});
-            return why.empty() ? std::to_string(raw.dim(0)) + " sections is not a multiple of ndirs * nphases = " +
-                                     std::to_string(impl_->sectionsPerZ()) + "."
-                               : why;
+            // simLayoutProblem words a declared layout's own arithmetic; the
+            // fallback is the shorthand angles x phases, and
+            // SIMParameters::sectionCountProblem words that the same way the
+            // layout machinery would, so the two branches read alike
+            return why.empty() ? impl_->params.sectionCountProblem(raw.dim(0)) : why;
         }
         return {};
     }

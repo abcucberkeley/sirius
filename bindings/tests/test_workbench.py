@@ -565,6 +565,54 @@ class TestSimStep(unittest.TestCase):
             wb.run_step("sim", dict(params, otf=str(self.DATA / "no-such-otf.tif")),
                         np.zeros((15, 8, 8), np.float32), meta, device="cpu")
 
+    def test_odd_lateral_sizes_reconstruct_and_the_shape_messages_are_the_fronts(self):
+        # Until 2026-10-08 three C++ guards refused an odd nx or ny and worded
+        # that one condition three ways, with nothing at all in Python
+        # (docs/findings.md 9k.50, finding 5). The guards are gone and both
+        # sentences now come from the library, so the message Python raises is
+        # the message the GUI shows and the CLI returns -- there is no Python
+        # copy of the wording to drift. This is the mirror's half of
+        # tests/test_sim_parameters.cpp's "the shape conditions are one
+        # wording" and tests/test_reconstruction.cpp's refusal case; the
+        # known-answer odd reconstruction is the C++ one
+        # (tests/test_reconstruction.cpp, a synthetic pattern on 127 x 97),
+        # since there is no odd-size reference output anywhere.
+        sirius = _sirius_extension()
+        meta = {"voxel_um": [0.08, 0.08, 0.125]}
+        params = {"mode": "From file", "params_file": str(self.DATA / "config.txt"),
+                  "otf": str(self.DATA / "otf.tif")}
+        # an odd, square-but-odd lateral extent of the bundled acquisition --
+        # a shape case, not a measurement: 63 x 63 of its 64 x 64 frames
+        raw = sirius.read_tiff(str(self.DATA / "raw.tif"), dtype=np.float32)
+        self.assertEqual(raw.shape[-3:], (135, 64, 64))
+        odd = np.ascontiguousarray(raw[..., :63, :63])
+        r = wb.run_step("sim", params, odd, meta, device="cpu")
+        self.assertEqual(r.array.shape, (1, 1, 9, 126, 126))   # zoomfact 2 of 63 x 63
+        self.assertEqual(int(np.count_nonzero(~np.isfinite(r.array))), 0)
+        self.assertEqual(len(r.info["fits"][0]["k0"]), 3)
+
+        # the one wording, straight from the library, and what it is of
+        self.assertEqual(sirius.sim_image_size_problem(281, 241), "")   # the isoar stack
+        self.assertEqual(sirius.sim_image_size_problem(5, 7), "")
+        self.assertEqual(sirius.sim_image_size_problem(4, 4), "")
+        self.assertEqual(sirius.sim_image_size_problem(3, 8),
+                         "Image size must be at least 4 \u00d7 4, got 3 \u00d7 8.")
+        self.assertEqual(sirius.sim_image_size_problem(3, 8, True),
+                         "Each tile must be at least 4 \u00d7 4, got 3 \u00d7 8.")
+        # and the mirror raises exactly it, as a ValueError, for a stack the
+        # reconstructor cannot bind
+        with self.assertRaises(ValueError) as cm:
+            wb.run_step("sim", params, np.zeros((15, 3, 8), np.float32), meta, device="cpu")
+        self.assertEqual(str(cm.exception), sirius.sim_image_size_problem(8, 3))
+        # the section-count sentence likewise comes from the parameters
+        p = wb._sim_parameters(params, meta)
+        self.assertEqual(p.section_count_problem(135), "")
+        self.assertEqual(p.section_count_problem(134),
+                         "z holds 134 sections, not a multiple of angle 3 \u00d7 phase 5 = 15.")
+        with self.assertRaises(ValueError) as cm:
+            wb.run_step("sim", params, np.zeros((134, 8, 8), np.float32), meta, device="cpu")
+        self.assertEqual(str(cm.exception), p.section_count_problem(134))
+
     def test_an_exported_default_sim_pipeline_runs_through_run_pipeline(self):
         # The application's export_python writes a script whose whole body is
         # run_pipeline(DATASET, PIPELINE) (app/core/pipeline.cpp's
