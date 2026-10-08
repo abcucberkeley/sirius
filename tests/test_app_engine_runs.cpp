@@ -667,6 +667,22 @@ TEST_CASE("engine runs: previews and validation come from the node; a missing no
     wb.openDataset(makeClusterPath("enginehost", data));
     wb.setRemoteConfig(engineConfig(ep));
     while (wb.pipeline().size() > 1) wb.removeStep(1);
+    // The Load step reports a histogram of the data as it was read, which is
+    // where the launch screen's cell comes from now that the workbench adds no
+    // Contrast step. For a dataset the node holds, measuring it would pull 8
+    // planes per channel over the link on every refresh, so it says why the
+    // cell is empty and reads nothing at all.
+    {
+        const std::uint64_t before = RemoteDownloads::planeBytes();
+        Diagnostics load;
+        REQUIRE_NOTHROW(load = wb.diagnosticsOf(0));
+        CHECK(load.histograms.empty());
+        CHECK(RemoteDownloads::planeBytes() == before);
+        bool said = false;
+        for (const std::string& w : load.warnings)
+            if (w.find("held on the cluster node") != std::string::npos) said = true;
+        CHECK(said);
+    }
     wb.addStep("contrast", -1, false);
     // the contrast histograms of a cluster dataset, computed on the node
     const std::uint64_t planes = RemoteDownloads::planeBytes(), volumes = RemoteDownloads::volumeBytes();

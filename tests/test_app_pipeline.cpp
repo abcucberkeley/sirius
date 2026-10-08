@@ -2011,14 +2011,25 @@ TEST_CASE("Replacing the pipeline drops the previous steps' outputs", "[app][wor
     wb.setDataset(syntheticSource());
     wb.setBackend(Backend::Cpu);
     while (wb.pipeline().size() > 1) wb.removeStep(1);
+    // The case is about an incoming pipeline whose LAST step carries the id the
+    // outgoing pipeline's scale step had: an executor keyed on the id alone
+    // would then serve the scale step's array as the maxz step's output. A
+    // fresh Pipeline gives 1 to Load and 2 and 3 to its two steps, so the scale
+    // step here has to be id 3 -- one id is spent and dropped to get there.
+    // That used to happen by accident: the Workbench's constructor added a
+    // Contrast step, which spent id 2. It no longer does (the pipeline is the
+    // Load step alone, like the CLI's), so the case says so itself rather than
+    // depending on how long the default pipeline happens to be.
+    wb.addStep("test_maxz");
+    wb.removeStep(1);   // ids keep counting: the next step added is id 3
     const StepId scale = wb.addStep("test_scale");
     REQUIRE(runSync(wb)->succeeded());
     REQUIRE(wb.output(1));
-    // an incoming pipeline whose second step gets the id the scale step had
     Pipeline p;
     p.add("test_scale");
     p.add("test_maxz");
-    REQUIRE(p.at(2).id == scale);
+    REQUIRE(p.at(2).id == scale);   // the collision the rest of the case rests on
+    REQUIRE(p.at(2).kind != wb.pipeline().at(1).kind);   // and it is a different operation
     wb.replacePipeline(p, "swap");
     REQUIRE(wb.pipeline().size() == 3);
     CHECK(wb.pipeline().at(2).kind == "test_maxz");

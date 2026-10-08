@@ -1689,13 +1689,24 @@ namespace sirius::app {
         // knows about this -- and Load has no window or gamma to drag: these
         // histograms say what the data is, not what a step would do to it.
         // contrastPreview samples at most 8 planes per channel (~100 ms on
-        // 2048 squared), and previewDiagnostics is answered on a change, not per frame.
+        // 2048 squared), and previewDiagnostics is answered on a change, not per
+        // frame. NOT for a dataset held on a cluster node, though: those 8
+        // planes per channel would be pulled over the link on every refresh,
+        // which is why every other preview here goes through inputOnCluster and
+        // asks the node instead. The Load step has no such request yet, so it
+        // says why the cell is empty rather than reading the data from afar.
         if (index == 0 && source_) {
             if (const std::shared_ptr<const StepOutput> loaded = output(0); loaded && (loaded->array || loaded->source)) {
-                try {
-                    d.histograms = contrastPreview(loaded->asInput(), ParamSet{}).histograms;
-                } catch (const std::exception& e) {
-                    d.warnings.push_back(std::string("No histogram of the input: ") + e.what());
+                // inputOnCluster's own test, which answers only for index >= 1
+                const bool onNode = remote_.hasEngine() && !loaded->array && loaded->source && loaded->source->viewProvider();
+                if (onNode) {
+                    d.warnings.push_back("No histogram: the dataset is held on the cluster node.");
+                } else {
+                    try {
+                        d.histograms = contrastPreview(loaded->asInput(), ParamSet{}).histograms;
+                    } catch (const std::exception& e) {
+                        d.warnings.push_back(std::string("No histogram of the input: ") + e.what());
+                    }
                 }
             }
         }
