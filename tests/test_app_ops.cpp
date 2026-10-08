@@ -28,6 +28,7 @@
 #include <string>
 #include <thread>
 
+#include <sirius/otf_io.hpp>
 #include <sirius/tiff_io.hpp>
 
 #include "core/array_source.hpp"
@@ -317,6 +318,139 @@ TEST_CASE("SIM reconstructs the bundled stack from a parameter file and reports 
         CHECK(ideal.array->dims() == predicted.dims);
         CHECK(ideal.note.find("theoretical OTF") != std::string::npos);
     }
+}
+
+TEST_CASE("SIM From file reconstructs with the file's pixel sizes, as cudasirecon does", "[app][ops][sim]") {
+    // cudasirecon reconstructs a TIFF stack with the config's xyres / zres
+    // and derives a measured OTF's radial step from xyres; the dataset's own
+    // calibration (none for a plain TIFF, or mistaken) must not stretch the
+    // OTF. On 2026-10-08 sirius-cli opened raw.tif with voxel_um handed over
+    // in z, y, x order, the step took dx = 0.125 from it, and the measured
+    // OTF's radial support ended short of the side bands: "the overlap of
+    // orders 0 and 2 holds no signal" in every mode that named otf.tif.
+    DatasetMeta meta = metaFor(Dims5{1, 1, 135, 64, 64});
+    meta.voxelUm = {0.125, 0.08, 0.08};
+    meta.sim.present = true;
+    meta.sim.ndirs = 3;
+    meta.sim.nphases = 5;
+    const Operation& sim = requireOperation("sim");
+    ParamSet fromFile = sim.defaults();
+    fromFile.set("mode", std::string("From file"));
+    fromFile.set("params_file", (kData / "config.txt").string());   // xyres=0.08 zres=0.125 zresPSF=0.125
+    fromFile.set("otf", (kData / "otf.tif").string());
+    const SIMParameters p = simParametersFromStep(fromFile, meta);
+    CHECK_THAT(p.dx, WithinAbs(0.08, 1e-9));
+    CHECK_THAT(p.dy, WithinAbs(0.08, 1e-9));
+    CHECK_THAT(p.dz, WithinAbs(0.125, 1e-9));
+    CHECK_THAT(p.dz_psf, WithinAbs(0.125, 1e-9));
+    // so the OTF the step loads is sampled as cudasirecon samples it
+    // ("nzotf=65, dkzotf=0.123077, nxotf=129, nyotf=1, dkrotf=0.048828")
+    const OTFRadiallyAveraged otf = loadOTF((kData / "otf.tif").string(), p);
+    CHECK_THAT(otf.dkrotf(), WithinAbs(0.048828, 1e-6));
+    CHECK_THAT(otf.dkzotf(), WithinAbs(0.123077, 1e-6));
+    // the output voxel is the reconstruction's pixel, and the user is told
+    const DatasetMeta out = sim.outputMeta(fromFile, meta);
+    CHECK_THAT(out.dx(), WithinRel(0.04, 1e-9));
+    CHECK_THAT(out.dy(), WithinRel(0.04, 1e-9));
+    CHECK_THAT(out.dz(), WithinRel(0.125, 1e-9));
+    const Validation v = sim.validate(fromFile, meta);
+    INFO(v.firstError());
+    REQUIRE(v.ok());
+    REQUIRE_FALSE(v.warnings.empty());
+    CHECK_THAT(v.warnings.back(), Catch::Matchers::ContainsSubstring("pixel size"));
+    CHECK_THAT(v.warnings.back(), Catch::Matchers::ContainsSubstring("0.125"));
+
+    SECTION("a file without pixel sizes takes the stack's, with nothing to warn about") {
+        const test::TempFile bare("sim_pixels_bare", ".txt");
+        std::ofstream(bare.path) << "nphases=5\nndirs=3\nna=1.42\nnimm=1.515\nls=0.2035\n";
+        fromFile.set("params_file", bare.str);
+        const SIMParameters q = simParametersFromStep(fromFile, meta);
+        CHECK_THAT(q.dx, WithinAbs(0.125, 1e-9));
+        CHECK_THAT(q.dy, WithinAbs(0.08, 1e-9));
+        CHECK_THAT(q.dz, WithinAbs(0.08, 1e-9));
+        CHECK_THAT(q.dz_psf, WithinAbs(0.08, 1e-9));
+        CHECK(sim.validate(fromFile, meta).warnings.empty());
+    }
+    SECTION("a TOML file's pixels table is the same contract") {
+        const test::TempFile toml("sim_pixels", ".toml");
+        std::ofstream(toml.path) << "pixels = { dx = 0.07, dy = 0.07, dz = 0.15 }\n"
+                                    "[optics]\nndirs = 3\nnphases = 5\nna = 1.42\nnimm = 1.515\nlinespacing_um = 0.2035\n";
+        fromFile.set("params_file", toml.str);
+        const SIMParameters q = simParametersFromStep(fromFile, meta);
+        CHECK_THAT(q.dx, WithinAbs(0.07, 1e-9));
+        CHECK_THAT(q.dy, WithinAbs(0.07, 1e-9));
+        CHECK_THAT(q.dz, WithinAbs(0.15, 1e-9));
+        CHECK_THAT(q.dz_psf, WithinAbs(0.08, 1e-9));   // not in the file: the stack's dz
+    }
+    SECTION("Estimate mode has no file: the stack's") {
+        ParamSet estimate = sim.defaults();
+        estimate.set("mode", std::string("Estimate"));
+        const SIMParameters q = simParametersFromStep(estimate, meta);
+        CHECK_THAT(q.dx, WithinAbs(0.125, 1e-9));
+        CHECK_THAT(q.dy, WithinAbs(0.08, 1e-9));
+        CHECK_THAT(q.dz, WithinAbs(0.08, 1e-9));
+    }
+}
+
+TEST_CASE("SIM From file with the measured OTF reconstructs whatever the dataset's calibration says", "[app][ops][sim]") {
+    // The run of 2026-10-08 (jobs 4247298 / 4247299): raw.tif opened with its
+    // voxel in z, y, x order, then config.txt + otf.tif. While the dataset's
+    // dx won, the step read 0.125 um, sampled the measured OTF at 0.03125
+    // cycles/um per table step instead of cudasirecon's 0.048828, and the
+    // pattern fit found no signal; the theoretical OTF, which carries its
+    // own step, reconstructed. With the file's pixel sizes the result is
+    // the cudasirecon reference, as it is from a correctly opened dataset.
+    const Operation& load = requireOperation("load");
+    ParamSet lp = load.defaults();
+    lp.set("path", (kData / "raw.tif").string());
+    lp.set("sim_ndirs", std::int64_t{3});
+    lp.set("sim_nphases", std::int64_t{5});
+    lp.set("voxel_x", 0.125);
+    lp.set("voxel_y", 0.08);
+    lp.set("voxel_z", 0.08);
+    Progress prog;
+    const StepOutput loaded = load.run(StepInput{}, lp, prog.ctx);
+    REQUIRE(loaded.array);
+    CHECK_THAT(loaded.meta.dx(), WithinRel(0.125, 1e-12));
+
+    const Operation& sim = requireOperation("sim");
+    ParamSet sp = sim.defaults();
+    sp.set("mode", std::string("From file"));
+    sp.set("params_file", (kData / "config.txt").string());
+    sp.set("otf", (kData / "otf.tif").string());
+    const Validation v = sim.validate(sp, loaded.meta);
+    INFO(v.firstError());
+    REQUIRE(v.ok());
+    const StepOutput out = sim.run(loaded.asInput(), sp, prog.ctx);
+    REQUIRE(out.array);
+    CHECK(out.array->dims() == Dims5{1, 1, 9, 128, 128});
+    CHECK_THAT(out.meta.dx(), WithinRel(0.04, 1e-9));
+    CHECK_THAT(out.meta.dz(), WithinRel(0.125, 1e-9));
+    CHECK(out.note.find("measured OTF") != std::string::npos);
+    REQUIRE(out.diagnostics.table);
+    REQUIRE(out.diagnostics.table->rows.size() == 3);
+    for (const std::vector<std::string>& row : out.diagnostics.table->rows) {
+        // k0 in px^-1 of the raw pixel, which is the file's 0.08 um
+        const double spacingUm = 0.08 / std::stod(row[1]);
+        CHECK(spacingUm > 0.40);
+        CHECK(spacingUm < 0.415);
+    }
+
+    // The volume is cudasirecon's own reconstruction of the stack (raw_proc.tif).
+    const Buffer<float> vol = out.asInput().readVolume(0, 0);
+    REQUIRE(vol.shape() == Shape{9, 128, 128});
+    const auto expected = readTiffStack<float>((kData / "raw_proc.tif").string());
+    REQUIRE(expected.dimension(0) == 9);
+    REQUIRE(expected.dimension(1) == 128);
+    REQUIRE(expected.dimension(2) == 128);
+    double peak = 0.0, diff = 0.0;
+    for (Eigen::Index i = 0; i < expected.size(); ++i) {
+        peak = std::max(peak, std::abs(static_cast<double>(expected.data()[i])));
+        diff = std::max(diff, std::abs(static_cast<double>(vol.data()[i]) - static_cast<double>(expected.data()[i])));
+    }
+    REQUIRE(peak > 0.0);
+    INFO("max |actual - expected| / max |expected| = " << diff / peak);
+    CHECK(diff / peak < 1e-3);
 }
 
 TEST_CASE("SIM From file keeps the file's OTF axial step unless the field is set", "[app][ops][sim]") {

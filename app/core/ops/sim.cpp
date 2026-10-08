@@ -17,6 +17,7 @@
 #include <fstream>
 #include <memory>
 #include <mutex>
+#include <set>
 #include <vector>
 
 #include <sirius/constants.hpp>
@@ -34,12 +35,27 @@ namespace sirius::app {
         constexpr const char* kManual = "Manual";
         constexpr const char* kFromFile = "From file";
 
-        // True when the parameter file sets the OTF's axial step. A missing key
-        // is not the library default: From file then uses the stack's dz.
-        bool fileSetsDzPsf(const std::string& path) {
+        // The keys a parameter file assigns -- lower-cased, the last segment
+        // of a dotted key -- and whether the file is TOML. From file, a key the
+        // file sets is the file's value, and a missing key is not the library
+        // default but the stack's: the OTF's axial step, and since 2026-10-08
+        // the pixel sizes too (buildParameters says why).
+        struct ParameterFileKeys {
+            bool toml = false;
+            std::set<std::string> keys;
+            // Only the key the loader actually reads for a quantity: dz_psf in
+            // TOML (including a .toml file with no [table] header), zresPSF in
+            // a cudasirecon file.
+            bool has(const char* tomlKey, const char* legacyKey) const {
+                return keys.count(toml ? tomlKey : legacyKey) > 0;
+            }
+        };
+
+        ParameterFileKeys parameterFileKeys(const std::string& path) {
+            ParameterFileKeys found;
             std::ifstream in(std::filesystem::u8path(path));
-            if (!in) return false;
-            const bool toml = detectParameterFormat(path) == ParameterFormat::Toml;
+            if (!in) return found;
+            found.toml = detectParameterFormat(path) == ParameterFormat::Toml;
             std::string all;
             std::string line;
             while (std::getline(in, line)) {
@@ -50,10 +66,7 @@ namespace sirius::app {
             }
             // Every assignment, not only the first '=' on the line, so a dotted
             // key and an inline table (pixels.dz_psf, pixels = { dz_psf = … })
-            // count. Only the key the loader actually reads: dz_psf in TOML
-            // (including a .toml file with no [table] header), zresPSF in a
-            // cudasirecon file.
-            const std::string want = toml ? "dz_psf" : "zrespsf";
+            // count.
             for (std::size_t eq = all.find('='); eq != std::string::npos; eq = all.find('=', eq + 1)) {
                 std::size_t end = eq;
                 while (end > 0 && (all[end - 1] == ' ' || all[end - 1] == '\t')) --end;
@@ -71,9 +84,9 @@ namespace sirius::app {
                 }
                 const auto dot = key.rfind('.');
                 if (dot != std::string::npos) key = key.substr(dot + 1);
-                if (key == want) return true;
+                if (!key.empty()) found.keys.insert(key);
             }
-            return false;
+            return found;
         }
 
         ApodizationType apodizationFromChoice(const std::string& s) {
@@ -197,7 +210,7 @@ namespace sirius::app {
                     choiceParam("mode", "Pattern", {kEstimate, kManual, kFromFile}, kEstimate)
                         .withHelp("Estimate fits the pattern vectors from a start angle; Manual starts from the "
                                   "given angles; From file takes every parameter from a TOML / cudasirecon file."),
-                    pathParam("params_file", "Parameter file").visibleWhen("mode", {"From file"}).withFilter("Parameters (*.toml *.txt *.cfg);;All files (*)").withHelp("Used by the From file mode"),
+                    pathParam("params_file", "Parameter file").visibleWhen("mode", {"From file"}).withFilter("Parameters (*.toml *.txt *.cfg);;All files (*)").withHelp("Used by the From file mode. Its pixel sizes (xyres, zres, zresPSF; pixels.dx, dy, dz, dz_psf) win over the dataset's, as in cudasirecon"),
                     intParam("angles", "Angles", 3).range(1, 16).hiddenWhen("mode", {"From file"}),
                     intParam("phases", "Phases", 5).range(2, 32).hiddenWhen("mode", {"From file"}),
                     doubleParam("wiener", "Wiener", 0.001).range(1e-5, 1.0, 0.0005, 5).withHelp("Regularisation constant of the generalised Wiener filter").hiddenWhen("mode", {"From file"}),
@@ -276,15 +289,30 @@ namespace sirius::app {
                     p.equalizez = params.getBool("equalizez", false);
                     p.fast_si = input.sim.present && input.sim.fastSi;
                 }
-                p.dx = input.dx();
-                p.dy = input.dy();
-                p.dz = input.dz();
+                // The pixel sizes: the file's where it sets them, the stack's
+                // otherwise. A cudasirecon config's xyres / zres are the pixel
+                // sizes it reconstructs a TIFF stack with, and the radial step
+                // of a measured OTF is derived from xyres (loadOTF: dkr =
+                // 1 / (xyres * (nkr - 1) * 2)), so a step driven by such a file
+                // must use them whatever the dataset's calibration says -- a
+                // plain TIFF has none, and sirius-cli was handed one in z, y, x
+                // order on 2026-10-08: dx = 0.125 for a 0.08 um pixel stretched
+                // the OTF's radial axis until its support no longer reached
+                // the side bands, and every fit with the measured OTF ended in
+                // "the overlap of orders 0 and 2 holds no signal" while the
+                // theoretical OTF, which carries its own step, was unaffected.
+                // Estimate and Manual have no file.
+                const ParameterFileKeys file =
+                    mode == kFromFile ? parameterFileKeys(params.getString("params_file")) : ParameterFileKeys{};
+                if (!file.has("dx", "xyres")) p.dx = input.dx();
+                if (!file.has("dy", "xyres")) p.dy = input.dy();
+                if (!file.has("dz", "zres")) p.dz = input.dz();
                 // 0 means "not set". From file, that keeps the file's OTF step
                 // (and the stack's dz only when the file has none). Estimate
                 // and Manual have no file, so 0 means the stack's dz.
                 const double dzPsf = params.getDouble("dz_psf", 0.0);
                 if (dzPsf > 0.0) p.dz_psf = dzPsf;
-                else if (mode != kFromFile || !fileSetsDzPsf(params.getString("params_file"))) p.dz_psf = input.dz();
+                else if (!file.has("dz_psf", "zrespsf")) p.dz_psf = input.dz();
                 return p;
             }
 
@@ -315,6 +343,15 @@ namespace sirius::app {
                 const std::string mode = params.getString("mode", kEstimate);
                 if (mode == kFromFile && params.getString("params_file").empty())
                     v.errors.push_back("From file mode needs a parameter file.");
+                const auto differs = [](double a, double b) { return std::abs(a - b) > 1e-9 * std::max(std::abs(a), std::abs(b)); };
+                if (mode == kFromFile && (differs(p.dx, input.dx()) || differs(p.dy, input.dy()) || differs(p.dz, input.dz()))) {
+                    char buf[256];
+                    std::snprintf(buf, sizeof buf,
+                                  "The parameter file sets the pixel size %.4g × %.4g × %.4g µm; the dataset says %.4g × %.4g × %.4g µm. "
+                                  "The step reconstructs with the file's, as cudasirecon does.",
+                                  p.dx, p.dy, p.dz, input.dx(), input.dy(), input.dz());
+                    v.warnings.push_back(buf);
+                }
                 if (mode == kManual) {
                     const std::vector<double> angles = params.getDoubleList("k0_angles");
                     if (static_cast<int>(angles.size()) < p.ndirs)
@@ -350,9 +387,11 @@ namespace sirius::app {
                 out.dims.z = nz * std::max(1, p.z_zoom);
                 out.dims.y = static_cast<Index>(std::lround(input.dims.y * p.zoomfact));
                 out.dims.x = static_cast<Index>(std::lround(input.dims.x * p.zoomfact));
-                out.voxelUm[0] = input.dx() / p.zoomfact;
-                out.voxelUm[1] = input.dy() / p.zoomfact;
-                out.voxelUm[2] = input.dz() / std::max(1, p.z_zoom);
+                // the pixel the reconstruction assumed (From file: the file's),
+                // not the dataset's claim
+                out.voxelUm[0] = p.dx / p.zoomfact;
+                out.voxelUm[1] = p.dy / p.zoomfact;
+                out.voxelUm[2] = p.dz / std::max(1, p.z_zoom);
                 out.sim = SimLayout{};
                 out.acquisition = nz > 1 ? "3D-SIM reconstructed" : "2D-SIM reconstructed";
                 out.sourceType = PixelType::Float32;
