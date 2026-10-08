@@ -386,7 +386,6 @@ namespace sirius::app {
             std::thread thread;
             std::string id;
             int target = 0;
-            StepId targetId = 0;
             std::string backend;
             bool announce = false;   // its run call returned "running": a run_finished event follows
             Clock::time_point started;
@@ -394,7 +393,6 @@ namespace sirius::app {
         std::unique_ptr<ActiveRun> run;
         json lastOutcome;            // null until a run finished
         std::optional<WorkerStartError> lastWorkerFailure;
-        StepId lastRunTarget = 0;    // the target of the last run that succeeded
         int runCounter = 0;
         bool pluginsAttempted = false, pluginsLoaded = false;
         OpenResult lastOpened;       // its summary fields only (no source)
@@ -433,7 +431,8 @@ namespace sirius::app {
 
         // --- steps and outputs ---------------------------------------------------------
         int resolveStep(const json& a) const { return ToolApi::resolveStepIndex(wb.pipeline(), a); }
-        int defaultInspectStep() const;
+        // The one default-step rule, shared with the window (core/tool_api.hpp).
+        int defaultInspectStep() const { return ToolApi::defaultStepIndex(wb); }
         int inspectStep(const json& a) const { return has(a, "step") ? resolveStep(a) : defaultInspectStep(); }
         // The last step that is not skipped (0, Load, at least): a skipped
         // step at the end would only pass its input through.
@@ -499,8 +498,7 @@ namespace sirius::app {
         // here: which step a call that names none means, how to get that
         // step's output -- starting a run and waiting for it, when the call
         // says run -- and the progress and cancellation of the call in hand.
-        api.setOutputAccess({[this] { return defaultInspectStep(); },
-                             [this](int index, bool runIfNeeded) { return outputFor(index, runIfNeeded); },
+        api.setOutputAccess({[this](int index, bool runIfNeeded) { return outputFor(index, runIfNeeded); },
                              [this](double f, const std::string& m) { progress(f, m); },
                              cancelFn()});
 
@@ -688,19 +686,6 @@ namespace sirius::app {
 
     // --- steps and outputs ------------------------------------------------------------
 
-    int HeadlessWorkbench::Impl::defaultInspectStep() const {
-        // the target of the last run while it has an output, else the last
-        // enabled step that has one, else Load
-        const Pipeline& p = wb.pipeline();
-        if (lastRunTarget != 0) {
-            const int i = p.indexOf(lastRunTarget);
-            if (i >= 0 && wb.output(i)) return i;
-        }
-        for (int i = p.size() - 1; i > 0; --i)
-            if (p.at(i).enabled && wb.output(i)) return i;
-        return 0;
-    }
-
     std::shared_ptr<const StepOutput> HeadlessWorkbench::Impl::outputFor(int index, bool runIfNeeded) {
         if (!wb.hasDataset()) throw ToolFailure("no_dataset", "no dataset is open", "open_dataset or load_pipeline first");
         const std::string which = "step " + std::to_string(index + 1) + " (" + wb.pipeline().at(index).name + ")";
@@ -742,7 +727,6 @@ namespace sirius::app {
         wb.adoptDataset(std::move(opened), path, openOptions);
         lastOpened = std::move(summary);
         lastOpenedPath = reported(wb.dataset().sourcePath);
-        lastRunTarget = 0;
         // the display models would keep the previous dataset's output alive:
         // this one renders, the tool table's probes (core/tool_api.hpp)
         model.setOutput(nullptr);
@@ -800,7 +784,6 @@ namespace sirius::app {
         r->job = job;
         r->id = "r" + std::to_string(++runCounter);
         r->target = job->target();
-        r->targetId = wb.pipeline().at(job->target()).id;
         r->backend = backendName(wb.backend());
         r->started = Clock::now();
         workerCancel = false;
@@ -918,7 +901,6 @@ namespace sirius::app {
         capturingRun = false;
         lastOutcome = outcome;
         lastWorkerFailure = r->job->workerFailure();
-        if (r->job->succeeded()) lastRunTarget = r->targetId;
         if (r->announce) pushEvent({{"event", "run_finished"}, {"run_id", r->id}, {"result", outcome}});
         return outcome;
     }
@@ -1119,7 +1101,6 @@ namespace sirius::app {
                               "a pipeline is a .sirius.toml file that save_pipeline or the application wrote");
         }
         const bool openedItsOwn = datasetChanges != changesBefore;
-        lastRunTarget = 0;
         model.setOutput(nullptr);   // the pipeline may have opened another dataset
         const std::string named = fileLoad.getString("path");
         if (!dataset.empty()) {
@@ -1958,15 +1939,26 @@ namespace sirius::app {
         agent::ToolResult result;
         try {
             json r = m.api.call(name, a);
-            // What a tool, or the table's own argument check, reported as a
-            // warning: the session's warnings are the one place a client reads
-            // them, for a failure as much as for a value, so the key does not
-            // stay in the answer.
-            if (r.is_object() && r.contains("warnings") && r["warnings"].is_array()) {
+            // The session's warnings are the one place a client reads them,
+            // for a failure as much as for a value, so both kinds are
+            // harvested here. The two kinds are not the same thing:
+            //  - "call_warnings" is about the CALL (an argument no tool takes,
+            //    dropped by ToolApi::call). It belongs to this layer alone, so
+            //    it is MOVED out and the key does not stay in the answer.
+            //  - "warnings" is a reply field get_step, get_diagnostics and
+            //    `validate` document and callers read. It is COPIED:
+            //    erasing it took a documented field away from every session
+            //    and every sirius-cli caller while the window's --tool, which
+            //    calls ToolApi directly, kept it -- the three fronts
+            //    disagreeing about a reply (docs/findings.md 9k.52, finding B).
+            if (r.is_object() && r.contains("call_warnings") && r["call_warnings"].is_array()) {
+                for (const json& w : r["call_warnings"])
+                    if (w.is_string()) m.warnings.push_back(w.get<std::string>());
+                r.erase("call_warnings");
+            }
+            if (r.is_object() && r.contains("warnings") && r["warnings"].is_array())
                 for (const json& w : r["warnings"])
                     if (w.is_string()) m.warnings.push_back(w.get<std::string>());
-                r.erase("warnings");
-            }
             if (r.is_object() && r.contains("error_kind")) {
                 // D25: a failure is a result with error_kind, and nothing else is
                 const std::string code = r["error_kind"].is_string() ? r["error_kind"].get<std::string>() : std::string("failed");

@@ -205,7 +205,7 @@ namespace sirius::cli {
                  "address other than loopback needs one. Once it listens it prints one line, the announce the job log is read for, and "
                  "nothing else on stdout; logs go to stderr. It ends on a client's shutdown, SIGTERM or Ctrl+C.",
                  R"((one line on stdout) {"port":40123,"pid":4711,"host":"0.0.0.0","hostname":"n0042","device":"cuda:0","engine":{"api":1,
- "build":"0.1.0+g7cc582c","commit":"7cc582c...","dirty":false,"ops_schema":"...","version":"0.1.0"}})",
+ "build":"0.1.0+g7cc582c","commit":"7cc582c...","dirty":false,"ops_schema":"...","ops_generation":1,"version":"0.1.0"}})",
                  "0 after a shutdown, SIGTERM or Ctrl+C, 2 usage (a refused bind, a token file that cannot be read), 1 fatal",
                  {"SIRIUS_TOKEN_FILE=~/.sirius/run/token.4711 sirius-cli serve --host 0.0.0.0 --port 0 --python python3",
                   "sirius-cli serve --no-python-worker"}},

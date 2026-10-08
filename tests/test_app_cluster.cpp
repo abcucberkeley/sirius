@@ -1709,7 +1709,11 @@ TEST_CASE("cluster: an engine of other operations is refused at its hello, in wo
     if (!pythonHas(fc.python, "numpy")) SKIP("no numpy in " + fc.python + " for the checks");
     copyCheckout(fc.home / "sirius");
     setEnv("FAKE_SLURM_PENDING_POLLS", "0");
-    setEnv("SIRIUS_TEST_ENGINE_BUILD", R"({"build": "0.0.9+gdeadbee", "ops_schema": "0000"})");
+    // An engine installed before kOpsGeneration existed (so it reports none)
+    // whose operation schema is not this build's and not one this build
+    // accepts: the case the cluster path has to refuse, said in words
+    // (core/build_info.hpp, docs/findings.md 9k.52 finding A).
+    setEnv("SIRIUS_TEST_ENGINE_BUILD", R"({"build": "0.0.9+gdeadbee", "ops_schema": "0000", "ops_generation": 0})");
     cluster::Session session;
     session.setPollInterval(std::chrono::milliseconds(200), std::chrono::milliseconds(500));
     const cluster::Status st = connectUntilSettled(session, engineProfile(fc));
@@ -1719,7 +1723,8 @@ TEST_CASE("cluster: an engine of other operations is refused at its hello, in wo
     CHECK(st.state == cluster::State::JobReady);   // the job holds on for another engine
     CHECK(st.steps[static_cast<int>(cluster::Step::Hello)].status == cluster::StepStatus::Failed);
     CHECK(st.reason.find("0.0.9+gdeadbee") != std::string::npos);
-    CHECK(st.reason.find("their operations differ") != std::string::npos);
+    CHECK(st.reason.find("is not one this application accepts") != std::string::npos);
+    CHECK(st.reason.find("The engine is the older side") != std::string::npos);
     session.disconnect(true);
 }
 
@@ -2058,6 +2063,7 @@ TEST_CASE("cluster: the engine build of this application, or one of the same ope
     same["build"] = "0.1.0+gother";
     nlohmann::json other = mine;
     other["ops_schema"] = "ffff";
+    other["ops_generation"] = 99;   // the operation SET is what differs (core/build_info.hpp)
     const std::string out = "builds=yes\n@@build 1234abcd yes " + mine.dump() + "\n@@build 0000other yes " + same.dump() + "\n@@build broken no " +
                             mine.dump() + "\n@@build bad yes {not json\n@@build different yes " + other.dump() + "\n";
     const std::vector<cluster::EngineBuild> found = cluster::parseEngineBuilds(out);
@@ -2505,7 +2511,7 @@ TEST_CASE("cluster wizard: the worker's health report from its hello", "[app][cl
     engine["commit"] = "1234567";
     st.caps.engine = engine;
     CHECK(find(wz::healthReport(st, p, app, now), "C++ engine")->value.find("compatible (same operations)") != std::string::npos);
-    engine["ops_schema"] = "ops2";
+    engine["ops_generation"] = 2;   // another operation set, which is what is compared
     st.caps.engine = engine;
     r = wz::healthReport(st, p, app, now);
     CHECK(find(r, "C++ engine")->mark == M::Fail);
@@ -2705,6 +2711,7 @@ TEST_CASE("cluster: the engine asked for and not found fails the checks with the
     // the worker's code, and its engine answers
     nlohmann::json eightK = toJson(buildInfo());
     eightK.erase("ops_schema");
+    eightK.erase("ops_generation");   // a BUILD.json written before the generation existed
     eightK["schema_hash"] = buildInfo().opsSchema;
     eightK["commit"] = "8368aab4582f71273b16eaa63ce09d38ba867d8e";
     eightK["build"] = "0.1.0+g8368aab";
@@ -2811,8 +2818,12 @@ TEST_CASE("cluster: the launch script never starts the Python worker in place of
 TEST_CASE("cluster: BUILD.json's schema hash under either key, the python column, the fixes", "[app][cluster]") {
     BuildInfo app = buildInfo();
     app.commit = "f5a2303000000000000000000000000000000000";
-    // the cluster agent's BUILD.json: both keys, the same hash; or only one of them
+    // the cluster agent's BUILD.json: both keys, the same hash; or only one of
+    // them. None of them names an operation set version -- these are the
+    // folders written before it existed, which is what makes the hash the
+    // thing being tested here (core/build_info.hpp).
     nlohmann::json both = toJson(app);
+    both.erase("ops_generation");
     both["commit"] = "8368aab4582f71273b16eaa63ce09d38ba867d8e";
     both["build"] = "0.1.0+g8368aab";
     both["schema_hash"] = app.opsSchema;
@@ -2822,6 +2833,7 @@ TEST_CASE("cluster: BUILD.json's schema hash under either key, the python column
     apiText.erase("api");
     apiText["engine_api"] = std::to_string(app.api);
     CHECK(buildInfoFromJson(onlyNew).opsSchema == app.opsSchema);
+    CHECK(buildInfoFromJson(onlyNew).opsGeneration == 0);   // it says none
     CHECK(buildInfoFromJson(onlyNew).api == app.api);
     CHECK(buildInfoFromJson(apiText).api == app.api);
     CHECK(buildInfoFromJson(both).opsSchema == app.opsSchema);

@@ -7,9 +7,11 @@
 #include <catch2/generators/catch_generators.hpp>
 #include <catch2/matchers/catch_matchers_string.hpp>
 
+#include <algorithm>
 #include <cmath>
 #include <filesystem>
 #include <stdexcept>
+#include <vector>
 
 #include "sirius/buffer.hpp"
 #include "sirius/errors.hpp"
@@ -664,6 +666,19 @@ TEST_CASE("Odd and non-square lateral sizes reconstruct the pattern they were bu
     // path is wrong at the outermost frequency of each axis and cannot serve
     // as a reference (docs/findings.md 9k.50, 9k.49 for the isoar stack that
     // motivated it).
+    //
+    // WHAT THE BAR IS. It was a 0.15 correlation with the scene plus a
+    // CPU-against-CUDA comparison -- and the CPU and CUDA kernels deliberately
+    // share the parity helpers, so an error inside one of those would agree
+    // with itself and pass (docs/findings.md 9k.52). The failure an index
+    // error on an odd axis actually produces is a SHIFT or a MIRROR of the
+    // output grid, which a 0.15 correlation cannot see at all: the scene here
+    // is 400 point emitters at random positions with random amplitudes, so it
+    // correlates with itself shifted by one sample, or mirrored, hardly at
+    // all. The bar is therefore that the correlation PEAKS at no shift, by a
+    // margin, over every shift within +-3 samples and over all three mirrors.
+    // An even size runs the same bar as a control: if the bar were wrong
+    // rather than the odd branch, the control would fail with it.
     SIMParameters p = params2d();
     struct Size {
         int nx, ny;
@@ -673,7 +688,7 @@ TEST_CASE("Odd and non-square lateral sizes reconstruct the pattern they were bu
     // half-complex rows made an odd extent a mis-read rather than only a
     // misplacement, so it is covered on its own
     const Size sz = GENERATE(Size{127, 97, "both odd, non-square"}, Size{127, 96, "odd x (the r2c axis)"},
-                             Size{128, 97, "odd y"});
+                             Size{128, 97, "odd y"}, Size{128, 96, "both even: the control for the bar"});
     INFO(sz.what << ": " << sz.nx << " x " << sz.ny);
     std::vector<double> object;
     const Buffer<double> raw = test::syntheticSim2dRect(p, sz.nx, sz.ny, 0.8, &object);
@@ -688,26 +703,67 @@ TEST_CASE("Odd and non-square lateral sizes reconstruct the pattern they were bu
     checkPattern2d(recon.lastFit(), p);
 
     // Box-mean the zoomed reconstruction back onto the object's grid, as the
-    // even 2D case does. A finite volume with the right k0 that is not this
-    // scene would pass everything above and fail here.
-    double sa = 0, sb = 0, saa = 0, sbb = 0, sab = 0;
+    // even 2D case does.
+    std::vector<double> img(static_cast<std::size_t>(sz.nx) * sz.ny);
     for (int y = 0; y < sz.ny; ++y)
         for (int x = 0; x < sz.nx; ++x) {
             double acc = 0;
             for (int dy = 0; dy < 2; ++dy)
                 for (int dx = 0; dx < 2; ++dx) acc += out.data()[(y * 2 + dy) * (sz.nx * 2) + (x * 2 + dx)];
-            const double a = acc * 0.25;
-            const double b = object[static_cast<std::size_t>(y) * sz.nx + x];
-            sa += a;
-            sb += b;
-            saa += a * a;
-            sbb += b * b;
-            sab += a * b;
+            img[static_cast<std::size_t>(y) * sz.nx + x] = acc * 0.25;
         }
-    const double count = static_cast<double>(sz.nx) * sz.ny;
-    const double corr = (count * sab - sa * sb) / std::sqrt((count * saa - sa * sa) * (count * sbb - sb * sb));
+    // The correlation of that image with the object read at (x + shiftX,
+    // y + shiftY), optionally mirrored, over the samples where both are
+    // defined. No wrap: a shift compares the overlap only.
+    const auto corrOf = [&](int shiftX, int shiftY, bool mirrorX, bool mirrorY) {
+        double sa = 0, sb = 0, saa = 0, sbb = 0, sab = 0;
+        long long n = 0;
+        for (int y = 0; y < sz.ny; ++y)
+            for (int x = 0; x < sz.nx; ++x) {
+                int ox = x + shiftX, oy = y + shiftY;
+                if (mirrorX) ox = sz.nx - 1 - ox;
+                if (mirrorY) oy = sz.ny - 1 - oy;
+                if (ox < 0 || ox >= sz.nx || oy < 0 || oy >= sz.ny) continue;
+                const double a = img[static_cast<std::size_t>(y) * sz.nx + x];
+                const double b = object[static_cast<std::size_t>(oy) * sz.nx + ox];
+                sa += a;
+                sb += b;
+                saa += a * a;
+                sbb += b * b;
+                sab += a * b;
+                ++n;
+            }
+        const double count = static_cast<double>(n);
+        const double den = (count * saa - sa * sa) * (count * sbb - sb * sb);
+        return den > 0.0 ? (count * sab - sa * sb) / std::sqrt(den) : 0.0;
+    };
+    const double corr = corrOf(0, 0, false, false);
     INFO("correlation with the synthetic object: " << corr);
     CHECK(corr > 0.15);
+
+    // Every shift within +-3 samples, and the three mirrors: the aligned
+    // correlation has to be the largest of them, by a margin. A one-sample
+    // misplacement on an odd axis moves the peak off (0, 0) and fails here
+    // whether the CPU and the CUDA kernels agree with each other or not.
+    double best = -2.0;
+    int bestX = 0, bestY = 0;
+    for (int shiftY = -3; shiftY <= 3; ++shiftY)
+        for (int shiftX = -3; shiftX <= 3; ++shiftX) {
+            if (shiftX == 0 && shiftY == 0) continue;
+            const double c = corrOf(shiftX, shiftY, false, false);
+            if (c > best) {
+                best = c;
+                bestX = shiftX;
+                bestY = shiftY;
+            }
+        }
+    const double mirrorXCorr = corrOf(0, 0, true, false);
+    const double mirrorYCorr = corrOf(0, 0, false, true);
+    const double mirrorBoth = corrOf(0, 0, true, true);
+    best = std::max(best, std::max(mirrorXCorr, std::max(mirrorYCorr, mirrorBoth)));
+    INFO("best rival " << best << "; nearest shift (" << bestX << ", " << bestY << "); mirrors x " << mirrorXCorr << " y "
+                       << mirrorYCorr << " xy " << mirrorBoth);
+    CHECK(corr > best + 0.10);
 
     if (cudaAvailable()) {
         // the CUDA twins of both expressions, on an odd axis: nothing else in

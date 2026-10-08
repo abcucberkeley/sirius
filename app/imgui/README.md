@@ -24,8 +24,12 @@ compared with `sirius-cli`'s by file and by numbers rather than off a
 screenshot. `export_result` refuses `needs_download` for an output that stays
 on the cluster, as File ▸ Export result asks the user first; `download: true`
 is that answer written down. An argument the named tool does not take is
-dropped and reported in the result's `warnings`, as it has always been in a
-session: a typo used to be taken here in silence.
+dropped and reported in the result's `call_warnings`, as it has always been
+reported in a session: a typo used to be taken here in silence. The key is
+`call_warnings` and not `warnings` because `warnings` is a reply field of
+`get_step`, `get_diagnostics` and `validate` that callers read, and a host
+that moves the note about the call out of the answer would otherwise take
+that field with it (docs/findings.md 9k.52).
 
 ## Layout of the code
 

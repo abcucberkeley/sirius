@@ -435,6 +435,36 @@ namespace sirius::simdetail {
         // which is what cudasirecon still does (gpuFunctionsImpl.cu:1872).
         // nz == 1 needs no special case: zi is 0 and signedFrequency(0, 1)
         // is 0.
+        //
+        // THE Z AXIS IS NOT COVERED BY THE EVEN ARGUMENT ABOVE, and has to
+        // be argued separately, because nz was never guarded to be even and
+        // is odd on every stack this project reconstructs (9 for
+        // cudasirecon's raw.tif, 101 for the isoar volumes). The reason the
+        // change is still a no-op there is the ZOOM, not the parity:
+        //
+        //   zout = signedToStorage(zSigned, zdim),  zin = signedToStorage(+-zSigned, nz)
+        //
+        // and zdim = z_zoom * nz, so at z_zoom == 1 the destination and the
+        // source are reduced modulo the SAME extent. Replacing zSigned by
+        // zSigned + k (any constant: k = nz/2 - 1 is the old form, k = 0 the
+        // new one) then adds k modulo nz to both of them, which permutes the
+        // elements without changing any (source, destination) pair: the
+        // non-conjugated half is the identity map big[m] <- small[m] for
+        // every m under either form, and the conjugated half is the pair set
+        // {(m, (-m) mod nz)}, likewise shift-invariant. So the z axis is
+        // unchanged for EITHER parity whenever z_zoom == 1 -- the default,
+        // and the value every stack here uses, raw.tif's reconstruction
+        // included, which is why the cudasirecon agreement (9k.48) is
+        // untouched. tests/test_sim_math.cpp drives both forms and asserts
+        // exactly this.
+        //
+        // With z_zoom > 1 and nz ODD the two forms genuinely differ, in
+        // exactly one plane of the band: the old form sent kz = -((nz-1)/2)
+        // to the big grid's +((nz-1)/2 + 1), a frequency the axis does not
+        // have, and left the plane where that kz belongs at zero. The new
+        // form puts it where it belongs. cudasirecon does what the old form
+        // did, so there is nothing to match bit for bit there either
+        // (docs/findings.md 9k.50).
         const IndexT ySigned = signedFrequency(yi, c.ny);
         const IndexT zSigned = signedFrequency(zi, c.nz);
         const IndexT xSigned = signedFrequency(t, c.nx);

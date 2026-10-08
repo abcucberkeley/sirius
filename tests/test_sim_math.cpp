@@ -264,6 +264,77 @@ TEST_CASE("moveBandElement writes the same big grid on even axes as the expressi
     }
 }
 
+TEST_CASE("moveBandElement leaves an odd z axis alone at z_zoom 1, and corrects one plane above it",
+          "[sim_math][parity]") {
+    // nz was never guarded to be even and is odd on every stack this project
+    // reconstructs (9 for cudasirecon's raw.tif, 101 for the isoar volumes),
+    // so "set-identical for even axes" does not cover z. What covers z is the
+    // ZOOM: zout reduces modulo zdim = z_zoom * nz and zin modulo nz, so at
+    // z_zoom == 1 both reduce modulo the same extent and shifting the
+    // frequency origin permutes the elements without changing any
+    // (source, destination) pair. src/sim_math.hpp states the argument; this
+    // drives both forms and is what says it is true.
+    struct Case {
+        IndexT nx, ny, nz;
+    };
+    for (Case g : {Case{8, 6, 9}, Case{8, 6, 101}, Case{8, 6, 5}, Case{8, 6, 4}, Case{9, 7, 5}}) {
+        for (int order : {0, 1}) {
+            INFO("nx " << g.nx << " ny " << g.ny << " nz " << g.nz << " order " << order);
+            const MoveCtx c = makeCtx(g.nx, g.ny, g.nz, /*zoom=*/1, order);
+            REQUIRE(c.zdim == c.nz);   // z_zoom 1: the premise of the argument
+            const std::size_t bandElems = static_cast<std::size_t>(c.nz * c.ny * c.nxh);
+            const std::vector<Cd> bre = bandValues(bandElems, 1.0);
+            const std::vector<Cd> bim = bandValues(bandElems, 1000.0);
+            const std::vector<Cd> now = runMove(c, bre, bim, /*oldForm=*/false);
+            const std::vector<Cd> before = runMove(c, bre, bim, /*oldForm=*/true);
+            REQUIRE(now.size() == before.size());
+            for (std::size_t i = 0; i < now.size(); ++i) {
+                REQUIRE(now[i].re == before[i].re);
+                REQUIRE(now[i].im == before[i].im);
+            }
+            // and it is the right grid, not merely the same one twice
+            const std::vector<Cd> want = referenceBig(c, bre, bim);
+            for (std::size_t i = 0; i < now.size(); ++i) {
+                REQUIRE(now[i].re == want[i].re);
+                REQUIRE(now[i].im == want[i].im);
+            }
+        }
+    }
+
+    SECTION("z_zoom > 1 with an odd nz: the forms differ in exactly the kz = -((nz-1)/2) plane") {
+        const MoveCtx c = makeCtx(8, 6, 5, /*zoom=*/2, /*order=*/0);
+        const std::size_t bandElems = static_cast<std::size_t>(c.nz * c.ny * c.nxh);
+        const std::vector<Cd> bre = bandValues(bandElems, 1.0);
+        const std::vector<Cd> bim = bandValues(bandElems, 1000.0);
+        const std::vector<Cd> now = runMove(c, bre, bim, /*oldForm=*/false);
+        const std::vector<Cd> before = runMove(c, bre, bim, /*oldForm=*/true);
+        const std::vector<Cd> want = referenceBig(c, bre, bim);
+        // the new form is the reference everywhere
+        for (std::size_t i = 0; i < now.size(); ++i) {
+            REQUIRE(now[i].re == want[i].re);
+            REQUIRE(now[i].im == want[i].im);
+        }
+        // the old form differs only on two z planes of the big grid: the one
+        // kz = -((nz-1)/2) belongs on, which it left unwritten, and the
+        // +((nz-1)/2 + 1) the axis does not have, which it wrote instead
+        const IndexT belongs = (c.zdim - (c.nz - 1) / 2) % c.zdim;
+        const IndexT wrote = (c.nz - 1) / 2 + 1;
+        REQUIRE(belongs != wrote);
+        std::vector<IndexT> planes;
+        for (IndexT z = 0; z < c.zdim; ++z) {
+            bool same = true;
+            for (IndexT y = 0; y < c.ydim && same; ++y)
+                for (IndexT x = 0; x < c.xdim && same; ++x) {
+                    const std::size_t i = static_cast<std::size_t>((z * c.ydim + y) * c.xdim + x);
+                    if (now[i].re != before[i].re || now[i].im != before[i].im) same = false;
+                }
+            if (!same) planes.push_back(z);
+        }
+        INFO("planes that differ: " << planes.size());
+        CHECK(planes == std::vector<IndexT>{std::min(belongs, wrote), std::max(belongs, wrote)});
+    }
+}
+
 TEST_CASE("moveBandElement covers an odd axis exactly once, where the old expression aliased",
           "[sim_math][parity]") {
     struct Case {

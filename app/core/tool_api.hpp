@@ -114,7 +114,6 @@ namespace sirius::app {
         // progress and no cancellation -- so the window needs none of this
         // and a session (core/headless.hpp) sets all four.
         struct OutputAccess {
-            std::function<int()> defaultStep;
             std::function<std::shared_ptr<const StepOutput>(int index, bool runIfNeeded)> output;
             std::function<void(double fraction, const std::string& message)> progress;
             std::function<bool()> cancelled;
@@ -146,6 +145,20 @@ namespace sirius::app {
         // name or kind. Throws ToolFailure: "unknown_step" for a step there
         // is not, "invalid_argument" for a value missing or of another type.
         static int resolveStepIndex(const Pipeline& p, const nlohmann::json& args, const char* key = "step");
+
+        // THE default-step rule, the one probe, statistics, export_result and
+        // get_diagnostics use when a call names no step. One rule, here, for
+        // every front: the window, sirius-cli and the MCP session used to
+        // disagree -- the window answered the step it was VIEWING, which a
+        // session has no equivalent of (nothing but add_step and
+        // load_pipeline move it there, so it is usually a step with no
+        // output at all), while a session answered the last computed one
+        // (docs/findings.md 9k.50's requirement, 9k.51, and 9k.52 finding C).
+        // The rule: the step the last successful run produced while it still
+        // exists and still has an output, else the last enabled step that has
+        // one, else Load. It never names a step without an output, so an
+        // argument-free call cannot fail with not_computed.
+        static int defaultStepIndex(const Workbench& wb);
         nlohmann::json stepJson(int index) const;
         void noteAction(ActionRecord r);
         // Whether a Path parameter (add_step, set_params) or a directory a
@@ -156,7 +169,7 @@ namespace sirius::app {
     private:
         void add(ToolSpec t);
         int resolveStep(const nlohmann::json& args, const char* key = "step") const;   // throws with a message
-        // The step an inspecting tool means: args[step], else OutputAccess::defaultStep.
+        // The step an inspecting tool means: args[step], else defaultStepIndex.
         int inspectStep(const nlohmann::json& args) const;
         // That step's output, through OutputAccess::output when the host gave one.
         std::shared_ptr<const StepOutput> outputFor(int index, bool runIfNeeded);

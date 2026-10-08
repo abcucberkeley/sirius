@@ -444,6 +444,38 @@ TEST_CASE("headless: open_dataset describes raw.tif", "[app][headless]") {
         REQUIRE(r.ok);
         REQUIRE(r.warnings.size() == 1);
         CHECK_THAT(r.warnings[0], ContainsSubstring("verbose"));
+        CHECK_FALSE(r.value.contains("call_warnings"));   // moved out, not left in the answer
+    }
+    SECTION("get_step and get_diagnostics keep the `warnings` array their callers read") {
+        // Their descriptions name it ("parameters, summary, validation errors
+        // and warnings"; "summary, facts, table, curves, histograms,
+        // warnings"; `validate`'s "each step's errors and warnings"), the
+        // window's --tool has always returned it, and the session erased it
+        // along with the note about the call. Both kinds now
+        // reach the session's warnings, and the reply field stays
+        // (docs/findings.md 9k.52, finding B).
+        const json step = f.ok("get_step", {{"step", 1}});
+        REQUIRE(step.contains("warnings"));
+        CHECK(step["warnings"].is_array());
+        const json diag = f.ok("get_diagnostics", {{"step", 1}});
+        REQUIRE(diag.contains("warnings"));
+        CHECK(diag["warnings"].is_array());
+        const json validated = f.ok("validate");
+        REQUIRE(validated.contains("steps"));
+        REQUIRE(validated["steps"].is_array());
+        REQUIRE_FALSE(validated["steps"].empty());
+        CHECK(validated["steps"][0].contains("warnings"));
+
+        // and the call's own note still arrives where a client looks for it,
+        // without taking the field with it
+        const agent::ToolResult r = f.call("get_step", {{"step", 1}, {"verbsoe", true}});
+        REQUIRE(r.ok);
+        CHECK(r.value.contains("warnings"));
+        CHECK_FALSE(r.value.contains("call_warnings"));
+        bool said = false;
+        for (const std::string& w : r.warnings)
+            if (w.find("verbsoe") != std::string::npos) said = true;
+        CHECK(said);
     }
 }
 
