@@ -525,6 +525,162 @@ TEST_CASE("the finite bead size is divided out, and only then", "[otf_measure]")
     CHECK(maxAbsDiff(a.otf, b.otf) > 1e-3);
 }
 
+// The side bands' division is offset by the illumination's own k0, so the LINE
+// SPACING is a physical constant of the instrument and not a preference: order
+// n is divided by the sphere's transform at |k| + n/(norders-1)/spacing. With
+// makeotf's 0.2 um default on the iSOAR2 stacks, whose configs say ls=0.504
+// (tests/data/isoar2_mount2a_2026-04-21_488.cfg), order 1 is divided by
+// 3(sin x - x cos x)/x^3 at x = 2 pi r / 0.2 = 1.885 (0.6868) instead of at
+// x = 2 pi r / 0.504 = 0.748 (0.9452), so it comes out 1.376x too large --
+// uniformly enough that nothing in the table's shape says so. Hence: the
+// spacing comes from the caller's own SIM parameters, and when it is not
+// stated the result says which number was used and that it was a guess.
+TEST_CASE("the bead-size division takes the stated line spacing, and says when it had none",
+          "[otf_measure][linespacing]") {
+    // the scene IS the instrument: a 0.504 um pattern, which is what the
+    // iSOAR2 configs say and what the division should be offset by
+    Scene s;
+    s.periodUm = 0.504;
+    s.angleRad = 0.6;
+    const Stack stack = render(s);
+
+    // setIllumination is the route from the parameters a run of this
+    // instrument already has -- it fills an options struct that states
+    // nothing, so nobody has to re-type makeotf's defaults
+    SIMParameters p;
+    p.ndirs = 1;
+    p.nphases = 3;
+    p.linespacing_um = s.periodUm;
+    p.k0_start_angle = s.angleRad;
+    OtfMeasureOptions fromParams;
+    fromParams.setIllumination(p);
+    CHECK(fromParams.patternPeriodUm == s.periodUm);
+    CHECK(fromParams.patternAngleRad == s.angleRad);
+    {
+        // one direction of several: the angle is that direction's, the
+        // spacing is the instrument's
+        SIMParameters three = p;
+        three.ndirs = 3;
+        three.k0_angles = std::vector<double>{0.1, 1.2, 2.3};
+        OtfMeasureOptions second;
+        second.setIllumination(three, 1);
+        CHECK(second.patternAngleRad == 1.2);
+        CHECK(second.patternPeriodUm == s.periodUm);
+    }
+
+    OtfMeasureOptions stated = baseOptions(s);   // states the scene's own spacing
+    CHECK(stated.patternPeriodUm == s.periodUm);
+    stated.beadDiameterUm = 0.12;
+    stated.repairKr0Column = false;   // so the kr = 0 sample is the one the division touched
+
+    // and what the library does when nobody states it: its own default must
+    // not be an instrument's number
+    CHECK(OtfMeasureOptions{}.patternPeriodUm == 0.0);
+    OtfMeasureOptions guessing = stated;
+    guessing.patternPeriodUm = 0.0;
+    CHECK(validateOtfMeasure(guessing, static_cast<int>(stack.dimension(0)), static_cast<int>(stack.dimension(1)),
+                             static_cast<int>(stack.dimension(2)))
+              .empty());
+    OtfMeasureOptions negative = stated;
+    negative.patternPeriodUm = -0.3;
+    CHECK_THAT(validateOtfMeasure(negative, static_cast<int>(stack.dimension(0)),
+                                  static_cast<int>(stack.dimension(1)), static_cast<int>(stack.dimension(2))),
+               ContainsSubstring("patternPeriodUm"));
+
+    const OtfMeasureResult mine = measureOTF(stack, stated);
+    const OtfMeasureResult guessed = measureOTF(stack, guessing);
+
+    // the result carries which spacing the division used, and whether it was
+    // the caller's
+    CHECK(mine.patternPeriodStated);
+    CHECK_THAT(mine.patternPeriodUsedUm, WithinRel(s.periodUm, 1e-12));
+    CHECK_FALSE(guessed.patternPeriodStated);
+    CHECK_THAT(guessed.patternPeriodUsedUm, WithinRel(kMakeotfLineSpacingUm, 1e-12));
+    bool saidSo = false;
+    for (const std::string& n : guessed.notes)
+        saidSo = saidSo || n.find("LINE SPACING WAS NOT STATED") != std::string::npos;
+    CHECK(saidSo);
+    CHECK_THAT(guessed.summary(), ContainsSubstring("NOT STATED"));
+
+    // and it is not cosmetic: the kr = kz = 0 sample of order 1 is divided at
+    // exactly |k0|, so the two differ by the closed-form ratio
+    const auto sphere = [](double k, double radius) {
+        const double x = 2.0 * kPi * radius * k;
+        return 3.0 * (std::sin(x) - x * std::cos(x)) / (x * x * x);
+    };
+    const double expected = sphere(1.0 / s.periodUm, 0.06) / sphere(1.0 / kMakeotfLineSpacingUm, 0.06);
+    INFO("order 1 inflated by " << guessed.modulationDepth / mine.modulationDepth << ", closed form "
+                                << expected);
+    CHECK(expected > 1.37);
+    CHECK(expected < 1.38);
+    // 1e-6 rather than exact: combine_reim's rotation angle is atan of two
+    // sums over the whole band, which is invariant under a per-sample real
+    // scaling but not bit for bit.
+    CHECK_THAT(guessed.modulationDepth / mine.modulationDepth, WithinRel(expected, 1e-6));
+    // order 0 has no k0 offset, so it is the same table in both
+    CHECK_THAT(guessed.orderDc[0], WithinRel(mine.orderDc[0], 1e-12));
+}
+
+// The inventory is three numbers a reader compares: found, kept, and a count
+// per reason. They have to add up, and `kept` has to mean kept. Two ways they
+// did not: a bead the maxBeads cap left out carried BeadRejection::None, whose
+// name IS "kept", so the table printed "kept" beside a bead that was not; and
+// the candidates past the examination cap were counted in `found` and in no
+// reason at all.
+TEST_CASE("the bead inventory adds up, and `kept` means kept", "[otf_measure][inventory]") {
+    Scene s;
+    s.beads = {Bead{20.3, 31.6, 11.5, 1000.0, 1.0}, Bead{44.4, 31.5, 11.5, 600.0, 1.0}};
+    const Stack stack = render(s);
+    OtfMeasureOptions o = baseOptions(s);
+    o.field = true;
+    o.detect.minSeparationLateralUm = 0.8;
+    o.detect.roiLateralUm = 1.2;
+    o.detect.boundaryMarginLateralUm = 0.4;
+    o.detect.minAmplitudeFraction = 0.02;
+    o.detect.sigmaMaxLateralUm = 0.4;
+
+    const auto sumOf = [](const OtfMeasureResult& r) {
+        int n = 0;
+        for (const int c : r.rejected) n += c;
+        return n;
+    };
+    const auto invariants = [&](const OtfMeasureResult& r) {
+        CHECK(sumOf(r) == r.found);
+        CHECK(r.rejected[static_cast<std::size_t>(BeadRejection::None)] == r.kept);
+        for (const BeadFit& b : r.beads) {
+            CHECK(b.kept == (b.rejection == BeadRejection::None));
+            if (!b.kept) CHECK(std::string(beadRejectionName(b.rejection)) != "kept");
+        }
+    };
+
+    const OtfMeasureResult all = measureOTF(stack, o);
+    INFO("uncapped: " << all.summary());
+    invariants(all);
+
+    SECTION("the single-bead path reports one found and one kept") {
+        OtfMeasureOptions one = o;
+        one.field = false;
+        const OtfMeasureResult r = measureOTF(stack, one);
+        CHECK(r.found == 1);
+        CHECK(r.kept == 1);
+        invariants(r);
+    }
+
+    SECTION("a bead the maxBeads cap leaves out has its own reason") {
+        REQUIRE(all.kept >= 2);   // otherwise the cap below leaves nothing out
+        OtfMeasureOptions capped = o;
+        capped.detect.maxBeads = 1;
+        const OtfMeasureResult r = measureOTF(stack, capped);
+        CHECK(r.kept == 1);
+        CHECK(r.rejected[static_cast<std::size_t>(BeadRejection::OverMaxBeads)] >= 1);
+        CHECK(r.rejected[static_cast<std::size_t>(BeadRejection::None)] == 1);
+        invariants(r);
+        bool said = false;
+        for (const std::string& n : r.notes) said = said || n.find("maxBeads cap") != std::string::npos;
+        CHECK(said);
+    }
+}
+
 TEST_CASE("validateOtfMeasure refuses what it cannot measure, with the numbers", "[otf_measure]") {
     OtfMeasureOptions o;
     o.dxy = 0.1;
@@ -754,7 +910,10 @@ TEST_CASE("measure an OTF from the stack the environment names", "[otf_measure][
                                ? BackgroundEstimate::DarkestFraction
                                : BackgroundEstimate::BorderMean;
     o.beadDiameterUm = envNum("SIRIUS_OTF_BEAD_UM", 0.12);
-    o.patternPeriodUm = envNum("SIRIUS_OTF_PERIOD_UM", 0.2);
+    // 0 = not stated, so a job that does not pass the instrument's own line
+    // spacing gets a table that says it was measured on makeotf's default
+    // rather than one that looks measured
+    o.patternPeriodUm = envNum("SIRIUS_OTF_PERIOD_UM", 0.0);
     o.patternAngleRad = envNum("SIRIUS_OTF_ANGLE_RAD", 1.57);
     o.beadCompensationPixelUm = envNum("SIRIUS_OTF_COMP_PIXEL_UM", 0.0);
     const std::string scale = envStr("SIRIUS_OTF_SCALE", "dc");

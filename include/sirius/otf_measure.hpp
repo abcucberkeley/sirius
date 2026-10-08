@@ -151,15 +151,27 @@
 
 #include <array>
 #include <complex>
+#include <cstddef>
 #include <string>
 #include <vector>
 
 #include <Eigen/Core>
 #include <unsupported/Eigen/CXX11/Tensor>
 
+#include "sirius/constants.hpp"
 #include "sirius/otf.hpp"
+#include "sirius/sim_parameters.hpp"
 
 namespace sirius {
+
+    // makeotf's `-ls` default (radialft.cpp: `float linespacing = 0.2f`). It
+    // is a DEFAULT and not a property of any instrument: the iSOAR2 configs
+    // this project runs say ls=0.504
+    // (tests/data/isoar2_mount2a_2026-04-21_488.cfg), where 0.2 inflates
+    // order 1 by about 1.38. Named here because the measurement falls back to
+    // it when the caller states no line spacing, and a fallback that is not
+    // named is how a wrong constant ends up in a result with nothing saying so.
+    inline constexpr double kMakeotfLineSpacingUm = 0.2;
 
     // Where the phases sit along a raw stack's section axis. The iSOAR2
     // RAW_* stacks are PhaseFastest, and their slicelist.sqlite3 says so
@@ -194,9 +206,20 @@ namespace sirius {
         WidthTooSmall,   // narrower than sigmaMinUm: hot pixel or cosmic ray
         WidthTooLarge,   // wider than sigmaMaxUm: an aggregate or two beads
         FitFailed,       // the Gaussian fit did not converge inside its ROI
-        Saturated        // at or above saturationLevel
+        Saturated,       // at or above saturationLevel
+        // The last two are not the detector's judgement of a bead but a cap
+        // on how many it looks at. They exist so that the inventory adds up:
+        // every candidate the detector found lands in exactly one bucket, and
+        // `None` means kept and nothing else. Before them, a bead the
+        // maxBeads cap left out carried `None` -- the inventory printed
+        // "kept" beside a bead that was not kept -- and the candidates past
+        // the examination cap were counted in `found` and in no bucket at all.
+        OverMaxBeads,    // passed every filter, but maxBeads were already kept
+        NotExamined      // above the amplitude floor, past the 4*maxBeads+16 examination cap
     };
     const char* beadRejectionName(BeadRejection r) noexcept;
+    // One past the last BeadRejection: the width of OtfMeasureResult::rejected.
+    inline constexpr std::size_t kBeadRejectionCount = 10;
 
     // A candidate from the field path. Positions are in voxels of the input
     // grid, widths in voxels, and `kept` says whether it reached the average.
@@ -254,8 +277,25 @@ namespace sirius {
 
         // --- the finite bead size
         double beadDiameterUm = 0.12;      // 0 = no compensation
-        double patternPeriodUm = 0.2;      // the side bands' k0 offset into the division
-        double patternAngleRad = 1.57;
+        // THE ILLUMINATION LINE SPACING, um. It is one quantity under three
+        // names -- makeotf's `-ls`, SIMParameters::linespacing_um and this --
+        // and the division uses it exactly as makeotf does: order n is
+        // divided by the sphere's transform at |k + n/(norders-1)/period|,
+        // which is SIMParameters::patternFundamental's own arithmetic. It is
+        // an INSTRUMENT number, not a preference: on the iSOAR2 stacks the
+        // spacing is 0.504 um, and measuring them with makeotf's 0.2 um
+        // default divides order 1 by 0.687 instead of 0.945 -- order 1 comes
+        // out about 1.38x too large, uniformly enough that no shape in the
+        // table says anything is wrong.
+        //
+        // 0 = NOT STATED. Then the division falls back to
+        // kMakeotfLineSpacingUm, OtfMeasureResult::patternPeriodUsedUm says
+        // what was used, patternPeriodStated says it was a fallback, and
+        // notes carries a line to that effect. setIllumination() below is how
+        // a caller that has the acquisition's SIM parameters states it
+        // instead of a caller guessing.
+        double patternPeriodUm = 0.0;
+        double patternAngleRad = 1.57;     // makeotf's `-angle`, radians
         // The pixel sizes the DIVISION uses, where they are not the
         // acquisition's. makeotf has one dr for everything, but for a square
         // section dr cancels out of the radial binning entirely (the bin is
@@ -284,6 +324,26 @@ namespace sirius {
         bool perBeadNormalise = true;      // each bead's table on its own scale before averaging;
                                            // off makes the average brightness-weighted
         BeadDetectionOptions detect;
+
+        // The illumination the bead stack was taken under, from the SIM
+        // parameters a caller that reconstructs this instrument already has
+        // (fromLegacy of the cudasirecon config states both numbers: ls and
+        // k0angles / k0startangle). ONE direction, because an OTF is measured
+        // per direction, and makeotf takes one `-angle`.
+        //
+        // What it does NOT set: nphases, norders and the pixel sizes. Those
+        // come from the stack in front of the measurement, which for a
+        // montage or a re-binned acquisition is not what a run's parameters
+        // say, and silently taking them from here would put the layout back
+        // in two places. The illumination is different: the pattern is a
+        // property of the instrument and nothing in a bead stack states it.
+        void setIllumination(const SIMParameters& p, int dir = 0) noexcept {
+            patternPeriodUm = p.linespacing_um;
+            if (p.k0_angles && dir >= 0 && static_cast<std::size_t>(dir) < p.k0_angles->size())
+                patternAngleRad = (*p.k0_angles)[static_cast<std::size_t>(dir)];
+            else
+                patternAngleRad = p.k0_start_angle + (dir > 0 ? dir : 0) * kPi / (p.ndirs > 0 ? p.ndirs : 1);
+        }
     };
 
     struct OtfMeasureResult {
@@ -292,12 +352,27 @@ namespace sirius {
         int nz = 0, ny = 0, nx = 0;        // the de-interleaved stack it was measured from
         double dkr = 0.0, dkz = 0.0;       // 1/um
         double dxy = 0.0, dz = 0.0;        // um, what the measurement was made at
+        // The line spacing the finite-bead-size division actually used, and
+        // whether the caller stated it. 0 when nothing was divided out
+        // (beadDiameterUm 0, or a single order, where there is no side band
+        // to offset). A table whose patternPeriodStated is false was measured
+        // on a guess, which is the one thing a reader of an OTF cannot see
+        // from the samples.
+        double patternPeriodUsedUm = 0.0;
+        bool patternPeriodStated = false;
 
         // --- the inventory. In single-bead mode `beads` holds the one centre
         // makeotf would have found, so the two paths report the same way.
+        // `found` is every candidate the detector produced and
+        // `rejected` is indexed by BeadRejection, so
+        // sum(rejected) == found and rejected[None] == kept, always: the two
+        // buckets that make that true are OverMaxBeads and NotExamined.
+        // `beads` holds the candidates that were examined one by one, which
+        // is fewer than `found` whenever a cap or the amplitude floor cut the
+        // list short -- those are counted but not fitted.
         std::vector<BeadFit> beads;
         int found = 0, kept = 0;
-        std::array<int, 8> rejected{};     // indexed by BeadRejection
+        std::array<int, kBeadRejectionCount> rejected{};   // indexed by BeadRejection
 
         // --- the scale, with both candidates so the choice is visible
         // the raw kr = kz = 0 sample of order 0, averaged over the kept beads

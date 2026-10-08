@@ -1,7 +1,9 @@
 #include "core/otf_measure.hpp"
 
 #include <algorithm>
+#include <array>
 #include <cmath>
+#include <cstddef>
 #include <fstream>
 #include <iomanip>
 #include <limits>
@@ -453,6 +455,11 @@ namespace sirius::app {
                           std::to_string(result.nzotf) + " kz");
         fact("Sampling", "dkr " + num(result.dkr) + " · dkz " + num(result.dkz) + " 1/um");
         fact("Measured at", "dxy " + num(result.dxy) + " · dz " + num(result.dz) + " um");
+        // The side-band division's own constant, and whether anyone stated it.
+        if (result.patternPeriodUsedUm > 0.0)
+            fact("Line spacing", num(result.patternPeriodUsedUm) + " um" +
+                                     (result.patternPeriodStated ? " (stated)"
+                                                                 : " (NOT STATED: makeotf's default)"));
         fact("Stack", std::to_string(result.nz) + " z x " + std::to_string(result.ny) + " y x " +
                           std::to_string(result.nx) + " x");
         fact("Beads", std::to_string(result.kept) + " of " + std::to_string(result.found) +
@@ -563,7 +570,13 @@ namespace sirius::app {
                         {"darkest_fraction", m.darkestFraction},
                         {"apodize_px", m.apodize},
                         {"bead_diameter_um", m.beadDiameterUm},
+                        // What was asked for, then what the division used: 0
+                        // asked for means the fallback, and a table measured
+                        // on a fallback spacing cannot be told from one
+                        // measured on the real thing by looking at it.
                         {"pattern_period_um", m.patternPeriodUm},
+                        {"pattern_period_um_used", result.patternPeriodUsedUm},
+                        {"pattern_period_stated", result.patternPeriodStated},
                         {"pattern_angle_rad", m.patternAngleRad},
                         {"bead_compensation_pixel_um", m.beadCompensationPixelUm},
                         {"bead_compensation_axial_um", m.beadCompensationAxialUm},
@@ -689,9 +702,22 @@ namespace sirius::app {
         if (meta.dz() > 0.0 && m.dz > 0.0 && std::abs(m.dz - meta.dz()) > 1e-9)
             out.notes.push_back("the measurement used dz " + num(m.dz) + " um where the dataset says " +
                                 num(meta.dz()) + " um");
-        out.notes.push_back("bead diameter " + num(m.beadDiameterUm) + " um with the pattern at " +
-                            num(m.patternPeriodUm) + " um / " + num(m.patternAngleRad, 4) +
-                            " rad are stated parameters: nothing in the acquisition's metadata says them");
+        // The bead diameter and the illumination are stated parameters -- no
+        // acquisition metadata this layer sees carries either -- so say which
+        // numbers were used, and say it differently when the line spacing was
+        // not one of them. A measurement on makeotf's 0.2 um default when the
+        // instrument runs 0.504 um (the iSOAR2 configs) scales order 1 by
+        // about 1.38 with nothing in the table to show it.
+        if (m.patternPeriodUm > 0.0)
+            out.notes.push_back("bead diameter " + num(m.beadDiameterUm) + " um with the illumination at " +
+                                num(m.patternPeriodUm) + " um / " + num(m.patternAngleRad, 4) +
+                                " rad are stated parameters: nothing in the acquisition's metadata says them");
+        else if (m.beadDiameterUm > 0.0)
+            out.notes.push_back("the illumination line spacing was not stated, so the finite-bead-size "
+                                "division of the side bands fell back to makeotf's " +
+                                num(sirius::kMakeotfLineSpacingUm) +
+                                " um; state the acquisition's own (the iSOAR2 configs say 0.504 um) or "
+                                "quote only order 0 and the band ratio");
         if (m.beadCompensationPixelUm > 0.0)
             out.notes.push_back("the finite-bead-size division used " + num(m.beadCompensationPixelUm) +
                                 " um rather than the acquisition's pixel, which is what reaching an existing "
@@ -778,6 +804,40 @@ namespace sirius::app {
                                         v + "\"");
         }
 
+        // Every key this face reads, in ONE list beside the reader, so a key
+        // it does not read is REFUSED instead of dropped. Dropping is the
+        // worse failure of the two: a call carrying "pattern_period" or
+        // "patternPeriodUm" measured on the default line spacing and reported
+        // success, which is a wrong number with nothing saying so -- the same
+        // shape as the defect this list was added with.
+        constexpr std::array<const char*, 34> kRequestKeys{
+            "channel", "time", "angle", "path", "note", "overwrite", "sidecar", "provenance",
+            "preview_max_side", "nphases", "norders", "packing", "phases", "dxy", "dz", "background",
+            "background_estimate", "background_border", "darkest_fraction", "apodize", "bead_diameter_um",
+            "pattern_period_um", "pattern_angle_rad", "bead_compensation_pixel_um", "bead_compensation_axial_um",
+            "scale", "line_fit_first", "line_fit_last", "band_ratio_min_order0", "repair_kr0_column",
+            "combine_reim", "field", "per_bead_normalise", "detect"};
+        constexpr std::array<const char*, 19> kDetectKeys{
+            "dog_small_lateral_um", "dog_small_axial_um", "dog_large_lateral_um", "dog_large_axial_um",
+            "min_separation_lateral_um", "min_separation_axial_um", "min_amplitude", "min_amplitude_fraction",
+            "saturation_level", "roi_lateral_um", "roi_axial_um", "boundary_margin_lateral_um",
+            "boundary_margin_axial_um", "sigma_min_lateral_um", "sigma_max_lateral_um", "sigma_min_axial_um",
+            "sigma_max_axial_um", "max_beads", "max_residual"};
+
+        template <std::size_t N>
+        void refuseUnknownKeys(const nlohmann::json& object, const std::array<const char*, N>& known,
+                               const std::string& where) {
+            for (auto it = object.begin(); it != object.end(); ++it) {
+                const std::string key = it.key();
+                if (std::find_if(known.begin(), known.end(),
+                                 [&key](const char* k) { return key == k; }) != known.end())
+                    continue;
+                std::string accepted;
+                for (const char* k : known) accepted += (accepted.empty() ? "" : ", ") + std::string(k);
+                throw std::invalid_argument(where + " does not accept \"" + key + "\"; its keys are " + accepted);
+            }
+        }
+
     } // namespace
 
     OtfMeasureRequest otfMeasureRequestFromJson(const nlohmann::json& args, const DatasetMeta& meta, const Dims5& dims) {
@@ -786,6 +846,7 @@ namespace sirius::app {
         OtfMeasureRequest r = otfMeasureDefaults(meta, dims);
         if (args.is_null()) return r;
         const nlohmann::json& a = args;
+        refuseUnknownKeys(a, kRequestKeys, "the OTF measurement");
 
         readIf(a, "channel", r.channel);
         readIf(a, "time", r.time);
@@ -826,8 +887,16 @@ namespace sirius::app {
         readIf(a, "field", m.field);
         readIf(a, "per_bead_normalise", m.perBeadNormalise);
 
-        if (const auto it = a.find("detect"); it != a.end() && it->is_object()) {
+        // A `detect` that is not an object was dropped without a word, which
+        // is the same silence as an unknown key: a caller that sent a list of
+        // pairs, or one value, measured with the defaults and was told
+        // nothing.
+        if (const auto it = a.find("detect"); it != a.end() && !it->is_null()) {
+            if (!it->is_object())
+                throw std::invalid_argument("detect must be an object of bead-detection options, not " +
+                                            std::string(it->type_name()));
             const nlohmann::json& dj = *it;
+            refuseUnknownKeys(dj, kDetectKeys, "the OTF measurement's detect");
             sirius::BeadDetectionOptions& d = m.detect;
             readIf(dj, "dog_small_lateral_um", d.dogSmallLateralUm);
             readIf(dj, "dog_small_axial_um", d.dogSmallAxialUm);

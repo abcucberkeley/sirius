@@ -237,10 +237,15 @@ sirius_lib_unit(otf_select
 # Measuring one from a bead stack -- makeotf's chain for a single bead, mcSIM's
 # detection for a field -- and writing it in makeotf's layout with the sidecar
 # otf_io reads. A calibration artefact, not a pipeline operation.
+# sim_parameters is a dependency of the HEADER rather than of the measurement:
+# the illumination line spacing and angle the side-band division needs are the
+# acquisition's own (SIMParameters::linespacing_um, k0_angles), and
+# OtfMeasureOptions::setIllumination is what takes them from a run's own
+# parameters instead of a caller re-typing makeotf's defaults.
 sirius_lib_unit(otf_measure
     HEADERS sirius/otf_measure.hpp
     SOURCES otf_measure.cpp
-    DEPENDS otf separation real_fft tiff_io errors constants)
+    DEPENDS otf separation real_fft tiff_io sim_parameters errors constants)
 
 # the per-device stage implementations behind the reconstruction driver
 sirius_lib_unit(sim_backend

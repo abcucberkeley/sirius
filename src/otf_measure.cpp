@@ -484,6 +484,8 @@ namespace sirius {
             case BeadRejection::WidthTooLarge: return "wider than the width bound";
             case BeadRejection::FitFailed: return "the Gaussian fit did not converge in its region";
             case BeadRejection::Saturated: return "saturated";
+            case BeadRejection::OverMaxBeads: return "left out by the maxBeads cap";
+            case BeadRejection::NotExamined: return "not examined: past the candidate cap";
         }
         return "unknown";
     }
@@ -517,8 +519,13 @@ namespace sirius {
         if (!(o.darkestFraction > 0.0) || o.darkestFraction > 1.0)
             return "darkestFraction must lie in (0, 1], not " + std::to_string(o.darkestFraction);
         if (o.beadDiameterUm < 0.0) return "beadDiameterUm must not be negative";
-        if (o.beadDiameterUm > 0.0 && norders > 1 && !(o.patternPeriodUm > 0.0))
-            return "patternPeriodUm must be positive for the bead-size compensation of the side bands";
+        // 0 means "not stated" and falls back to makeotf's own default (the
+        // measurement says which was used and that it fell back); a negative
+        // spacing is a mistake, not a choice.
+        if (o.patternPeriodUm < 0.0)
+            return "patternPeriodUm (the illumination line spacing, um) must not be negative; 0 states that "
+                   "the acquisition does not say, and the bead-size division then falls back to makeotf's " +
+                   num(kMakeotfLineSpacingUm) + " um";
         if (o.scale == OtfMeasureScale::MakeotfFixOrigin) {
             const int nkr = std::min(nx, ny) / 2 + 1;
             if (std::max(1, o.lineFitFirst) + 1 >= std::min(o.lineFitLast, nkr - 1))
@@ -679,7 +686,12 @@ namespace sirius {
 
         // --- the bead inventory ------------------------------------------------
         std::vector<BeadFit> beads;
-        int extraBelowFloor = 0;   // candidates counted but not fitted
+        // Candidates `found` counts but `beads` does not hold, because the
+        // amplitude floor and the examination cap cut the sorted list short
+        // before any fit was attempted. They still get a bucket each, so that
+        // sum(rejected) == found.
+        int extraBelowFloor = 0;
+        int extraNotExamined = 0;
         if (!o.field) {
             // determine_center: the global maximum of the phase-averaged volume
             // to sub-pixel by three parabola fits, with the wrap radialft uses.
@@ -769,8 +781,9 @@ namespace sirius {
                     break;
                 }
             const std::size_t cap = static_cast<std::size_t>(d.maxBeads) * 4 + 16;
-            std::size_t belowFloor = cand.size() - examine;
+            const std::size_t belowFloor = cand.size() - examine;
             if (examine > cap) {
+                extraNotExamined = static_cast<int>(examine - cap);
                 res.notes.emplace_back(std::to_string(examine - cap) + " of the " + std::to_string(examine) +
                                        " candidates above the amplitude floor were not examined (the cap is "
                                        "4 x maxBeads + 16)");
@@ -833,7 +846,14 @@ namespace sirius {
                             f.rejection = BeadRejection::FitFailed;
                     }
                 }
-                f.kept = f.rejection == BeadRejection::None && static_cast<int>(keptList.size()) < d.maxBeads;
+                // A bead the maxBeads cap leaves out passed every filter, so
+                // it is not None: it carried None before, and the inventory
+                // then printed "kept" (beadRejectionName(None)) beside a bead
+                // whose `kept` was false. With its own reason, `None` means
+                // kept and nothing else.
+                if (f.rejection == BeadRejection::None && static_cast<int>(keptList.size()) >= d.maxBeads)
+                    f.rejection = BeadRejection::OverMaxBeads;
+                f.kept = f.rejection == BeadRejection::None;
                 if (f.kept) keptList.push_back(f);
                 beads.push_back(f);
             }
@@ -865,8 +885,13 @@ namespace sirius {
             if (f.kept) ++res.kept;
         }
         res.rejected[static_cast<std::size_t>(BeadRejection::Amplitude)] += extraBelowFloor;
-        if (res.rejected[0] > res.kept)
-            res.notes.emplace_back(std::to_string(res.rejected[0] - res.kept) +
+        res.rejected[static_cast<std::size_t>(BeadRejection::NotExamined)] += extraNotExamined;
+        // The inventory's arithmetic, which is now an identity rather than
+        // something a reader has to reconstruct: every candidate the detector
+        // found is in exactly one bucket, and bucket None is exactly the kept
+        // ones.
+        if (const int capped = res.rejected[static_cast<std::size_t>(BeadRejection::OverMaxBeads)]; capped > 0)
+            res.notes.emplace_back(std::to_string(capped) +
                                    " beads passed every filter and were left out by the maxBeads cap of " +
                                    std::to_string(o.detect.maxBeads));
         if (res.kept == 0)
@@ -913,7 +938,33 @@ namespace sirius {
         const double dkx = 1.0 / (nx * compDxy), dky = 1.0 / (ny * compDxy);
         const double dkzv = nz > 1 ? 1.0 / (nz * compDz) : 0.0;
         const double radius = 0.5 * o.beadDiameterUm;
-        const double k0mag = o.patternPeriodUm > 0.0 ? 1.0 / o.patternPeriodUm : 0.0;
+        // The side bands' k0 offset into the division is the illumination LINE
+        // SPACING -- makeotf's -ls, SIMParameters::linespacing_um. Nothing in
+        // a bead stack states it, so it is the caller's to state; 0 means it
+        // did not, and then this falls back to makeotf's own default and says
+        // so. Getting it wrong is invisible in the table: on the iSOAR2
+        // stacks (0.504 um) makeotf's 0.2 um divides order 1 by the sphere's
+        // transform at 5.0 instead of 1.98 1/um, which scales order 1 by
+        // about 1.38 and leaves its shape alone.
+        const bool periodStated = o.patternPeriodUm > 0.0;
+        const double periodUm = periodStated ? o.patternPeriodUm : kMakeotfLineSpacingUm;
+        const double k0mag = 1.0 / periodUm;
+        if (o.beadDiameterUm > 0.0 && norders > 1) {
+            res.patternPeriodUsedUm = periodUm;
+            res.patternPeriodStated = periodStated;
+            if (periodStated)
+                res.notes.emplace_back("the finite-bead-size division offset order n by n/" +
+                                       std::to_string(norders - 1) + " x " + num(k0mag) +
+                                       " 1/um, from the stated line spacing of " + num(periodUm) + " um");
+            else
+                res.notes.emplace_back(
+                    "THE ILLUMINATION LINE SPACING WAS NOT STATED, so the finite-bead-size division used "
+                    "makeotf's default of " +
+                    num(kMakeotfLineSpacingUm) + " um (order 1 offset by " + num(k0mag) +
+                    " 1/um). On an instrument whose spacing is not that, every side band is off by a "
+                    "near-uniform factor and the table's shape does not show it: state it with "
+                    "OtfMeasureOptions::setIllumination, from the acquisition's own SIM parameters");
+        }
 
         BandSet acc;
         acc.nbands = nbands;

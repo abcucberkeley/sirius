@@ -29,11 +29,17 @@
 // order, the saturation level implied by the pixel type -- and leaves the rest
 // at the library's defaults. Three numbers the dataset genuinely does not
 // know, and which therefore stay the user's to state: the bead diameter, and
-// the illumination period and angle that the finite-bead-size division applies
-// to the side bands (sirius/otf_measure.hpp, beadDiameterUm /
+// the illumination line spacing and angle that the finite-bead-size division
+// applies to the side bands (sirius/otf_measure.hpp, beadDiameterUm /
 // patternPeriodUm / patternAngleRad). They are not guessed from the data here,
 // because a wrong guess is a wrong table with nothing saying so, which is the
-// failure mode of 9k.48 one layer up.
+// failure mode of 9k.48 one layer up. The line spacing's own default is 0 --
+// NOT STATED -- rather than a plausible number, so a measurement made without
+// it says so in its notes, in its provenance
+// (options.pattern_period_stated) and in its summary instead of quietly using
+// makeotf's 0.2 um on an instrument that runs 0.504 um. A caller holding the
+// acquisition's SIM parameters states it by calling
+// sirius::OtfMeasureOptions::setIllumination on request.measure.
 //
 // THE OUTPUT PATH IS NOT DEFAULTED NEXT TO THE STACK. otfMeasureFileName
 // proposes a NAME ("OTF_488_sirius.tif", from the channel's own wavelength)
@@ -212,6 +218,14 @@ namespace sirius::app {
     // "makeotf_fixorigin" / "as_measured" and "border_mean" /
     // "darkest_fraction"; anything else throws std::invalid_argument naming
     // the key and what it accepts.
+    //
+    // ANY OTHER KEY IS REFUSED, top level or inside `detect`, and so is a
+    // `detect` that is not an object. This face used to ignore what it did not
+    // recognise, which turns a caller's typo into a measurement on the
+    // defaults reported as a success -- the same silence as an unstated
+    // constant. A front end that wraps these arguments in an envelope of its
+    // own (a dataset id, a request id) therefore passes the measurement's own
+    // object, not the envelope.
     OtfMeasureRequest otfMeasureRequestFromJson(const nlohmann::json& args, const DatasetMeta& meta, const Dims5& dims);
 
     // The report as a tool reply: what was written, the table's shape and

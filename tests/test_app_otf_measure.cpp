@@ -457,6 +457,17 @@ TEST_CASE("the provenance ties the table to the acquisition it came from", "[otf
     CHECK(p["options"]["scale"].get<std::string>() == "order0_dc");
     CHECK(p["options"]["packing"].get<std::string>() == "phase_fastest");
     CHECK(p["options"]["bead_diameter_um"].get<double>() == OtfMeasureOptions{}.beadDiameterUm);
+    // the line spacing the side-band division used, and whether anyone stated
+    // it: a table measured on makeotf's 0.2 um default cannot be told from one
+    // measured on the instrument's own by looking at the samples, so the
+    // record has to say. This dataset states none.
+    CHECK(p["options"]["pattern_period_um"].get<double>() == 0.0);
+    CHECK_FALSE(p["options"]["pattern_period_stated"].get<bool>());
+    CHECK(p["options"]["pattern_period_um_used"].get<double>() == sirius::kMakeotfLineSpacingUm);
+    bool warned = false;
+    for (const std::string& w : out.diagnostics.warnings)
+        warned = warned || w.find("line spacing was not stated") != std::string::npos;
+    CHECK(warned);
 
     // which beads, and what was rejected
     REQUIRE(p["beads"].size() == out.measurement.beads.size());
@@ -586,9 +597,16 @@ TEST_CASE("a field of beads reports every candidate, kept or not, with its reaso
         CHECK(out.diagnostics.table->rows[i].back() ==
               std::string(beadRejectionName(out.measurement.beads[i].rejection)));
 
+    // The counts have to add up to what the detector did: every candidate it
+    // found is in exactly one bucket (the ones the amplitude floor and the
+    // examination cap cut short included), and the bucket whose name is
+    // "kept" holds exactly the kept ones. Before BeadRejection gained
+    // OverMaxBeads and NotExamined, neither was true.
     int counted = 0;
     for (const nlohmann::json& n : out.provenance["rejected"]) counted += n.get<int>();
+    CHECK(counted == out.measurement.found);
     CHECK(counted >= static_cast<int>(out.measurement.beads.size()));
+    CHECK(out.provenance["rejected"].value("kept", 0) == out.measurement.kept);
 
     SECTION("a single-bead run reports the one centre makeotf would have taken") {
         OtfMeasureRequest one = otfMeasureDefaults(meta, dims);
@@ -638,6 +656,52 @@ TEST_CASE("the JSON face parses once for every front, and an unknown enum says w
         // untouched keys still come from the dataset
         CHECK(r.measure.dxy == kDxy);
         CHECK(r.measure.detect.roiLateralUm == BeadDetectionOptions{}.roiLateralUm);
+    }
+
+    SECTION("a key this face does not read is refused, not dropped") {
+        // Dropping is the worse of the two failures: "patternPeriodUm" or
+        // "pattern_period" in a tool call used to measure on the default line
+        // spacing and report success, which is a wrong constant with nothing
+        // saying so.
+        for (const char* key : {"patternPeriodUm", "pattern_period", "bead_diameter", "dataset"}) {
+            nlohmann::json args = nlohmann::json::object();
+            args[key] = 0.5;
+            bool threw = false;
+            try {
+                otfMeasureRequestFromJson(args, meta, dims);
+            } catch (const std::invalid_argument& e) {
+                threw = true;
+                CHECK(std::string(e.what()).find(key) != std::string::npos);
+            }
+            CHECK(threw);
+        }
+        // the same inside the nested object, and a detect that is not one
+        nlohmann::json nested = {{"detect", {{"maxBeads", 3}}}};
+        CHECK_THROWS_AS(otfMeasureRequestFromJson(nested, meta, dims), std::invalid_argument);
+        nlohmann::json notAnObject = {{"detect", 3}};
+        CHECK_THROWS_AS(otfMeasureRequestFromJson(notAnObject, meta, dims), std::invalid_argument);
+        // and every key the header documents is still accepted
+        const nlohmann::json every = {
+            {"channel", 0}, {"time", 0}, {"angle", 0}, {"path", ""}, {"note", ""}, {"overwrite", false},
+            {"sidecar", true}, {"provenance", true}, {"preview_max_side", 64}, {"nphases", 3},
+            {"norders", 2}, {"packing", "phase_fastest"}, {"phases", nlohmann::json::array({0.0, 1.0, 2.0})},
+            {"dxy", 0.1}, {"dz", 0.2}, {"background", -1.0}, {"background_estimate", "border_mean"},
+            {"background_border", 6}, {"darkest_fraction", 0.1}, {"apodize", 4}, {"bead_diameter_um", 0.12},
+            {"pattern_period_um", 0.504}, {"pattern_angle_rad", 1.57}, {"bead_compensation_pixel_um", 0.0},
+            {"bead_compensation_axial_um", 0.0}, {"scale", "order0_dc"}, {"line_fit_first", 2},
+            {"line_fit_last", 9}, {"band_ratio_min_order0", 0.02}, {"repair_kr0_column", true},
+            {"combine_reim", true}, {"field", false}, {"per_bead_normalise", true},
+            {"detect", {{"dog_small_lateral_um", 0.1}, {"dog_small_axial_um", 0.1},
+                        {"dog_large_lateral_um", 5.0}, {"dog_large_axial_um", 5.0},
+                        {"min_separation_lateral_um", 1.0}, {"min_separation_axial_um", 0.0},
+                        {"min_amplitude", 0.0}, {"min_amplitude_fraction", 0.05}, {"saturation_level", 0.0},
+                        {"roi_lateral_um", 1.5}, {"roi_axial_um", 0.0}, {"boundary_margin_lateral_um", 1.0},
+                        {"boundary_margin_axial_um", 0.0}, {"sigma_min_lateral_um", 0.05},
+                        {"sigma_max_lateral_um", 0.2}, {"sigma_min_axial_um", 0.0},
+                        {"sigma_max_axial_um", 0.0}, {"max_beads", 64}, {"max_residual", 0.0}}}};
+        const OtfMeasureRequest r = otfMeasureRequestFromJson(every, meta, dims);
+        CHECK(r.measure.patternPeriodUm == 0.504);
+        CHECK(r.measure.detect.maxBeads == 64);
     }
 
     SECTION("an enum value no front end should have sent names the key and its values, once") {
