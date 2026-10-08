@@ -30,8 +30,26 @@ namespace sirius {
         std::optional<std::vector<double>> k0_angles; // null, derive from k0_start_angles
         // Absolute phase of each raw frame, radians, length nphases. Empty: equal steps 2πj/nphases.
         std::optional<std::vector<double>> phase_steps;
-        // Modulation amplitudes that replace the fitted ones. Length norders (every direction)
-        // or ndirs * norders (per direction, direction-major). Empty: fit them.
+        // A magnitude FLOOR under the fitted modulation amplitudes, not a
+        // replacement for them: this is cudasirecon's `forcemodamp`
+        // (cudaSirecon.cpp, "force modamp's amplitude to be a value user
+        // provided"), and matching it matters because forcemodamp=0.5 is in
+        // the configs the user runs daily. Its rules, all four of which SIRIUS
+        // used to get wrong:
+        //   * SIDE BANDS ONLY. The loop runs order = 1 .. norders-1; order 0
+        //     is the widefield band and is never touched.
+        //   * A FLOOR. An order whose fitted magnitude already exceeds its
+        //     value is left exactly as fitted.
+        //   * THE FITTED PHASE SURVIVES. The complex amplitude is scaled by
+        //     floor/|amp|, so only its magnitude changes.
+        //   * ONE GATE FOR THE WHOLE FEATURE: the first entry of the list
+        //     being <= 0 switches it off, whatever the later entries say.
+        // Four lengths are accepted. norders-1 and ndirs*(norders-1) are
+        // cudasirecon's own, listing the side bands alone (and norders-1 is
+        // what a 3-phase config's single value is); norders and
+        // ndirs*norders are SIRIUS's older spelling, whose leading entry is
+        // order 0's and is ignored except as the gate. Per direction, the
+        // layout is direction-major. Empty: fit everything.
         std::optional<std::vector<double>> force_mod_amp;
 
         // Pixel sizes (um) in the sample plane
@@ -58,6 +76,13 @@ namespace sirius {
         bool equalizez = false; // ref = equalizez ? S[sidx(0, 0, 0)] : S[sidx(0, 0, z)]; where S(d, p, z) is plane sums over (ny, nx)
         bool no_kz0 = true;
         bool filter_overlaps = true;
+        // Fit the pattern vector, or take it as given. False is cudasirecon's
+        // `searchforvector=0`: skip the cross-correlation search and the
+        // angle/magnitude refinement, keep k0 exactly as k0_angles (or
+        // k0_start_angle) and linespacing_um state it, and fit only each
+        // order's modulation amplitude and phase against order 0
+        // (cudaSirecon.cpp:319, the "assume k0 vector known" branch).
+        bool search_pattern_vector = true;
 
         // The orders the reconstruction separates and assembles: norders, or
         // nphases / 2 + 1 when norders is 0. Everything that consumes the
@@ -75,6 +100,13 @@ namespace sirius {
             const int denom = resolvedOrders() - 1;
             return k / static_cast<double>(denom < 1 ? 1 : denom);
         }
+
+        // The magnitude floor forced onto direction `dir`'s order `order`, or
+        // 0 when none applies -- and 0 is a no-op, because a magnitude is
+        // never below it. One place decides what a force_mod_amp list of each
+        // accepted length means, so the reconstruction does not have to, and a
+        // dir or order out of range answers 0 rather than reading past the end.
+        double forcedModAmpFloor(int dir, int order) const noexcept;
 
         // Throws std::runtime_error on invalid parameters
         void validate() const;

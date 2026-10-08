@@ -1,6 +1,7 @@
 #ifndef SIRIUS_LEGACY_CONFIG
 #define SIRIUS_LEGACY_CONFIG
 
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -107,7 +108,97 @@ namespace sirius {
         std::string ifiles;
         std::string ofiles;
         std::string otffiles;
+
+        // ---- cudasirecon 1.2.0 ("2Beam3D") output and tiling keys --------
+        // These are in the vocabulary of the build the user runs daily and in
+        // neither 1.1.1's nor the fork's, and SIRIUS refused a file outright
+        // on the first of them. They are I/O and scheduling quantities, not
+        // reconstruction maths: SIRIUS reads them so the file loads, reports
+        // them through LegacyConversionReport as not applied, and leaves the
+        // acting on them to the caller. The semantics are the ones the
+        // binary's own option help states.
+
+        // "Write TIFF output as uint16 instead of float32 (clamps negatives
+        // to 0 and values above 65535)" -- an exporter concern.
+        bool  bUint16Output = false;
+        // "Constant value added to every pixel just before the uint16
+        // [0, 65535] clamp ... Only applied when --uint16 is set; default 0."
+        float uint16Offset = 0.0f;
+
+        // "Crop bounding box ... (0-indexed, inclusive, TIFF only)", applied
+        // to the raw stack at load time (SIM_Reconstructor::cropRawImageToBBox).
+        // z is in LOGICAL-z units, i.e. after the phases are de-interleaved.
+        // -1 means the key was not in the file. INCLUSIVE: the width is
+        // max - min + 1, so the user's two mounts are 2301 x 759 and
+        // 2301 x 751 -- odd in both lateral axes.
+        int cropXmin = -1, cropXmax = -1;
+        int cropYmin = -1, cropYmax = -1;
+        int cropZmin = -1, cropZmax = -1;
+
+        // "Chunk size along X/Y in raw input pixels (0 = entire axis)",
+        // chunkZ "in logical z-planes", and "Chunk overlap in raw input
+        // pixels (must be non-negative and even)". A tiling schedule for a
+        // stack too large to reconstruct in one piece, stitched afterwards;
+        // it is not a change to the reconstruction of any one tile.
+        int chunkX = 0, chunkY = 0, chunkZ = 0;
+        int chunkOverlap = 0;
+
+        // Every key the file actually set, in the order the file set them
+        // (a key repeated in the file appears once, at its first position).
+        // fromLegacy's report is computed against this, so a key that is
+        // parsed and then thrown away is visible instead of silent.
+        std::vector<std::string> keysPresent;
     };
+
+    // What fromLegacy() did with each key the file set.
+    enum class LegacyKeyStatus {
+        Applied,   // reaches SIMParameters, and the reconstruction honours it
+        Pending,   // reaches SIMParameters; nothing reads it yet
+        Dropped    // parsed so the file is accepted, then thrown away
+    };
+
+    // The audit of one conversion: accepting a key is not applying it, and
+    // before this existed a config saying `gammaApo=0.5` or `fitallphases=0`
+    // or `searchforvector=0` was read, stored on LegacyReconConfig and then
+    // silently ignored, so the run did something other than the file asked.
+    struct LegacyConversionReport {
+        std::vector<std::string> applied;   // keys in effect
+        std::vector<std::string> pending;   // carried, not yet acted on
+        std::vector<std::string> dropped;   // not in effect at all
+        // One "key: why" line per pending or dropped key, naming where the
+        // quantity has to be handled instead. Fit for a log or a dialog.
+        std::vector<std::string> notes;
+
+        // Everything the file asked for that is not in effect.
+        std::vector<std::string> notInEffect() const;
+        bool everythingApplied() const noexcept { return pending.empty() && dropped.empty(); }
+    };
+
+    // The status SIRIUS gives a recognized legacy key, and the reason line
+    // that goes with a Pending or Dropped one (empty for Applied). An
+    // unrecognized key yields Dropped and a reason saying so.
+    LegacyKeyStatus legacyKeyStatus(const std::string& key, std::string* reason = nullptr);
+
+    // Every key loadLegacyConfig accepts, sorted. For the test that keeps the
+    // parser's table and the status table from drifting apart.
+    std::vector<std::string> legacyConfigKeys();
+
+    // A crop bounding box from a legacy config, as a HALF-OPEN extent, for the
+    // caller that applies it. The file's bounds are 0-indexed and inclusive,
+    // so each size is max - min + 1; one place does that arithmetic, because
+    // an off-by-one here is invisible in the result.
+    struct LegacyCropBox {
+        int x0 = 0, y0 = 0, z0 = 0;
+        int nx = 0, ny = 0, nz = 0;
+    };
+
+    // The box the config asks for, or nullopt unless all six bounds are set
+    // and each max is >= its min. All six is what cudasirecon 1.2.0 demands of
+    // itself ("requires all 6 crop{X,Y,Z}{min,max}"), so a config giving four
+    // of them -- which both of the user's 2026-04-21 configs do -- yields
+    // nullopt here rather than a box with a guessed z range. z is in logical-z
+    // units, i.e. after the phases are de-interleaved.
+    std::optional<LegacyCropBox> legacyCropBox(const LegacyReconConfig& c);
 
     // Parse a legacy flat `key=value` cudasirecon config file. Blank lines and
     // lines beginning with '#' or ';' are ignored. Throws sirius::IoError on
@@ -116,7 +207,12 @@ namespace sirius {
 
     // Convert the legacy config into the modern, lean SIMParameters. Fields the
     // modern container does not model are dropped. The result is validated.
-    SIMParameters fromLegacy(const LegacyReconConfig& c);
+    // Pass `report` to learn which of the keys the file set are actually in
+    // effect: `fromLegacy` ends with validate(), so a file can be accepted by
+    // the parser and still be refused here, and a key can be accepted and then
+    // dropped without a word. The report is filled from c.keysPresent, so it
+    // is empty for a LegacyReconConfig built in code rather than parsed.
+    SIMParameters fromLegacy(const LegacyReconConfig& c, LegacyConversionReport* report = nullptr);
 
 } // namespace sirius
 

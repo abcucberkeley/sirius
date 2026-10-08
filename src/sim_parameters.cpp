@@ -27,6 +27,41 @@ namespace sirius {
         }
     } // namespace
 
+    double SIMParameters::forcedModAmpFloor(int dir, int order) const noexcept {
+        if (!force_mod_amp || force_mod_amp->empty()) return 0.0;
+        const std::vector<double>& f = *force_mod_amp;
+        // cudasirecon gates the whole feature on `forceamp[0] > 0.0`, with
+        // forceamp defaulting to a single 0. Kept exactly: the only case where
+        // a per-entry rule would differ is a leading entry <= 0 followed by a
+        // positive one, and there cudasirecon forces nothing.
+        if (f[0] <= 0.0) return 0.0;
+        const int orders = resolvedOrders();
+        // Order 0 is the widefield band. cudasirecon's loop starts at 1 and
+        // SIRIUS overwriting amps[0] with a real constant is what made the
+        // fitted amplitudes of findings 9k.51 incomparable.
+        if (order < 1 || order >= orders) return 0.0;
+        if (dir < 0 || dir >= ndirs) return 0.0;
+
+        const std::size_t n = f.size();
+        const std::size_t d = static_cast<std::size_t>(dir);
+        const std::size_t o = static_cast<std::size_t>(order);
+        const std::size_t all = static_cast<std::size_t>(orders);
+        const std::size_t side = static_cast<std::size_t>(orders - 1);
+        const std::size_t dirs = static_cast<std::size_t>(ndirs);
+
+        // SIRIUS's two older lengths are tested FIRST, so that a length which
+        // already validated today keeps the meaning it had today: at
+        // ndirs == 2, norders == 2 a list of 2 is ndirs*(norders-1) as well as
+        // norders, and it was norders before this function existed.
+        std::size_t idx = 0;
+        if (n == all)                  idx = o;              // shared, order-indexed
+        else if (n == dirs * all)      idx = d * all + o;    // per direction, order-indexed
+        else if (n == side)            idx = o - 1;          // shared, side bands (cudasirecon's)
+        else if (n == dirs * side)     idx = d * side + o - 1;
+        else return 0.0;                                     // validate() refuses these
+        return f[idx];
+    }
+
     void SIMParameters::validate() const {
         // NaN passes every range check below (each comparison with it is
         // false), and an infinity overflows the cutoffs derived from these.
@@ -64,8 +99,15 @@ namespace sirius {
             for (double a : *force_mod_amp)
                 if (!std::isfinite(a)) throw std::runtime_error("force_mod_amp must be finite");
             const int n = static_cast<int>(force_mod_amp->size());
-            if (n != orders && n != ndirs * orders)
-                throw std::runtime_error("force_mod_amp length must be norders (" + std::to_string(orders) + ") or ndirs*norders (" +
+            // cudasirecon indexes forceamp[order - 1] over order = 1..norders-1
+            // and shares one list across directions, so norders-1 is its own
+            // length -- and the single 0.5 of a 3-phase config is that length.
+            // Demanding `orders` here is what refused the user's own file.
+            const int side = orders - 1;
+            if (n != orders && n != ndirs * orders && n != side && n != ndirs * side)
+                throw std::runtime_error("force_mod_amp length must be norders-1 (" + std::to_string(side) +
+                                         "), ndirs*(norders-1) (" + std::to_string(ndirs * side) + "), norders (" +
+                                         std::to_string(orders) + ") or ndirs*norders (" +
                                          std::to_string(ndirs * orders) + "), got " + std::to_string(n));
         }
         if (na <= 0.0) throw std::runtime_error("na must be > 0");
@@ -143,6 +185,7 @@ namespace sirius {
         output.insert("equalizez", p.equalizez);
         output.insert("no_kz0", p.no_kz0);
         output.insert("filter_overlaps", p.filter_overlaps);
+        output.insert("search_pattern_vector", p.search_pattern_vector);
 
         toml::table tbl;
         tbl.insert("optics", std::move(optics));
@@ -211,6 +254,7 @@ namespace sirius {
         p.equalizez = output["equalizez"].value_or(p.equalizez);
         p.no_kz0 = output["no_kz0"].value_or(p.no_kz0);
         p.filter_overlaps = output["filter_overlaps"].value_or(p.filter_overlaps);
+        p.search_pattern_vector = output["search_pattern_vector"].value_or(p.search_pattern_vector);
 
         if (auto s = output["apodize_input"].value<std::string>())
             p.apodize_input = apodizeFromString(*s);

@@ -1,9 +1,11 @@
 #include "sirius/legacy_config.hpp"
 #include "sirius/errors.hpp"
 
+#include <algorithm>
 #include <cctype>
 #include <fstream>
 #include <functional>
+#include <optional>
 #include <sstream>
 #include <stdexcept>
 #include <string>
@@ -115,7 +117,11 @@ namespace sirius {
                 {"zzoom", [](auto& c, auto& k, auto& v) { c.z_zoom = parseInt(k, v); }},
                 {"nzPadTo", [](auto& c, auto& k, auto& v) { c.nzPadTo = parseInt(k, v); }},
                 {"explodefact", [](auto& c, auto& k, auto& v) { c.explodefact = parseFloat(k, v); }},
+                // 1.1.1 spells it `nofilteroverlaps`; 1.2.0 and the user's
+                // fork spell the same switch `nofilterovlps`, and SIRIUS knew
+                // only the first, so the fork's own vocabulary was refused.
                 {"nofilteroverlaps", [](auto& c, auto& k, auto& v) { c.bFilteroverlaps = !parseBool(k, v); }},
+                {"nofilterovlps", [](auto& c, auto& k, auto& v) { c.bFilteroverlaps = !parseBool(k, v); }},
                 {"recalcarrays", [](auto& c, auto& k, auto& v) { c.recalcarrays = parseInt(k, v); }},
                 {"napodize", [](auto& c, auto& k, auto& v) { c.napodize = parseInt(k, v); }},
                 {"searchforvector", [](auto& c, auto& k, auto& v) { c.bSearchforvector = parseInt(k, v); }},
@@ -169,11 +175,193 @@ namespace sirius {
                 {"input", [](auto& c, auto&, auto& v) { c.ifiles = v; }},
                 {"output", [](auto& c, auto&, auto& v) { c.ofiles = v; }},
                 {"otf", [](auto& c, auto&, auto& v) { c.otffiles = v; }},
+
+                // cudasirecon 1.2.0's output and tiling keys. Every one of
+                // these appears in a config the user runs daily and in no
+                // earlier cudasirecon, and the parser threw on the first of
+                // them, so the whole file was refused.
+                {"uint16", [](auto& c, auto& k, auto& v) { c.bUint16Output = parseBool(k, v); }},
+                {"uint16offset", [](auto& c, auto& k, auto& v) { c.uint16Offset = parseFloat(k, v); }},
+                {"cropXmin", [](auto& c, auto& k, auto& v) { c.cropXmin = parseInt(k, v); }},
+                {"cropXmax", [](auto& c, auto& k, auto& v) { c.cropXmax = parseInt(k, v); }},
+                {"cropYmin", [](auto& c, auto& k, auto& v) { c.cropYmin = parseInt(k, v); }},
+                {"cropYmax", [](auto& c, auto& k, auto& v) { c.cropYmax = parseInt(k, v); }},
+                {"cropZmin", [](auto& c, auto& k, auto& v) { c.cropZmin = parseInt(k, v); }},
+                {"cropZmax", [](auto& c, auto& k, auto& v) { c.cropZmax = parseInt(k, v); }},
+                {"chunkX", [](auto& c, auto& k, auto& v) { c.chunkX = parseInt(k, v); }},
+                {"chunkY", [](auto& c, auto& k, auto& v) { c.chunkY = parseInt(k, v); }},
+                {"chunkZ", [](auto& c, auto& k, auto& v) { c.chunkZ = parseInt(k, v); }},
+                {"chunkOverlap", [](auto& c, auto& k, auto& v) { c.chunkOverlap = parseInt(k, v); }},
+            };
+            return table;
+        }
+
+        // What fromLegacy() does with each recognized key, and why, when the
+        // answer is not "applies it". Accepting a key is not applying it: the
+        // parser stores every key on LegacyReconConfig, and fromLegacy maps
+        // only part of that onto SIMParameters. Before this table existed, the
+        // difference was invisible -- a config saying gammaApo=0.5 or
+        // fitallphases=0 or searchforvector=0 was read without complaint and
+        // then reconstructed with SIRIUS's own value instead.
+        //
+        // Keeping it next to aliasTable() is deliberate: legacyConfigKeys()
+        // and a test compare the two key sets, so a new alias without a status
+        // fails the suite rather than being reported as applied by default.
+        struct KeyStatus {
+            LegacyKeyStatus status;
+            const char*     reason;   // "" for Applied
+        };
+
+        const std::unordered_map<std::string, KeyStatus>& statusTable() {
+            constexpr auto A = LegacyKeyStatus::Applied;
+            constexpr auto P = LegacyKeyStatus::Pending;
+            constexpr auto D = LegacyKeyStatus::Dropped;
+            static const std::unordered_map<std::string, KeyStatus> table = {
+                // --- in effect ------------------------------------------------
+                {"ndirs", {A, ""}},
+                {"nphases", {A, ""}},
+                {"nordersout", {A, ""}},
+                {"norders", {A, ""}},
+                {"ls", {A, ""}},
+                {"angle0", {A, ""}},
+                {"k0angles", {A, ""}},
+                {"na", {A, ""}},
+                {"nimm", {A, ""}},
+                {"wavelength", {A, ""}},
+                {"xyres", {A, ""}},
+                {"zres", {A, ""}},
+                {"zresPSF", {A, ""}},
+                {"otfcutoff", {A, ""}},
+                {"zoomfact", {A, ""}},
+                {"zzoom", {A, ""}},
+                {"explodefact", {A, ""}},
+                {"nofilteroverlaps", {A, ""}},
+                {"nofilterovlps", {A, ""}},
+                {"napodize", {A, ""}},
+                {"apodizeoutput", {A, ""}},
+                {"nosuppress", {A, ""}},
+                {"suppressR", {A, ""}},
+                {"dampenOrder0", {A, ""}},
+                {"norescale", {A, ""}},
+                {"equalizez", {A, ""}},
+                {"nokz0", {A, ""}},
+                {"wiener", {A, ""}},
+                {"fastSI", {A, ""}},
+                {"forcemodamp", {A, ""}},
+                {"phaseSteps", {A, ""}},
+                {"background", {A, ""}},
+
+                // --- carried onto SIMParameters, not yet acted on -------------
+                {"searchforvector",
+                 {P, "mapped to SIMParameters::search_pattern_vector, which the "
+                     "reconstruction does not read yet: k0 is fitted even when the file "
+                     "says it is known"}},
+
+                // --- parsed so the file loads, then thrown away ---------------
+                {"gammaApo",
+                 {D, "output apodization gamma: SIMParameters has no gamma, so the "
+                     "reconstruction always uses 1 (plain triangular apodization)"}},
+                {"fitallphases",
+                 {D, "SIRIUS always uses every fitted phase; cudasirecon's 0 infers "
+                     "order 2 and above from order 1's phase"}},
+                {"equalizet",
+                 {D, "bleach correction across time: SIRIUS reconstructs one (c, t) "
+                     "volume at a time, so there is no series to equalize here"}},
+                {"wienerInr", {D, "the per-order Wiener increment is not modelled"}},
+                {"nbeams", {D, "the beam count is not modelled; the order count comes from nphases/norders"}},
+                {"recalcarrays", {D, "a cudasirecon caching strategy with no counterpart"}},
+                {"usetime0k0", {D, "SIRIUS fits each (c, t) volume it is given, so there is no time 0 to reuse"}},
+                {"k0searchAll", {D, "SIRIUS already fits k0 on every volume it reconstructs, which is what this asks for"}},
+                {"nzPadTo", {D, "axial padding of the input is not modelled"}},
+                {"2lenses", {D, "I5S (two-objective) data is not supported"}},
+                {"bessel", {D, "Bessel-SIM is not supported"}},
+                {"besselNA", {D, "Bessel-SIM is not supported"}},
+                {"besselLambdaEx", {D, "Bessel-SIM is not supported"}},
+                {"besselExWave", {D, "Bessel-SIM is not supported"}},
+                {"deskew", {D, "deskewing is a preprocessing step, not a reconstruction parameter"}},
+                {"deskewshift", {D, "deskewing is a preprocessing step, not a reconstruction parameter"}},
+                {"noRecon", {D, "whether to reconstruct is the caller's decision, not a parameter of the reconstruction"}},
+                {"writeTitle", {D, "writes the command line into an MRC header; SIRIUS does not write MRC"}},
+                {"otfRA", {D, "SIRIUS reads the radially averaged table the OTF file itself declares"}},
+                {"otfPerAngle", {D, "one OTF per angle is not supported; one table serves every direction"}},
+                {"nxotf", {D, "the OTF file carries its own geometry (otf_io.cpp); a config's copy is ignored"}},
+                {"nyotf", {D, "the OTF file carries its own geometry (otf_io.cpp); a config's copy is ignored"}},
+                {"nzotf", {D, "the OTF file carries its own geometry (otf_io.cpp); a config's copy is ignored"}},
+                {"dkrotf", {D, "the OTF sampling is derived from the pixel sizes, not read from the config"}},
+                {"dkzotf", {D, "the OTF sampling is derived from the pixel sizes, not read from the config"}},
+                {"fixdrift", {D, "drift correction between directions is not implemented"}},
+                {"drift_filter_fact", {D, "drift correction between directions is not implemented"}},
+                {"bgInExtHdr", {D, "a per-frame background in an MRC extended header; SIRIUS does not read MRC headers here"}},
+                {"usecorr", {D, "flat-field correction is a separate operation; pass the field to it"}},
+                {"readoutNoiseVar", {D, "camera noise modelling is not implemented"}},
+                {"electrons_per_bit", {D, "camera gain is not modelled"}},
+                {"makemodel", {D, "a cudasirecon debug output"}},
+                {"saveprefiltered", {D, "a cudasirecon debug output; SIRIUS captures bands through setCaptureDiagnostics"}},
+                {"savealignedraw", {D, "a cudasirecon debug output; SIRIUS captures bands through setCaptureDiagnostics"}},
+                {"saveoverlaps", {D, "a cudasirecon debug output; SIRIUS captures bands through setCaptureDiagnostics"}},
+                {"input", {D, "a file path: the caller opens the dataset"}},
+                {"output", {D, "a file path: the caller writes the result"}},
+                {"otf", {D, "a file path: the caller passes the OTF to the step"}},
+                {"version", {D, "a cudasirecon CLI flag (print the version); it is not a parameter"}},
+
+                // 1.2.0's I/O and tiling keys. All of them describe what to
+                // read and how to schedule it, so none belongs in
+                // SIMParameters; see the report notes for where each goes.
+                {"uint16", {D, "writes the output TIFF as uint16 instead of float32: an exporter option, not a reconstruction parameter"}},
+                {"uint16offset", {D, "an offset added before the uint16 clamp: an exporter option, not a reconstruction parameter"}},
+                {"cropXY", {D, "crop the lateral dimensions to a size: the caller crops before the step runs"}},
+                {"cropXmin", {D, "crop bounding box (0-indexed, inclusive): the caller crops the dataset before the step runs"}},
+                {"cropXmax", {D, "crop bounding box (0-indexed, inclusive): the caller crops the dataset before the step runs"}},
+                {"cropYmin", {D, "crop bounding box (0-indexed, inclusive): the caller crops the dataset before the step runs"}},
+                {"cropYmax", {D, "crop bounding box (0-indexed, inclusive): the caller crops the dataset before the step runs"}},
+                {"cropZmin", {D, "crop bounding box in logical z (0-indexed, inclusive): the caller crops the dataset before the step runs"}},
+                {"cropZmax", {D, "crop bounding box in logical z (0-indexed, inclusive): the caller crops the dataset before the step runs"}},
+                {"chunkX", {D, "a tiling schedule for a stack too large to reconstruct in one piece: the caller tiles and stitches"}},
+                {"chunkY", {D, "a tiling schedule for a stack too large to reconstruct in one piece: the caller tiles and stitches"}},
+                {"chunkZ", {D, "a tiling schedule for a stack too large to reconstruct in one piece: the caller tiles and stitches"}},
+                {"chunkOverlap", {D, "the overlap of the tiling schedule: the caller tiles and stitches"}},
             };
             return table;
         }
 
     } // namespace
+
+    std::vector<std::string> LegacyConversionReport::notInEffect() const {
+        std::vector<std::string> out = pending;
+        out.insert(out.end(), dropped.begin(), dropped.end());
+        return out;
+    }
+
+    LegacyKeyStatus legacyKeyStatus(const std::string& key, std::string* reason) {
+        const auto& table = statusTable();
+        const auto it = table.find(key);
+        if (it == table.end()) {
+            if (reason) *reason = "not a key SIRIUS recognizes";
+            return LegacyKeyStatus::Dropped;
+        }
+        if (reason) *reason = it->second.reason;
+        return it->second.status;
+    }
+
+    std::optional<LegacyCropBox> legacyCropBox(const LegacyReconConfig& c) {
+        const int lo[3] = {c.cropXmin, c.cropYmin, c.cropZmin};
+        const int hi[3] = {c.cropXmax, c.cropYmax, c.cropZmax};
+        for (int a = 0; a < 3; ++a)
+            if (lo[a] < 0 || hi[a] < lo[a]) return std::nullopt;
+        LegacyCropBox b;
+        b.x0 = lo[0]; b.nx = hi[0] - lo[0] + 1;
+        b.y0 = lo[1]; b.ny = hi[1] - lo[1] + 1;
+        b.z0 = lo[2]; b.nz = hi[2] - lo[2] + 1;
+        return b;
+    }
+
+    std::vector<std::string> legacyConfigKeys() {
+        std::vector<std::string> out;
+        out.reserve(aliasTable().size());
+        for (const auto& entry : aliasTable()) out.push_back(entry.first);
+        std::sort(out.begin(), out.end());
+        return out;
+    }
 
     LegacyReconConfig loadLegacyConfig(const std::string& path) {
         std::ifstream file(path);
@@ -204,11 +392,15 @@ namespace sirius {
                 throw IoError("Unknown legacy config key '" + key +
                               "' on line " + std::to_string(lineNo) + " of " + path);
             it->second(c, key, val);
+            // In file order, once per key: the parser is last-wins, so a
+            // repeated key is one entry, at the position it first appeared.
+            if (std::find(c.keysPresent.begin(), c.keysPresent.end(), key) == c.keysPresent.end())
+                c.keysPresent.push_back(key);
         }
         return c;
     }
 
-    SIMParameters fromLegacy(const LegacyReconConfig& c) {
+    SIMParameters fromLegacy(const LegacyReconConfig& c, LegacyConversionReport* report) {
         SIMParameters p;
 
         p.ndirs = c.ndirs;
@@ -247,6 +439,9 @@ namespace sirius {
         p.equalizez = c.equalizez;
         p.no_kz0 = c.bNoKz0;
         p.filter_overlaps = c.bFilteroverlaps;
+        // searchforvector was parsed and stored and then never mapped, so a
+        // file saying the pattern vector is known was searched for anyway.
+        p.search_pattern_vector = (c.bSearchforvector != 0);
 
         // Legacy decodes the input apodization from napodize at runtime in
         // apodizationDriver(): >0 => edge ("triangle") blend of that width,
@@ -270,6 +465,27 @@ namespace sirius {
             default:
                 throw IoError("apodizeoutput must be 0, 1, or 2, got: " +
                               std::to_string(c.apodizeoutput));
+        }
+
+        // Filled before validate(), so a caller that catches the validation
+        // error still gets the audit of the file it was handed.
+        if (report) {
+            *report = LegacyConversionReport{};
+            for (const std::string& key : c.keysPresent) {
+                std::string why;
+                switch (legacyKeyStatus(key, &why)) {
+                    case LegacyKeyStatus::Applied:
+                        report->applied.push_back(key);
+                        continue;
+                    case LegacyKeyStatus::Pending:
+                        report->pending.push_back(key);
+                        break;
+                    case LegacyKeyStatus::Dropped:
+                        report->dropped.push_back(key);
+                        break;
+                }
+                report->notes.push_back(key + ": " + why);
+            }
         }
 
         p.validate();
