@@ -591,7 +591,11 @@ class TestSimStep(unittest.TestCase):
         self.assertEqual(int(np.count_nonzero(~np.isfinite(r.array))), 0)
         self.assertEqual(len(r.info["fits"][0]["k0"]), 3)
 
-        # the one wording, straight from the library, and what it is of
+        # The one wording, straight from the library, reached through the
+        # PACKAGE and not the extension module -- sirius/__init__.py has to
+        # re-export it or `sirius.sim_image_size_problem` is an AttributeError
+        # for every caller, which is how job 4247406 found it missing.
+        self.assertIn("sim_image_size_problem", sirius.__all__)
         self.assertEqual(sirius.sim_image_size_problem(281, 241), "")   # the isoar stack
         self.assertEqual(sirius.sim_image_size_problem(5, 7), "")
         self.assertEqual(sirius.sim_image_size_problem(4, 4), "")
