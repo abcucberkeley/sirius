@@ -28,6 +28,39 @@ namespace sirius {
         double nimm = 1.33;   // immersion refractive index (>= na)
         double wavelength_nm = 510.;   // emission wavelength (nm)
         std::optional<std::vector<double>> k0_angles; // null, derive from k0_start_angles
+        // Whether the illumination intensity is modulated along z as well as
+        // laterally -- whether the pattern carries an AXIAL COMPONENT. It is
+        // a property of how the beams were launched, so it is stated here and
+        // never inferred.
+        //
+        // TRUE (the default, and what SIRIUS has always assumed) is
+        // three-beam illumination: both first diffraction orders AND the
+        // undiffracted central beam reach the sample, each side band
+        // interferes with the central beam, and the pattern is modulated in z
+        // at the axial frequency kz1 = kex - sqrt(kex^2 - k1^2). idealOTF then
+        // builds order 1 as the mean of the widefield OTF shifted by +-kz1,
+        // which is where a 3D-SIM side band's support actually sits.
+        // Acquisitions with this value: cudasirecon's own 3-angle 5-phase
+        // stack (tests/data/raw.tif, 3 orders), and 3D-SIM on a commercial
+        // scope generally.
+        //
+        // FALSE is two-beam illumination: the central beam is blocked or only
+        // two beams are launched, the two side beams interfere with each other
+        // alone, and the pattern is a pure lateral sinusoid, constant along z
+        // (illum = 1 + m cos(2 pi k0 . r + phi), no z term). Its order-1 band
+        // is then the PLAIN WIDEFIELD OTF, unshifted. Acquisitions with this
+        // value: the iSOAR2 2-beam 3-phase stacks (Data/iSOAR2_nvme2, and the
+        // 2026-04-21 configs' ndirs 1 x nphases 3), the lab's mmmSIM
+        // calibration and phantom stacks, and 2D / TIRF-SIM.
+        //
+        // NOT DERIVED FROM THE ORDER COUNT, deliberately. A 3-phase stack
+        // resolves two orders and is usually two-beam, but a 5-phase
+        // three-beam stack reconstructed with norders = 2 is not, and deciding
+        // from the order count would silently change results that already
+        // exist. It affects only the THEORETICAL OTF (idealOTF): a measured
+        // OTF carries whatever axial structure its bead stack had, so nothing
+        // here touches it.
+        bool illumination_has_axial_component = true;
         // Absolute phase of each raw frame, radians, length nphases. Empty: equal steps 2πj/nphases.
         std::optional<std::vector<double>> phase_steps;
         // A magnitude FLOOR under the fitted modulation amplitudes, not a

@@ -146,6 +146,9 @@ namespace sirius {
         optics.insert("na", p.na);
         optics.insert("nimm", p.nimm);
         optics.insert("wavelength_nm", p.wavelength_nm);
+        // A property of the illumination, so it lives with the optics rather
+        // than with the output knobs. Only idealOTF reads it.
+        optics.insert("illumination_has_axial_component", p.illumination_has_axial_component);
         if (p.k0_angles) {
             toml::array arr;
             for (double a : *p.k0_angles)
@@ -217,6 +220,8 @@ namespace sirius {
         p.na = optics["na"].value_or(p.na);
         p.nimm = optics["nimm"].value_or(p.nimm);
         p.wavelength_nm = optics["wavelength_nm"].value_or(p.wavelength_nm);
+        p.illumination_has_axial_component =
+            optics["illumination_has_axial_component"].value_or(p.illumination_has_axial_component);
 
         auto readDoubles = [](auto node) -> std::optional<std::vector<double>> {
             auto* arr = node.as_array();
