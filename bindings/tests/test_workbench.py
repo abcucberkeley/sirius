@@ -480,6 +480,93 @@ class TestSimStep(unittest.TestCase):
         with self.assertRaises(wb.NotAvailable):
             wb.run_step("sim", {"angles": 3, "phases": 5}, raw)
 
+    def test_sim_from_file_reconstructs_with_the_files_pixel_sizes(self):
+        # tests/test_app_ops.cpp "SIM From file reconstructs with the file's
+        # pixel sizes": a cudasirecon config's xyres / zres are what it
+        # reconstructs a TIFF stack with, and a measured OTF's radial step is
+        # derived from xyres, so the dataset's calibration (none for a plain
+        # TIFF, or mistaken: on 2026-10-08 sirius-cli was handed raw.tif's
+        # voxel in z, y, x order) must not stretch the OTF. The file's pixel
+        # sizes win where it sets them, the stack's fill in the rest. The
+        # worker runs every node-side SIM step through this module, so the
+        # fix in sim.cpp alone left the node route reconstructing with
+        # dx = 0.125 and "the overlap of orders 0 and 2 holds no signal".
+        sirius = _sirius_extension()
+        wrong = {"voxel_um": [0.125, 0.08, 0.08]}
+        params = {"mode": "From file", "params_file": str(self.DATA / "config.txt"), "otf": str(self.DATA / "otf.tif")}
+        p = wb._sim_parameters(params, wrong)   # xyres=0.08 zres=0.125 zresPSF=0.125
+        self.assertAlmostEqual(p.dx, 0.08, places=9)
+        self.assertAlmostEqual(p.dy, 0.08, places=9)
+        self.assertAlmostEqual(p.dz, 0.125, places=9)
+        self.assertAlmostEqual(p.dz_psf, 0.125, places=9)
+        with tempfile.TemporaryDirectory() as d:
+            # a file without pixel sizes takes the stack's
+            bare = Path(d) / "bare.txt"
+            bare.write_text("nphases=5\nndirs=3\nna=1.42\nnimm=1.515\nls=0.2035\n")
+            q = wb._sim_parameters({"mode": "From file", "params_file": str(bare)}, wrong)
+            self.assertAlmostEqual(q.dx, 0.125, places=9)
+            self.assertAlmostEqual(q.dy, 0.08, places=9)
+            self.assertAlmostEqual(q.dz, 0.08, places=9)
+            self.assertAlmostEqual(q.dz_psf, 0.08, places=9)
+            # a TOML file's pixels table is the same contract
+            toml = Path(d) / "pixels.toml"
+            toml.write_text("pixels = { dx = 0.07, dy = 0.07, dz = 0.15 }\n"
+                            "[optics]\nndirs = 3\nnphases = 5\nna = 1.42\nnimm = 1.515\nlinespacing_um = 0.2035\n")
+            q = wb._sim_parameters({"mode": "From file", "params_file": str(toml)}, wrong)
+            self.assertAlmostEqual(q.dx, 0.07, places=9)
+            self.assertAlmostEqual(q.dy, 0.07, places=9)
+            self.assertAlmostEqual(q.dz, 0.15, places=9)
+            self.assertAlmostEqual(q.dz_psf, 0.08, places=9)   # not in the file: the stack's dz
+        # Estimate mode has no file: the stack's
+        q = wb._sim_parameters({"mode": "Estimate"}, wrong)
+        self.assertAlmostEqual(q.dx, 0.125, places=9)
+        self.assertAlmostEqual(q.dy, 0.08, places=9)
+        self.assertAlmostEqual(q.dz, 0.08, places=9)
+        # and the reconstruction is cudasirecon's own (raw_proc.tif), as it
+        # is from a correctly opened dataset
+        raw = sirius.read_tiff(str(self.DATA / "raw.tif"), dtype=np.float32)
+        expected = sirius.read_tiff(str(self.DATA / "raw_proc.tif"), dtype=np.float32)
+        r = wb.run_step("sim", params, raw, wrong, device="cpu")
+        self.assertEqual(r.array.shape, (1, 1) + expected.shape)
+        rel = np.max(np.abs(r.array[0, 0] - expected)) / np.max(np.abs(expected))
+        self.assertLess(rel, 1e-3)
+        # the output voxel is the reconstruction's pixel, not the dataset's claim
+        self.assertAlmostEqual(r.meta["voxel_um"][0], 0.04, places=9)
+        self.assertAlmostEqual(r.meta["voxel_um"][1], 0.04, places=9)
+        self.assertAlmostEqual(r.meta["voxel_um"][2], 0.125, places=9)
+        right = wb.run_step("sim", params, raw, {"voxel_um": [0.08, 0.08, 0.125]}, device="cpu")
+        np.testing.assert_array_equal(right.array, r.array)
+
+    def test_sim_from_file_keeps_the_files_otf_axial_step_unless_the_field_is_set(self):
+        # tests/test_app_ops.cpp "SIM From file keeps the file's OTF axial
+        # step unless the field is set": 0 in dz_psf means "not set"
+        meta = {"voxel_um": [0.1, 0.1, 0.2]}
+
+        def dz_psf(path, **extra):
+            return wb._sim_parameters(dict({"mode": "From file", "params_file": str(path)}, **extra), meta).dz_psf
+
+        with tempfile.TemporaryDirectory() as d:
+            cfg = Path(d) / "dzpsf.txt"
+            cfg.write_text("nphases=5\nndirs=3\nna=1.2\nnimm=1.33\nxyres=0.1\nzres=0.2\nzresPSF=0.5\nls=0.2\n")
+            self.assertAlmostEqual(dz_psf(cfg), 0.5, places=9)
+            self.assertAlmostEqual(dz_psf(cfg, dz_psf=0.3), 0.3, places=9)
+            bare = Path(d) / "bare.txt"
+            bare.write_text("nphases=5\nndirs=3\nna=1.2\nnimm=1.33\nxyres=0.1\nzres=0.2\nls=0.2\n")
+            self.assertAlmostEqual(dz_psf(bare), 0.2, places=9)   # not in the file: the stack's dz
+            # an inline table and a dotted key are both assignments the
+            # loader reads; a scanner that only looks at the first '=' on a
+            # line misses them and replaces the file's step with the stack dz
+            inlined = Path(d) / "inline.toml"
+            inlined.write_text("pixels = { dx = 0.1, dy = 0.1, dz = 0.2, dz_psf = 0.55 }\n"
+                               "[optics]\nndirs = 3\nnphases = 5\nna = 1.2\nnimm = 1.33\nlinespacing_um = 0.2\n")
+            self.assertAlmostEqual(dz_psf(inlined), 0.55, places=6)
+            dotted = Path(d) / "dotted.toml"
+            dotted.write_text("pixels.dx = 0.1\npixels.dy = 0.1\npixels.dz = 0.2\npixels.dz_psf = 0.45\n"
+                              "[optics]\nndirs = 3\nnphases = 5\nna = 1.2\nnimm = 1.33\nlinespacing_um = 0.2\n")
+            self.assertAlmostEqual(dz_psf(dotted), 0.45, places=6)
+        self.assertAlmostEqual(wb._sim_parameters({"mode": "Estimate"}, meta).dz_psf, 0.2, places=9)
+        self.assertAlmostEqual(wb._sim_parameters({"mode": "Estimate", "dz_psf": 0.3}, meta).dz_psf, 0.3, places=9)
+
 
 class TestParameters(unittest.TestCase):
     def test_unknown_keys_warn_and_are_ignored(self):

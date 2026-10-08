@@ -188,7 +188,7 @@
         {
           "advanced": false,
           "default": "",
-          "help": "Used by the From file mode. Its pixel sizes (xyres, zres, zresPSF; pixels.dx, dy, dz, dz_psf) win over the dataset's, as in cudasirecon",
+          "help": "Used by the From file mode. The pixel sizes it sets (xyres, zres, zresPSF; pixels.dx, dy, dz, dz_psf) win over the dataset's; the dataset fills in what the file leaves out",
           "key": "params_file",
           "label": "Parameter file",
           "read_only": false,

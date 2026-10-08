@@ -3119,7 +3119,10 @@ _SIM = StepSpec(
              "dampen_order0": "suppress_zero_order", "suppress_zero": "suppress_zero_order",
              "apodize_output": "apodization", "otf_cutoff": "otfcutoff", "immersion": "nimm",
              "otf_path": "otf", "otf_file": "otf", "config": "params_file", "parameter_file": "params_file"},
-    extra=("dx", "dy", "dz", "fast_si"),   # SIMParameters fields the metadata normally provides
+    # SIMParameters fields the metadata normally provides; dx / dy / dz stand
+    # in for the metadata's voxel, and a parameter file's pixel sizes win over
+    # them as they win over the metadata (_sim_parameters)
+    extra=("dx", "dy", "dz", "fast_si"),
     translate=_sim_legacy)
 
 
@@ -3146,6 +3149,58 @@ def _sim_parameter_format(path: str) -> str:
                 continue
             return "toml" if s[0] == "[" else "legacy"
     return "legacy"   # an empty file: the legacy loader yields defaults
+
+
+class _SimParameterFileKeys:
+    """The keys a parameter file assigns -- lower-cased, the last segment of
+    a dotted key -- and whether the file is TOML, as sim.cpp's
+    parameterFileKeys scans them. From file, a key the file sets is the
+    file's value, and a missing key is not the library default but the
+    stack's: the pixel sizes and the OTF's axial step."""
+
+    def __init__(self) -> None:
+        self.toml = False
+        self.keys: set = set()
+
+    def has(self, toml_key: str, legacy_key: str) -> bool:
+        # only the key the loader actually reads for a quantity: dz_psf in
+        # TOML (including a .toml file with no [table] header), zresPSF in a
+        # cudasirecon file
+        return (toml_key if self.toml else legacy_key) in self.keys
+
+
+def _sim_parameter_file_keys(path: str) -> _SimParameterFileKeys:
+    found = _SimParameterFileKeys()
+    try:
+        with open(path, encoding="utf-8", errors="replace") as f:
+            lines = f.read().split("\n")
+    except OSError:
+        return found
+    found.toml = _sim_parameter_format(path) == "toml"
+    text = ""
+    for line in lines:
+        cut = [i for i in (line.find("#"), line.find(";")) if i >= 0]
+        if cut:
+            line = line[:min(cut)]
+        text += line + "\n"
+    # every assignment, not only the first '=' on the line, so a dotted key
+    # and an inline table (pixels.dz_psf, pixels = { dz_psf = ... }) count
+    key_chars = "_.\"'"
+    eq = text.find("=")
+    while eq >= 0:
+        end = eq
+        while end > 0 and text[end - 1] in " \t":
+            end -= 1
+        begin = end
+        while begin > 0 and (text[begin - 1] in key_chars or
+                             ("0" <= text[begin - 1] <= "9") or ("a" <= text[begin - 1].lower() <= "z")):
+            begin -= 1
+        key = "".join(c for c in text[begin:end] if c not in "\"'").lower()
+        key = key.rsplit(".", 1)[-1]
+        if key:
+            found.keys.add(key)
+        eq = text.find("=", eq + 1)
+    return found
 
 
 def _sim_parameters(params: Dict[str, Any], meta: Dict[str, Any]):
@@ -3200,15 +3255,37 @@ def _sim_parameters(params: Dict[str, Any], meta: Dict[str, Any]):
         p.equalizez = _bool(params, "equalizez", False)
         sim = meta.get("sim") or {}
         p.fast_si = bool(sim.get("present") and sim.get("fast_si"))
+    # The pixel sizes: the file's where it sets them, the stack's otherwise,
+    # as sim.cpp's buildParameters has it since 2026-10-08. A cudasirecon
+    # config's xyres / zres are the pixel sizes it reconstructs a TIFF stack
+    # with, and the radial step of a measured OTF is derived from xyres, so a
+    # step driven by such a file must use them whatever the dataset's
+    # calibration says (a plain TIFF has none; sirius-cli was handed one in
+    # z, y, x order, and dx = 0.125 for a 0.08 um pixel stretched the OTF's
+    # radial axis until every fit ended in "the overlap of orders 0 and 2
+    # holds no signal"). The worker runs every node-side SIM step through
+    # this function, so the rule has to hold here as well as in the
+    # application, or a local and a node run of one pipeline differ. The
+    # Python-only dx / dy / dz keys stand in for the metadata's voxel.
+    file_keys = _sim_parameter_file_keys(cfg) if mode == "From file" else _SimParameterFileKeys()
     vx, vy, vz = _voxel_um(meta)
-    p.dx, p.dy, p.dz = float(vx), float(vy), float(vz)
-    for k in ("dx", "dy", "dz"):
-        if params.get(k) is not None:
-            setattr(p, k, _float(params, k, getattr(p, k)))
+    vx, vy, vz = _float(params, "dx", vx), _float(params, "dy", vy), _float(params, "dz", vz)
+    if not file_keys.has("dx", "xyres"):
+        p.dx = vx
+    if not file_keys.has("dy", "xyres"):
+        p.dy = vy
+    if not file_keys.has("dz", "zres"):
+        p.dz = vz
     if params.get("fast_si") is not None:
         p.fast_si = _bool(params, "fast_si", p.fast_si)
+    # 0 means "not set". From file, that keeps the file's OTF step (and the
+    # stack's dz only when the file has none); Estimate and Manual have no
+    # file, so 0 means the stack's dz.
     dz_psf = _float(params, "dz_psf", 0.0)
-    p.dz_psf = dz_psf if dz_psf > 0.0 else p.dz
+    if dz_psf > 0.0:
+        p.dz_psf = dz_psf
+    elif not file_keys.has("dz_psf", "zrespsf"):
+        p.dz_psf = vz
     p.validate()
     return p
 
@@ -3246,8 +3323,10 @@ def step_sim(a: np.ndarray, params: Dict[str, Any], meta: Dict[str, Any], progre
     angles * phases * nz sections, with the application's SIM step parameters
     (mode: Estimate | Manual | From file (params_file); angles, phases, wiener,
     apodization, na, nimm, wavelength_nm, linespacing_um, k0_start_angle /
-    k0_angles, ...). Needs a measured `otf` file: the theoretical OTF exists
-    only in the application."""
+    k0_angles, ...). From file, the parameter file's pixel sizes win where
+    it sets them and the metadata's fill in the rest, as in the application.
+    Needs a measured `otf` file: the theoretical OTF exists only in the
+    application."""
     sirius = _sirius_ext()
     p = _sim_parameters(params, meta)
     otf = _str(params, "otf")
@@ -3287,8 +3366,9 @@ def step_sim(a: np.ndarray, params: Dict[str, Any], meta: Dict[str, Any], progre
                          "amps": [[[float(x.real), float(x.imag)] for x in row] for row in fit.amps]})
             k += 1
     assert out is not None
-    vx, vy, vz = _voxel_um(meta)
-    m = dict(meta, dims=_dims(out), voxel_um=[vx / p.zoomfact, vy / p.zoomfact, vz / max(p.z_zoom, 1)],
+    # the pixel the reconstruction assumed (From file: the file's), not the
+    # dataset's claim -- sim.cpp's outputMeta
+    m = dict(meta, dims=_dims(out), voxel_um=[p.dx / p.zoomfact, p.dy / p.zoomfact, p.dz / max(p.z_zoom, 1)],
              sim={"present": False, "ndirs": p.ndirs, "nphases": p.nphases, "fast_si": p.fast_si})
     _progress(progress, 1.0, "done")
     return StepResult(out, m, info={"fits": fits, "wiener": p.wiener, "ndirs": p.ndirs, "nphases": p.nphases,

@@ -210,7 +210,7 @@ namespace sirius::app {
                     choiceParam("mode", "Pattern", {kEstimate, kManual, kFromFile}, kEstimate)
                         .withHelp("Estimate fits the pattern vectors from a start angle; Manual starts from the "
                                   "given angles; From file takes every parameter from a TOML / cudasirecon file."),
-                    pathParam("params_file", "Parameter file").visibleWhen("mode", {"From file"}).withFilter("Parameters (*.toml *.txt *.cfg);;All files (*)").withHelp("Used by the From file mode. Its pixel sizes (xyres, zres, zresPSF; pixels.dx, dy, dz, dz_psf) win over the dataset's, as in cudasirecon"),
+                    pathParam("params_file", "Parameter file").visibleWhen("mode", {"From file"}).withFilter("Parameters (*.toml *.txt *.cfg);;All files (*)").withHelp("Used by the From file mode. The pixel sizes it sets (xyres, zres, zresPSF; pixels.dx, dy, dz, dz_psf) win over the dataset's; the dataset fills in what the file leaves out"),
                     intParam("angles", "Angles", 3).range(1, 16).hiddenWhen("mode", {"From file"}),
                     intParam("phases", "Phases", 5).range(2, 32).hiddenWhen("mode", {"From file"}),
                     doubleParam("wiener", "Wiener", 0.001).range(1e-5, 1.0, 0.0005, 5).withHelp("Regularisation constant of the generalised Wiener filter").hiddenWhen("mode", {"From file"}),
@@ -348,7 +348,7 @@ namespace sirius::app {
                     char buf[256];
                     std::snprintf(buf, sizeof buf,
                                   "The parameter file sets the pixel size %.4g × %.4g × %.4g µm; the dataset says %.4g × %.4g × %.4g µm. "
-                                  "The step reconstructs with the file's, as cudasirecon does.",
+                                  "The step reconstructs with the file's pixel sizes where it sets them.",
                                   p.dx, p.dy, p.dz, input.dx(), input.dy(), input.dz());
                     v.warnings.push_back(buf);
                 }
