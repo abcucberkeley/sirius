@@ -56,6 +56,17 @@
 // -- so dkr is the field's, not a small ROI's -- given ITS OWN phase ramp, and
 // radially averaged; the per-bead tables are normalised and averaged.
 //
+// Measured, on five planted beads whose answer is known in closed form: the
+// field path reproduces the one-bead table to 4.2e-5 where the single-bead
+// path is 0.748 out, and recovers the band ratio as 0.35000 against a planted
+// m/2 of 0.35 (tests/test_otf_measure.cpp). On the user's own sparse bead
+// field it buys nothing, and for a reason worth knowing rather than a defect:
+// that acquisition is a 128 x 128 camera ROI (Left 321, Top 1089, Right 448,
+// Bottom 1216) centred on ONE bead, so detection finds one bead above the
+// amplitude floor in each channel -- 1 of 10 candidates at 488, 1 of 20 at
+// 560 -- and the two paths then agree to 0.06% on the band ratio, which is
+// the right answer for a one-bead field rather than an improvement on it.
+//
 // Two details decide whether this works at all:
 //   * the phase ramp has to be removed per bead BEFORE averaging, which is the
 //     whole reason a field cannot go through makeotf, and
@@ -94,14 +105,17 @@
 // and that factor is the ratio of the two runs' DC, nothing else.
 //
 // WHAT SURVIVES IT. Every order is divided by the SAME number, so the ratio of
-// one order to another at the same (kr, kz) does not move: on those two tables
+// one order to another at the same (kr, kz) does not move. On those two tables
 // order 1 / order 0 at kz = 0 runs 0.59373, 0.63026, 0.64048, 0.63356 from
-// kr = 1 and agrees to five decimals, with a median of 0.664915 against
-// 0.664916 over the 752 samples where order 0 clears 2% of its peak -- while
-// "the modulation depth", read as order 1's own kr = 0 sample, says 0.442808
-// in ours and 0.209638 in theirs. So OtfMeasureResult::bandRatio, the median
-// over kr >= 1, is the number to quote, and modulationDepth is kept beside it
-// only because it is what a reader of the file sees.
+// kr = 1 and agrees to five decimals -- it has to, since the tables agree
+// sample for sample to 1.9e-7 once one scale is taken out -- while "the
+// modulation depth", read as order 1's own kr = 0 sample, says 0.442808 in
+// ours and 0.209638 in theirs. The same contrast appears between the two
+// background estimators on our own run: 0.442808 from the border mean and
+// 0.128922 from the darkest tenth, with bandRatio 0.664844 either way.
+// So OtfMeasureResult::bandRatio, the median of |order 1| / |order 0| over
+// kr >= 1, is the number to quote, and modulationDepth is kept beside it only
+// because it is what a reader of the file sees.
 //
 // WHY NOT NORMALISE SOMEWHERE ELSE. Two candidates were measured and both are
 // worse than the DC, which is the answer the design this implements started
@@ -128,7 +142,12 @@
 //     extrapolates to 0.256 of the DC.
 // So the default is OtfMeasureScale::Order0Dc: makeotf's, which is what
 // loadOTF, idealOTF and the 0.006 otfcutoff are all calibrated against, with
-// the softness measured and reported rather than papered over.
+// the softness measured and reported rather than papered over. One cause of
+// that softness IS fixable and the result says so when it bites: makeotf's
+// background border is 20 px whatever the section is, which on the user's
+// 128 x 128 ROI is 51.7% of the image and holds the bead's own haze, so the
+// estimate over-subtracts. BackgroundEstimate::DarkestFraction is the
+// alternative, and both numbers are reported whichever was used.
 
 #include <array>
 #include <complex>
@@ -281,7 +300,8 @@ namespace sirius {
         std::array<int, 8> rejected{};     // indexed by BeadRejection
 
         // --- the scale, with both candidates so the choice is visible
-        double order0Dc = 0.0;             // the raw kr = kz = 0 sample of order 0
+        // the raw kr = kz = 0 sample of order 0, averaged over the kept beads
+        double order0Dc = 0.0;
         double lineFitToOrigin = 0.0;      // the fixorigin extrapolation, for comparison
         double scaleDivisor = 1.0;         // what every order was divided by
         OtfMeasureScale scaleUsed = OtfMeasureScale::Order0Dc;
@@ -295,7 +315,10 @@ namespace sirius {
         double dcFractionOfSignal = 0.0;
         // The relative change in the table's scale per 1 ADU of error in the
         // background: (voxels per section * sections / nphases) / order0Dc.
-        // 0.21 means a 1 ADU error moves every sample but the DC by 21%.
+        // 0.21 means a 1 ADU error moves every sample but the DC by 21%. It is
+        // the whole section's count, which is what the single-bead path
+        // integrates; a field path whose masks are smaller than the field is
+        // less exposed than this says.
         double scaleSensitivityPerAdu = 0.0;
 
         // --- what the table says

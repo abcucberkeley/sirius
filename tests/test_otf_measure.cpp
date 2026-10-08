@@ -130,6 +130,25 @@ namespace {
         return m;
     }
 
+
+    // --- reading options from the environment ---------------------------------
+    // The measurement has no tool, no CLI flag and no Python binding yet: those
+    // live in files another chain owns this round (app/core/tool_api.cpp,
+    // bindings/src/bind_sim.cpp). Until they land, this is how a job measures an
+    // OTF from a stack -- a stopgap, said plainly, and the reason the last case
+    // in this file reads its options from the environment.
+    std::string envStr(const char* name, const std::string& fallback = std::string()) {
+        const char* v = std::getenv(name);
+        return (v != nullptr && *v != '\0') ? std::string(v) : fallback;
+    }
+    double envNum(const char* name, double fallback) {
+        const std::string v = envStr(name);
+        return v.empty() ? fallback : std::stod(v);
+    }
+    int envInt(const char* name, int fallback) {
+        const std::string v = envStr(name);
+        return v.empty() ? fallback : std::stoi(v);
+    }
 } // namespace
 
 TEST_CASE("measureOTF on one synthetic bead is the PSF's own OTF", "[otf_measure]") {
@@ -710,4 +729,65 @@ TEST_CASE("the measured table equals makeotf's on the same real bead stack", "[o
                              << " -> " << beadRejectionName(b.rejection) << (b.kept ? " (kept)" : ""));
         CHECK(asField.kept >= 1);
     }
+}
+
+// --- measuring any stack a job names -----------------------------------------
+// Runs only when SIRIUS_OTF_MEASURE_STACK and SIRIUS_OTF_OUT are set, so it
+// SKIPs in ctest. $S/sim/otf-measure/measure_otf.sbatch drives it.
+TEST_CASE("measure an OTF from the stack the environment names", "[otf_measure][measure]") {
+    const std::string stackPath = envStr("SIRIUS_OTF_MEASURE_STACK");
+    const std::string outPath = envStr("SIRIUS_OTF_OUT");
+    if (stackPath.empty() || outPath.empty())
+        SKIP("set SIRIUS_OTF_MEASURE_STACK and SIRIUS_OTF_OUT to measure a stack");
+
+    OtfMeasureOptions o;
+    o.nphases = envInt("SIRIUS_OTF_NPHASES", 3);
+    o.norders = envInt("SIRIUS_OTF_NORDERS", 0);
+    o.dxy = envNum("SIRIUS_OTF_DXY", 0.0);
+    o.dz = envNum("SIRIUS_OTF_DZ", 0.0);
+    o.packing = envStr("SIRIUS_OTF_PACKING", "phase-fastest") == "phase-slowest"
+                    ? BeadPhasePacking::PhaseSlowest
+                    : BeadPhasePacking::PhaseFastest;
+    o.background = envNum("SIRIUS_OTF_BACKGROUND", -1.0);
+    o.backgroundBorder = envInt("SIRIUS_OTF_BORDER", 20);
+    o.backgroundEstimate = envStr("SIRIUS_OTF_BG", "border") == "darkest"
+                               ? BackgroundEstimate::DarkestFraction
+                               : BackgroundEstimate::BorderMean;
+    o.beadDiameterUm = envNum("SIRIUS_OTF_BEAD_UM", 0.12);
+    o.patternPeriodUm = envNum("SIRIUS_OTF_PERIOD_UM", 0.2);
+    o.patternAngleRad = envNum("SIRIUS_OTF_ANGLE_RAD", 1.57);
+    o.beadCompensationPixelUm = envNum("SIRIUS_OTF_COMP_PIXEL_UM", 0.0);
+    const std::string scale = envStr("SIRIUS_OTF_SCALE", "dc");
+    o.scale = scale == "fixorigin" ? OtfMeasureScale::MakeotfFixOrigin
+                                   : (scale == "none" ? OtfMeasureScale::AsMeasured
+                                                      : OtfMeasureScale::Order0Dc);
+    o.field = envInt("SIRIUS_OTF_FIELD", 0) != 0;
+    o.detect.minSeparationLateralUm = envNum("SIRIUS_OTF_MIN_SEP_UM", 1.0);
+    o.detect.roiLateralUm = envNum("SIRIUS_OTF_ROI_UM", 1.5);
+    o.detect.boundaryMarginLateralUm = envNum("SIRIUS_OTF_MARGIN_UM", 1.0);
+    o.detect.sigmaMaxLateralUm = envNum("SIRIUS_OTF_SIGMA_MAX_UM", 0.2);
+    o.detect.sigmaMinLateralUm = envNum("SIRIUS_OTF_SIGMA_MIN_UM", 0.05);
+    o.detect.minAmplitudeFraction = envNum("SIRIUS_OTF_MIN_AMP_FRAC", 0.05);
+    o.detect.maxBeads = envInt("SIRIUS_OTF_MAX_BEADS", 64);
+
+    const ImageStack<double> raw = readTiffStack<double>(stackPath);
+    WARN("stack " << stackPath << " is " << raw.dimension(0) << " x " << raw.dimension(1) << " x "
+                  << raw.dimension(2) << " (sections, rows, columns)");
+    const std::string bad = validateOtfMeasure(o, static_cast<int>(raw.dimension(0)),
+                                               static_cast<int>(raw.dimension(1)),
+                                               static_cast<int>(raw.dimension(2)));
+    if (!bad.empty()) FAIL("these options do not fit the stack: " << bad);
+
+    const OtfMeasureResult r = measureOTF(raw, o);
+    WARN(r.summary());
+    for (const BeadFit& b : r.beads)
+        WARN("  bead x " << b.x << " y " << b.y << " z " << b.z << " amp " << b.amplitude << " sxy "
+                         << 0.5 * (b.sigmaX + b.sigmaY) << " sz " << b.sigmaZ << " residual " << b.residual
+                         << " -> " << beadRejectionName(b.rejection) << (b.kept ? " (kept)" : ""));
+    OtfWriteOptions w;
+    w.note = "measured from " + stackPath;
+    const std::vector<std::string> files = writeMeasuredOTF(outPath, r, w);
+    for (const std::string& f : files) WARN("wrote " << f);
+    CHECK(files.size() == 2);
+    CHECK(r.kept >= 1);
 }
