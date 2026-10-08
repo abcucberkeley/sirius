@@ -188,6 +188,40 @@ namespace sirius::app {
     nlohmann::json otfMeasureProvenance(const sirius::OtfMeasureResult& result, const DatasetMeta& meta,
                                         const OtfMeasureRequest& request, const OtfMeasureReport& report);
 
+    // --- the JSON face the tool and the bindings share --------------------------
+    //
+    // The tool API and a Python binding both receive their arguments as JSON
+    // and both have to turn them into an OtfMeasureRequest. Doing that twice
+    // is the same defect one layer down from the one validate above: two
+    // places deciding what "scale" may be, and two wordings when it is wrong.
+    // So the parsing lives here, the tool's handler is a few lines over it,
+    // and the only thing a front end states for itself is the schema.
+    //
+    // Every key is optional and names a field of OtfMeasureRequest in
+    // snake_case: channel, time, angle, path, note, overwrite, sidecar,
+    // provenance, preview_max_side, nphases, norders, packing, phases, dxy,
+    // dz, background, background_estimate, background_border,
+    // darkest_fraction, apodize, bead_diameter_um, pattern_period_um,
+    // pattern_angle_rad, bead_compensation_pixel_um,
+    // bead_compensation_axial_um, scale, line_fit_first, line_fit_last,
+    // band_ratio_min_order0, repair_kr0_column, combine_reim, field,
+    // per_bead_normalise, and a nested `detect` object for
+    // BeadDetectionOptions. What is absent keeps otfMeasureDefaults' answer,
+    // so a caller states only what the acquisition cannot. The three enum
+    // keys take "phase_fastest" / "phase_slowest", "order0_dc" /
+    // "makeotf_fixorigin" / "as_measured" and "border_mean" /
+    // "darkest_fraction"; anything else throws std::invalid_argument naming
+    // the key and what it accepts.
+    OtfMeasureRequest otfMeasureRequestFromJson(const nlohmann::json& args, const DatasetMeta& meta, const Dims5& dims);
+
+    // The report as a tool reply: what was written, the table's shape and
+    // sampling, the bead counts, the scale with its softness, the warnings a
+    // user has to read before quoting a depth, and the provenance whole (so a
+    // caller that wrote no file still has it). The images and curves are not
+    // in it -- a reply is text, and a front end that wants them has the
+    // Diagnostics.
+    nlohmann::json otfMeasureReportJson(const OtfMeasureReport& report);
+
 } // namespace sirius::app
 
 #endif // SIRIUS_APP_OTF_MEASURE_HPP

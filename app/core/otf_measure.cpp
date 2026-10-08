@@ -746,4 +746,153 @@ namespace sirius::app {
         return out;
     }
 
+
+    // --- the JSON face the tool and the bindings share --------------------------
+
+    namespace {
+
+        template <typename T> void readIf(const nlohmann::json& a, const char* key, T& into) {
+            const auto it = a.find(key);
+            if (it != a.end() && !it->is_null()) into = it->get<T>();
+        }
+
+        // The enums, with the accepted spellings in ONE place: a front end
+        // that states them in its schema and a front end that does not both
+        // get this message for a value neither of them should have sent.
+        sirius::BeadPhasePacking packingFromJson(const std::string& v) {
+            if (v == "phase_fastest") return sirius::BeadPhasePacking::PhaseFastest;
+            if (v == "phase_slowest") return sirius::BeadPhasePacking::PhaseSlowest;
+            throw std::invalid_argument("packing must be \"phase_fastest\" or \"phase_slowest\", not \"" + v + "\"");
+        }
+        sirius::OtfMeasureScale scaleFromJson(const std::string& v) {
+            if (v == "order0_dc") return sirius::OtfMeasureScale::Order0Dc;
+            if (v == "makeotf_fixorigin") return sirius::OtfMeasureScale::MakeotfFixOrigin;
+            if (v == "as_measured") return sirius::OtfMeasureScale::AsMeasured;
+            throw std::invalid_argument("scale must be \"order0_dc\", \"makeotf_fixorigin\" or \"as_measured\", not \"" +
+                                        v + "\"");
+        }
+        sirius::BackgroundEstimate backgroundFromJson(const std::string& v) {
+            if (v == "border_mean") return sirius::BackgroundEstimate::BorderMean;
+            if (v == "darkest_fraction") return sirius::BackgroundEstimate::DarkestFraction;
+            throw std::invalid_argument("background_estimate must be \"border_mean\" or \"darkest_fraction\", not \"" +
+                                        v + "\"");
+        }
+
+    } // namespace
+
+    OtfMeasureRequest otfMeasureRequestFromJson(const nlohmann::json& args, const DatasetMeta& meta, const Dims5& dims) {
+        if (!args.is_object() && !args.is_null())
+            throw std::invalid_argument("the OTF measurement's arguments must be an object");
+        OtfMeasureRequest r = otfMeasureDefaults(meta, dims);
+        if (args.is_null()) return r;
+        const nlohmann::json& a = args;
+
+        readIf(a, "channel", r.channel);
+        readIf(a, "time", r.time);
+        readIf(a, "angle", r.angle);
+        readIf(a, "path", r.path);
+        readIf(a, "note", r.note);
+        readIf(a, "overwrite", r.overwrite);
+        readIf(a, "sidecar", r.sidecar);
+        readIf(a, "provenance", r.provenanceFile);
+        readIf(a, "preview_max_side", r.previewMaxSide);
+
+        sirius::OtfMeasureOptions& m = r.measure;
+        readIf(a, "nphases", m.nphases);
+        readIf(a, "norders", m.norders);
+        if (const auto it = a.find("packing"); it != a.end() && !it->is_null())
+            m.packing = packingFromJson(it->get<std::string>());
+        readIf(a, "phases", m.phases);
+        readIf(a, "dxy", m.dxy);
+        readIf(a, "dz", m.dz);
+        readIf(a, "background", m.background);
+        if (const auto it = a.find("background_estimate"); it != a.end() && !it->is_null())
+            m.backgroundEstimate = backgroundFromJson(it->get<std::string>());
+        readIf(a, "background_border", m.backgroundBorder);
+        readIf(a, "darkest_fraction", m.darkestFraction);
+        readIf(a, "apodize", m.apodize);
+        readIf(a, "bead_diameter_um", m.beadDiameterUm);
+        readIf(a, "pattern_period_um", m.patternPeriodUm);
+        readIf(a, "pattern_angle_rad", m.patternAngleRad);
+        readIf(a, "bead_compensation_pixel_um", m.beadCompensationPixelUm);
+        readIf(a, "bead_compensation_axial_um", m.beadCompensationAxialUm);
+        if (const auto it = a.find("scale"); it != a.end() && !it->is_null())
+            m.scale = scaleFromJson(it->get<std::string>());
+        readIf(a, "line_fit_first", m.lineFitFirst);
+        readIf(a, "line_fit_last", m.lineFitLast);
+        readIf(a, "band_ratio_min_order0", m.bandRatioMinOrder0);
+        readIf(a, "repair_kr0_column", m.repairKr0Column);
+        readIf(a, "combine_reim", m.combineReIm);
+        readIf(a, "field", m.field);
+        readIf(a, "per_bead_normalise", m.perBeadNormalise);
+
+        if (const auto it = a.find("detect"); it != a.end() && it->is_object()) {
+            const nlohmann::json& dj = *it;
+            sirius::BeadDetectionOptions& d = m.detect;
+            readIf(dj, "dog_small_lateral_um", d.dogSmallLateralUm);
+            readIf(dj, "dog_small_axial_um", d.dogSmallAxialUm);
+            readIf(dj, "dog_large_lateral_um", d.dogLargeLateralUm);
+            readIf(dj, "dog_large_axial_um", d.dogLargeAxialUm);
+            readIf(dj, "min_separation_lateral_um", d.minSeparationLateralUm);
+            readIf(dj, "min_separation_axial_um", d.minSeparationAxialUm);
+            readIf(dj, "min_amplitude", d.minAmplitude);
+            readIf(dj, "min_amplitude_fraction", d.minAmplitudeFraction);
+            readIf(dj, "saturation_level", d.saturationLevel);
+            readIf(dj, "roi_lateral_um", d.roiLateralUm);
+            readIf(dj, "roi_axial_um", d.roiAxialUm);
+            readIf(dj, "boundary_margin_lateral_um", d.boundaryMarginLateralUm);
+            readIf(dj, "boundary_margin_axial_um", d.boundaryMarginAxialUm);
+            readIf(dj, "sigma_min_lateral_um", d.sigmaMinLateralUm);
+            readIf(dj, "sigma_max_lateral_um", d.sigmaMaxLateralUm);
+            readIf(dj, "sigma_min_axial_um", d.sigmaMinAxialUm);
+            readIf(dj, "sigma_max_axial_um", d.sigmaMaxAxialUm);
+            readIf(dj, "max_beads", d.maxBeads);
+            readIf(dj, "max_residual", d.maxResidual);
+        }
+        return r;
+    }
+
+    nlohmann::json otfMeasureReportJson(const OtfMeasureReport& report) {
+        using nlohmann::json;
+        const sirius::OtfMeasureResult& m = report.measurement;
+        json rejected = json::object();
+        for (int i = 0; i < static_cast<int>(m.rejected.size()); ++i)
+            if (m.rejected[static_cast<std::size_t>(i)] > 0)
+                rejected[sirius::beadRejectionName(static_cast<sirius::BeadRejection>(i))] =
+                    m.rejected[static_cast<std::size_t>(i)];
+        return json{{"table", report.tablePath.empty() ? json(nullptr) : json(report.tablePath.string())},
+                    {"files", report.files},
+                    {"bytes", report.bytes},
+                    {"summary", report.summary},
+                    {"section_order", otfSectionOrderName(report.sectionOrder)},
+                    {"sections", report.sections},
+                    {"nphases", report.nphases},
+                    {"nz", report.nz},
+                    {"angles", report.angles},
+                    {"section_shape", {{"y", report.ny}, {"x", report.nx}}},
+                    {"otf",
+                     {{"norders", m.norders},
+                      {"nkr", m.nkr},
+                      {"nzotf", m.nzotf},
+                      {"dkr_per_um", m.dkr},
+                      {"dkz_per_um", m.dkz},
+                      {"kz_origin", "dc_first"}}},
+                    {"beads", {{"found", m.found}, {"kept", m.kept}, {"rejected", rejected}}},
+                    // the two numbers a reader has to keep apart: the band
+                    // ratio no divisor can move, and the depth as stored,
+                    // which 1 ADU of background can double
+                    {"band_ratio", m.bandRatio},
+                    {"band_ratio_iqr", m.bandRatioIqr},
+                    {"band_ratio_samples", m.bandRatioSamples},
+                    {"modulation_depth", m.modulationDepth},
+                    {"scale",
+                     {{"used", scaleName(m.scaleUsed)},
+                      {"divisor", m.scaleDivisor},
+                      {"dc_fraction_of_signal", m.dcFractionOfSignal},
+                      {"sensitivity_per_adu", m.scaleSensitivityPerAdu}}},
+                    {"notes", report.notes},
+                    {"warnings", report.diagnostics.warnings},
+                    {"provenance", report.provenance}};
+    }
+
 } // namespace sirius::app

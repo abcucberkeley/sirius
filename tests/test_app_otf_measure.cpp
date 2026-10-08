@@ -555,7 +555,15 @@ TEST_CASE("the diagnostics are the dock's own types, with the marks in the previ
 
 TEST_CASE("a field of beads reports every candidate, kept or not, with its reason", "[otf_measure]") {
     Scene s;
-    s.beads = {{26.0, 26.0, 6.0, 3000.0}, {38.0, 38.0, 6.0, 2400.0}};
+    // Two beads the detector must see as two. Its non-maximum suppression is a
+    // BOX of half-width round(minSeparationLateralUm / dxy) = 12 px
+    // (src/otf_measure.cpp), so beads 12 px apart in EVERY axis leave one
+    // candidate however far apart they are in Euclidean distance -- which is
+    // what my first placement, (26, 26) and (38, 38), measured: found = 1. And
+    // the field has to be large enough for the boundary filter, which needs
+    // roiLateral/2 + boundaryMargin = 21 px of clearance on every side.
+    s.ny = s.nx = 96;
+    s.beads = {{32.0, 48.0, 6.0, 3000.0}, {64.0, 48.0, 6.0, 2400.0}};
     const Dims5 dims = dimsOf(s);
     const DatasetMeta meta = metaOf(s, "z=[z, phase 3]");
     const Array5 a = storeAs(s, SimLayout::fromText("z=[z, phase 3]"));
@@ -589,6 +597,83 @@ TEST_CASE("a field of beads reports every candidate, kept or not, with its reaso
         CHECK(single.measurement.kept == 1);
         CHECK(single.diagnostics.table->rows.size() == 1);
         CHECK(single.diagnostics.table->caption == "Bead centre");
+    }
+}
+
+TEST_CASE("the JSON face parses once for every front, and an unknown enum says what it accepts", "[otf_measure]") {
+    Scene s;
+    const Dims5 dims = dimsOf(s);
+    const DatasetMeta meta = metaOf(s, "z=[z, phase 3]");
+
+    SECTION("what is absent keeps the dataset's answer") {
+        const OtfMeasureRequest r = otfMeasureRequestFromJson(nlohmann::json::object(), meta, dims);
+        const OtfMeasureRequest d = otfMeasureDefaults(meta, dims);
+        CHECK(r.measure.dxy == d.measure.dxy);
+        CHECK(r.measure.nphases == d.measure.nphases);
+        CHECK(r.measure.packing == d.measure.packing);
+        CHECK(r.measure.detect.saturationLevel == d.measure.detect.saturationLevel);
+        CHECK(r.path.empty());
+        CHECK(otfMeasureRequestFromJson(nlohmann::json(), meta, dims).measure.dxy == d.measure.dxy);
+    }
+
+    SECTION("and what is present is applied, nested options included") {
+        const nlohmann::json args = {{"path", "/tmp/otf.tif"},
+                                     {"angle", 0},
+                                     {"field", true},
+                                     {"scale", "as_measured"},
+                                     {"background_estimate", "darkest_fraction"},
+                                     {"bead_diameter_um", 0.1},
+                                     {"bead_compensation_pixel_um", 0.106},
+                                     {"detect", {{"max_beads", 9}, {"min_amplitude", 510.8}}}};
+        const OtfMeasureRequest r = otfMeasureRequestFromJson(args, meta, dims);
+        CHECK(r.path == "/tmp/otf.tif");
+        CHECK(r.measure.field);
+        CHECK(r.measure.scale == OtfMeasureScale::AsMeasured);
+        CHECK(r.measure.backgroundEstimate == BackgroundEstimate::DarkestFraction);
+        CHECK(r.measure.beadDiameterUm == 0.1);
+        CHECK(r.measure.beadCompensationPixelUm == 0.106);
+        CHECK(r.measure.detect.maxBeads == 9);
+        CHECK(r.measure.detect.minAmplitude == 510.8);
+        // untouched keys still come from the dataset
+        CHECK(r.measure.dxy == kDxy);
+        CHECK(r.measure.detect.roiLateralUm == BeadDetectionOptions{}.roiLateralUm);
+    }
+
+    SECTION("an enum value no front end should have sent names the key and its values, once") {
+        for (const char* key : {"packing", "scale", "background_estimate"}) {
+            nlohmann::json args = nlohmann::json::object();
+            args[key] = "sideways";
+            bool threw = false;
+            try {
+                otfMeasureRequestFromJson(args, meta, dims);
+            } catch (const std::invalid_argument& e) {
+                threw = true;
+                const std::string what = e.what();
+                CHECK(what.find(key) != std::string::npos);
+                CHECK(what.find("sideways") != std::string::npos);
+            }
+            CHECK(threw);
+        }
+    }
+
+    SECTION("the reply carries what was written, the sampling, and both depth numbers") {
+        const Array5 a = storeAs(s, SimLayout::fromText("z=[z, phase 3]"));
+        const OtfMeasureReport out = measureOtfFromDataset(a, meta, otfMeasureDefaults(meta, dims));
+        const nlohmann::json reply = otfMeasureReportJson(out);
+        CHECK(reply["table"].is_null());               // nothing written without a path
+        CHECK(reply["files"].empty());
+        CHECK(reply["section_order"].get<std::string>() == "layout");
+        CHECK(reply["sections"].get<int>() == 36);
+        CHECK(reply["otf"]["nkr"].get<int>() == out.measurement.nkr);
+        CHECK(reply["otf"]["dkr_per_um"].get<double>() == out.measurement.dkr);
+        CHECK(reply["otf"]["kz_origin"].get<std::string>() == "dc_first");
+        CHECK(reply["beads"]["kept"].get<int>() == out.measurement.kept);
+        CHECK(reply["band_ratio"].get<double>() == out.measurement.bandRatio);
+        CHECK(reply["modulation_depth"].get<double>() == out.measurement.modulationDepth);
+        CHECK(reply["scale"]["used"].get<std::string>() == "order0_dc");
+        CHECK(reply["provenance"]["stack"]["sections"].get<int>() == 36);
+        CHECK_FALSE(reply["warnings"].empty());
+        CHECK(reply["summary"].get<std::string>() == out.summary);
     }
 }
 
