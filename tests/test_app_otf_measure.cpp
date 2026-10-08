@@ -15,6 +15,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstdlib>
 #include <filesystem>
 #include <fstream>
 #include <sstream>
@@ -691,4 +692,123 @@ TEST_CASE("otfMeasureFileName names the channel and proposes no folder", "[otf_m
 
     CHECK(otfMeasureFileName(DatasetMeta{}, 0) == "OTF_sirius.tif");
     CHECK(otfMeasureFileName(meta, 7) == "OTF_sirius.tif");       // a channel the dataset does not have
+}
+
+// --- the user's own sparse bead field, when it is at hand --------------------
+// Everything above is synthetic, because the service's job is the layer
+// between a dataset and the measurement and a synthetic scene is the only one
+// whose answer is known. This case is the other half: the SAME acquisition the
+// library's own real-data case uses (the sparse bead field, never the dense
+// one -- the user ruled the dense field out), driven through the app service
+// from an Array5 and a DatasetMeta rather than from a bare tensor, and
+// compared with the colleague's makeotf table, which IS committed
+// (tests/data/isoar2_sparse_OTF_488.tif). Only the 4.6 MB raw stack is not, so
+// the environment names it -- SIRIUS_OTF_BEAD_STACK, the same variable
+// tests/test_otf_measure.cpp uses, so one job drives both.
+//
+// The claim is exact rather than approximate: the file is uint16, which float
+// holds without loss, so going through Array5's float32 cannot move a sample
+// and this table has to be the one the library measured.
+TEST_CASE("the app service measures the user's own sparse bead field", "[otf_measure][real]") {
+    const char* stackPath = std::getenv("SIRIUS_OTF_BEAD_STACK");
+    if (stackPath == nullptr || *stackPath == '\0')
+        SKIP("set SIRIUS_OTF_BEAD_STACK to the sparse bead field's raw stack");
+    const char* refEnv = std::getenv("SIRIUS_OTF_BEAD_REFERENCE");
+    const std::string refPath = refEnv && *refEnv ? std::string(refEnv)
+                                                  : std::string(SIRIUS_TEST_DATA_DIR) + "/isoar2_sparse_OTF_488.tif";
+
+    const ImageStack<float> raw = readTiffStack<float>(stackPath);
+    REQUIRE(raw.dimension(0) > 0);
+    Dims5 dims;
+    dims.c = dims.t = 1;
+    dims.z = static_cast<Index>(raw.dimension(0));
+    dims.y = static_cast<Index>(raw.dimension(1));
+    dims.x = static_cast<Index>(raw.dimension(2));
+    Array5 a = Array5::zeros(dims);
+    std::copy(raw.data(), raw.data() + dims.numel(), a.data());
+
+    DatasetMeta meta;
+    meta.name = "RAW_488_3phase_ols20px_3G";
+    meta.sourcePath = stackPath;
+    meta.format = "tiff";
+    meta.dims = dims;
+    meta.sourceType = PixelType::UInt16;
+    // the acquisition's own numbers: the camera pixel and the SampleMotion
+    // step out of 488_3phase_ols20px_3G_JSONsettings.json
+    meta.voxelUm = {0.085526315789473686, 0.085526315789473686, 0.1};
+    ChannelInfo ch;
+    ch.label = "StayGold";
+    ch.wavelengthNm = 515.0;
+    meta.channels = {ch};
+    // phase fastest, which the acquisition's slicelist.sqlite3 states
+    // independently: three rows share each Slice_Index
+    meta.sim = SimLayout::fromText("z=[z, phase 3]");
+
+    OtfMeasureRequest r = otfMeasureDefaults(meta, dims);
+    REQUIRE(validateOtfMeasureRequest(r, meta, dims).empty());
+    CHECK(r.measure.nphases == 3);
+    CHECK(r.measure.dxy == 0.085526315789473686);
+    CHECK(r.measure.dz == 0.1);
+    // makeotf's own defaults for what the colleague did not pass, and its
+    // default dr of 0.106 um in the finite-bead-size division -- the only step
+    // that reads a pixel size -- which is what reproducing their table needs
+    r.measure.beadDiameterUm = 0.12;
+    r.measure.patternPeriodUm = 0.2;
+    r.measure.patternAngleRad = 1.57;
+    r.measure.beadCompensationPixelUm = 0.106;
+
+    const OtfMeasureReport out = measureOtfFromDataset(a, meta, r);
+    INFO("measured: " << out.measurement.summary());
+    CHECK(out.sectionOrder == OtfSectionOrder::Layout);
+    CHECK(out.nphases == 3);
+    CHECK(out.nz == 101);
+    CHECK(out.measurement.norders == 2);
+    CHECK(out.measurement.nkr == 65);
+    CHECK(out.measurement.nzotf == 101);
+    CHECK(out.measurement.hermitianKzError == 0.0);
+    CHECK(std::abs(out.measurement.dkr - 0.09134615384615385) < 1e-12);
+    CHECK(std::abs(out.measurement.dkz - 0.09900990099009901) < 1e-12);
+    CHECK(out.provenance["sampling"]["dkr_per_um"].get<double>() == out.measurement.dkr);
+    CHECK(out.provenance["stack"]["section_order"].get<std::string>() == "layout");
+
+    // the colleague's table, read in makeotf's own layout: norders pages of
+    // nkr rows by 2 * nzotf columns, kz fastest, re/im interleaved
+    const ImageStack<float> ref = readTiffStack<float>(refPath);
+    REQUIRE(ref.dimension(0) == out.measurement.norders);
+    REQUIRE(ref.dimension(1) == out.measurement.nkr);
+    REQUIRE(ref.dimension(2) == 2 * out.measurement.nzotf);
+
+    // ONE global real scale, which is the only quantity the two runs can
+    // legitimately differ in: makeotf divides every order by order 0's
+    // zero-frequency sample, and that sample is the integral of the
+    // background-subtracted band, so it follows the background estimate.
+    // Order 0's (0, 0) sample is 1 in both tables by construction and is left
+    // out of the fit.
+    const auto& mine = out.measurement.otf.data();
+    double num = 0.0, den = 0.0, refPeak = 0.0;
+    for (Eigen::Index o = 0; o < mine.dimension(0); ++o)
+        for (Eigen::Index q = 0; q < mine.dimension(1); ++q)
+            for (Eigen::Index k = 0; k < mine.dimension(2); ++k) {
+                if (o == 0 && q == 0 && k == 0) continue;
+                const double rr = ref(o, q, 2 * k), ri = ref(o, q, 2 * k + 1);
+                num += rr * mine(o, q, k).real() + ri * mine(o, q, k).imag();
+                den += mine(o, q, k).real() * mine(o, q, k).real() + mine(o, q, k).imag() * mine(o, q, k).imag();
+                refPeak = std::max(refPeak, std::hypot(rr, ri));
+            }
+    REQUIRE(den > 0.0);
+    REQUIRE(refPeak > 0.0);
+    const double scale = num / den;
+    double worst = 0.0;
+    for (Eigen::Index o = 0; o < mine.dimension(0); ++o)
+        for (Eigen::Index q = 0; q < mine.dimension(1); ++q)
+            for (Eigen::Index k = 0; k < mine.dimension(2); ++k)
+                worst = std::max(worst, std::hypot(scale * mine(o, q, k).real() - ref(o, q, 2 * k),
+                                                   scale * mine(o, q, k).imag() - ref(o, q, 2 * k + 1)));
+    INFO("one global scale " << scale << ", worst residual " << worst / refPeak << " of peak");
+    CHECK(worst / refPeak < 1e-5);
+
+    // And the number that scale cannot move, which is what to quote off a
+    // table: the reference's own band ratio, computed the same way.
+    CHECK(out.measurement.bandRatio > 0.0);
+    CHECK(out.measurement.bandRatioSamples > 100);
 }
