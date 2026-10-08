@@ -44,6 +44,7 @@
 #include "core/rpc.hpp"
 #include "core/workbench.hpp"
 #include "imgui/cluster_link.hpp"
+#include "imgui/dialogs/export_dialog_support.hpp"
 #include "imgui/dialogs/model_hub_cache.hpp"
 #include "imgui/http.hpp"
 #include "imgui/platform.hpp"
@@ -324,18 +325,6 @@ namespace sirius::app::gui {
 
         bool enterPressed() { return ImGui::IsKeyPressed(ImGuiKey_Enter, false) || ImGui::IsKeyPressed(ImGuiKey_KeypadEnter, false); }
 
-        // The 8 px bar of a download: a groove, the accent up to `fraction`.
-        void progressBar(float fraction, float width, float rowH) {
-            const ImVec2 at = ImGui::GetCursorScreenPos();
-            const float h = theme::snap(px(8));
-            const float y = theme::snap(at.y + (rowH - h) * 0.5f);
-            ImDrawList* dl = ImGui::GetWindowDrawList();
-            dl->AddRectFilled(ImVec2(at.x, y), ImVec2(at.x + width, y + h), theme::kNeutral300);
-            const float f = std::clamp(fraction, 0.0f, 1.0f);
-            if (f > 0.0f) dl->AddRectFilled(ImVec2(at.x, y), ImVec2(at.x + theme::snap(width * f), y + h), theme::kAccent);
-            ImGui::Dummy(ImVec2(width, rowH));
-        }
-
         // --- tables ------------------------------------------------------------------
         //
         // Rows that select as a whole, no grid, headers in caption case. The
@@ -574,6 +563,15 @@ namespace sirius::app::gui {
                     ImGui::SameLine(0.0f, 0.0f);
                     ImGui::SetCursorPos(ImVec2(at.x + labelW + gap, at.y));
                 }
+                // Deliberately not dialog_support::actionRow or buttonRow. This
+                // pair is 84 px wide whatever its labels measure, it shares its
+                // line with the elided "Model: ..." label whose width decides
+                // where it starts, and its Enter test is this dialog's own
+                // (enterUsed_, WantTextInput: the search field and the tables
+                // take the key first). Either shared row would change the
+                // widths, the narrow-window behaviour and the key handling, so
+                // moving it would not be the behaviour-preserving promotion
+                // this change is. The bar above IS shared.
                 widgets::ButtonOpts cancel;
                 cancel.kind = ButtonKind::Ghost;
                 cancel.width = 84;
@@ -1073,7 +1071,12 @@ namespace sirius::app::gui {
                 const bool anyFile = fileRow_ >= 0 && fileRow_ < static_cast<int>(files_.size());
                 const bool busy = downloading();
                 const float downloadW = px(88), useW = px(64), gap8 = px(8);
-                progressBar(progress_, std::max(px(40), ImGui::GetContentRegionAvail().x - downloadW - useW - 2 * gap8), buttonH);
+                // The bar is dialog_support's (export_dialog_support.hpp); this
+                // one shares its line with Download and Use, so it is centred
+                // in a row as high as those buttons.
+                dialog_support::progressBar(progress_,
+                                            std::max(px(40), ImGui::GetContentRegionAvail().x - downloadW - useW - 2 * gap8),
+                                            buttonH);
                 ImGui::SameLine(0.0f, gap8);
                 bool download = false;
                 if (busy) {

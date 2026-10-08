@@ -287,83 +287,14 @@ namespace sirius::app::gui {
         }
 
         // --- controls -------------------------------------------------------------------
+        //
+        // The progress bar and the button row used to be here, and a second
+        // copy of the bar was in the model hub. Both are
+        // export_dialog_support.hpp's now (dialog_support::progressBar,
+        // dialog_support::buttonRow), so a new dialog that needs either takes
+        // the one that exists.
 
         void paragraph(const std::string& text, ImU32 color = theme::kText) { widgets::textWrapped(text, 13, color); }
-
-        // The 8 px bar of a download: a groove, the accent up to `fraction`.
-        void progressBar(double fraction) {
-            const float width = ImGui::GetContentRegionAvail().x;
-            const float h = theme::snap(px(8));
-            const ImVec2 at = ImGui::GetCursorScreenPos();
-            ImDrawList* dl = ImGui::GetWindowDrawList();
-            dl->AddRectFilled(at, ImVec2(at.x + width, at.y + h), theme::kNeutral300);
-            const float f = std::clamp(static_cast<float>(fraction), 0.0f, 1.0f);
-            if (f > 0.0f) dl->AddRectFilled(at, ImVec2(at.x + theme::snap(width * f), at.y + h), theme::kAccent);
-            ImGui::Dummy(ImVec2(width, h));
-        }
-
-        struct ButtonSpec {
-            std::string label;
-            bool enabled = true;
-            std::string tooltip;
-            bool secondary = false;   // never the default, even as the last of its row
-        };
-
-        // The buttons flush right, the last one the default (primary; Enter
-        // presses it on the dialog on top) unless it is `secondary`, with an
-        // optional checkbox at the left of the same row, or above it when the
-        // row has no room for it. The index of the button pressed, else -1.
-        int buttonRow(const Dialog& dialog, const std::vector<ButtonSpec>& buttons, const char* checkLabel = nullptr,
-                      bool* check = nullptr) {
-            const float gap = px(8);
-            std::vector<float> widths;
-            float total = 0.0f;
-            for (std::size_t i = 0; i < buttons.size(); ++i) {
-                const bool primary = i + 1 == buttons.size() && !buttons[i].secondary;
-                const theme::Weight weight = primary ? theme::Weight::ExtraBold : theme::Weight::SemiBold;
-                const float w = std::max(px(84), theme::textSize(buttons[i].label, 13, weight).x + px(28));
-                widths.push_back(w);
-                total += w + (i ? gap : 0.0f);
-            }
-            const float avail = ImGui::GetContentRegionAvail().x;
-            if (check) {
-                // tokenCheck's size: the 14 px box, 8 px, the 12 px label
-                const float boxH = std::max(theme::snap(px(14)), theme::textSize("Ag", 12).y) + px(4);
-                const float checkW = theme::snap(px(14)) + px(8) + theme::textSize(checkLabel, 12).x;
-                if (checkW + 2 * gap + total > avail) {
-                    widgets::checkbox(checkLabel, check);
-                } else {
-                    // centred on the buttons' line (widgets::button's own arithmetic)
-                    const ImVec2 start = ImGui::GetCursorPos();
-                    const float textH = theme::textSize("Ag", 13).y;
-                    const float rowH = theme::snap(std::max(px(18), textH) + 2 * px(7) + 2 * px(theme::kBorder));
-                    ImGui::SetCursorPos(ImVec2(start.x, start.y + std::max(0.0f, std::floor((rowH - boxH) * 0.5f))));
-                    widgets::checkbox(checkLabel, check);
-                    ImGui::SetCursorPos(start);
-                }
-            }
-            const ImVec2 start = ImGui::GetCursorPos();
-            ImGui::SetCursorPos(ImVec2(start.x + std::max(0.0f, avail - total), start.y));
-            int pressed = -1;
-            for (std::size_t i = 0; i < buttons.size(); ++i) {
-                if (i) ImGui::SameLine(0.0f, gap);
-                const bool primary = i + 1 == buttons.size() && !buttons[i].secondary;
-                widgets::ButtonOpts o;
-                o.kind = primary ? widgets::ButtonKind::Primary : widgets::ButtonKind::Secondary;
-                o.width = design(widths[i]);
-                o.centered = true;
-                o.enabled = buttons[i].enabled;
-                o.tooltip = buttons[i].tooltip;
-                // Not while a dropdown of the dialog is open: that Enter picks its item.
-                const bool enterKey =
-                    ImGui::IsKeyPressed(ImGuiKey_Enter, false) || ImGui::IsKeyPressed(ImGuiKey_KeypadEnter, false);
-                const bool enter = primary && o.enabled && dialog.onTop() && !ImGui::IsAnyItemActive() &&
-                                   !ImGui::IsPopupOpen("", ImGuiPopupFlags_AnyPopupId) && enterKey;
-                const std::string id = buttons[i].label + "##button" + std::to_string(i);
-                if (widgets::button(id.c_str(), o) || enter) pressed = static_cast<int>(i);
-            }
-            return pressed;
-        }
 
         // --- the dialog -------------------------------------------------------------------
 
@@ -710,7 +641,7 @@ namespace sirius::app::gui {
                 if (!failNote_.empty()) note(failNote_, theme::kAccentText);
                 widgets::vspace(4);
                 const std::string primary = nothingToDo() ? "Use it" : (recreate ? "Recreate" : "Download and set up");
-                const int pressed = buttonRow(*this, {{dismissLabel()}, setupButton(app, primary, ready && canSetUp())},
+                const int pressed = buttonRow(onTop(), {{dismissLabel()}, setupButton(app, primary, ready && canSetUp())},
                                               offer() ? "Don't ask again" : nullptr, offer() ? &dontAsk_ : nullptr);
                 if (pressed == 0) close();
                 else if (pressed == 1) nothingToDo() ? useEnvironment(app) : startSetup(app);
@@ -725,7 +656,7 @@ namespace sirius::app::gui {
                     note("Cannot work out the setup: " + planned_->error, theme::kAccentText);
                 widgets::vspace(4);
                 const ButtonSpec retry{"Retry", !planning_, "Look for an interpreter again"};
-                const int pressed = buttonRow(*this, {{"Not now"}, retry}, "Don't ask again", &dontAsk_);
+                const int pressed = buttonRow(onTop(), {{"Not now"}, retry}, "Don't ask again", &dontAsk_);
                 if (pressed == 0) close();
                 else if (pressed == 1) startPlanning();
             }
@@ -746,7 +677,7 @@ namespace sirius::app::gui {
                 if (planning_) note("Looking at SIRIUS's own environment\xE2\x80\xA6");
                 widgets::vspace(4);
                 const ButtonSpec instead{"Use SIRIUS's environment instead", !planning_ && planned_ && planned_->error.empty()};
-                const int pressed = buttonRow(*this, {{"Not now"}, {"Open Preferences"}, instead}, "Don't ask again", &dontAsk_);
+                const int pressed = buttonRow(onTop(), {{"Not now"}, {"Open Preferences"}, instead}, "Don't ask again", &dontAsk_);
                 if (pressed == 0) {
                     close();
                 } else if (pressed == 1) {
@@ -776,7 +707,7 @@ namespace sirius::app::gui {
                               names + ". Install it there (" + path + " -m pip install " + join(distributions(e.missing), " ") +
                               "), or " + otherwise + ".");
                 widgets::vspace(4);
-                if (buttonRow(*this, {{"Close"}}, "Don't ask again", &dontAsk_) == 0) close();
+                if (buttonRow(onTop(), {{"Close"}}, "Don't ask again", &dontAsk_) == 0) close();
             }
 
             // The environment no longer runs, or needs an update.
@@ -829,7 +760,7 @@ namespace sirius::app::gui {
                 if (!failNote_.empty()) note(failNote_, theme::kAccentText);
                 widgets::vspace(4);
                 const std::string primary = nothingToDo() ? "Use it" : (repair ? "Repair" : "Update");
-                const int pressed = buttonRow(*this, {{dismissLabel()}, setupButton(app, primary, ready && canSetUp())},
+                const int pressed = buttonRow(onTop(), {{dismissLabel()}, setupButton(app, primary, ready && canSetUp())},
                                               offer() ? "Don't ask again" : nullptr, offer() ? &dontAsk_ : nullptr);
                 if (pressed == 0) close();
                 else if (pressed == 1) nothingToDo() ? useEnvironment(app) : startSetup(app);
@@ -984,7 +915,7 @@ namespace sirius::app::gui {
                 const char* doing =
                     variant_ == Variant::Update ? "Updating" : (mode() == pyenv::Mode::Recreate ? "Recreating" : "Setting up");
                 paragraph(std::string(doing) + " SIRIUS's Python environment in " + envDir() + "\xE2\x80\xA6");
-                progressBar(fraction);
+                progressBar(fraction, ImGui::GetContentRegionAvail().x);
                 note(message.empty() ? std::string("Starting\xE2\x80\xA6") : message);
                 drawDetails();
                 widgets::vspace(4);
@@ -992,7 +923,7 @@ namespace sirius::app::gui {
                 // started the setup must not roll the download back.
                 const ButtonSpec cancel{cancelling_ ? "Cancelling\xE2\x80\xA6" : "Cancel", !cancelling_,
                                         "Stop the setup; nothing is left half done", true};
-                if (buttonRow(*this, {cancel}) == 0) {
+                if (buttonRow(onTop(), {cancel}) == 0) {
                     app.bridge().cancelTask();
                     cancelling_ = true;
                 }
@@ -1020,7 +951,7 @@ namespace sirius::app::gui {
                     paragraph(text);
                     drawDetails();
                     widgets::vspace(4);
-                    if (buttonRow(*this, {{"Close"}}) == 0) close();
+                    if (buttonRow(onTop(), {{"Close"}}) == 0) close();
                     return;
                 }
                 paragraph(r.message.empty() ? std::string("The setup failed.") : r.message,
@@ -1028,7 +959,7 @@ namespace sirius::app::gui {
                 if (!r.hint.empty()) note(r.hint);
                 drawDetails();
                 widgets::vspace(4);
-                const int pressed = buttonRow(*this, {{"Copy log"}, {"Retry", true, "Plan the setup again"}, {"Close"}});
+                const int pressed = buttonRow(onTop(), {{"Copy log"}, {"Retry", true, "Plan the setup again"}, {"Close"}});
                 if (pressed == 0) {
                     std::string text = r.message + (r.hint.empty() ? std::string() : "\n" + r.hint) + "\n\n";
                     {
