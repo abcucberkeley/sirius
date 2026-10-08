@@ -8,7 +8,9 @@
 #include <catch2/matchers/catch_matchers_string.hpp>
 
 #include <cmath>
+#include <complex>
 #include <filesystem>
+#include <limits>
 #include <stdexcept>
 
 #include "sirius/buffer.hpp"
@@ -544,7 +546,7 @@ TEST_CASE("A 2D stack reconstructs at the default settings", "[reconstruction][2
     SECTION("library defaults") {}
     SECTION("the order-0 damping on") { p.dampen_order0 = true; }
     SECTION("no_kz0 off gives the same pattern") { p.no_kz0 = false; }
-    SECTION("forced modulation amplitudes replace the fit") { p.force_mod_amp = std::vector<double>{1.0, 0.42}; }
+    SECTION("a forced modulation floor still reconstructs") { p.force_mod_amp = std::vector<double>{1.0, 0.42}; }
 
     SimReconstructor recon(p, otf, Device::cpu(), PlanRigor::Estimate);
     const Buffer<double> out = recon.reconstruct(raw.view());
@@ -552,10 +554,15 @@ TEST_CASE("A 2D stack reconstructs at the default settings", "[reconstruction][2
     CHECK(nonFinite(out) == 0);
     checkPattern2d(recon.lastFit(), p);
     if (p.force_mod_amp) {
+        // forcemodamp is a FLOOR on the side bands: order 0 stays the
+        // widefield band the fit set and order 1 is at least its floor. What
+        // it does order by order is pinned below, in "forcemodamp is a floor
+        // on the side bands"; the section asserting amps[1] == 0.42 exactly
+        // was asserting the replace-every-order behaviour that was the bug.
         for (const auto& amps : recon.lastFit().amps) {
             REQUIRE(amps.size() == 2);
             CHECK(std::abs(amps[0] - 1.0) < 1e-12);
-            CHECK(std::abs(amps[1] - 0.42) < 1e-12);
+            CHECK(std::abs(amps[1]) >= 0.42);
         }
     }
 
@@ -582,6 +589,95 @@ TEST_CASE("A 2D stack reconstructs at the default settings", "[reconstruction][2
     const double corr = (count * sab - sa * sb) / std::sqrt((count * saa - sa * sa) * (count * sbb - sb * sb));
     INFO("correlation with the synthetic object: " << corr);
     CHECK(corr > 0.15);
+}
+
+// forcemodamp, order by order. cudasirecon (cudaSirecon.cpp, the
+// `if (params->forceamp[0] > 0.0)` block) runs order = 1 .. norders-1, tests
+// `if (a < forceamp[order-1])` and then scales the complex amplitude by
+// forceamp/a. Three things that implies, each of which the consumer got wrong
+// until 2026-10-08:
+//   * the widefield band is never touched -- it was overwritten with a real
+//     constant, which destroyed order 0 and every fitted phase with it;
+//   * an order already above its floor is left exactly as fitted; and
+//   * a list of ndirs*(norders-1) -- the length validate() accepts so that the
+//     user's own 3-phase cudasirecon config works -- is per direction and is
+//     resolved by SIMParameters::forcedModAmpFloor. The consumer's own
+//     `base = d * norders` read forced[2] and forced[4] of a 3-entry vector,
+//     which is a live read past the end.
+TEST_CASE("forcemodamp is a floor on the side bands, indexed as the parameters say",
+          "[reconstruction][2d][forcemodamp]") {
+    const SIMParameters base = params2d();
+    REQUIRE(base.resolvedOrders() == 2);
+    REQUIRE(base.ndirs == 3);
+    const Buffer<double> raw = test::syntheticSim2d(base, 128, 0.8);
+    const OTFRadiallyAveraged otf = idealOTF(base, /*threeD=*/false);
+
+    const auto fitOf = [&](const SIMParameters& q) {
+        SimReconstructor recon(q, otf, Device::cpu(), PlanRigor::Estimate);
+        const Buffer<double> out = recon.reconstruct(raw.view());
+        CHECK(nonFinite(out) == 0);
+        return recon.lastFit();
+    };
+
+    // The reference: the same scene with nothing forced. Every threshold below
+    // is derived from these fitted magnitudes, so no number here is the
+    // scene's by hand.
+    const SimFit fitted = fitOf(base);
+    REQUIRE(fitted.amps.size() == 3);
+    double lo = std::numeric_limits<double>::infinity(), hi = 0.0;
+    for (const auto& amps : fitted.amps) {
+        REQUIRE(amps.size() == 2);
+        REQUIRE(amps[0] == std::complex<double>(1.0, 0.0));
+        lo = std::min(lo, std::abs(amps[1]));
+        hi = std::max(hi, std::abs(amps[1]));
+    }
+    INFO("fitted |amp1| over the three directions: " << lo << " .. " << hi);
+    REQUIRE(lo > 0.0);
+
+    SECTION("a floor under every fitted magnitude leaves the fit exactly alone") {
+        SIMParameters q = base;
+        q.force_mod_amp = std::vector<double>{0.5 * lo};   // norders-1: cudasirecon's own length
+        q.validate();
+        const SimFit f = fitOf(q);
+        for (std::size_t d = 0; d < f.amps.size(); ++d) {
+            CHECK(f.amps[d][0] == fitted.amps[d][0]);
+            CHECK(f.amps[d][1] == fitted.amps[d][1]);
+        }
+    }
+
+    SECTION("a floor above the fit lifts the magnitude and keeps the fitted phase") {
+        const double floorMag = 2.0 * hi;
+        SIMParameters q = base;
+        q.force_mod_amp = std::vector<double>{floorMag};
+        q.validate();
+        const SimFit f = fitOf(q);
+        for (std::size_t d = 0; d < f.amps.size(); ++d) {
+            CHECK(f.amps[d][0] == std::complex<double>(1.0, 0.0));   // the widefield band
+            CHECK(std::abs(std::abs(f.amps[d][1]) - floorMag) < 1e-12 * floorMag);
+            CHECK(std::abs(std::arg(f.amps[d][1]) - std::arg(fitted.amps[d][1])) < 1e-12);
+        }
+    }
+
+    SECTION("ndirs*(norders-1) is one floor per direction, and is not read past its end") {
+        const std::vector<double> floors{2.0 * hi, 3.0 * hi, 4.0 * hi};
+        SIMParameters q = base;
+        q.force_mod_amp = floors;
+        q.validate();   // the length validate() was widened to accept
+        const SimFit f = fitOf(q);
+        REQUIRE(f.amps.size() == floors.size());
+        for (std::size_t d = 0; d < f.amps.size(); ++d) {
+            CHECK(f.amps[d][0] == std::complex<double>(1.0, 0.0));
+            CHECK(std::abs(std::abs(f.amps[d][1]) - floors[d]) < 1e-12 * floors[d]);
+        }
+    }
+
+    SECTION("the first entry is the gate for the whole feature") {
+        SIMParameters q = base;
+        q.force_mod_amp = std::vector<double>{0.0, 3.0 * hi, 4.0 * hi};
+        q.validate();
+        const SimFit f = fitOf(q);
+        for (std::size_t d = 0; d < f.amps.size(); ++d) CHECK(f.amps[d][1] == fitted.amps[d][1]);
+    }
 }
 
 TEST_CASE("Unequal phaseSteps change the reconstruction", "[reconstruction][2d]") {
