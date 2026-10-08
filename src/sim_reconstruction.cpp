@@ -763,14 +763,34 @@ namespace sirius {
                     for (int order = 2; order < norders; ++order)
                         fit.amps[static_cast<std::size_t>(d)][static_cast<std::size_t>(order)] *=
                             fit.amps[static_cast<std::size_t>(d)][static_cast<std::size_t>(order - 1)];
+                // forcemodamp: a magnitude FLOOR on the side bands, which is
+                // what cudasirecon does (cudaSirecon.cpp's `if
+                // (params->forceamp[0] > 0.0)` block: order = 1 .. norders-1,
+                // `if (a < forceamp[order-1])` then scale x and y by
+                // forceamp/a). SIMParameters::forcedModAmpFloor is the one
+                // place that decides what a list of each accepted length
+                // means; it answers 0 for order 0, for a dir or order out of
+                // range, and for a length validate() refuses, and 0 is a
+                // no-op because no magnitude is below it. Indexing the list
+                // here instead is what read past the end of a norders-1 list
+                // (base = d * norders on a list of norders-1 entries) and
+                // what overwrote order 0 -- the widefield band -- and every
+                // fitted phase with a real constant.
                 if (p.force_mod_amp) {
-                    const std::vector<double>& forced = *p.force_mod_amp;
-                    const std::size_t base = forced.size() == static_cast<std::size_t>(norders)
-                                                 ? 0
-                                                 : static_cast<std::size_t>(d) * static_cast<std::size_t>(norders);
                     auto& amps = fit.amps[static_cast<std::size_t>(d)];
-                    for (int order = 0; order < norders; ++order)
-                        amps[static_cast<std::size_t>(order)] = Cplx(forced[base + static_cast<std::size_t>(order)], 0.0);
+                    for (int order = 1; order < norders; ++order) {
+                        const double floorMag = p.forcedModAmpFloor(d, order);
+                        if (!(floorMag > 0.0)) continue;
+                        Cplx& a = amps[static_cast<std::size_t>(order)];
+                        const double mag = std::abs(a);
+                        if (!(mag < floorMag)) continue;   // already above its floor: left as fitted
+                        // Scaling by floor/|amp| keeps the fitted phase, as
+                        // cudasirecon's does. At |amp| == 0 there is no phase
+                        // to keep and that division is inf or NaN, so the
+                        // floor goes in on the real axis: the one deviation,
+                        // and it replaces a NaN band rather than a number.
+                        a = mag > 0.0 ? a * (floorMag / mag) : Cplx(floorMag, 0.0);
+                    }
                 }
                 fit.k0[static_cast<std::size_t>(d)] = k0;
             }
