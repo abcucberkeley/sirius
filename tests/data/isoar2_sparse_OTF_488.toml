@@ -1,0 +1,26 @@
+# Sampling for isoar2_sparse_OTF_488.tif, which carries none of its own:
+# makeotf writes a bare CImg TIFF with no sampling metadata at all.
+#
+# The file is OTF_488.tif as a colleague produced it with makeotf from the
+# SPARSE bead field at
+# /clusterfs/nvme2/Data/iSOAR2_nvme2/Imaging/260325_2beamSIM/PSFs/2beam/psf
+# (RAW_488_3phase_ols20px_3G_ch0_*, 3 phases packed along z), copied here
+# byte for byte (md5 162fcd263c7db0d8dd52bb4e29df9eb7).
+#
+# Both numbers come from that acquisition's own settings file beside the
+# stack, 488_3phase_ols20px_3G_JSONsettings.json:
+#   Camera "X Pixel Size (um/pix)" = 0.08552631578947369
+#   Waveform SampleMotion          = 0.1 um per step, 101 steps ("Z motion:
+#                                    Sample piezo"), which is the table's 101
+#                                    kz planes
+# and the table's 65 radial samples put the PSF at 128 px across
+# (makeotf: nkr = min(nx, ny) / 2 + 1), so
+#   dkr = 1 / (0.08552631578947369 * 128) = 0.09134615384615385
+#   dkz = 1 / (0.1 * 101)                 = 0.09900990099009901
+#
+# Deriving these from the 2026-04-21 cudasirecon config instead (xyres =
+# 0.085) would give dkr = 0.09191176, 0.62% high: the config rounds the camera
+# pixel, and a frequency axis 0.62% off is exactly what a sidecar is for.
+[sampling]
+dkr = 0.09134615384615385
+dkz = 0.09900990099009901

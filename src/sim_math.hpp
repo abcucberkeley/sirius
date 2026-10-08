@@ -154,6 +154,28 @@ namespace sirius::simdetail {
         IndexT nx, ny, nz, nxh;
         double dkx, dky;
         double rdistcutoff;
+        // THE TWO SCALE-DEPENDENT NUMBERS IN THIS FILE, and what makes them
+        // mean anything. otfcutoff is an ABSOLUTE threshold on |OTF| (0.006
+        // by default), so it is a fraction of something: of order 0's
+        // kr = kz = 0 sample, because that is the one sample every OTF this
+        // library accepts is 1 at. idealOTF divides by its own DC
+        // (otf_ideal.cpp) and loadOTF now normalizes a measured table to the
+        // same reference and reports when it could not (sirius/otf_io.hpp),
+        // so a measured and a theoretical OTF finally mean the same thing to
+        // one otfcutoff. Until that landed, a table on its file's own scale
+        // made this test meaningless in both directions: OpenSIM's uint16
+        // OTF image has a minimum of 2, so every sample of it cleared 0.006,
+        // and the Wiener constant at :317 -- which is added to a sum of
+        // |OTF|^2, and so scales as 1/s^2 when the table scales by s --
+        // landed 51577^2 = 2.7e9 too small.
+        //
+        // It stays an ABSOLUTE threshold deliberately. Making it relative
+        // would mean dividing by order 0's DC, which is 1 by construction on
+        // every table that reaches here, so it would be a no-op on a
+        // compliant table and a silent rescue for a non-compliant one -- and
+        // a table whose scale cannot be established is a thing to refuse or
+        // report, not to normalize inside the kernel, where neither the file
+        // nor the reason is in scope.
         double otfcutoff;
         double order02factor;   // relaxes otfcutoff for the bright order-0 OTF
         int noKz0;              // block the kz==0 plane
