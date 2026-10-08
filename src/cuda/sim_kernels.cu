@@ -197,7 +197,7 @@ namespace sirius::simdetail {
         __global__ void filterPass1Kernel(FilterCtx c, int order, int zdo, Cd conjamp,
                                           Cd* __restrict__ bre, Cd* __restrict__ bim) {
             const IndexT nzc = 2 * (IndexT)zdo + 1;
-            const IndexT xspan = c.nx / 2 + 1;
+            const IndexT xspan = r2cColumns(c.nx);
             const IndexT total = nzc * c.ny * xspan;
             for (IndexT t = blockIdx.x * (IndexT)blockDim.x + threadIdx.x; t < total;
                  t += (IndexT)gridDim.x * blockDim.x) {
@@ -218,11 +218,11 @@ namespace sirius::simdetail {
         __global__ void filterPass2Kernel(FilterCtx c, int order, int zdo, Cd conjamp,
                                           Cd* __restrict__ bre, Cd* __restrict__ bim) {
             const IndexT nzc = 2 * (IndexT)zdo + 1;
-            const IndexT xspan = c.nx / 2 - 1;   // x1 in [-(nx/2-1), -1]
+            const IndexT xspan = mirrorColumns(c.nx);   // x1 in [-mirrorColumns(nx), -1]
             const IndexT total = nzc * c.ny * xspan;
             for (IndexT t = blockIdx.x * (IndexT)blockDim.x + threadIdx.x; t < total;
                  t += (IndexT)gridDim.x * blockDim.x) {
-                const IndexT x1 = -(c.nx / 2 - 1) + t % xspan;
+                const IndexT x1 = -xspan + t % xspan;
                 const IndexT y1 = (t / xspan) % c.ny - c.ny / 2;
                 const IndexT z0 = t / (xspan * c.ny) - zdo;
                 bool inSupport = false;
@@ -406,11 +406,11 @@ namespace sirius::simdetail {
                     Cd* bre = bands + (order == 0 ? 0 : 2 * order - 1) * bandElems;
                     Cd* bim = order == 0 ? nullptr : bands + 2 * order * bandElems;
 
-                    filterPass1Kernel<<<gridFor(nzc * ctx.ny * (ctx.nx / 2 + 1)), kBlock, 0,
+                    filterPass1Kernel<<<gridFor(nzc * ctx.ny * r2cColumns(ctx.nx)), kBlock, 0,
                                         cuda::handle(stream_)>>>(ctx, order, zdo, hostConjamp[order], bre, bim);
                     cuda::check(cudaGetLastError(), "filter pass1 kernel");
-                    if (order != 0 && ctx.nx / 2 - 1 > 0) {
-                        filterPass2Kernel<<<gridFor(nzc * ctx.ny * (ctx.nx / 2 - 1)), kBlock, 0,
+                    if (order != 0 && mirrorColumns(ctx.nx) > 0) {
+                        filterPass2Kernel<<<gridFor(nzc * ctx.ny * mirrorColumns(ctx.nx)), kBlock, 0,
                                             cuda::handle(stream_)>>>(ctx, order, zdo, hostConjamp[order], bre, bim);
                         cuda::check(cudaGetLastError(), "filter pass2 kernel");
                     }

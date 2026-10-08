@@ -187,7 +187,7 @@ namespace sirius::simdetail {
                         const IndexT y1 = r % c.ny - c.ny / 2;
                         const IndexT zi = signedToStorage(z0, c.nz);
                         const IndexT yi = signedToStorage(y1, c.ny);
-                        for (IndexT x1 = 0; x1 <= c.nx / 2; ++x1) {
+                        for (IndexT x1 = 0; x1 < r2cColumns(c.nx); ++x1) {
                             bool inSupport = false;
                             Cd scale = filterScale(c, order, static_cast<double>(x1),
                                                    static_cast<double>(y1),
@@ -210,7 +210,14 @@ namespace sirius::simdetail {
                             const IndexT y1 = r % c.ny - c.ny / 2;
                             const IndexT zi = signedToStorage(-z0, c.nz);
                             const IndexT yi = signedToStorage(-y1, c.ny);
-                            for (IndexT x1 = -(c.nx / 2 - 1); x1 < 0; ++x1) {
+                            // -mirrorColumns(nx) .. -1: for an even nx this is
+                            // the old -(nx/2 - 1) .. -1 exactly (the Nyquist
+                            // column is its own mirror and must not be scaled
+                            // twice); for an odd nx it also takes the last
+                            // stored column, whose negative is a frequency of
+                            // its own. The loop runs zero times when the count
+                            // is 0 (nx <= 2), as the old bound did.
+                            for (IndexT x1 = -mirrorColumns(c.nx); x1 < 0; ++x1) {
                                 bool inSupport = false;
                                 Cd scale = filterScale(c, order, static_cast<double>(x1),
                                                        static_cast<double>(y1),

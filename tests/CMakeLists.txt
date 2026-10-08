@@ -34,6 +34,9 @@ endfunction()
 # --- the library ---------------------------------------------------------------
 
 sirius_lib_test(tensor_util     test_tensor_util.cpp)
+# the header-only per-voxel SIM arithmetic: the index sets, where the parity
+# of an extent enters, before any FFT or backend is involved
+sirius_lib_test(sim_math        test_sim_math.cpp INTERNAL)
 sirius_lib_test(fft_util        test_fft_util.cpp)
 sirius_lib_test(buffer          test_buffer.cpp)        # and `device`, which has no life apart from it
 sirius_lib_test(fft             test_fft1d.cpp test_fft2d.cpp test_fft3d.cpp test_fft_inplace.cpp test_fft_cuda.cpp)

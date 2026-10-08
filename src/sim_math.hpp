@@ -56,6 +56,32 @@ namespace sirius::simdetail {
     // storage index of the mirrored (negated) frequency: (n - i) % n
     SIRIUS_HD IndexT mirrorIndex(IndexT i, IndexT n) { return i == 0 ? 0 : n - i; }
 
+    // --- where the parity of an extent enters the index arithmetic ---------
+    // Three questions, one answer each, called by both backends -- the CPU
+    // kernels in sim_cpu.cpp and the CUDA kernels in cuda/sim_kernels.cu --
+    // so the two cannot drift apart on them again. They did: the filter's
+    // mirror pass had its bound spelled out in five places.
+
+    // Signed FFT frequency of storage index i on a full axis of extent n:
+    // 0 .. n/2, then the negative half, i.e. the set [-((n-1)/2) .. n/2].
+    // For EVEN n that is [-(n/2 - 1) .. n/2], with the Nyquist counted
+    // positive, as cudasirecon's move_kernel does. For ODD n it is
+    // [-(n/2) .. n/2]: every frequency of the axis exactly once. n == 1
+    // gives 0.
+    SIRIUS_HD IndexT signedFrequency(IndexT i, IndexT n) { return i <= n / 2 ? i : i - n; }
+
+    // Stored columns of an r2c axis of extent n: kx = 0 .. n/2, so n/2 + 1
+    // of them, for either parity.
+    SIRIUS_HD IndexT r2cColumns(IndexT n) { return n / 2 + 1; }
+
+    // Stored columns whose NEGATIVE frequency is a distinct frequency, i.e.
+    // the extent of a pass over kx < 0: x1 = -mirrorColumns(n) .. -1.
+    // An even axis ends at the Nyquist, which is its own mirror
+    // (-n/2 == n/2 mod n) and must not be visited twice, so n/2 - 1 columns;
+    // an odd axis has no Nyquist and its last stored column's negative is a
+    // frequency of its own, so n/2 columns. (n - 1) / 2 is both.
+    SIRIUS_HD IndexT mirrorColumns(IndexT n) { return (n - 1) / 2; }
+
     SIRIUS_HD double clampd(double v, double lo, double hi) {
         return v < lo ? lo : (v > hi ? hi : v);
     }
@@ -374,10 +400,22 @@ namespace sirius::simdetail {
 
     SIRIUS_HD void moveBandElement(const MoveCtx& c, const Cd* bandRe, const Cd* bandIm,
                                    Cd* big, IndexT zi, IndexT yi, IndexT t) {
-        // signed frequencies enumerated exactly as move_kernel does
-        const IndexT ySigned = yi - (c.ny / 2 - 1);
-        const IndexT zSigned = c.nz > 1 ? zi - (c.nz / 2 - 1) : 0;
-        const IndexT xSigned = t <= c.nx / 2 ? t : t - c.nx;   // [-(nx/2-1) .. nx/2]
+        // Signed frequencies of the small grid, the same parity-general form
+        // on all three axes. For an EVEN extent this enumerates exactly the
+        // set that `i - (n/2 - 1)` did (move_kernel's own expression, and
+        // this function's for y and z until 2026-10-08): the same
+        // [-(n/2 - 1) .. n/2], reached in a different order, and the order
+        // cannot matter because an element's source, destination and
+        // conjugation are functions of the frequency alone. For an ODD
+        // extent the old form omitted -((n-1)/2) and produced a frequency
+        // (n+1)/2 that the axis does not have -- on x, which is the r2c
+        // axis, that is also a read one element past the end of the row,
+        // which is what cudasirecon still does (gpuFunctionsImpl.cu:1872).
+        // nz == 1 needs no special case: zi is 0 and signedFrequency(0, 1)
+        // is 0.
+        const IndexT ySigned = signedFrequency(yi, c.ny);
+        const IndexT zSigned = signedFrequency(zi, c.nz);
+        const IndexT xSigned = signedFrequency(t, c.nx);
 
         const IndexT yout = signedToStorage(ySigned, c.ydim);
         const IndexT zout = signedToStorage(zSigned, c.zdim);
