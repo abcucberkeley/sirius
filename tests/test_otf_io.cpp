@@ -474,9 +474,13 @@ TEST_CASE("loadOTF takes its sampling from the file, then a sidecar, then the pa
 
     SECTION("the <file>.toml spelling is found too, and is looked for first") {
         test::TempFile tf("otf_side", ".tif");
-        ImageStack<float> raw(1, 16, 8);
+        // two pages, because isoar2Params()'s 3 phases resolve 2 orders and
+        // the reader now refuses a table with fewer -- which is what the
+        // first run of this test found out about its own fixture
+        ImageStack<float> raw(2, 16, 8);
         raw.setZero();
-        for (int ir = 0; ir < 16; ++ir) raw(0, ir, 0) = static_cast<float>(16 - ir);
+        for (int o = 0; o < 2; ++o)
+            for (int ir = 0; ir < 16; ++ir) raw(o, ir, 0) = static_cast<float>((o == 0 ? 1.0 : 0.4) * (16 - ir));
         writeTiffStack<float>(tf.str, raw);
         Scratch side(tf.str + ".toml");
         {
@@ -495,9 +499,10 @@ TEST_CASE("loadOTF takes its sampling from the file, then a sidecar, then the pa
 
     SECTION("a sidecar may give the measurement's pixel sizes instead of the steps") {
         test::TempFile tf("otf_side_px", ".tif");
-        ImageStack<float> raw(1, 33, 8);
+        ImageStack<float> raw(2, 33, 8);
         raw.setZero();
-        for (int ir = 0; ir < 33; ++ir) raw(0, ir, 0) = static_cast<float>(33 - ir);
+        for (int o = 0; o < 2; ++o)
+            for (int ir = 0; ir < 33; ++ir) raw(o, ir, 0) = static_cast<float>((o == 0 ? 1.0 : 0.4) * (33 - ir));
         writeTiffStack<float>(tf.str, raw);
         Scratch side(tf.str + ".toml");
         {
@@ -525,15 +530,23 @@ TEST_CASE("loadOTF takes its sampling from the file, then a sidecar, then the pa
 
     SECTION("an unreadable sidecar is a refusal, not a silent fallback") {
         test::TempFile tf("otf_side_bad", ".tif");
-        ImageStack<float> raw(1, 16, 8);
+        ImageStack<float> raw(2, 16, 8);
         raw.setZero();
+        for (int o = 0; o < 2; ++o)
+            for (int ir = 0; ir < 16; ++ir) raw(o, ir, 0) = static_cast<float>((o == 0 ? 1.0 : 0.4) * (16 - ir));
         writeTiffStack<float>(tf.str, raw);
         Scratch side(tf.str + ".toml");
         {
             std::ofstream out(side.p);
             out << "[sampling\ndkr = ";
         }
+        // and it is the SIDECAR that is refused, not the table
         REQUIRE_THROWS_AS(loadOTF(tf.str, p), IoError);
+        try {
+            loadOTF(tf.str, p);
+        } catch (const IoError& e) {
+            CHECK_THAT(std::string(e.what()), ContainsSubstring("not a readable OTF sidecar"));
+        }
     }
 }
 
