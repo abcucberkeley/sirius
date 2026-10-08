@@ -282,7 +282,7 @@ sirius_core_unit(serialize
 sirius_core_unit(session
     HEADERS session.hpp
     SOURCES session.cpp
-    DEPENDS lib/sim_reconstruction lib/otf lib/otf_io lib/otf_ideal lib/legacy_config lib/tiff_io
+    DEPENDS dataset lib/sim_reconstruction lib/otf lib/otf_io lib/otf_ideal lib/legacy_config lib/tiff_io
             lib/sim_parameters lib/buffer lib/device lib/fft_common lib/constants)
 
 sirius_core_unit(volume_ops

@@ -282,11 +282,36 @@ TEST_CASE("headless: open_dataset describes raw.tif", "[app][headless]") {
     CHECK(info["voxel_um"].size() == 3);
     CHECK(info["channels"].size() == 1);
     CHECK(info["sim"].is_object());
+    // raw.tif carries no SIM metadata: the answer is present false and
+    // nothing else -- the 3 x 5 that used to stand beside it was the
+    // struct's default, which read as a detection
+    CHECK(info["sim"] == json{{"present", false}});
     CHECK(info["float32_bytes"].get<long long>() == 135LL * 64 * 64 * 4);
     const std::string path = info["path"].get<std::string>();
     CHECK(path.find('\\') == std::string::npos);
     CHECK(std::filesystem::path(path).is_absolute());
     CHECK_THAT(path, ContainsSubstring("raw.tif"));
+
+    SECTION("the SIM layout, as the shorthand and as its general form") {
+        const json shorthand = f.ok("dataset_info", {{"path", (kData / "raw.tif").string()}, {"sim", {{"ndirs", 3}, {"nphases", 5}}}});
+        CHECK(shorthand["sim"] == json{{"present", true}, {"ndirs", 3}, {"nphases", 5}, {"fast", false}});
+        CHECK_THAT(shorthand["acquisition"].get<std::string>(), ContainsSubstring("15 phase images"));
+        const json general = f.ok("dataset_info", {{"path", (kData / "raw.tif").string()}, {"sim", {{"layout", "z=[z, angle 3, phase 5]"}}}});
+        CHECK(general["sim"] == json{{"present", true}, {"ndirs", 3}, {"nphases", 5}, {"fast", true}, {"layout", "z=[z, angle 3, phase 5]"}});
+        const json text = f.ok("dataset_info", {{"path", (kData / "raw.tif").string()}, {"sim", "z=[angle 3, z, phase 5]"}});
+        CHECK(text["sim"]["layout"] == "z=[angle 3, z, phase 5]");
+        CHECK(text["sim"]["fast"] == false);
+        // opened with it, the Load step carries the layout as its sim_layout parameter
+        const json opened = f.ok("open_dataset", {{"path", (kData / "raw.tif").string()}, {"sim", "c=angle 1; z=[z, phase 15]"}});
+        CHECK(opened["sim"]["layout"] == "c=angle 1; z=[z, phase 15]");
+        const json state = f.ok("get_state");
+        CHECK(state["steps"][0]["params"]["sim_layout"] == "c=angle 1; z=[z, phase 15]");
+        CHECK(state["dataset"]["sim"]["layout"] == "c=angle 1; z=[z, phase 15]");
+        // a layout that does not read is invalid_argument naming the problem
+        const agent::ToolResult bad = f.call("dataset_info", {{"path", (kData / "raw.tif").string()}, {"sim", {{"layout", "c=angle; z=phase 5"}}}});
+        CHECK(bad.error.code == "invalid_argument");
+        CHECK_THAT(bad.error.message, ContainsSubstring("angle on c needs its extent"));
+    }
 
     SECTION("a missing file is not_found, an unusable option invalid_argument") {
         CHECK(f.call("open_dataset", {{"path", (kData / "no-such.tif").string()}}).error.code == "not_found");
@@ -1078,7 +1103,14 @@ TEST_CASE("headless: the option parsers refuse what they cannot honour", "[app][
     CHECK(o.pageOrder->z == 9);
     REQUIRE(o.sim);
     CHECK(o.sim->nphases == 5);
+    CHECK(o.sim->isShorthand());
     CHECK_FALSE(o.readAll);
+    const OpenOptions g = openOptionsFromJson({{"sim", {{"layout", "yx=3x3[angle 3, phase 3]"}}}});
+    REQUIRE(g.sim);
+    CHECK(g.sim->storage == "yx=3x3[angle 3, phase 3]");
+    CHECK(g.sim->ndirs == 3);
+    CHECK_THROWS_AS(openOptionsFromJson({{"sim", {{"layout", 3}}}}), ToolFailure);
+    CHECK_THROWS_AS(openOptionsFromJson({{"sim", "z=[angle 3, z, phase 5]; z=phase 3"}}), ToolFailure);
 
     DatasetMeta meta;
     meta.dims = Dims5{2, 1, 4, 8, 8};

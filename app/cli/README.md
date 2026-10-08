@@ -176,7 +176,7 @@ The open options, also taken by `info <dataset>`:
 | `--page-order czt` | the order of the TIFF pages, fastest first, for a file without dimension metadata (default `czt`) |
 | `--page-c N`, `--page-t N`, `--page-z N` | channels and time points (at least 1, default 1) and z planes (default 0: the page count divided by c × t) |
 | `--voxel x,y,z` | voxel size in µm |
-| `--sim d,p[,fast]` / `--no-sim` | a SIM raw stack of d directions and p phases, or not one |
+| `--sim d,p[,fast]` / `--sim <layout>` / `--no-sim` | a SIM raw stack of d directions and p phases, or one with the general storage layout (`--sim 'c=angle 3; z=phase 3'`, the Load step's `sim_layout`), or not one |
 | `--dataset-tile N` | the tile of a tiled dataset |
 | `--full-load` | read the whole dataset now instead of plane by plane on demand |
 
@@ -257,12 +257,14 @@ The result is a DatasetInfo, here of a SIM raw stack:
  "tile": 0, "metadata_summary": "…", "dims_from_metadata": false, "full_load_skipped": ""}
 ```
 
-`sim.present` is true only when the file's metadata says it is a SIM
-acquisition; `ndirs` and `nphases` are then its layout, and otherwise the
-layout a SIM step assumes until told. A raw stack without that metadata
-(`tests/data/raw.tif`, 3 directions × 5 phases × 9 planes) reads as a plain
-z stack. `voxel_um` is what the file says, or 0.1, 0.1, 0.2 when it says
-nothing.
+`sim.present` is true only when the file's metadata or the open options say
+it is a SIM acquisition; `ndirs`, `nphases` and `fast` are then its layout,
+and a stack opened with the general storage layout carries it as `layout`
+(`"sim": {"present": true, "ndirs": 3, "nphases": 3, "fast": false, "layout":
+"c=angle 3; z=phase 3"}`). A stack that is not SIM says `{"present": false}`
+and nothing else. A raw stack without that metadata (`tests/data/raw.tif`,
+3 directions × 5 phases × 9 planes) reads as a plain z stack. `voxel_um` is
+what the file says, or 0.1, 0.1, 0.2 when it says nothing.
 
 ### `ops` and `help`
 
@@ -520,7 +522,7 @@ serve (`sirius-cli tools` prints it). Rules they share:
 
 | tool | arguments (* = required) | returns | hints | during a run |
 | --- | --- | --- | --- | --- |
-| `open_dataset` | `path`*, `page_order`, `c`, `t`, `z`, `voxel_um` [x,y,z], `sim` ({ndirs, nphases, fast} or false), `tile`, `full_load` | DatasetInfo + `workspace` | | |
+| `open_dataset` | `path`*, `page_order`, `c`, `t`, `z`, `voxel_um` [x,y,z], `sim` ({ndirs, nphases, fast}, {layout: "c=angle 3; z=phase 3"}, a layout text, or false), `tile`, `full_load` | DatasetInfo + `workspace` | | |
 | `dataset_info` | `path` (probe that file; else the open dataset) + the open options | DatasetInfo | RO | yes (with `path`) |
 | `load_pipeline` | `path`*, `dataset` | `{workspace, pipeline_path, steps, dataset, missing_kinds, plugins_loaded}` | | |
 | `save_pipeline` | `path`* | `{path}` | DE | yes |

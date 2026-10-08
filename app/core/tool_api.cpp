@@ -197,7 +197,10 @@ namespace sirius::app {
                      json ch = json::array();
                      for (const ChannelInfo& c : m.channels) ch.push_back({{"label", c.label}, {"wavelength_nm", c.wavelengthNm}, {"color", c.hexColor()}});
                      ds["channels"] = ch;
-                     if (m.sim.present) ds["sim"] = {{"ndirs", m.sim.ndirs}, {"nphases", m.sim.nphases}};
+                     if (m.sim.present) {
+                         ds["sim"] = {{"ndirs", m.sim.ndirs}, {"nphases", m.sim.nphases}};
+                         if (!m.sim.isShorthand()) ds["sim"]["layout"] = m.sim.storage;
+                     }
                  }
                  return json{{"dataset", ds},
                              {"steps", steps},

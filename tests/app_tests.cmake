@@ -23,6 +23,8 @@ app_test(labels    test_app_labels.cpp    UNITS labels ops_common ops_segment_co
 app_test(tracking  test_app_tracking.cpp  UNITS tracking labels)
 app_test(training  test_app_training.cpp  UNITS training_export LINK TIFF::TIFF)
 app_test(io        test_app_io.cpp        UNITS array_source export labels dataset)
+# The raw SIM storage layout: its text, the binding to a dataset's dims and the frame arithmetic.
+app_test(sim_layout test_app_sim_layout.cpp UNITS dataset)
 app_test(manifest  test_app_manifest.cpp  UNITS manifest array_source executor pipeline ops_registry)
 app_test(session   test_app_session.cpp   UNITS session volume_ops)
 app_test(rpc       test_app_rpc.cpp       UNITS rpc app_paths cancel errors ops_registry plugin workbench

@@ -280,6 +280,25 @@ TEST_CASE("DatasetManifest round-trips through JSON and TOML", "[app][manifest]"
         CHECK(j["tiles"][1]["grid"][2] == 1);
         check(DatasetManifest::fromJson(j));
     }
+    SECTION("not SIM says only that, and the general layout round-trips as its text") {
+        DatasetManifest plain = m;
+        plain.sim = SimLayout{};
+        const nlohmann::json pj = plain.toJson();
+        CHECK(pj["sim"] == nlohmann::json{{"present", false}});
+        CHECK_FALSE(pj["sim"].contains("ndirs"));
+        CHECK_FALSE(DatasetManifest::fromJson(pj).sim.present);
+        CHECK(plain.toText().find("ndirs") == std::string::npos);
+        CHECK(DatasetManifest::fromText(plain.toText(), "plain").sim.present == false);
+        CHECK(m.toJson()["sim"] == nlohmann::json{{"present", true}, {"ndirs", 3}, {"nphases", 5}, {"fast_si", true}});
+        DatasetManifest general = m;
+        general.sim = SimLayout::fromText("yx=3x3[angle 3, phase 3]");
+        CHECK(general.toJson()["sim"]["layout"] == "yx=3x3[angle 3, phase 3]");
+        const DatasetManifest back = DatasetManifest::fromText(general.toText(), "general");
+        CHECK(back.sim == general.sim);
+        CHECK(back.sim.storage == "yx=3x3[angle 3, phase 3]");
+        CHECK(back.sim.ndirs == 3);
+        CHECK(back.sim.nphases == 3);
+    }
     SECTION("toml file") {
         const test::TempFile file("app_manifest", ".toml");
         m.save(file.path);

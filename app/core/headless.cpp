@@ -244,7 +244,7 @@ namespace sirius::app {
                     {"t", prop("integer", "Plain TIFF: number of time points in the page order")},
                     {"z", prop("integer", "Plain TIFF: number of z planes (0 = from the page count)")},
                     {"voxel_um", {{"type", "array"}, {"items", {{"type", "number"}}}, {"description", "Voxel size [x, y, z] in micrometres, over what the file says"}}},
-                    {"sim", {{"type", json::array({"object", "boolean"})}, {"description", "Raw SIM layout {ndirs, nphases, fast}, or false for none"}}},
+                    {"sim", {{"type", json::array({"object", "string", "boolean"})}, {"description", "Raw SIM layout {ndirs, nphases, fast}, or its general form {layout: \"c=angle 3; z=phase 3\"} (a text alone works too), or false for none"}}},
                     {"tile", prop("integer", "Multi-file datasets: the tile to open")},
                     {"full_load", prop("boolean", "Read everything into memory now (default false: planes are read when needed)")}};
         }

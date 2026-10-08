@@ -295,6 +295,31 @@ TEST_CASE("engine: meta, reports, lineage and diagnostics round-trip through JSO
         CHECK(r.tiles[1].gridIndex[2] == 1);
         CHECK(r.tileIndex == 1);
         CHECK_THROWS(datasetMetaFromJson(json{{"dims", {1, 2}}}));
+
+        // not SIM: the JSON says only that. The struct's default 3 x 5 used
+        // to come through as ndirs / nphases and read as a detection.
+        DatasetMeta plain = m;
+        plain.sim = SimLayout{};
+        const json pj = toJson(plain);
+        REQUIRE(pj["sim"].is_object());
+        CHECK(pj["sim"] == json{{"present", false}});
+        CHECK_FALSE(pj["sim"].contains("ndirs"));
+        CHECK_FALSE(pj["sim"].contains("nphases"));
+        CHECK_FALSE(datasetMetaFromJson(pj).sim.present);
+        // the shorthand serialises as it always has, with no layout text
+        const json sj = toJson(m)["sim"];
+        CHECK(sj == json{{"present", true}, {"ndirs", 3}, {"nphases", 5}, {"fast_si", true}});
+        // the general storage layout travels as its text and comes back as it
+        DatasetMeta general = m;
+        general.sim = SimLayout::fromText("c=angle 3; z=phase 3");
+        const json gj = toJson(general);
+        CHECK(gj["sim"]["layout"] == "c=angle 3; z=phase 3");
+        CHECK(gj["sim"]["ndirs"] == 3);
+        CHECK(gj["sim"]["nphases"] == 3);
+        const DatasetMeta gr = datasetMetaFromJson(json::parse(gj.dump()));
+        CHECK(gr.sim == general.sim);
+        CHECK_FALSE(gr.sim.isShorthand());
+        CHECK(gr.sim.ndirs == 3);
     }
     SECTION("StepReport and lineage") {
         StepReport rep;

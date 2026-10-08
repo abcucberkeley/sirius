@@ -211,6 +211,52 @@ TEST_CASE("Load validates its path and describes the raw SIM stack", "[app][ops]
     Buffer<float> vol = out.asInput().readVolume(0, 0);
     CHECK(vol.shape() == Shape{135, 64, 64});
 
+    SECTION("the storage layout is the shorthand written out, and the two have to agree") {
+        ParamSet g = p;
+        g.set("sim_ndirs", std::int64_t{0});
+        g.set("sim_nphases", std::int64_t{0});
+        g.set("sim_layout", std::string("z=[angle 3, z, phase 5]"));
+        const Validation gv = load.validate(g, DatasetMeta{});
+        INFO(gv.firstError());
+        CHECK(gv.ok());
+        CHECK(gv.warnings.empty());
+        const DatasetMeta gm = load.outputMeta(g, DatasetMeta{});
+        CHECK(gm.dims == meta.dims);
+        CHECK(gm.sim.present);
+        CHECK_FALSE(gm.sim.isShorthand());
+        CHECK(gm.sim.storage == "z=[angle 3, z, phase 5]");
+        CHECK(gm.sim.ndirs == 3);
+        CHECK(gm.sim.nphases == 5);
+        CHECK(gm.sim.sectionsPerPlane() == 15);
+        CHECK(load.summary(g, DatasetMeta{}).find("15 phase images per plane") != std::string::npos);
+        const StepOutput gout = load.run(StepInput{}, g, prog.ctx);
+        CHECK(gout.meta.sim == gm.sim);
+        // a shorthand beside it that says something else is an error, not a silent choice
+        g.set("sim_ndirs", std::int64_t{3});
+        g.set("sim_nphases", std::int64_t{3});
+        const Validation both = load.validate(g, DatasetMeta{});
+        REQUIRE_FALSE(both.ok());
+        CHECK_THAT(both.firstError(), Catch::Matchers::ContainsSubstring("3 angles × 5 phases"));
+        CHECK_THAT(both.firstError(), Catch::Matchers::ContainsSubstring("3 × 3"));
+        // a layout that does not read is an error naming the text's problem
+        g.set("sim_ndirs", std::int64_t{0});
+        g.set("sim_nphases", std::int64_t{0});
+        g.set("sim_layout", std::string("c=angle; z=phase 5"));
+        CHECK_THAT(load.validate(g, DatasetMeta{}).firstError(), Catch::Matchers::ContainsSubstring("angle on c needs its extent"));
+        // one that reads but does not divide the axes warns with the arithmetic (the SIM step refuses it)
+        g.set("sim_layout", std::string("z=[angle 3, z, phase 4]"));
+        const Validation odd = load.validate(g, DatasetMeta{});
+        CHECK(odd.ok());
+        REQUIRE_FALSE(odd.warnings.empty());
+        CHECK(odd.warnings.front() == "z holds 135 sections, not a multiple of angle 3 × phase 4 = 12.");
+        // the same for the shorthand: the one check, worded once
+        ParamSet odd2 = p;
+        odd2.set("sim_nphases", std::int64_t{4});
+        const Validation w = load.validate(odd2, DatasetMeta{});
+        REQUIRE_FALSE(w.warnings.empty());
+        CHECK(w.warnings.front() == "z holds 135 sections, not a multiple of angle 3 × phase 4 = 12.");
+    }
+
     SECTION("Lazy keeps the pixels on disk") {
         p.set("read_as", std::string("Lazy (chunk on demand)"));
         const StepOutput lazy = load.run(StepInput{}, p, prog.ctx);
@@ -279,10 +325,22 @@ TEST_CASE("SIM reconstructs the bundled stack from a parameter file and reports 
     CHECK(out.note.find("measured OTF") != std::string::npos);
     CHECK(prog.fractions.back() == 1.0);
 
-    SECTION("a section count that is not angles x phases is rejected") {
+    SECTION("a section count that is not angles x phases is rejected, with the arithmetic") {
         DatasetMeta bad = loaded.meta;
         bad.dims.z = 134;
-        CHECK_FALSE(sim.validate(sp, bad).ok());
+        const Validation v = sim.validate(sp, bad);
+        REQUIRE_FALSE(v.ok());
+        CHECK(v.firstError() == "z holds 134 sections, not a multiple of angle 3 × phase 5 = 15.");
+    }
+    SECTION("a storage layout the dataset states has to hold the step's angles and phases") {
+        DatasetMeta declared = loaded.meta;
+        declared.sim = SimLayout::fromText("z=[angle 3, z, phase 5]");
+        CHECK(sim.validate(sp, declared).ok());
+        CHECK(sim.outputMeta(sp, declared).dims == predicted.dims);
+        declared.sim = SimLayout::fromText("z=[angle 5, z, phase 3]");
+        const Validation v = sim.validate(sp, declared);
+        REQUIRE_FALSE(v.ok());
+        CHECK_THAT(v.firstError(), Catch::Matchers::ContainsSubstring("holds 5 angles × 3 phases; the step uses 3 × 5"));
     }
     SECTION("Manual mode needs one angle per direction, in the degrees the table reports") {
         ParamSet m = sim.defaults();
@@ -597,6 +655,143 @@ TEST_CASE("SIM reconstructs a 2D stack with the step's defaults", "[app][ops][si
         sp.set("mode", std::string("From file"));
         sp.set("params_file", toml.str);
         run(sp);
+    }
+}
+
+TEST_CASE("SIM gathers the frames through the storage layout: angles on c, a montage, another z order", "[app][ops][sim][layout]") {
+    // The synthetic 2D scene as a z-packed stack (angle -> phase, nz = 1),
+    // rearranged into the other storages. Every arrangement holds the same
+    // frames, so every reconstruction has to equal the z-packed one.
+    SIMParameters optics;
+    optics.ndirs = 3;
+    optics.nphases = 3;
+    optics.na = 1.2;
+    optics.nimm = 1.33;
+    optics.wavelength_nm = 530.0;
+    optics.linespacing_um = 0.30;
+    optics.k0_start_angle = 0.3;
+    optics.dx = 0.08;
+    optics.dy = 0.08;
+    const int n = 128;
+    const Buffer<double> raw = test::syntheticSim2d(optics, n);   // (9, n, n): section = angle * 3 + phase
+    auto frame = [&](Index angle, Index phase) { return raw.data() + (angle * 3 + phase) * n * n; };
+
+    const Operation& sim = requireOperation("sim");
+    ParamSet sp = sim.defaults();
+    sp.set("phases", std::int64_t{3});
+    sp.set("na", 1.2);
+    sp.set("nimm", 1.33);
+    sp.set("wavelength_nm", 530.0);
+    sp.set("linespacing_um", 0.30);
+    sp.set("k0_start_angle", 0.3 * 180.0 / kPi);
+
+    auto runOn = [&](std::shared_ptr<Array5> array, DatasetMeta meta) {
+        const Validation v = sim.validate(sp, meta);
+        INFO(meta.sim.text() << ": " << v.firstError());
+        REQUIRE(v.ok());
+        const DatasetMeta predicted = sim.outputMeta(sp, meta);
+        CHECK(predicted.dims == Dims5{1, 1, 1, 2 * n, 2 * n});
+        CHECK_FALSE(predicted.sim.present);
+        Progress prog;
+        StepOutput out = sim.run(inputOf(std::move(array), meta), sp, prog.ctx);
+        REQUIRE(out.array);
+        REQUIRE(out.array->dims() == predicted.dims);
+        REQUIRE(out.diagnostics.table);
+        REQUIRE(out.diagnostics.table->rows.size() == 3);
+        return out;
+    };
+    auto same = [&](const Array5& a, const Array5& b) {
+        REQUIRE(a.dims() == b.dims());
+        double maxDiff = 0.0, maxAbs = 0.0;
+        const Index count = a.dims().numel();
+        for (Index i = 0; i < count; ++i) {
+            maxDiff = std::max(maxDiff, static_cast<double>(std::abs(a.data()[i] - b.data()[i])));
+            maxAbs = std::max(maxAbs, static_cast<double>(std::abs(b.data()[i])));
+        }
+        CHECK(maxAbs > 0.0);
+        CHECK(maxDiff <= 1e-5 * maxAbs);   // the same frames in the same order: equal to rounding
+    };
+
+    // the z-packed reference: what every stack was before layouts existed
+    const Dims5 packedDims{1, 1, 9, n, n};
+    DatasetMeta packedMeta = metaFor(packedDims, 0.08, 0.3);
+    packedMeta.sim = SimLayout::shorthand(3, 3);
+    auto packed = std::make_shared<Array5>(packedDims);
+    for (Index z = 0; z < 9; ++z) std::copy_n(raw.data() + z * n * n, n * n, packed->plane(0, 0, z));
+    // the float copy of the sections, as the gathered stacks are built from floats too
+    const StepOutput reference = runOn(packed, packedMeta);
+    CHECK(reference.diagnostics.table->rows[0][0] == "17°");
+
+    SECTION("the angle on the channel axis, the phase on z (mcSIM's arrangement)") {
+        const Dims5 dims{3, 1, 3, n, n};
+        DatasetMeta meta = metaFor(dims, 0.08, 0.3);
+        meta.sim = SimLayout::fromText("c=angle 3; z=phase 3");
+        auto array = std::make_shared<Array5>(dims);
+        for (Index a = 0; a < 3; ++a)
+            for (Index ph = 0; ph < 3; ++ph) std::copy_n(frame(a, ph), n * n, array->plane(a, 0, ph));
+        const StepOutput out = runOn(array, meta);
+        same(*out.array, *reference.array);
+        CHECK(out.meta.dims.c == 1);
+        CHECK(out.meta.channels.size() == 1);
+        CHECK(out.diagnostics.table->rows[0][0] == reference.diagnostics.table->rows[0][0]);
+    }
+    SECTION("a 3 x 3 montage of the frames inside one plane (OpenSIM's arrangement)") {
+        const Dims5 dims{1, 1, 1, 3 * n, 3 * n};
+        DatasetMeta meta = metaFor(dims, 0.08, 0.3);
+        meta.sim = SimLayout::fromText("yx=3x3[angle 3, phase 3]");
+        auto array = std::make_shared<Array5>(dims);
+        for (Index a = 0; a < 3; ++a)
+            for (Index ph = 0; ph < 3; ++ph)
+                for (Index y = 0; y < n; ++y)
+                    std::copy_n(frame(a, ph) + y * n, n, array->plane(0, 0, 0) + (a * n + y) * (3 * n) + ph * n);
+        const StepOutput out = runOn(array, meta);
+        same(*out.array, *reference.array);
+        // the output is one tile's size: a montage of 3n x 3n reconstructs to 2n x 2n
+        CHECK(out.meta.dims.y == 2 * n);
+        CHECK(out.meta.dx() == packedMeta.dx() / 2.0);
+    }
+    SECTION("phase outermost on z, an order the reconstructor does not read itself") {
+        const Dims5 dims{1, 1, 9, n, n};
+        DatasetMeta meta = metaFor(dims, 0.08, 0.3);
+        meta.sim = SimLayout::fromText("z=[phase 3, angle 3]");
+        auto array = std::make_shared<Array5>(dims);
+        for (Index a = 0; a < 3; ++a)
+            for (Index ph = 0; ph < 3; ++ph) std::copy_n(frame(a, ph), n * n, array->plane(0, 0, ph * 3 + a));
+        const StepOutput out = runOn(array, meta);
+        same(*out.array, *reference.array);
+    }
+    SECTION("a real channel beside the angles reconstructs to its own volume") {
+        // two channels, each with its three angles on c: c = [c, angle 3]
+        const Dims5 dims{6, 1, 3, n, n};
+        DatasetMeta meta = metaFor(dims, 0.08, 0.3);
+        meta.sim = SimLayout::fromText("c=[c, angle 3]; z=phase 3");
+        auto array = std::make_shared<Array5>(dims);
+        for (Index c = 0; c < 2; ++c)
+            for (Index a = 0; a < 3; ++a)
+                for (Index ph = 0; ph < 3; ++ph) {
+                    float* dst = array->plane(c * 3 + a, 0, ph);
+                    const double* src = frame(a, ph);
+                    for (Index i = 0; i < n * n; ++i) dst[i] = static_cast<float>(src[i] * (c == 0 ? 1.0 : 0.5));
+                }
+        const Validation v = sim.validate(sp, meta);
+        REQUIRE(v.ok());
+        const DatasetMeta predicted = sim.outputMeta(sp, meta);
+        CHECK(predicted.dims == Dims5{2, 1, 1, 2 * n, 2 * n});
+        Progress prog;
+        const StepOutput out = sim.run(inputOf(array, meta), sp, prog.ctx);
+        REQUIRE(out.array);
+        CHECK(out.array->dims() == predicted.dims);
+        // channel 0 is the reference scene
+        Array5 first(Dims5{1, 1, 1, 2 * n, 2 * n});
+        std::copy_n(out.array->plane(0, 0, 0), 4 * n * n, first.plane(0, 0, 0));
+        same(first, *reference.array);
+    }
+    SECTION("a montage whose tiles do not fit is refused with the numbers") {
+        DatasetMeta meta = metaFor(Dims5{1, 1, 1, 3 * n, 3 * n + 2}, 0.08, 0.3);
+        meta.sim = SimLayout::fromText("yx=3x3[angle 3, phase 3]");
+        const Validation v = sim.validate(sp, meta);
+        REQUIRE_FALSE(v.ok());
+        CHECK(v.firstError() == "x holds " + std::to_string(3 * n + 2) + " columns, not a multiple of 3 tile columns.");
     }
 }
 

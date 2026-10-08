@@ -57,6 +57,14 @@ namespace sirius::app {
     }
 
     json toJson(const DatasetMeta& m) {
+        // not SIM: present alone, so no angle or phase count reads as a detection
+        json sim = {{"present", m.sim.present}};
+        if (m.sim.present) {
+            sim["ndirs"] = m.sim.ndirs;
+            sim["nphases"] = m.sim.nphases;
+            sim["fast_si"] = m.sim.fastSi;
+            if (!m.sim.isShorthand()) sim["layout"] = m.sim.storage;
+        }
         json channels = json::array();
         for (const ChannelInfo& c : m.channels)
             channels.push_back({{"label", c.label}, {"wavelength_nm", c.wavelengthNm}, {"color", color(c.color)}, {"exposure", c.exposure}});
@@ -75,7 +83,7 @@ namespace sirius::app {
                 {"frame_interval_s", m.frameIntervalS},
                 {"channels", channels},
                 {"acquisition", m.acquisition},
-                {"sim", {{"present", m.sim.present}, {"ndirs", m.sim.ndirs}, {"nphases", m.sim.nphases}, {"fast_si", m.sim.fastSi}}},
+                {"sim", sim},
                 {"rgb", m.rgb},
                 {"light_sheet", m.lightSheet},
                 {"sheet_angle_deg", m.sheetAngleDeg},
@@ -113,6 +121,15 @@ namespace sirius::app {
             read(*it, "ndirs", m.sim.ndirs);
             read(*it, "nphases", m.sim.nphases);
             read(*it, "fast_si", m.sim.fastSi);
+            std::string layout;
+            read(*it, "layout", layout);
+            if (!layout.empty()) {
+                const SimLayout general = SimLayout::fromText(layout);
+                m.sim.storage = general.storage;
+                m.sim.ndirs = general.ndirs;
+                m.sim.nphases = general.nphases;
+                m.sim.fastSi = general.fastSi;
+            }
         }
         read(j, "rgb", m.rgb);
         read(j, "light_sheet", m.lightSheet);

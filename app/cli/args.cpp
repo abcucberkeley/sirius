@@ -239,7 +239,7 @@ namespace sirius::cli {
             opt("page-t", "N", "integer", "", "time points, for a plain TIFF"),
             opt("page-z", "N", "integer", "", "z planes, for a plain TIFF (default: from the page count)"),
             opt("voxel", "x,y,z", "list", "", "the voxel size in microns, instead of the file's"),
-            opt("sim", "d,p[,fast]", "list", "", "raw SIM data: directions and phases per plane (fast: z before direction)"),
+            opt("sim", "d,p[,fast]", "list", "", "raw SIM data: directions and phases per plane (fast: z before direction), or a storage layout such as 'c=angle 3; z=phase 3'"),
             flag("no-sim", "not raw SIM data, whatever the file says"),
             opt("dataset-tile", "N", "integer", "", "the tile to serve, for a multi-file dataset"),
             flag("full-load", "read the whole dataset into memory now (default: read planes as needed)"),

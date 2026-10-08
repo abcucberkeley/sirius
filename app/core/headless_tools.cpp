@@ -117,6 +117,20 @@ namespace sirius::app {
 
     // --- datasets --------------------------------------------------------------------
 
+    // The SIM layout of a DatasetInfo: {present: false} for a stack that is
+    // not SIM -- the angle and phase counts beside it were the struct's
+    // defaults and read as a detection -- else the counts, the order and,
+    // for the general form, its layout text.
+    json simInfo(const SimLayout& sim) {
+        json j = {{"present", sim.present}};
+        if (!sim.present) return j;
+        j["ndirs"] = sim.ndirs;
+        j["nphases"] = sim.nphases;
+        j["fast"] = sim.fastSi;
+        if (!sim.isShorthand()) j["layout"] = sim.storage;
+        return j;
+    }
+
     json datasetInfo(const DatasetMeta& meta, const OpenResult* opened) {
         json dims = {{"c", meta.dims.c}, {"t", meta.dims.t}, {"z", meta.dims.z}, {"y", meta.dims.y}, {"x", meta.dims.x}};
         json float32Bytes = nullptr;
@@ -147,7 +161,7 @@ namespace sirius::app {
                 {"frame_interval_s", meta.frameIntervalS},
                 {"channels", channels},
                 {"acquisition", meta.acquisition},
-                {"sim", {{"present", meta.sim.present}, {"ndirs", meta.sim.ndirs}, {"nphases", meta.sim.nphases}, {"fast", meta.sim.fastSi}}},
+                {"sim", simInfo(meta.sim)},
                 {"rgb", meta.rgb},
                 {"light_sheet", meta.lightSheet},
                 {"sheet_angle_deg", meta.sheetAngleDeg},
@@ -189,8 +203,21 @@ namespace sirius::app {
         }
         if (const auto it = a.find("sim"); it != a.end() && !it->is_null()) {
             SimLayout sim;
+            // the general form: a layout text, alone or as {"layout": ...}
+            auto fromLayoutText = [&](const std::string& text) {
+                try {
+                    sim = SimLayout::fromText(text);
+                } catch (const std::exception& e) {
+                    invalid(std::string("'sim' layout: ") + e.what(), "a layout such as \"z=[angle 3, z, phase 5]\", \"c=angle 3; z=phase 3\" or \"yx=3x3[angle 3, phase 3]\"");
+                }
+            };
             if (it->is_boolean()) {
                 sim.present = it->get<bool>();   // true: 3 directions x 5 phases
+            } else if (it->is_string()) {
+                fromLayoutText(it->get<std::string>());
+            } else if (it->is_object() && it->contains("layout") && !(*it)["layout"].is_null()) {
+                if (!(*it)["layout"].is_string()) invalid("'sim.layout' must be a string");
+                fromLayoutText((*it)["layout"].get<std::string>());
             } else if (it->is_object()) {
                 sim.present = true;
                 sim.ndirs = static_cast<int>(integerArg(*it, "ndirs", 3, 1));
@@ -204,7 +231,7 @@ namespace sirius::app {
                 sim.nphases = static_cast<int>(integerArg(named, "nphases", 5, 1));
                 sim.fastSi = named["fast"].is_boolean() ? named["fast"].get<bool>() : named["fast"].is_number() && named["fast"].get<double>() != 0.0;
             } else {
-                invalid("'sim' must be {\"ndirs\", \"nphases\", \"fast\"} or false");
+                invalid("'sim' must be {\"ndirs\", \"nphases\", \"fast\"}, {\"layout\": \"...\"}, a layout text or false");
             }
             o.sim = sim;
         }

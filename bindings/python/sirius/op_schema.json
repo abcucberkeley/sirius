@@ -149,6 +149,15 @@
           "type": "bool"
         },
         {
+          "advanced": true,
+          "default": "",
+          "help": "Raw SIM, the general form: which file axes hold angle, phase and z. z=[angle 3, z, phase 5] is SIM angles × phases on z; c=angle 3; z=phase 3 puts the angles on the channels; yx=3x3[angle 3, phase 3] is a montage of tiles in every plane. Empty = the SIM angles, phases and order above.",
+          "key": "sim_layout",
+          "label": "SIM storage layout",
+          "read_only": false,
+          "type": "string"
+        },
+        {
           "advanced": false,
           "default": 0.0,
           "help": "Angle between the light sheet and the coverslip (0 = not light-sheet)",

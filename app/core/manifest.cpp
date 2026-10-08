@@ -283,7 +283,15 @@ namespace sirius::app {
         if (!positions.empty()) j["positions"] = positions;
         if (overlapFraction) j["overlap_fraction"] = *overlapFraction;
         if (!filesFolder.empty()) j["files_folder"] = filesFolder;
-        j["sim"] = json{{"present", sim.present}, {"ndirs", sim.ndirs}, {"nphases", sim.nphases}, {"fast_si", sim.fastSi}};
+        // a stack that is not SIM says only that: the angle and phase counts
+        // would be the struct's defaults, which read as a detection
+        j["sim"] = json{{"present", sim.present}};
+        if (sim.present) {
+            j["sim"]["ndirs"] = sim.ndirs;
+            j["sim"]["nphases"] = sim.nphases;
+            j["sim"]["fast_si"] = sim.fastSi;
+            if (!sim.isShorthand()) j["sim"]["layout"] = sim.storage;
+        }
         j["channels"] = json::array();
         for (const ChannelInfo& c : channels) j["channels"].push_back(channelToJson(c));
         j["tiles"] = json::array();
@@ -312,6 +320,14 @@ namespace sirius::app {
             m.sim.ndirs = s.value("ndirs", 3);
             m.sim.nphases = s.value("nphases", 5);
             m.sim.fastSi = s.value("fast_si", false);
+            if (s.contains("layout") && s["layout"].is_string() && !s["layout"].get<std::string>().empty()) {
+                // the general form is the layout; its counts come from it
+                const SimLayout general = SimLayout::fromText(s["layout"].get<std::string>());
+                m.sim.storage = general.storage;
+                m.sim.ndirs = general.ndirs;
+                m.sim.nphases = general.nphases;
+                m.sim.fastSi = general.fastSi;
+            }
         }
         if (j.contains("channels"))
             for (const json& c : j["channels"]) m.channels.push_back(channelFromJson(c));

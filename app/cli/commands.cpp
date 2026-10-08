@@ -753,10 +753,15 @@ namespace sirius::cli {
                 else if (o.name == "page-z") a["z"] = toInteger(o.name, o.value);
                 else if (o.name == "voxel") a["voxel_um"] = numberList(o.name, o.value, 3);
                 else if (o.name == "sim") {
-                    const std::vector<std::string> parts = split(o.value, ',');
-                    if (parts.size() < 2 || parts.size() > 3 || (parts.size() == 3 && lower(parts[2]) != "fast"))
-                        throw UsageError("--sim expects directions,phases[,fast], not '" + o.value + "'");
-                    a["sim"] = {{"ndirs", toInteger(o.name, parts[0])}, {"nphases", toInteger(o.name, parts[1])}, {"fast", parts.size() == 3}};
+                    if (o.value.find('=') != std::string::npos) {
+                        // the general storage layout, "c=angle 3; z=phase 3"
+                        a["sim"] = {{"layout", trim(o.value)}};
+                    } else {
+                        const std::vector<std::string> parts = split(o.value, ',');
+                        if (parts.size() < 2 || parts.size() > 3 || (parts.size() == 3 && lower(parts[2]) != "fast"))
+                            throw UsageError("--sim expects directions,phases[,fast] or a storage layout such as 'c=angle 3; z=phase 3', not '" + o.value + "'");
+                        a["sim"] = {{"ndirs", toInteger(o.name, parts[0])}, {"nphases", toInteger(o.name, parts[1])}, {"fast", parts.size() == 3}};
+                    }
                 } else if (o.name == "no-sim") a["sim"] = false;
                 else if (o.name == "dataset-tile") a["tile"] = toInteger(o.name, o.value);
                 else if (o.name == "full-load") a["full_load"] = true;

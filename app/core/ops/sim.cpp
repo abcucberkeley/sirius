@@ -15,9 +15,12 @@
 #include <cstdio>
 #include <filesystem>
 #include <fstream>
+#include <map>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <set>
+#include <utility>
 #include <vector>
 
 #include <sirius/constants.hpp>
@@ -101,10 +104,37 @@ namespace sirius::app {
             return buf;
         }
 
-        // Section index of (direction, z, phase) in the raw stack.
-        Index sectionIndex(const SIMParameters& p, Index nz, Index d, Index z, Index phase) {
-            if (p.fast_si) return (z * p.ndirs + d) * p.nphases + phase;
-            return (d * nz + z) * p.nphases + phase;
+        // The layout the raw frames are read through: the dataset's general
+        // storage layout when it has one, else the step's angles x phases on
+        // z in the order the parameters say -- what every stack was read as
+        // before layouts existed, so those runs index exactly as they did.
+        SimLayout stackLayout(const SIMParameters& p, const DatasetMeta& input) {
+            if (input.sim.present && !input.sim.isShorthand()) return input.sim;
+            return SimLayout::shorthand(p.ndirs, p.nphases, p.fast_si);
+        }
+
+        // The raw (sections, y, x) stack of real volume (c, t) as the
+        // reconstructor takes it: read as stored when the frames already lie
+        // on z in an order it knows, otherwise gathered frame by frame
+        // through the layout into the order `stack` describes (angle -> z ->
+        // phase), one tile at a time for a montage. A file volume is read
+        // once however many frames it holds.
+        Buffer<float> rawStack(const StepInput& input, const SimFrames& frames, const SimFrames& stack, Index c, Index t) {
+            if (frames.libraryOrder()) return input.readVolume(c, t);
+            Buffer<float> out(Shape{stack.sections(), frames.tileY, frames.tileX});
+            std::map<std::pair<Index, Index>, Buffer<float>> volumes;
+            const Index rowStride = input.meta.dims.x, planeStride = input.meta.dims.y * rowStride;
+            for (Index a = 0; a < frames.angles; ++a)
+                for (Index z = 0; z < frames.nz; ++z)
+                    for (Index ph = 0; ph < frames.phases; ++ph) {
+                        const SimFrames::Frame fr = frames.frameOf({a, ph, z, c, t});
+                        auto it = volumes.find({fr.c, fr.t});
+                        if (it == volumes.end()) it = volumes.emplace(std::make_pair(fr.c, fr.t), input.readVolume(fr.c, fr.t)).first;
+                        const float* src = it->second.data() + fr.z * planeStride + fr.row * frames.tileY * rowStride + fr.col * frames.tileX;
+                        float* dst = out.data() + stack.sectionIndex(a, ph, z) * frames.tileY * frames.tileX;
+                        for (Index y = 0; y < frames.tileY; ++y) std::copy_n(src + y * rowStride, frames.tileX, dst + y * frames.tileX);
+                    }
+            return out;
         }
 
         // Pixel of a lateral frequency on a spectrum image whose full-size
@@ -289,6 +319,11 @@ namespace sirius::app {
                     p.equalizez = params.getBool("equalizez", false);
                     p.fast_si = input.sim.present && input.sim.fastSi;
                 }
+                // a general storage layout says the order itself: the stack
+                // is passed through in one of the two orders the reconstructor
+                // reads, or gathered into angle -> z -> phase
+                if (input.sim.present && !input.sim.isShorthand() && simLayoutProblem(input.sim, input.dims).empty())
+                    p.fast_si = bindSimLayout(input.sim, input.dims).libraryOrder().value_or(false);
                 // The pixel sizes: the file's where it sets them, the stack's
                 // otherwise. A cudasirecon config's xyres / zres are the pixel
                 // sizes it reconstructs a TIFF stack with, and the radial step
@@ -360,13 +395,21 @@ namespace sirius::app {
                 }
                 const std::string otf = params.getString("otf");
                 if (!otf.empty() && !std::filesystem::exists(otf)) v.errors.push_back("OTF file not found: " + otf);
-                const Index perPlane = static_cast<Index>(p.ndirs) * p.nphases;
-                if (input.dims.z % perPlane != 0)
-                    v.errors.push_back(std::to_string(input.dims.z) + " sections is not a multiple of angles × phases = " +
-                                       std::to_string(perPlane) + ".");
-                if (input.dims.x % 2 != 0 || input.dims.y % 2 != 0 || input.dims.x < 4 || input.dims.y < 4)
-                    v.errors.push_back("Image size must be even and at least 4 × 4.");
-                if (input.sim.present && (input.sim.ndirs != p.ndirs || input.sim.nphases != p.nphases))
+                // the frames through the layout: the extents have to divide the
+                // axes (the message quotes the arithmetic), and a layout the
+                // dataset states has to hold the angles and phases the step uses
+                const SimLayout layout = stackLayout(p, input);
+                const std::string problem = simLayoutProblem(layout, input.dims);
+                if (!problem.empty()) v.errors.push_back(problem);
+                const std::optional<SimFrames> frames = problem.empty() ? std::optional<SimFrames>(bindSimLayout(layout, input.dims)) : std::nullopt;
+                const Index ny = frames ? frames->tileY : input.dims.y, nx = frames ? frames->tileX : input.dims.x;
+                if (nx % 2 != 0 || ny % 2 != 0 || nx < 4 || ny < 4)
+                    v.errors.push_back(frames && frames->storage.montage() ? "Each tile must be even and at least 4 × 4." : "Image size must be even and at least 4 × 4.");
+                if (frames && !layout.isShorthand() && (frames->angles != p.ndirs || frames->phases != p.nphases))
+                    v.errors.push_back("The dataset's layout " + layout.text() + " holds " + std::to_string(frames->angles) + " angles × " +
+                                       std::to_string(frames->phases) + " phases; the step uses " + std::to_string(p.ndirs) + " × " +
+                                       std::to_string(p.nphases) + ". They have to agree for the frames to be gathered.");
+                if (input.sim.present && layout.isShorthand() && (input.sim.ndirs != p.ndirs || input.sim.nphases != p.nphases))
                     v.warnings.push_back("The dataset declares " + std::to_string(input.sim.ndirs) + " angles × " +
                                          std::to_string(input.sim.nphases) + " phases; the step uses " +
                                          std::to_string(p.ndirs) + " × " + std::to_string(p.nphases) + ".");
@@ -382,11 +425,23 @@ namespace sirius::app {
                 } catch (const std::exception&) {
                     return out;
                 }
+                // one result per real (c, t) volume, each tile's size enlarged:
+                // through the layout when it binds, else as a z-packed stack would
                 const Index perPlane = std::max<Index>(1, static_cast<Index>(p.ndirs) * p.nphases);
-                const Index nz = std::max<Index>(1, input.dims.z / perPlane);
+                Index nz = std::max<Index>(1, input.dims.z / perPlane), ny = input.dims.y, nx = input.dims.x;
+                const SimLayout layout = stackLayout(p, input);
+                if (simLayoutProblem(layout, input.dims).empty()) {
+                    const SimFrames frames = bindSimLayout(layout, input.dims);
+                    nz = std::max<Index>(1, frames.nz);
+                    ny = frames.tileY;
+                    nx = frames.tileX;
+                    out.dims.c = frames.channels;
+                    out.dims.t = frames.times;
+                    if (out.dims.c != input.dims.c) out.normalizeChannels();
+                }
                 out.dims.z = nz * std::max(1, p.z_zoom);
-                out.dims.y = static_cast<Index>(std::lround(input.dims.y * p.zoomfact));
-                out.dims.x = static_cast<Index>(std::lround(input.dims.x * p.zoomfact));
+                out.dims.y = static_cast<Index>(std::lround(ny * p.zoomfact));
+                out.dims.x = static_cast<Index>(std::lround(nx * p.zoomfact));
                 // the pixel the reconstruction assumed (From file: the file's),
                 // not the dataset's claim
                 out.voxelUm[0] = p.dx / p.zoomfact;
@@ -402,8 +457,16 @@ namespace sirius::app {
                 const Validation v = validate(params, input.meta);
                 if (!v.ok()) throw std::runtime_error(v.firstError());
                 const SIMParameters p = buildParameters(params, input.meta);
-                const Index perPlane = static_cast<Index>(p.ndirs) * p.nphases;
-                const Index nz = input.meta.dims.z / perPlane;
+                // validate() passed, so the layout binds; `stack` describes the
+                // (sections, y, x) stack handed to the reconstructor: the frames
+                // as stored when they are in an order it reads, else the
+                // angle -> z -> phase order rawStack gathers them into
+                const SimFrames frames = bindSimLayout(stackLayout(p, input.meta), input.meta.dims);
+                const SimFrames stack = frames.libraryOrder()
+                                            ? frames
+                                            : bindSimLayout(SimLayout::shorthand(p.ndirs, p.nphases, false),
+                                                            Dims5{1, 1, frames.sections(), frames.tileY, frames.tileX});
+                const Index nz = frames.nz;
 
                 StepOutput out;
                 out.meta = outputMeta(params, input.meta);
@@ -423,19 +486,18 @@ namespace sirius::app {
                     sessions.back()->setOtfPath(params.getString("otf"));
                     sessionLocks.push_back(std::make_unique<std::mutex>());
                 }
-                const Index sections = input.meta.dims.z;
                 // Capturing the band spectra keeps two complex volumes covering
                 // every direction and band -- gigabytes on a full-size stack --
                 // so it is only done for small ones. When it is skipped the
                 // reason goes in the warnings, which is what the SIM parameter
                 // panel renders; a fact would be built and never shown, the
                 // panel drawing only images, the fit table and the footer.
-                const bool capture = input.meta.dims.y * input.meta.dims.x <= 512 * 512 && sections <= 64 * perPlane;
+                const bool capture = frames.tileY * frames.tileX <= 512 * 512 && nz <= 64;
                 std::string captureNote;
                 if (!capture) {
                     const int bands = 2 * p.resolvedOrders() - 1;
                     const double bytes = 2.0 * p.ndirs * bands * static_cast<double>(nz) *
-                                         static_cast<double>(input.meta.dims.y) * static_cast<double>(input.meta.dims.x) * 16.0;
+                                         static_cast<double>(frames.tileY) * static_cast<double>(frames.tileX) * 16.0;
                     char buf[256];
                     std::snprintf(buf, sizeof buf,
                                   "The separated and Wiener-filtered band spectra are kept only for stacks up to 512 × 512 "
@@ -452,8 +514,13 @@ namespace sirius::app {
                 double seconds = 0.0;
                 bool plansReused = false;
                 std::mutex firstMu;
-                forEachVolumeOnGpus(input.meta, ctx, [&](Index c, Index t, Device volDevice) {
-                    Buffer<float> raw = input.readVolume(c, t);
+                // one reconstruction per real (c, t) volume: the angles on the
+                // channel axis, say, are frames of one volume, not channels
+                DatasetMeta volumes = input.meta;
+                volumes.dims.c = frames.channels;
+                volumes.dims.t = frames.times;
+                forEachVolumeOnGpus(volumes, ctx, [&](Index c, Index t, Device volDevice) {
+                    Buffer<float> raw = rawStack(input, frames, stack, c, t);
                     Buffer<double> rawD(raw.shape());
                     convert(raw, rawD);
                     const int slot = volDevice.isCuda() ? volDevice.index % nSessions : 0;
@@ -476,7 +543,7 @@ namespace sirius::app {
                     ctx.throwIfCancelled();
                     if (diagnosed) {
                         std::lock_guard<std::mutex> f(firstMu);
-                        out.diagnostics = diagnostics(input, raw, r, p, nz, *result, params, captureNote);
+                        out.diagnostics = diagnostics(input, raw, r, p, stack, *result, params, captureNote);
                     }
                 });
                 out.array = result;
@@ -493,11 +560,13 @@ namespace sirius::app {
             }
 
         private:
+            // `stack` indexes `raw`: the (sections, y, x) stack the reconstructor was given.
             Diagnostics diagnostics(const StepInput& input, const Buffer<float>& raw, const ReconResult& r,
-                                    const SIMParameters& p, Index nz, const Array5& result, const ParamSet& params,
+                                    const SIMParameters& p, const SimFrames& stack, const Array5& result, const ParamSet& params,
                                     const std::string& captureNote = {}) const {
                 Diagnostics d;
                 d.kind = DiagnosticsKind::Sim;
+                const Index nz = stack.nz;
                 const Index ny = raw.dim(1), nx = raw.dim(2);
                 const Index zMid = nz / 2;
                 const std::vector<std::array<double, 2>> predicted = predictedK0(p, nz);
@@ -507,7 +576,7 @@ namespace sirius::app {
                 // --- Raw spectrum: one panel per direction (phase 0, middle z)
                 DiagnosticTab rawTab{"Raw spectrum", {}};
                 for (int dir = 0; dir < p.ndirs; ++dir) {
-                    const Index s = sectionIndex(p, nz, dir, zMid, 0);
+                    const Index s = stack.sectionIndex(dir, 0, zMid);
                     const float* plane = raw.data() + s * ny * nx;
                     const double angle = dir < static_cast<int>(predicted.size())
                                              ? std::atan2(predicted[static_cast<std::size_t>(dir)][1], predicted[static_cast<std::size_t>(dir)][0])
@@ -564,7 +633,7 @@ namespace sirius::app {
                     Index n = 0;
                     for (int dir = 0; dir < p.ndirs; ++dir)
                         for (int ph = 0; ph < p.nphases; ++ph, ++n) {
-                            const float* plane = raw.data() + sectionIndex(p, nz, dir, zMid, ph) * ny * nx;
+                            const float* plane = raw.data() + stack.sectionIndex(dir, ph, zMid) * ny * nx;
                             for (Index i = 0; i < ny * nx; ++i) wide[static_cast<std::size_t>(i)] += plane[i];
                         }
                     for (float& v : wide) v /= static_cast<float>(std::max<Index>(n, 1));

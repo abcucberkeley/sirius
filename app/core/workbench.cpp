@@ -851,9 +851,11 @@ namespace sirius::app {
                 params.set("sim_ndirs", static_cast<std::int64_t>(o.sim->present ? o.sim->ndirs : 0));
                 params.set("sim_nphases", static_cast<std::int64_t>(o.sim->present ? o.sim->nphases : 0));
                 params.set("sim_fast", o.sim->present && o.sim->fastSi);
+                params.set("sim_layout", o.sim->present ? o.sim->storage : std::string());
             } else if (meta.sim.present) {
                 params.set("sim_ndirs", static_cast<std::int64_t>(meta.sim.ndirs));
                 params.set("sim_nphases", static_cast<std::int64_t>(meta.sim.nphases));
+                params.set("sim_layout", meta.sim.storage);
             }
             if (meta.lightSheet) params.set("sheet_angle", meta.sheetAngleDeg);
         }

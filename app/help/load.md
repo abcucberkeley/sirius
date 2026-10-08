@@ -16,7 +16,22 @@ $$
 | **Source** <br> File · Folder | *File*: a multi-page TIFF / OME-TIFF / ImageJ hyperstack (decoded on the GPU by nvTIFF when possible), or a DeltaVision / MRC stack (`.dv`, `.mrc`: what OMX microscopes and cudasirecon write; the header's wavelengths and time points are the channels and time points, its pixel sizes the voxel size). Plain TIFFs without dimension metadata ask how the pages map onto channels, time points and z planes. *Folder*: a folder as one dataset — its `sirius-dataset.toml`, the folder dialog that writes one (below), or a zarr / N5 store. With a cluster session, *This computer · Cluster* says where Browse looks; a folder on the cluster is opened there by SIRIUS's engine. |
 | **Tile** <br> index | Multi-file datasets only: which tile of the folder is viewed and processed. *Stitch* with no tile files fuses all of them, whatever this is set to. |
 | **Read as** <br> full · lazy | Full load (the default) reads the current tile into RAM once — faster scrubbing, needs the whole volume in memory. Lazy reads planes on demand and keeps a bounded RAM cache. |
-| **SIM layout** <br> directions × phases | For raw structured-illumination stacks: how many pattern directions and phase steps the z axis interleaves, so the SIM step can unmix them. $Z_{\text{file}} = N_{\text{dir}} \cdot N_{\text{phase}} \cdot Z$ |
+| **SIM angles · SIM phases** <br> directions × phases | For raw structured-illumination stacks: how many pattern directions and phase steps the z axis interleaves, so the SIM step can unmix them. $Z_{\text{file}} = N_{\text{dir}} \cdot N_{\text{phase}} \cdot Z$. *Fast SI order* (under More) says the sections run z → direction → phase instead of direction → z → phase. |
+| **SIM storage layout** <br> text, under More | The general form of the same statement, for raw stacks the two counts cannot describe: which file axes hold the logical axes *angle*, *phase* and *z* (below). Empty, the angles, phases and order above are the layout. |
+
+## The SIM storage layout
+
+A raw SIM acquisition is a set of frames indexed by angle, phase and z, and files store those frames in more ways than "interleaved on z". The storage layout says where the file keeps them, and nothing about the illumination: the SIM step's own parameters describe the pattern. Three mechanisms, written as `axis=…` entries separated by `;`:
+
+| mechanism | example | meaning |
+|---|---|---|
+| identity | `c=angle 3` | the file axis *is* the logical axis: the three channels are the three pattern angles |
+| factorisation | `z=[angle 3, z, phase 5]` | one file axis multiplexes several, outermost first: the z axis runs angle, then z, then phase (the default order; the fast-SI order is `z=[z, angle 3, phase 5]`) |
+| montage | `yx=3x3[angle 3, phase 3]` | every plane is a grid of tiles, 3 rows by 3 columns, numbered row by row with the angle outermost and the phase innermost |
+
+The SIM angles and phases are always written with their counts; the axis's own kind — `c` on `c`, `t` on `t`, `z` on `z` — may be left without one and takes what remains (`z=[angle 3, z, phase 5]` on 135 sections gives 9 planes). A file axis without an entry is itself: `c=angle 3; z=phase 3` describes a stack with the angles on the channel axis and the phases on z, one plane deep. Every logical axis appears once. The counts have to divide the axes exactly, and the message says the arithmetic when they do not: *z holds 134 sections, not a multiple of angle 3 × phase 5 = 15.*
+
+The three shapes this covers: cudasirecon's `raw.tif`, 135 planes of 3 angles × 5 phases × 9 z packed on z (`z=[angle 3, z, phase 5]`, which is what SIM angles 3 and SIM phases 5 expand to); mcSIM's `synthetic_microtubules.tiff`, which opens as c3 z3 with the angle on the channel axis (`c=angle 3; z=phase 3`); OpenSIM's `sim01z4.tif`, a 1536 × 1536 plane that is a 3 × 3 montage of 512 × 512 frames (`yx=3x3[angle 3, phase 3]`). The SIM step gathers the frames through the layout and reconstructs one volume per remaining channel and time point; the output of a montage is one tile's size, enlarged by the lateral zoom.
 
 ## Folders of files
 

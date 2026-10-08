@@ -47,10 +47,10 @@ namespace sirius::app {
             const std::array<double, 3> v = o->voxelUm.value_or(std::array<double, 3>{-1.0, -1.0, -1.0});
             const SimLayout sim = o->sim.value_or(SimLayout{});
             char buf[256];
-            std::snprintf(buf, sizeof buf, "|%s %lld %lld %lld|%.17g %.17g %.17g|%d %d %d %d|%lld", po.order.c_str(),
+            std::snprintf(buf, sizeof buf, "|%s %lld %lld %lld|%.17g %.17g %.17g|%d %d %d %d|%lld|", po.order.c_str(),
                           static_cast<long long>(po.c), static_cast<long long>(po.t), static_cast<long long>(po.z), v[0], v[1],
                           v[2], sim.present ? 1 : 0, sim.ndirs, sim.nphases, sim.fastSi ? 1 : 0, static_cast<long long>(o->tile));
-            return buf;
+            return buf + sim.storage;
         }
 
         // Empty error when the probe succeeded. With `options`, the meta that
@@ -102,9 +102,8 @@ namespace sirius::app {
         // description and the light-sheet angle. Never the dims: those are
         // what the source serves.
         void annotate(const ParamSet& p, DatasetMeta& meta) {
-            const Index nd = p.getInt("sim_ndirs"), np = p.getInt("sim_nphases");
-            if (nd > 0 && np > 0 && meta.acquisition.empty())
-                meta.acquisition = "3D-SIM raw · " + std::to_string(nd * np) + " phase images per plane";
+            if (meta.sim.present && meta.acquisition.empty())
+                meta.acquisition = "3D-SIM raw · " + std::to_string(meta.sim.sectionsPerPlane()) + " phase images per plane";
             const double angle = p.getDouble("sheet_angle");
             if (angle > 0.0) {
                 meta.lightSheet = true;
@@ -184,6 +183,11 @@ namespace sirius::app {
                     boolParam("sim_fast", "Fast SI order", false)
                         .withHelp("Sections ordered z → direction → phase instead of direction → z → phase")
                         .asAdvanced(),
+                    stringParam("sim_layout", "SIM storage layout", "")
+                        .withHelp("Raw SIM, the general form: which file axes hold angle, phase and z. z=[angle 3, z, phase 5] is SIM angles × phases on z; "
+                                  "c=angle 3; z=phase 3 puts the angles on the channels; yx=3x3[angle 3, phase 3] is a montage of tiles in every plane. "
+                                  "Empty = the SIM angles, phases and order above.")
+                        .asAdvanced(),
                     doubleParam("sheet_angle", "Light-sheet angle", 0.0).range(0.0, 90.0, 0.1, 1).withUnit("°").withHelp("Angle between the light sheet and the coverslip (0 = not light-sheet)"),
                 };
             }
@@ -218,6 +222,19 @@ namespace sirius::app {
                 }
                 const Index nd = params.getInt("sim_ndirs"), np = params.getInt("sim_nphases");
                 if ((nd > 0) != (np > 0)) v.errors.push_back("SIM layout needs both angles and phases.");
+                // the general layout has to read, and the shorthand beside it has to agree with it
+                const std::string layoutText = params.getString("sim_layout");
+                if (!layoutText.empty()) {
+                    try {
+                        const SimLayout layout = SimLayout::fromText(layoutText);
+                        if (nd > 0 && np > 0 && (layout.ndirs != nd || layout.nphases != np))
+                            v.errors.push_back("The SIM storage layout " + layout.text() + " holds " + std::to_string(layout.ndirs) + " angles × " +
+                                               std::to_string(layout.nphases) + " phases; SIM angles and phases say " + std::to_string(nd) + " × " +
+                                               std::to_string(np) + ". Set those to 0 or make them agree.");
+                    } catch (const std::exception& e) {
+                        v.errors.push_back(e.what());
+                    }
+                }
                 const Index tile = params.getInt("tile");
                 if (tile < 0 || tile >= tileCountOf(plain))
                     v.errors.push_back("Tile " + std::to_string(tile) + " is out of range: the dataset has " +
@@ -238,9 +255,10 @@ namespace sirius::app {
                 if ((c > 0 && meta.dims.c != c) || (t > 0 && meta.dims.t != t) || (z > 0 && meta.dims.z != z))
                     v.warnings.push_back("Channels, time points and planes do not fit the file's " + std::to_string(meta.dims.planes()) +
                                          " pages: they are read as " + meta.dims.toString() + ".");
-                if (meta.sim.present && meta.dims.z % meta.sim.sectionsPerPlane() != 0)
-                    v.warnings.push_back(std::to_string(meta.dims.z) + " sections is not a multiple of " +
-                                         std::to_string(meta.sim.sectionsPerPlane()) + " (angles × phases).");
+                // the layout's extents against the axes: a warning here, since the
+                // dataset still opens; the SIM step refuses to run on it
+                if (meta.sim.present)
+                    if (const std::string problem = simLayoutProblem(meta.sim, meta.dims); !problem.empty()) v.warnings.push_back(problem);
                 return v;
             }
 
@@ -314,13 +332,16 @@ namespace sirius::app {
         const double vx = p.getDouble("voxel_x", 0.0), vy = p.getDouble("voxel_y", 0.0), vz = p.getDouble("voxel_z", 0.0);
         if (vx > 0.0 || vy > 0.0 || vz > 0.0) o.voxelUm = std::array<double, 3>{std::max(vx, 0.0), std::max(vy, 0.0), std::max(vz, 0.0)};
         const int ndirs = static_cast<int>(p.getInt("sim_ndirs", 0)), nphases = static_cast<int>(p.getInt("sim_nphases", 0));
-        if (ndirs > 0 && nphases > 0) {
-            SimLayout sim;
-            sim.present = true;
-            sim.ndirs = ndirs;
-            sim.nphases = nphases;
-            sim.fastSi = p.getBool("sim_fast", false);
-            o.sim = sim;
+        const std::string layout = p.getString("sim_layout");
+        if (!layout.empty()) {
+            // the general form is the layout; a text that does not read opens
+            // the dataset as not SIM, and validate() says what is wrong with it
+            try {
+                o.sim = SimLayout::fromText(layout);
+            } catch (const std::exception&) {
+            }
+        } else if (ndirs > 0 && nphases > 0) {
+            o.sim = SimLayout::shorthand(ndirs, nphases, p.getBool("sim_fast", false));
         }
         o.tile = std::max<Index>(0, p.getInt("tile", 0));
         return o;

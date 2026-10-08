@@ -3203,6 +3203,25 @@ def _sim_parameter_file_keys(path: str) -> _SimParameterFileKeys:
     return found
 
 
+_SIM_LAYOUT_ON_Z = re.compile(
+    r"^\s*z\s*=\s*\[\s*(?:(?:angles?|dirs?|directions?)\s*(?P<slow>\d+)\s*,\s*(?:z\s*,\s*)?"
+    r"|z\s*,\s*(?:angles?|dirs?|directions?)\s*(?P<fast>\d+)\s*,\s*)phases?\s*(?P<phases>\d+)\s*\]\s*;?\s*$", re.IGNORECASE)
+
+
+def _sim_layout_on_z(layout: str) -> Optional[Tuple[int, int, bool]]:
+    """(ndirs, nphases, fast_si) of a storage layout that packs everything on
+    the z axis in one of the two orders the reconstructor reads --
+    "z=[angle 3, z, phase 5]" or the fast-SI "z=[z, angle 3, phase 5]" --
+    else None: the angles on the channels or a montage are gathered by the
+    application's SIM step (app/core/ops/sim.cpp), not here."""
+    m = _SIM_LAYOUT_ON_Z.match(layout or "")
+    if not m:
+        return None
+    if m.group("slow") is not None:
+        return int(m.group("slow")), int(m.group("phases")), False
+    return int(m.group("fast")), int(m.group("phases")), True
+
+
 def _sim_parameters(params: Dict[str, Any], meta: Dict[str, Any]):
     """SIMParameters as sim.cpp's buildParameters assembles them."""
     sirius = _sirius_ext()
@@ -3255,6 +3274,15 @@ def _sim_parameters(params: Dict[str, Any], meta: Dict[str, Any]):
         p.equalizez = _bool(params, "equalizez", False)
         sim = meta.get("sim") or {}
         p.fast_si = bool(sim.get("present") and sim.get("fast_si"))
+    sim = meta.get("sim") or {}
+    if sim.get("present") and sim.get("layout"):
+        # the storage layout states the order: the two the reconstructor
+        # reads are passed through, anything else is only gathered by the application
+        packed = _sim_layout_on_z(str(sim["layout"]))
+        if packed is None:
+            raise NotAvailable(f"the SIM storage layout '{sim['layout']}' (angles on the channels, or a montage) is "
+                               "gathered into a stack only by the SIRIUS application's SIM step; run it there")
+        p.fast_si = packed[2]
     # The pixel sizes: the file's where it sets them, the stack's otherwise,
     # as sim.cpp's buildParameters has it since 2026-10-08. A cudasirecon
     # config's xyres / zres are the pixel sizes it reconstructs a TIFF stack
@@ -4052,7 +4080,7 @@ _LOAD = StepSpec(
     "load",
     {"path": "", "read_as": "Full load to RAM", "tile": 0, "page_order": "czt", "c": 0, "t": 0, "z": 0,
      "voxel_x": 0.0, "voxel_y": 0.0, "voxel_z": 0.0, "sim_ndirs": 0, "sim_nphases": 0, "sim_fast": False,
-     "sheet_angle": 0.0},
+     "sim_layout": "", "sheet_angle": 0.0},
     choices={"read_as": ("Lazy (chunk on demand)", "Full load to RAM")},
     aliases={"pageOrder": "page_order", "channels": "c", "timepoints": "t", "planes": "z",
              "ndirs": "sim_ndirs", "nphases": "sim_nphases", "fast_si": "sim_fast"},
@@ -4168,7 +4196,16 @@ def run_pipeline(dataset_path: str, pipeline: Any, progress: ProgressFn = None, 
                                progress=lambda f, m: _progress(progress, 0.0, m))
     voxel = [_float(lp, k, 0.0) for k in ("voxel_x", "voxel_y", "voxel_z")]
     meta["voxel_um"] = [v if v > 0 else cur for v, cur in zip(voxel, meta["voxel_um"])]
-    if _int(lp, "sim_ndirs", 0) > 0 and _int(lp, "sim_nphases", 0) > 0:
+    if _str(lp, "sim_layout"):
+        # the general storage layout (load.cpp's sim_layout): the counts it
+        # names, and the text itself for step_sim to read the order from
+        layout = _str(lp, "sim_layout")
+        packed = _sim_layout_on_z(layout)
+        meta["sim"] = {"present": True, "layout": layout,
+                       "ndirs": packed[0] if packed else _int(lp, "sim_ndirs", 0),
+                       "nphases": packed[1] if packed else _int(lp, "sim_nphases", 0),
+                       "fast_si": bool(packed[2]) if packed else False}
+    elif _int(lp, "sim_ndirs", 0) > 0 and _int(lp, "sim_nphases", 0) > 0:
         meta["sim"] = {"present": True, "ndirs": _int(lp, "sim_ndirs", 0), "nphases": _int(lp, "sim_nphases", 0),
                        "fast_si": _bool(lp, "sim_fast", False)}
     labels: Optional[np.ndarray] = None

@@ -1,5 +1,7 @@
 #include "core/session.hpp"
 
+#include "core/dataset.hpp"
+
 #include <sirius/constants.hpp>
 #include <sirius/legacy_config.hpp>
 #include <sirius/otf_ideal.hpp>
@@ -190,9 +192,15 @@ namespace sirius::app {
         if (nx < 4 || ny < 4 || nx % 2 != 0 || ny % 2 != 0)
             return "Image size must be even and at least 4 x 4, got " + std::to_string(nx) + " x " +
                    std::to_string(ny) + ".";
-        if (inferredNz() == 0)
-            return std::to_string(raw.dim(0)) + " sections is not a multiple of ndirs * nphases = " +
-                   std::to_string(impl_->sectionsPerZ()) + ".";
+        // the stack is ndirs x nphases x nz sections on its first axis: the
+        // one check every layout shares, worded as the storage layout words it
+        if (inferredNz() == 0) {
+            const std::string why = simLayoutProblem(SimLayout::shorthand(impl_->params.ndirs, impl_->params.nphases, impl_->params.fast_si),
+                                                     Dims5{1, 1, raw.dim(0), ny, nx});
+            return why.empty() ? std::to_string(raw.dim(0)) + " sections is not a multiple of ndirs * nphases = " +
+                                     std::to_string(impl_->sectionsPerZ()) + "."
+                               : why;
+        }
         return {};
     }
 
