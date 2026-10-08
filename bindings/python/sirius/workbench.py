@@ -3438,7 +3438,10 @@ def _parse_sim_storage(text: str) -> _SimStorage:
                 if extent == 0:
                     raise ValueError(f"SIM layout: {kind} in the montage needs its extent")
             if rows is not None:
-                st.rows, st.cols = rows, int(cols or 1)
+                # not `int(cols or 1)`: a written 0 has to stay 0 so the tile-count check below
+                # refuses it exactly as dataset.cpp does. Coercing it to 1 made the mirror accept
+                # 'yx=9x0[angle 3, phase 3]', which the application throws out.
+                st.rows, st.cols = rows, cols
             else:
                 st.rows = st.tiles[0][1]
                 st.cols = 1

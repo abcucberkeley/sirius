@@ -740,7 +740,7 @@ TEST_CASE("SIM gathers the frames through the storage layout: angles on c, a mon
     const StepOutput reference = runOn(packed, packedMeta);
     CHECK(reference.diagnostics.table->rows[0][0] == "17°");
 
-    SECTION("the angle on the channel axis, the phase on z (mcSIM's arrangement)") {
+    SECTION("the angle on the channel axis, the phase on z") {
         const Dims5 dims{3, 1, 3, n, n};
         DatasetMeta meta = metaFor(dims, 0.08, 0.3);
         meta.sim = SimLayout::fromText("c=angle 3; z=phase 3");

@@ -147,7 +147,13 @@ TEST_CASE("SIM layout: the three real shapes bind, and the arithmetic is loud wh
         // every extent given: the product has to be the length
         CHECK(simLayoutProblem(SimLayout::fromText("z=[angle 3, z 8, phase 5]"), raw) == "z holds 135 sections, but the layout needs angle 3 × z 8 × phase 5 = 120.");
     }
-    SECTION("mcSIM synthetic_microtubules.tiff: c3 z3, the angle on c and the phase on z") {
+    // A 3-channel, 3-section stack with the angle on c and the phase on z. WHICH axis mcSIM's
+    // synthetic_microtubules.tiff actually writes the angle on is NOT settled: both orientations
+    // bind and reconstruct, and the measured modulation depths (0.05 one way, 0.13-0.17 the other)
+    // favour the phase on c, which is the opposite of what this file was first named for. The file
+    // does not record its writer's axis order. The arithmetic below is what is being tested, and it
+    // holds either way; do not read the section name as a fact about that dataset.
+    SECTION("c3 z3: the angle on the channel axis, the phase on z") {
         const Dims5 mc{3, 1, 3, 2048, 2048};
         const SimLayout layout = SimLayout::fromText("c=angle 3; z=phase 3");
         CHECK(layout.ndirs == 3);
