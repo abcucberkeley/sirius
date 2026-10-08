@@ -191,6 +191,15 @@ sirius_core_unit(build_info        HEADERS build_info.hpp    SOURCES build_info.
                                    PUBLIC_LINK nlohmann_json::nlohmann_json)
 target_include_directories(sirius_core_build_info PRIVATE ${_sirius_build_info_dir})
 add_dependencies(sirius_core_build_info sirius_build_info_header)
+# Measuring an OTF from a bead stack that is open as a dataset: the service the
+# dialog, the tool API and the bindings share, so one validate holds the words
+# for every condition (findings 9k.50 item 5). The measurement itself is
+# lib/otf_measure; this is the dataset, the destination, the provenance and the
+# diagnostics -- and it is declared after build_info, as `cluster` below is,
+# because the provenance of a calibration artefact records which SIRIUS made it.
+sirius_core_unit(otf_measure       HEADERS otf_measure.hpp   SOURCES otf_measure.cpp
+                                   DEPENDS array dataset diagnostics build_info cancel lib/otf_measure
+                                   PUBLIC_LINK nlohmann_json::nlohmann_json)
 # The application's settings file: TOML (sirius-app.toml) <-> the "group/name"
 # keys the settings are held by in memory, and the store that reads, merges
 # and writes it (sirius-app's Settings; sirius-cli does not use it).
