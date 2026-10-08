@@ -1942,22 +1942,13 @@ namespace sirius::app {
                                       {{"workspace", m.workspace}});
             a.erase("workspace");
         }
-        std::vector<std::string> warnings;
-        if (spec->parameters.is_object() && spec->parameters.contains("properties") && spec->parameters["properties"].is_object()) {
-            const json& known = spec->parameters["properties"];
-            for (auto it = a.begin(); it != a.end();) {
-                if (known.contains(it.key())) {
-                    ++it;
-                    continue;
-                }
-                warnings.push_back("unknown argument '" + it.key() + "' ignored");
-                it = a.erase(it);
-            }
-        }
+        // An argument no tool takes is dropped with a warning by ToolApi::call
+        // (core/tool_api.cpp), which the window's --tool goes through too; the
+        // `workspace` above is this server's own and never reaches it.
 
         m.ctx = &ctx;
         m.images.clear();
-        m.warnings = std::move(warnings);
+        m.warnings.clear();
         m.cancelRequested = false;
         {
             const std::lock_guard<std::mutex> g(m.stateMutex);
@@ -1966,7 +1957,16 @@ namespace sirius::app {
         const std::uint64_t before = m.wb.history().revision();
         agent::ToolResult result;
         try {
-            const json r = m.api.call(name, a);
+            json r = m.api.call(name, a);
+            // What a tool, or the table's own argument check, reported as a
+            // warning: the session's warnings are the one place a client reads
+            // them, for a failure as much as for a value, so the key does not
+            // stay in the answer.
+            if (r.is_object() && r.contains("warnings") && r["warnings"].is_array()) {
+                for (const json& w : r["warnings"])
+                    if (w.is_string()) m.warnings.push_back(w.get<std::string>());
+                r.erase("warnings");
+            }
             if (r.is_object() && r.contains("error_kind")) {
                 // D25: a failure is a result with error_kind, and nothing else is
                 const std::string code = r["error_kind"].is_string() ? r["error_kind"].get<std::string>() : std::string("failed");
@@ -1984,14 +1984,6 @@ namespace sirius::app {
                 if (result.value.contains("clamped") && result.value["clamped"].is_array())
                     for (const json& w : result.value["clamped"])
                         if (w.is_string()) m.warnings.push_back(w.get<std::string>());
-                // And so is anything a tool reported as a warning of its own
-                // (export_result): the session's warnings are the one place a
-                // client reads them, so the key does not stay in the answer.
-                if (result.value.contains("warnings") && result.value["warnings"].is_array()) {
-                    for (const json& w : result.value["warnings"])
-                        if (w.is_string()) m.warnings.push_back(w.get<std::string>());
-                    result.value.erase("warnings");
-                }
             }
         } catch (const std::exception& e) {
             result = agent::failure("internal", e.what());

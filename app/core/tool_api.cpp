@@ -1338,13 +1338,32 @@ namespace sirius::app {
         // return, which the tool would have reported as done.
         if (spec->refusedWhileRunning && !wb_.canEdit())
             return failure("busy", "A run is in progress: cancel it or wait for it to finish before calling " + name + ".");
+        // An argument this tool does not take is a typo (or a client's own
+        // field), and the call would otherwise do something other than what
+        // was asked with nothing saying so. It is dropped and reported, as the
+        // session has always done it -- the window used to accept it in
+        // silence. Only the top level: what a nested object holds is the
+        // operation's business, not the schema's (set_params' `params`).
+        json a = args.is_object() ? args : json::object();
+        json stripped = json::array();
+        if (spec->parameters.is_object() && spec->parameters.contains("properties") && spec->parameters["properties"].is_object()) {
+            const json& known = spec->parameters["properties"];
+            for (auto it = a.begin(); it != a.end();) {
+                if (known.contains(it.key())) {
+                    ++it;
+                    continue;
+                }
+                stripped.push_back("unknown argument '" + it.key() + "' ignored");
+                it = a.erase(it);
+            }
+        }
         // A copy: a tool may add or remove tools, which moves the table.
         const std::function<json(const json&)> fn = spec->fn;
         const std::size_t firstRecord = actions_.size();
         const std::uint64_t before = wb_.history().revision();
         json result;
         try {
-            result = fn(args.is_object() ? args : json::object());
+            result = fn(a);
         } catch (const ToolFailure& e) {
             result = failure(e.code(), e.what(), e.hint(), e.data());
         } catch (const WorkerStartError& e) {
@@ -1377,6 +1396,14 @@ namespace sirius::app {
                 r.revBefore = before;
                 r.revAfter = after;
             }
+        }
+        // What was dropped goes with the answer, failure or value, in the same
+        // "warnings" array a tool reports its own in; a host moves them where
+        // its clients look (HeadlessWorkbench::call).
+        if (!stripped.empty() && result.is_object()) {
+            if (result.contains("warnings") && result["warnings"].is_array())
+                for (const json& w : result["warnings"]) stripped.push_back(w);
+            result["warnings"] = std::move(stripped);
         }
         return result;
     }
