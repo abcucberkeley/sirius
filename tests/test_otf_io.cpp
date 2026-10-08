@@ -113,9 +113,11 @@ TEST_CASE("loadOTF reads cudasirecon's radially averaged OTF TIFF as cudasirecon
         return std::pair{best, at};
     };
 
-    // Order 0 is the widefield OTF, normalised: its peak is 1 at kr = kz = 0.
+    // Order 0 is the widefield OTF, normalised: its peak is 1 at kr = kz = 0
+    // (to float32 rounding: the file stores 0.99999994).
     const auto [peak0, at0] = peak(0);
-    CHECK(d(0, 0, 0) == Cplx(1.0, 0.0));
+    CHECK_THAT(d(0, 0, 0).real(), WithinAbs(1.0, 1e-6));
+    CHECK_THAT(d(0, 0, 0).imag(), WithinAbs(0.0, 1e-6));
     CHECK_THAT(peak0, WithinAbs(1.0, 1e-6));
     CHECK(at0 == std::array<Eigen::Index, 2>{0, 0});
     // kz is in FFT order: sample 64 is kz = -1 and mirrors sample 1 in every order.
