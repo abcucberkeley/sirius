@@ -8,16 +8,22 @@
 
 #include <cstdint>
 #include <functional>
+#include <memory>
 #include <stdexcept>
 #include <string>
 #include <vector>
 
 #include <nlohmann/json.hpp>
 
+#include "core/export.hpp"         // export_result's options
 #include "core/workbench.hpp"
 #include "core/worker_error.hpp"   // call() maps WorkerStartError
 
 namespace sirius::app {
+
+    namespace display {
+        class DisplayModel;        // probe reads a voxel through it (core/display_model.hpp)
+    }
 
     struct ActionRecord {
         enum class Kind { Param,
@@ -77,6 +83,9 @@ namespace sirius::app {
     class ToolApi {
     public:
         explicit ToolApi(Workbench& wb);
+        ~ToolApi();                                                  // holds a DisplayModel by pointer
+        ToolApi(const ToolApi&) = delete;
+        ToolApi& operator=(const ToolApi&) = delete;
 
         // OpenAI-format tool list: [{"type":"function","function":{name, description, parameters}}]
         nlohmann::json schemas() const;
@@ -95,6 +104,26 @@ namespace sirius::app {
         // dataset, ops stack, selected step's params, diagnostics summary.
         nlohmann::json contextSnapshot() const;
         std::string systemPrompt() const;
+
+        // What probe, statistics and export_result need that only the host
+        // knows: which step a call that names no step means, that step's
+        // output (running it first when the call says run), and the progress
+        // and cancellation of the long read that follows. A field left empty
+        // is the application's answer instead -- the viewed step, the output
+        // the workbench already holds (run through the run hook above), no
+        // progress and no cancellation -- so the window needs none of this
+        // and a session (core/headless.hpp) sets all four.
+        struct OutputAccess {
+            std::function<int()> defaultStep;
+            std::function<std::shared_ptr<const StepOutput>(int index, bool runIfNeeded)> output;
+            std::function<void(double fraction, const std::string& message)> progress;
+            std::function<bool()> cancelled;
+        };
+        void setOutputAccess(OutputAccess access) { output_ = std::move(access); }
+        // Lets go of the output probe last read, and of the planes it cached.
+        // A host calls it when the dataset changes: the table would otherwise
+        // keep the previous dataset's output alive for nothing.
+        void releaseOutputCaches() noexcept;
 
         // Runs are asynchronous in the app: the hook starts one and returns
         // its JSON outcome once finished (the application blocks the assistant
@@ -127,14 +156,39 @@ namespace sirius::app {
     private:
         void add(ToolSpec t);
         int resolveStep(const nlohmann::json& args, const char* key = "step") const;   // throws with a message
+        // The step an inspecting tool means: args[step], else OutputAccess::defaultStep.
+        int inspectStep(const nlohmann::json& args) const;
+        // That step's output, through OutputAccess::output when the host gave one.
+        std::shared_ptr<const StepOutput> outputFor(int index, bool runIfNeeded);
+        display::DisplayModel& displayModel();                       // made on first use (probe)
+        void reportProgress(double fraction, const std::string& message) const;
+        // `message` stands in where the operation reports none of its own.
+        std::function<void(double, const std::string&)> progressFn(std::string message) const;
+        std::function<bool()> cancelledFn() const;
 
         Workbench& wb_;
         std::vector<ToolSpec> tools_;
         std::vector<ActionRecord> actions_;
         std::function<nlohmann::json(int)> runHook_;
         std::function<std::string(const std::string&)> helpHook_;
+        OutputAccess output_;
+        std::unique_ptr<display::DisplayModel> model_;
         bool allowNetworkPaths_ = false;
     };
+
+    // --- export_result's two halves, for every caller ---------------------------------------
+    // The options a caller's JSON asks for, checked against what the output
+    // holds; invalid_argument (ToolFailure) for anything it cannot mean.
+    ExportOptions exportOptionsFromJson(const nlohmann::json& args, const DatasetMeta& meta);
+    // The writing half, as File > Export result does it: the pipeline sidecar
+    // (options.includePipeline, written with Pipeline::save), a copy of the
+    // labels, then the pixels. `labelsOnly` writes the labels alone, as one
+    // 32-bit TIFF. {path, format, dtype, shape, files, bytes, seconds,
+    // warnings}; export_failed, cancelled (CancelledError) or invalid_argument
+    // otherwise.
+    nlohmann::json exportStepOutput(std::shared_ptr<const StepOutput> out, const Pipeline& pipeline, const ExportOptions& options,
+                                    bool labelsOnly, const std::function<void(double, const std::string&)>& progress = {},
+                                    const std::function<bool()>& cancelled = {});
 
 } // namespace sirius::app
 

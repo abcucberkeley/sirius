@@ -50,7 +50,9 @@ app_test(host           test_app_host.cpp           UNITS host)
 app_test(process        test_app_process.cpp        UNITS process host)
 app_test(python_env     test_app_python_env.cpp     UNITS python_env host process)
 app_test(local_worker   test_app_local_worker.cpp   UNITS local_worker worker_error python_env rpc)
-app_test(tool_gate      test_app_tool_gate.cpp      UNITS tool_api workbench ops_registry)
+# TIFF::TIFF: the export the window writes is read back and compared with the
+# step's own output, voxel for voxel.
+app_test(tool_gate      test_app_tool_gate.cpp      UNITS tool_api workbench ops_registry LINK TIFF::TIFF)
 app_test(render         test_app_render.cpp         UNITS display_model image_encode workbench ops_registry array_source)
 app_test(statistics     test_app_statistics.cpp     UNITS statistics array_source labels)
 app_test(agent_protocol test_app_agent_protocol.cpp UNITS agent_protocol)

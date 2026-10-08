@@ -22,10 +22,14 @@
 
 #include <nlohmann/json.hpp>
 
+#include <sirius/tiff_io.hpp>
+
 #include "core/array_source.hpp"
 #include "core/cancel.hpp"
+#include "core/dataset.hpp"
 #include "core/operation.hpp"
 #include "core/pipeline.hpp"
+#include "core/remote_source.hpp"
 #include "core/tool_api.hpp"
 #include "core/workbench.hpp"
 #include "core/worker_error.hpp"
@@ -127,6 +131,62 @@ namespace {
         }
     };
 
+    // A source that is drawn through display-sized views, as a cluster
+    // dataset's is: an export has to download it plane by plane, and the gate
+    // in export_result is what decides whether it may. It counts its reads and
+    // records whether the thread held a RemoteDownloads::Allow while reading,
+    // which is what File > Export result's question installs.
+    struct GateRemoteViews final : ViewProvider {
+        std::shared_ptr<const ViewTile> view(const ViewRequest&, bool& exact) override {
+            exact = false;
+            return nullptr;
+        }
+        std::optional<std::pair<float, float>> window(Index, Index, bool) override { return std::nullopt; }
+        std::uint64_t revision() const noexcept override { return 1; }
+        bool busy() const override { return false; }
+        std::string lastError() const override { return {}; }
+    };
+    struct GateRemoteSource final : ArraySource {
+        static inline std::atomic<int> reads{0};
+        static inline std::atomic<bool> allowedWhileReading{false};
+        DatasetMeta meta_;
+        mutable GateRemoteViews views_;
+        GateRemoteSource() {
+            meta_.name = "gate-remote";
+            meta_.sourcePath = "cluster://gate/remote.tif";
+            meta_.format = "cluster";
+            meta_.dims = Dims5{1, 1, 2, 4, 4};
+            meta_.voxelUm = {0.1, 0.1, 0.3};
+            meta_.normalizeChannels();
+        }
+        const DatasetMeta& meta() const noexcept override { return meta_; }
+        void readPlane(Index, Index, Index z, float* out) const override {
+            ++reads;
+            if (RemoteDownloads::allowed()) allowedWhileReading = true;
+            for (Index i = 0; i < meta_.dims.y * meta_.dims.x; ++i) out[i] = static_cast<float>(z * 100 + i);
+        }
+        ViewProvider* viewProvider() const noexcept override { return &views_; }
+    };
+    // Answers with that source and no array, as a step computed on a node does.
+    struct GateRemoteOp final : Operation {
+        OpInfo info_;
+        GateRemoteOp() {
+            info_.kind = "test_gate_remote";
+            info_.name = "Gate remote";
+            info_.group = "Intensity";
+            info_.kindLabel = "INTENSITY";
+        }
+        const OpInfo& info() const noexcept override { return info_; }
+        StepOutput run(const StepInput& in, const ParamSet&, const StepContext&) const override {
+            StepOutput o;
+            o.source = std::make_shared<GateRemoteSource>();
+            o.meta = o.source->meta();
+            o.meta.voxelUm = in.meta.voxelUm;
+            o.where = "fiona · n0042 · job 4711";
+            return o;
+        }
+    };
+
     void registerGateOps() {
         static bool done = false;
         if (done) return;
@@ -135,6 +195,20 @@ namespace {
         registerOperation(std::make_unique<GateWorkerOp>());
         registerOperation(std::make_unique<GateInvalidOp>());
         registerOperation(std::make_unique<GateDottedOp>());
+        registerOperation(std::make_unique<GateRemoteOp>());
+    }
+
+    // The window's run hook (app/imgui/main.cpp), with the frames taken out:
+    // a run blocks the caller and its outcome is the tool's answer.
+    void installRunHook(Workbench& wb, ToolApi& api) {
+        api.setRunHook([&wb](int target) {
+            const std::shared_ptr<RunJob> job = wb.createRun(target);
+            if (!job) return json{{"ok", false}, {"error", wb.lastRunRefusal().message}};
+            job->execute();
+            const std::string error = job->error();
+            wb.finishRun(job);
+            return json{{"ok", error.empty()}, {"error", error}};
+        });
     }
 
     std::shared_ptr<MemorySource> smallSource() {
@@ -479,14 +553,15 @@ TEST_CASE("tool gate: a tool may change the tool table while it runs", "[app][to
     CHECK(kindOf(api.call("gate_self", json::object())) == "unknown_tool");
 }
 
-TEST_CASE("tool gate: schemas() is what the assistant always had; the hints are set", "[app][tool_gate]") {
+TEST_CASE("tool gate: schemas() is the whole table, the window's --tool and the assistant's; the hints are set", "[app][tool_gate]") {
     Bench b;
     ToolApi api(b.wb);
     const std::vector<std::string> names = {"get_state", "list_operations", "get_step", "add_step", "remove_step",
                                             "move_step", "set_step_enabled", "set_params", "apply_preset", "set_cache",
                                             "run", "view_step", "select_step", "set_view", "list_tracks", "focus_track",
                                             "get_diagnostics", "get_help", "undo", "redo", "set_backend",
-                                            "load_example_pipeline", "export_training_data", "list_labels", "paint_label",
+                                            "load_example_pipeline", "export_training_data", "probe", "statistics",
+                                            "export_result", "list_labels", "paint_label",
                                             "fill_label", "merge_labels", "split_label", "delete_label", "clear_labels",
                                             "set_label_reviewed", "export_labels", "get_log"};
     CHECK(api.toolNames() == names);
@@ -506,11 +581,13 @@ TEST_CASE("tool gate: schemas() is what the assistant always had; the hints are 
 
     const std::vector<std::string> busy = {"add_step", "remove_step", "move_step", "set_step_enabled",
                                            "set_params", "apply_preset", "set_cache", "undo", "redo",
-                                           "load_example_pipeline", "export_training_data", "paint_label", "fill_label",
+                                           "load_example_pipeline", "export_training_data", "probe", "statistics",
+                                           "export_result", "paint_label", "fill_label",
                                            "merge_labels", "split_label", "delete_label", "clear_labels", "set_label_reviewed",
                                            "export_labels"};
     const std::vector<std::string> readOnly = {"get_state", "list_operations", "get_step", "list_tracks",
-                                               "get_diagnostics", "get_help", "get_log", "list_labels"};
+                                               "get_diagnostics", "get_help", "get_log", "list_labels",
+                                               "probe", "statistics"};
     const std::vector<std::string> idempotent = {"set_step_enabled", "set_params", "apply_preset", "set_cache", "set_backend",
                                                  "set_label_reviewed"};
     const std::vector<std::string> big = {"list_operations", "get_help", "get_log", "list_labels"};
@@ -523,11 +600,176 @@ TEST_CASE("tool gate: schemas() is what the assistant always had; the hints are 
         CHECK(t.refusedWhileRunning == in(busy, t.name));
         CHECK(t.readOnly == in(readOnly, t.name));
         CHECK(t.idempotent == in(idempotent, t.name));
-        CHECK(t.destructive == (t.name == "export_training_data" || t.name == "export_labels"));
+        CHECK(t.destructive == (t.name == "export_training_data" || t.name == "export_labels" || t.name == "export_result"));
         CHECK(t.openWorld == (t.name == "run"));   // a run may download weights and use the HPC worker
         CHECK(t.meta.is_object());
         CHECK(t.meta.contains("anthropic/maxResultSizeChars") == in(big, t.name));
     }
+}
+
+// --- the three tools the window could not reach -----------------------------------------
+// The reason this stage exists: a SIM run driven through the window could not
+// be written out at all, so a three-front comparison had to read the window
+// off a screenshot while sirius-cli compared files. These cases drive the
+// ToolApi the application builds (app/imgui/main.cpp: one Workbench, one
+// ToolApi, a run hook) and nothing of the session's.
+
+TEST_CASE("tool gate: the window exports the reconstruction it ran, and measures and probes the same file",
+          "[app][tool_gate][sim]") {
+    const std::filesystem::path data = SIRIUS_TEST_DATA_DIR;
+    registerGateOps();
+    Scratch scratch;
+    Workbench wb(scratch.dir);
+    wb.setBackend(Backend::Cpu);
+    // the whole bundled stack, as the application opens it: 3 angles x 5
+    // phases on z, 135 sections, no crop
+    OpenOptions open;
+    open.sim = SimLayout::shorthand(3, 5);
+    open.voxelUm = std::array<double, 3>{0.08, 0.08, 0.125};
+    const std::string raw = (data / "raw.tif").string();
+    OpenResult opened = openDataset(raw, open);
+    REQUIRE(opened.source);
+    wb.adoptDataset(std::move(opened), raw, open);
+    while (wb.pipeline().size() > 1) wb.removeStep(1);
+
+    ToolApi api(wb);
+    installRunHook(wb, api);
+
+    // Load, SIM -- the pipeline sirius-cli has always had and the window now
+    // has too. The reference arm of 9k.48: the bundled parameters and OTF.
+    const json added = api.call("add_step", {{"kind", "sim"},
+                                             {"params", {{"mode", "From file"},
+                                                         {"params_file", (data / "config.txt").string()},
+                                                         {"otf", (data / "otf.tif").string()}}}});
+    INFO(added.dump());
+    REQUIRE(kindOf(added).empty());
+    REQUIRE(wb.pipeline().size() == 2);
+
+    const std::filesystem::path file = scratch.dir / "window.tif";
+
+    SECTION("nothing is written before the step has run") {
+        const json refused = api.call("export_result", {{"step", 2}, {"path", file.string()}});
+        CHECK(kindOf(refused) == "not_computed");
+        CHECK_FALSE(std::filesystem::exists(file));
+    }
+
+    SECTION("run, then export; the file is the reconstruction voxel for voxel") {
+        const json ran = api.call("run", {{"step", 2}});
+        INFO(ran.dump());
+        REQUIRE(kindOf(ran).empty());
+        REQUIRE(ran.value("ok", false));
+
+        const json e = api.call("export_result", {{"step", 2}, {"path", file.string()}, {"dtype", "float32"}, {"include_pipeline", true}});
+        INFO(e.dump());
+        REQUIRE(kindOf(e).empty());
+        CHECK(e["step"] == 2);
+        CHECK(e["format"] == "tiff");                 // .tif, so no OME-XML
+        CHECK(e["dtype"] == "float32");
+        CHECK(e["shape"] == "c1 t1 z9 y128 x128");
+        CHECK(e["bytes"].get<std::uint64_t>() > 0);
+        REQUIRE(std::filesystem::exists(file));
+        CHECK(e["files"].size() == 2);                // the stack and the pipeline sidecar
+        CHECK(std::filesystem::exists(std::filesystem::u8path(e["path"].get<std::string>() + ".pipeline.toml")));
+
+        // Not "a file appeared": the file holds what the step computed.
+        const std::shared_ptr<const StepOutput> out = wb.output(1);
+        REQUIRE(out);
+        REQUIRE(out->array);
+        const auto written = readTiffStack<float>(file.string());
+        REQUIRE(written.dimension(0) == 9);
+        REQUIRE(written.dimension(1) == 128);
+        REQUIRE(written.dimension(2) == 128);
+        REQUIRE(static_cast<Index>(written.size()) == out->array->numel());
+        double worst = 0.0;
+        for (Eigen::Index i = 0; i < written.size(); ++i)
+            worst = std::max(worst, std::abs(static_cast<double>(written.data()[i]) - static_cast<double>(out->array->data()[i])));
+        CHECK(worst == 0.0);   // float32, scaling cast: a copy, not a rendering
+
+        // The same output measured and probed through the same table, so a
+        // comparison by numbers needs no screenshot either.
+        const json st = api.call("statistics", {{"step", 2}, {"histogram_bins", 16}});
+        INFO(st.dump().substr(0, 400));
+        REQUIRE(kindOf(st).empty());
+        CHECK(st["shape"] == "c1 t1 z9 y128 x128");
+        CHECK(st["fresh"] == true);
+        REQUIRE(st["channels"].size() == 1);
+        const json& c0 = st["channels"][0];
+        CHECK(c0["nan"] == 0);
+        CHECK(c0["count"].get<std::uint64_t>() == static_cast<std::uint64_t>(9 * 128 * 128));
+        REQUIRE(c0["histogram"]["counts"].size() == 16);
+        CHECK(c0["min"].get<double>() < c0["max"].get<double>());
+
+        const json pr = api.call("probe", {{"step", 2}, {"x", 64}, {"y", 70}, {"z", 4}});
+        INFO(pr.dump());
+        REQUIRE(kindOf(pr).empty());
+        CHECK(pr["step"] == 2);
+        CHECK(pr["z"] == 4);
+        REQUIRE(pr["values"].size() == 1);
+        REQUIRE(pr["values"][0]["value"].is_number());
+        // the voxel the probe reports is the voxel the file holds
+        CHECK(pr["values"][0]["value"].get<float>() == written(4, 70, 64));
+        CHECK(pr["label"].is_null());
+    }
+
+    SECTION("run:true exports a step that has not been computed yet") {
+        const json e = api.call("export_result", {{"step", 2}, {"path", file.string()}, {"dtype", "uint16"}, {"run", true}});
+        INFO(e.dump());
+        REQUIRE(kindOf(e).empty());
+        CHECK(e["dtype"] == "uint16");
+        CHECK(e["shape"] == "c1 t1 z9 y128 x128");
+        CHECK(std::filesystem::exists(file));
+        CHECK(wb.output(1));
+    }
+
+    SECTION("a network path is refused before anything is read") {
+        const json r = api.call("export_result", {{"path", R"(\\attacker.example\share\x.tif)"}, {"step", 2}, {"run", true}});
+        CHECK(kindOf(r) == "invalid_argument");
+        CHECK_THAT(r.value("error", std::string()), ContainsSubstring("network path"));
+        CHECK_FALSE(wb.output(1));   // refused before the run, not after it
+    }
+}
+
+TEST_CASE("tool gate: export_result asks before it downloads an output the cluster holds", "[app][tool_gate]") {
+    Bench b({"test_gate_remote"});
+    ToolApi api(b.wb);
+    installRunHook(b.wb, api);
+    GateRemoteSource::reads = 0;
+    GateRemoteSource::allowedWhileReading = false;
+    REQUIRE(kindOf(api.call("run", {{"step", 2}})).empty());
+    const std::shared_ptr<const StepOutput> out = b.wb.output(1);
+    REQUIRE(out);
+    REQUIRE_FALSE(out->array);           // it stays where it was computed
+    REQUIRE(out->source);
+    REQUIRE(out->source->viewProvider() != nullptr);
+    CHECK(GateRemoteSource::reads.load() == 0);
+
+    const std::filesystem::path file = b.scratch.dir / "remote.tif";
+    // File > Export result asks the user first (App::exportResultDialog); a
+    // tool call has nobody to ask, so without the answer nothing is read.
+    const json refused = api.call("export_result", {{"step", 2}, {"path", file.string()}});
+    CHECK(kindOf(refused) == "needs_download");
+    CHECK_THAT(refused.value("error", std::string()), ContainsSubstring("job 4711"));
+    CHECK_THAT(refused.value("error", std::string()), ContainsSubstring("downloads all of it"));
+    CHECK_THAT(refused.value("hint", std::string()), ContainsSubstring("download:true"));
+    CHECK(refused["data"]["step"] == 2);
+    CHECK(GateRemoteSource::reads.load() == 0);
+    CHECK_FALSE(std::filesystem::exists(file));
+
+    // With it, the export runs and the read happens with the thread's
+    // RemoteDownloads::Allow in place, as the window's task holds one.
+    const json e = api.call("export_result", {{"step", 2}, {"path", file.string()}, {"download", true}, {"dtype", "float32"}});
+    INFO(e.dump());
+    REQUIRE(kindOf(e).empty());
+    CHECK(e["shape"] == "c1 t1 z2 y4 x4");
+    CHECK(std::filesystem::exists(file));
+    CHECK(GateRemoteSource::reads.load() > 0);
+    CHECK(GateRemoteSource::allowedWhileReading.load());
+    CHECK_FALSE(RemoteDownloads::allowed());   // and the permission does not outlive the call
+
+    const auto written = readTiffStack<float>(file.string());
+    REQUIRE(written.dimension(0) == 2);
+    CHECK(written(0, 0, 0) == 0.0f);
+    CHECK(written(1, 0, 1) == 101.0f);
 }
 
 // --- what the workbench keeps for its host ----------------------------------------------

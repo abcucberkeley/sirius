@@ -82,7 +82,8 @@ namespace sirius::app {
     // Shared helpers (also used by tests and the CLI). They throw ToolFailure.
     nlohmann::json datasetInfo(const DatasetMeta& meta, const OpenResult* opened = nullptr);   // DatasetInfo, section 3.5
     OpenOptions openOptionsFromJson(const nlohmann::json& args);
-    ExportOptions exportOptionsFromJson(const nlohmann::json& args, const DatasetMeta& meta);
+    // export_result's halves -- exportOptionsFromJson and exportStepOutput --
+    // are the ToolApi's (core/tool_api.hpp): the window drives that tool too.
     struct RenderRequest {
         int step = -1;                                    // 0-based; -1 = default rule
         std::string plane = "xy";                         // xy | xz | yz | mip
@@ -139,14 +140,6 @@ namespace sirius::app {
     // always a PNG, one grey channel when there are no marks. Over `maxBytes` it is
     // reduced up to three more times, then too_large.
     RenderResult renderDiagnosticImage(const DiagnosticImage& image, int maxSize, std::size_t maxBytes = std::size_t{4} << 20);
-    // export_result's writing half, as File > Export result does it: the pipeline
-    // sidecar (options.includePipeline, written with Pipeline::save), a copy of the
-    // labels, then the pixels. `labelsOnly` writes the labels alone, as one 32-bit TIFF.
-    // {path, format, dtype, shape, files, bytes, seconds, warnings}; export_failed,
-    // cancelled (CancelledError) or invalid_argument otherwise.
-    nlohmann::json exportStepOutput(std::shared_ptr<const StepOutput> out, const Pipeline& pipeline, const ExportOptions& options,
-                                    bool labelsOnly, const std::function<void(double, const std::string&)>& progress = {},
-                                    const std::function<bool()>& cancelled = {});
 } // namespace sirius::app
 
 #endif // SIRIUS_APP_HEADLESS_HPP

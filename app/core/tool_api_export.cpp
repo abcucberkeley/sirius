@@ -1,4 +1,4 @@
-#include "core/headless.hpp"
+#include "core/tool_api.hpp"
 
 #include <algorithm>
 #include <cctype>
@@ -16,9 +16,14 @@
 #include <sirius/tiff_io.hpp>
 
 #include "core/cancel.hpp"
+#include "core/export.hpp"
 
 // Writing a step's output (export_result) and its labels, the way File >
-// Export result and Segment > Export labels do in the application.
+// Export result and Segment > Export labels do in the application. The two
+// halves -- the options a caller's JSON asks for, and the writing itself --
+// are declared in core/tool_api.hpp, because every front drives that tool:
+// the window through --tool, sirius-cli's session and the MCP server through
+// core/headless.hpp.
 
 namespace sirius::app {
 

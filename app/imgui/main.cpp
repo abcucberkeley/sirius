@@ -292,6 +292,9 @@ int main(int argc, char** argv) {
         ToolApi tools(workbench);
         // get_help answers from the pages the application reads, as it does for the assistant
         tools.setHelpHook([](const std::string& kind) { return loadHelpPage(kind).markdown; });
+        // A probe (--tool, the assistant) leaves the output it read in the tool
+        // table's own display model; a new dataset must not keep it alive.
+        bridge.datasetChanged.connect([&tools] { tools.releaseOutputCaches(); });
 
         const bool scripted = args.has("tool") || args.has("action") || args.has("ask") || args.has("stroke") || args.has("wheel") ||
                               args.has("drop");

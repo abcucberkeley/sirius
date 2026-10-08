@@ -24,7 +24,6 @@
 #include "core/image_encode.hpp"
 #include "core/python_env.hpp"
 #include "core/rpc.hpp"
-#include "core/statistics.hpp"
 
 // The workbench without a window: its tool table, the run driver that waits
 // for or polls runs, and the log and event plumbing the protocol servers read.
@@ -283,13 +282,6 @@ namespace sirius::app {
             return s;
         }
 
-        // "0.1", "50", "99.9": a percentile as a key.
-        std::string percentileKey(double p) {
-            char buf[32];
-            std::snprintf(buf, sizeof buf, "%g", p);
-            return buf;
-        }
-
         const char* stateName(StepReport::State s) {
             switch (s) {
                 case StepReport::State::Ran: return "ran";
@@ -487,9 +479,6 @@ namespace sirius::app {
         json listDevicesTool(const json& a);
         json renderTool(const json& a);
         json renderDiagnosticsTool(const json& a);
-        json probeTool(const json& a);
-        json statisticsTool(const json& a);
-        json exportResultTool(const json& a);
         json exportPythonTool(const json& a);
         json listPluginsTool(const json& a);
         json workerStatusTool(const json& a);
@@ -505,6 +494,15 @@ namespace sirius::app {
         wb.replacePipeline(Pipeline(), "Start");
         wb.history().clear();
         api.setAllowNetworkPaths(options.allowNetworkPaths);
+        // probe, statistics and export_result are the ToolApi's, so that the
+        // window serves them too (--tool). What only a session knows goes in
+        // here: which step a call that names none means, how to get that
+        // step's output -- starting a run and waiting for it, when the call
+        // says run -- and the progress and cancellation of the call in hand.
+        api.setOutputAccess({[this] { return defaultInspectStep(); },
+                             [this](int index, bool runIfNeeded) { return outputFor(index, runIfNeeded); },
+                             [this](double f, const std::string& m) { progress(f, m); },
+                             cancelFn()});
 
         const std::string backend = lower(options.backend);
         if (backend == "cpu") {
@@ -745,8 +743,10 @@ namespace sirius::app {
         lastOpened = std::move(summary);
         lastOpenedPath = reported(wb.dataset().sourcePath);
         lastRunTarget = 0;
-        // the display model would keep the previous dataset's output alive
+        // the display models would keep the previous dataset's output alive:
+        // this one renders, the tool table's probes (core/tool_api.hpp)
         model.setOutput(nullptr);
+        api.releaseOutputCaches();
     }
 
     void HeadlessWorkbench::Impl::attach(const RenderResult& r, json& caption) {
@@ -1462,130 +1462,6 @@ namespace sirius::app {
         return caption;
     }
 
-    json HeadlessWorkbench::Impl::probeTool(const json& a) {
-        const int i = inspectStep(a);
-        const std::shared_ptr<const StepOutput> out = outputFor(i, false);
-        const Dims5 d = out->meta.dims;
-        if (!has(a, "x") || !has(a, "y")) invalid("probe needs x and y (voxels of the xy plane)");
-        const Index x = static_cast<Index>(integerArg(a, "x", 0, 0, d.x - 1));
-        const Index y = static_cast<Index>(integerArg(a, "y", 0, 0, d.y - 1));
-        const Index z = static_cast<Index>(integerArg(a, "z", d.z / 2, 0, d.z - 1));
-        const Index t = static_cast<Index>(integerArg(a, "t", 0, 0, d.t - 1));
-        model.setOutput(out);
-        json values = json::array();
-        for (Index c = 0; c < d.c; ++c) {
-            const std::optional<float> v = model.valueAt(c, t, z, y, x);
-            const std::string label = static_cast<std::size_t>(c) < out->meta.channels.size() ? out->meta.channels[static_cast<std::size_t>(c)].label : std::string();
-            values.push_back({{"channel", c}, {"label", label}, {"value", v ? json(*v) : json(nullptr)}});
-        }
-        json label = nullptr;
-        if (const std::shared_ptr<const LabelVolume> labels = out->labels; labels && !labels->empty() && t < labels->t() && z < labels->z() &&
-                                                                           y < labels->y() && x < labels->x()) {
-            const std::uint32_t id = labels->at(t, z, y, x);
-            if (id != 0) {
-                const LabelStats* s = labels->statsT() == t ? labels->statsOf(id) : nullptr;
-                const LabelAnnotation note = labels->annotationOf(t, id);
-                label = {{"id", id},
-                         {"class", s ? s->cls : note.cls},
-                         {"voxels", s ? json(s->voxels) : json(nullptr)},
-                         {"flags", s ? json(s->flags) : json::array()},
-                         {"reviewed", s ? s->reviewed : note.reviewed}};
-            }
-        }
-        return {{"step", i + 1}, {"fresh", wb.outputFresh(i)}, {"x", x}, {"y", y}, {"z", z}, {"t", t}, {"values", values}, {"label", label}};
-    }
-
-    json HeadlessWorkbench::Impl::statisticsTool(const json& a) {
-        const int i = inspectStep(a);
-        const std::shared_ptr<const StepOutput> out = outputFor(i, boolArg(a, "run", false));
-        const DatasetMeta& meta = out->meta;
-        StatisticsOptions o;
-        if (has(a, "t") && a["t"].is_string()) {
-            if (lower(a["t"].get<std::string>()) != "all") invalid("'t' is a time point or \"all\"");
-            o.t = -1;
-        } else {
-            o.t = static_cast<Index>(integerArg(a, "t", 0, 0, meta.dims.t - 1));
-        }
-        if (has(a, "channels")) {
-            if (!a["channels"].is_array()) invalid("'channels' must be a list of channel indices");
-            for (const json& c : a["channels"]) {
-                const json one = {{"channels", c}};
-                o.channels.push_back(static_cast<Index>(integerArg(one, "channels", 0, 0, meta.dims.c - 1)));
-            }
-        }
-        if (has(a, "percentiles")) {
-            if (!a["percentiles"].is_array()) invalid("'percentiles' must be a list of numbers within 0..100");
-            o.percentiles.clear();
-            for (const json& p : a["percentiles"]) {
-                if (!p.is_number() || p.get<double>() < 0.0 || p.get<double>() > 100.0) invalid("'percentiles' must be numbers within 0..100");
-                o.percentiles.push_back(p.get<double>());
-            }
-        }
-        o.histogramBins = static_cast<int>(integerArg(a, "histogram_bins", 0, 0, 4096));
-        o.maxSamples = static_cast<std::uint64_t>(integerArg(a, "max_samples", std::int64_t{1} << 22, 1000, std::int64_t{1} << 32));
-        // what the camera clipped: the Load step of an integer type only
-        if (i == 0) o.saturationLevel = pixelTypeMaximum(meta);
-        const std::vector<ChannelStatistics> stats =
-            channelStatistics(*out, o, [this](double f) { progress(f, "Measuring intensities"); }, cancelFn());
-        json channels = json::array();
-        bool sampled = false;
-        for (const ChannelStatistics& s : stats) {
-            json percentiles = json::object();
-            for (const auto& [p, v] : s.percentiles) percentiles[percentileKey(p)] = v;
-            const std::string label = static_cast<std::size_t>(s.channel) < meta.channels.size() ? meta.channels[static_cast<std::size_t>(s.channel)].label : std::string();
-            json c = {{"channel", s.channel},
-                      {"label", label},
-                      {"min", s.min},
-                      {"max", s.max},
-                      {"mean", s.mean},
-                      {"std", s.stddev},
-                      {"count", s.count},
-                      {"nan", s.nanCount},
-                      {"percentiles", percentiles}};
-            if (s.saturatedFraction) c["saturated_fraction"] = *s.saturatedFraction;
-            if (!s.histogram.empty()) c["histogram"] = {{"lo", s.histLo}, {"hi", s.histHi}, {"counts", s.histogram}};
-            sampled = sampled || s.sampled;
-            channels.push_back(std::move(c));
-        }
-        json result = {{"step", i + 1},
-                       {"fresh", wb.outputFresh(i)},
-                       {"shape", meta.shapeString()},
-                       {"t", o.t < 0 ? json("all") : json(o.t)},
-                       {"sampled", sampled},
-                       {"channels", channels}};
-        if (boolArg(a, "labels", true) && out->labels && !out->labels->empty())
-            result["labels"] = labelStatistics(*out->labels, o.t < 0 ? 0 : o.t, meta.voxelUm);
-        return result;
-    }
-
-    json HeadlessWorkbench::Impl::exportResultTool(const json& a) {
-        (void)pathArg(a, "path", options.allowNetworkPaths);   // refused before anything runs
-        const int i = inspectStep(a);
-        const std::shared_ptr<const StepOutput> out = outputFor(i, boolArg(a, "run", false));
-        const ExportOptions o = exportOptionsFromJson(a, out->meta);
-        const bool labelsOnly = boolArg(a, "labels_only", false);
-        if (!labelsOnly) {
-            if (!exportFormatAvailable(o.format))
-                throw ToolFailure("unsupported", "this build cannot write zarr or N5 stores", "export to .ome.tif or .tif instead");
-            if (const std::string why = validateExport(o, out->meta.dims); !why.empty()) invalid(why);
-        } else {
-            // The labels are written whole, as they are: say which options that leaves unused.
-            std::string ignored;
-            for (const char* key : {"dtype", "scaling", "range", "percentiles", "t", "z", "channels", "tiff", "zarr", "include_labels", "include_pipeline"})
-                if (has(a, key)) ignored += (ignored.empty() ? "" : ", ") + std::string(key);
-            if (!ignored.empty()) warnings.push_back("labels_only writes every label as uint32 and ignores " + ignored);
-        }
-        json r = exportStepOutput(out, wb.pipeline(), o, labelsOnly, progressFn("Exporting"), cancelFn());
-        for (const json& w : r["warnings"]) warnings.push_back(w.get<std::string>());
-        r.erase("warnings");
-        r["step"] = i + 1;
-        const std::string path = r["path"].get<std::string>();
-        wb.logLine("Exported step " + Step::number(i) + " to " + path);
-        wb.recordEvent("export", {{"step", i + 1}, {"path", path}, {"format", r["format"]}, {"labels_only", labelsOnly}});
-        api.noteAction({ActionRecord::Kind::Run, "Exported step " + Step::number(i) + kMiddot + wb.pipeline().at(i).name + kArrow + path, "log", {}, "export_result"});
-        return r;
-    }
-
     json HeadlessWorkbench::Impl::exportPythonTool(const json& a) {
         const std::string script = wb.pipeline().toPythonScript(wb.hasDataset() ? wb.dataset().sourcePath : std::string());
         if (!has(a, "path")) return {{"script", script}};
@@ -1952,26 +1828,6 @@ namespace sirius::app {
                         {"index", prop("integer", "The image (default 0)")},
                         {"max_size", prop("integer", "The image's longer side at most (default 768, at most 1568; 0 = native)")}}),
                 [this](const json& a) { return renderDiagnosticsTool(a); });
-        addTool("probe", "Read the values of every channel at one voxel of a step's output, and the label there with its statistics.",
-                schema({{"step", stepProp("The step (default: the last computed)")},
-                        {"x", prop("integer", "Column")},
-                        {"y", prop("integer", "Row")},
-                        {"z", prop("integer", "Plane (default the middle)")},
-                        {"t", prop("integer", "Time point (default 0)")}},
-                       {"x", "y"}),
-                [this](const json& a) { return probeTool(a); });
-        addTool("statistics",
-                "Measure a step's output: per channel the exact minimum, maximum, mean, standard deviation and NaN count, percentiles, "
-                "optionally a histogram and (Load step) the saturated fraction; for labels their count, sizes, classes and flags.",
-                schema({{"step", stepProp("The step (default: the last computed)")},
-                        {"t", {{"type", json::array({"integer", "string"})}, {"description", "A time point, or \"all\" (default 0)"}}},
-                        {"channels", intList("The channels (default all)")},
-                        {"percentiles", {{"type", "array"}, {"items", {{"type", "number"}}}, {"description", "Default [0.1, 1, 50, 99, 99.9]"}}},
-                        {"histogram_bins", prop("integer", "Bins of a histogram per channel (default 0 = none)")},
-                        {"labels", prop("boolean", "Also the label statistics (default true)")},
-                        {"max_samples", prop("integer", "Values the percentiles and histogram are taken from, at most (default 4194304)")},
-                        {"run", prop("boolean", "Run the step first when it has no fresh output (default false)")}}),
-                [this](const json& a) { return statisticsTool(a); });
         addTool("get_diagnostics",
                 "What a step reports about itself: summary, facts, table, curves, histograms, warnings and its images (which "
                 "render_diagnostics draws). detail adds the curves' points and the histograms' bins.",
@@ -1991,28 +1847,6 @@ namespace sirius::app {
                     return json{{"lines", lines}};
                 });
 
-        addTool("export_result",
-                "Write a step's output to a file: OME-TIFF or TIFF (tiles, compression, BigTIFF, pyramid), a zarr or N5 store, or raw, "
-                "in any pixel type with a scaling rule and an optional t / z / channel range; the labels and the pipeline beside it "
-                "on request. The format follows the extension (.ome.tif, .tif, .zarr, .n5, .raw) unless named. Overwrites.",
-                schema({{"path", prop("string", "The file or store to write")},
-                        {"step", stepProp("The step (default: the last computed)")},
-                        {"format", enumProp({"ome-tiff", "tiff", "zarr", "n5", "raw"}, "The container (default from the extension)")},
-                        {"dtype", enumProp({"uint8", "int8", "uint16", "int16", "uint32", "int32", "float32", "float64"}, "Pixel type (default float32)")},
-                        {"scaling", enumProp({"cast", "minmax", "fixed", "percentile"}, "How values map into the pixel type (default cast)")},
-                        {"range", {{"type", "array"}, {"items", {{"type", "number"}}}, {"description", "scaling fixed: [lo, hi]"}}},
-                        {"percentiles", {{"type", "array"}, {"items", {{"type", "number"}}}, {"description", "scaling percentile: [lo, hi]"}}},
-                        {"t", intList("[first, end) of the time points; end -1 = to the last")},
-                        {"z", intList("[first, end) of the planes; end -1 = to the last")},
-                        {"channels", intList("The channels (default all)")},
-                        {"tiff", {{"type", "object"}, {"description", "{tiled, tile:[w, h], compression: none|lzw|deflate, level, bigtiff, ome, pyramid_levels, downsample}"}}},
-                        {"zarr", {{"type", "object"}, {"description", "{version: 2|3, chunk:[c, t, z, y, x], codec, level, shard, pyramid_levels, downsample, ome_ngff}"}}},
-                        {"include_labels", prop("boolean", "Write the step's labels beside it (default false)")},
-                        {"include_pipeline", prop("boolean", "Write <path>.pipeline.toml beside it (default false)")},
-                        {"labels_only", prop("boolean", "Write only the labels, as one 32-bit TIFF (default false)")},
-                        {"run", prop("boolean", "Run the step first when it has no fresh output (default false)")}},
-                       {"path"}),
-                [this](const json& a) { return exportResultTool(a); });
         addTool("export_python",
                 "The pipeline as a Python script that reproduces it with the sirius package; written to path, or returned as text.",
                 schema({{"path", prop("string", "The .py file to write (overwritten); none = return the script")}}),
@@ -2150,6 +1984,14 @@ namespace sirius::app {
                 if (result.value.contains("clamped") && result.value["clamped"].is_array())
                     for (const json& w : result.value["clamped"])
                         if (w.is_string()) m.warnings.push_back(w.get<std::string>());
+                // And so is anything a tool reported as a warning of its own
+                // (export_result): the session's warnings are the one place a
+                // client reads them, so the key does not stay in the answer.
+                if (result.value.contains("warnings") && result.value["warnings"].is_array()) {
+                    for (const json& w : result.value["warnings"])
+                        if (w.is_string()) m.warnings.push_back(w.get<std::string>());
+                    result.value.erase("warnings");
+                }
             }
         } catch (const std::exception& e) {
             result = agent::failure("internal", e.what());

@@ -321,6 +321,7 @@ the end, and exits.
 | `consent_required` | `setup_worker_env` without `--allow-worker-setup`, or without `confirm: true` | Ask the user, as above. |
 | `busy` | a run is active and this tool changes or reads what it computes | `run_status` until it ends, or `cancel_run`. |
 | `not_computed` | the step has no output yet | `run` first, or pass `run: true` to `render`, `statistics` or `export_result`. |
+| `needs_download` | `export_result` on a step whose output stays on the cluster: writing it here would download the whole volume first, and nothing has asked for that. The message says how much and where from. | Export from the cluster instead, or ask the user; call `export_result` again with `download: true` once they have agreed. The application asks them in a dialog (File ▸ Export result) and this is the same question. |
 | `stale_workspace` | the `workspace` argument names another workspace: the server restarted and its state is gone | `get_state`, then open the dataset or pipeline again. |
 | `unknown_step` | no such step (numbers shift after edits) | `get_state` lists the steps; address them by name. |
 | `validation` | `run` refused: a step has errors (`data` says which) | `validate`, fix the parameters, run again. |

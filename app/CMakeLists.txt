@@ -386,29 +386,38 @@ sirius_core_unit(workbench
             cancel ops_registry ops_factories ops_load_api ops_contrast_api plugin worker_error remote_source serialize build_info sha256
     PUBLIC_LINK nlohmann_json::nlohmann_json)
 
-sirius_core_unit(tool_api
-    HEADERS tool_api.hpp
-    SOURCES tool_api.cpp
-    DEPENDS workbench training_export worker_error cancel lib/tiff_io
-    PUBLIC_LINK nlohmann_json::nlohmann_json)
+# --- the tool table, and what it looks at ----------------------------------------
+# The viewer's display model (so a probe reads what the viewer draws) and the
+# intensity statistics come before the tool table rather than after it,
+# because export_result, statistics and probe are the ToolApi's: one
+# implementation for the window, sirius-cli's session and the MCP server.
 
-# --- headless: what sirius-cli drives --------------------------------------------
-# The viewer's display model (so a render is what the viewer draws), image
-# encoding, statistics, the JSON-lines session and MCP protocols, and the
-# window-less workbench that serves one tool table to all of them.
-
-sirius_core_unit(image_encode      HEADERS image_encode.hpp  SOURCES image_encode.cpp  LINK sirius_stb)
 sirius_core_unit(display_model     HEADERS display_model.hpp SOURCES display_model.cpp
                                    DEPENDS byte_budget_lru operation workbench array_source cancel)
 sirius_core_unit(statistics        HEADERS statistics.hpp    SOURCES statistics.cpp
                                    DEPENDS operation array_source labels tracks cancel dataset remote_source lib/pixel_type
                                    PUBLIC_LINK nlohmann_json::nlohmann_json)
+# The typed tool table every front drives. It owns export_result, statistics
+# and probe (tool_api_export.cpp is export_result's two halves), which is why
+# it reaches export, statistics, display_model and remote_source: a window
+# that can only be read off a screenshot cannot be compared with a session.
+sirius_core_unit(tool_api
+    HEADERS tool_api.hpp
+    SOURCES tool_api.cpp tool_api_export.cpp
+    DEPENDS workbench training_export worker_error cancel export statistics display_model remote_source lib/tiff_io
+    PUBLIC_LINK nlohmann_json::nlohmann_json)
+
+# --- headless: what sirius-cli drives --------------------------------------------
+# Image encoding, the JSON-lines session and MCP protocols, and the
+# window-less workbench that serves one tool table to all of them.
+
+sirius_core_unit(image_encode      HEADERS image_encode.hpp  SOURCES image_encode.cpp  LINK sirius_stb)
 sirius_core_unit(agent_protocol    HEADERS agent_protocol.hpp agent_server.hpp
                                    SOURCES agent_protocol.cpp agent_session.cpp agent_mcp.cpp
                                    PUBLIC_LINK nlohmann_json::nlohmann_json LINK Threads::Threads)
 sirius_core_unit(headless          HEADERS headless.hpp
-                                   SOURCES headless.cpp headless_tools.cpp headless_render.cpp headless_export.cpp
-                                   DEPENDS agent_protocol workbench tool_api display_model statistics image_encode export
+                                   SOURCES headless.cpp headless_tools.cpp headless_render.cpp
+                                   DEPENDS agent_protocol workbench tool_api display_model image_encode export
                                            training_export help_pages ops_schema ops_registry ops_factories plugin
                                            local_worker python_env worker_error host array_source pipeline dataset params
                                            labels tracks diagnostics display_mapping cancel app_paths rpc executor

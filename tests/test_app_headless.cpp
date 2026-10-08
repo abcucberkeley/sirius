@@ -188,7 +188,10 @@ TEST_CASE("headless: the tool table has no view tools and strict schemas", "[app
         CHECK(std::find(names.begin(), names.end(), view) == names.end());
         CHECK_FALSE(f.h->hasTool(view));
     }
-    for (const char* wanted : {"open_dataset", "load_pipeline", "render", "statistics", "run", "run_status", "export_result", "setup_worker_env",
+    // probe, statistics and export_result are the ToolApi's (core/tool_api.hpp),
+    // so that --tool serves them too; the session's traits still apply to them.
+    for (const char* wanted : {"open_dataset", "load_pipeline", "render", "statistics", "probe", "run", "run_status", "export_result",
+                               "setup_worker_env",
                                "list_labels", "paint_label", "fill_label", "merge_labels", "split_label", "delete_label", "clear_labels", "export_labels"})
         CHECK(std::find(names.begin(), names.end(), wanted) != names.end());
     const auto byName = [&](const std::string& n) {
@@ -197,6 +200,9 @@ TEST_CASE("headless: the tool table has no view tools and strict schemas", "[app
     CHECK_FALSE(byName("set_backend").inputSchema["properties"].contains("hpc"));
     CHECK_FALSE(byName("set_backend").inputSchema["properties"].contains("host"));
     CHECK(byName("render").hints.readOnly);
+    CHECK(byName("probe").hints.readOnly);
+    CHECK(byName("statistics").hints.readOnly);
+    CHECK_FALSE(byName("statistics").meta.contains("anthropic/maxResultSizeChars"));
     CHECK(byName("export_result").hints.destructive);
     CHECK(byName("export_labels").hints.destructive);
     CHECK(byName("list_labels").hints.readOnly);

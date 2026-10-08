@@ -555,7 +555,7 @@ serve (`sirius-cli tools` prints it). Rules they share:
 | `list_tracks` | `step`, `limit` (50) | the tracks | RO | |
 | `list_labels` | `step`, `t` (0), `limit` (200), `flag`, `unreviewed` | `{step, t, count, listed, max_label, tracked, shape, labels:[{id, voxels, class, confidence, flags, reviewed, bbox, centre}]}` | RO | |
 | `get_log` | `lines` (30, at most 500) | `{lines}` | RO | yes |
-| `export_result` | `path`*, `step`, `format`, `dtype` ("float32"), `scaling`, `range`, `percentiles`, `t`, `z`, `channels`, `tiff`{…}, `zarr`{…}, `include_labels`, `include_pipeline`, `labels_only`, `run` | `{path, format, dtype, shape, files, bytes, seconds}` | DE | |
+| `export_result` | `path`*, `step`, `format`, `dtype` ("float32"), `scaling`, `range`, `percentiles`, `t`, `z`, `channels`, `tiff`{…}, `zarr`{…}, `include_labels`, `include_pipeline`, `labels_only`, `download`, `run` | `{path, format, dtype, shape, files, bytes, seconds}` | DE | |
 | `export_training_data` | as the GUI's training export | what it wrote | DE | |
 | `export_labels` | `path`*, `step` | `{step, path, pages, shape, bytes, labels, max_label}`: one uint32 TIFF, t*z pages, what an `import_labels` step reads back | DE | |
 | `paint_label` | `x`*, `y`*, `z`*, `step`, `t` (0), `label` (0 = new), `radius` (3), `z_radius` (0), `erase` | `{step, t, label, voxels, labels}` | | |

@@ -18,6 +18,13 @@ command line: `--dataset`, `--pipeline`, `--run`, `--tool`, `--action`, `--ask`,
 `--drop`, `--stroke`, `--wheel`, `--record`, `--screenshot`, `--settings`,
 `--size`, `--quit-after` (`sirius-app --help`).
 
+`--tool` serves the whole `ToolApi` table (`core/tool_api.hpp`), `export_result`,
+`statistics` and `probe` included, so a run driven through the window can be
+compared with `sirius-cli`'s by file and by numbers rather than off a
+screenshot. `export_result` refuses `needs_download` for an output that stays
+on the cluster, as File ▸ Export result asks the user first; `download: true`
+is that answer written down.
+
 ## Layout of the code
 
 | Files | What they are |

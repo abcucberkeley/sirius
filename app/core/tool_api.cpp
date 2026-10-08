@@ -1,6 +1,9 @@
 #include "core/tool_api.hpp"
 
 #include "core/cancel.hpp"
+#include "core/display_model.hpp"    // probe reads a voxel the way the viewer does
+#include "core/remote_source.hpp"    // the download gate on an output held on the cluster
+#include "core/statistics.hpp"
 #include "core/training_export.hpp"
 
 #include <sirius/tiff_io.hpp>
@@ -11,6 +14,8 @@
 #include <cstdio>
 #include <cstring>
 #include <filesystem>
+#include <limits>
+#include <optional>
 #include <stdexcept>
 #include <utility>
 
@@ -124,6 +129,12 @@ namespace sirius::app {
             {"set_backend", "Compute backend", false, false, true, false, false, false},
             {"load_example_pipeline", "Load the example pipeline", true, false, false, false, false, false},
             {"export_training_data", "Export training data", true, false, false, true, false, false},
+            // looking at an output, and writing one out: the three tools a
+            // session used to serve alone, so that a run driven through the
+            // window can be compared by file and not only by screenshot
+            {"probe", "Probe a voxel", true, true, false, false, false, false},
+            {"statistics", "Intensity statistics", true, true, false, false, false, false},
+            {"export_result", "Export a result", true, false, false, true, false, false},
             // labels by step (core/workbench.hpp "labels by step"): the viewer's paint tools, for scripts
             {"list_labels", "List labels", false, true, false, false, false, true},
             {"paint_label", "Paint a label", true, false, false, false, false, false},
@@ -159,6 +170,13 @@ namespace sirius::app {
             return {{"type", {"integer", "string"}},
                     {"description", "Step number as shown in the operations list (1 = Load, 2 = second step, ...) or a step name"}};
         }
+        // The step probe, statistics and export_result look at. The default is
+        // the host's rule, so it is named rather than left to be guessed.
+        json inspectStepParam() {
+            return {{"type", {"integer", "string"}},
+                    {"description", "The step by number (1 = Load) or by name; default the viewed step in the application, "
+                                    "the last computed step in a session"}};
+        }
         json obj(std::initializer_list<std::pair<const std::string, json>> props, std::vector<std::string> required = {}) {
             json properties = json::object();
             for (const auto& p : props) properties[p.first] = p.second;
@@ -169,6 +187,57 @@ namespace sirius::app {
         std::string lower(std::string s) {
             std::transform(s.begin(), s.end(), s.begin(), [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
             return s;
+        }
+        // The tools accept these values in any case, so the choices are named
+        // in the description rather than as a JSON Schema enum, which a client
+        // that validates arguments would hold to the lowercase spelling.
+        json enumDesc(const std::vector<std::string>& values, const std::string& description) {
+            std::string names;
+            for (const std::string& v : values) names += (names.empty() ? "" : ", ") + v;
+            return {{"type", "string"}, {"description", description + ". One of: " + names + " (any case)"}};
+        }
+        json intList(const char* description) { return {{"type", "array"}, {"items", {{"type", "integer"}}}, {"description", description}}; }
+        json numberList(const char* description) { return {{"type", "array"}, {"items", {{"type", "number"}}}, {"description", description}}; }
+
+        // --- arguments of the inspecting tools, as a session reads them -----------
+        [[noreturn]] void invalidArg(const std::string& message, const std::string& hint = {}, json data = nullptr) {
+            throw ToolFailure("invalid_argument", message, hint, std::move(data));
+        }
+        bool given(const json& a, const char* key) { return a.contains(key) && !a[key].is_null(); }
+        bool boolArg(const json& a, const char* key, bool def) {
+            if (!given(a, key)) return def;
+            if (!a[key].is_boolean()) invalidArg(std::string("'") + key + "' must be true or false");
+            return a[key].get<bool>();
+        }
+        std::int64_t integerArg(const json& a, const char* key, std::int64_t def, std::int64_t min, std::int64_t max) {
+            if (!given(a, key)) return def;
+            const json& v = a[key];
+            if (!v.is_number() || (!v.is_number_integer() && v.get<double>() != std::floor(v.get<double>())))
+                invalidArg(std::string("'") + key + "' must be an integer");
+            const std::int64_t i = v.is_number_integer() ? v.get<std::int64_t>() : static_cast<std::int64_t>(v.get<double>());
+            if (i < min || i > max)
+                invalidArg(std::string("'") + key + "' must be within " + std::to_string(min) + " and " + std::to_string(max) +
+                           " here, not " + std::to_string(i));
+            return i;
+        }
+        // "0.1", "50", "99.9": a percentile as a key.
+        std::string percentileKey(double p) {
+            char buf[32];
+            std::snprintf(buf, sizeof buf, "%g", p);
+            return buf;
+        }
+        // Data that stays on the cluster (a cluster dataset, a step's output
+        // the engine holds on the node) is here only if it is downloaded
+        // first. File > Export result asks the user; a tool call has nobody to
+        // ask, so it carries the answer as download:true.
+        bool heldRemotely(const StepOutput& out) { return !out.array && out.source && out.source->viewProvider(); }
+        std::string downloadQuestion(const StepOutput& out, int index) {
+            const double gb = static_cast<double>(std::max<Index>(out.meta.dims.numel(), 0)) * sizeof(float) / 1e9;
+            char size[32];
+            std::snprintf(size, sizeof size, gb >= 0.1 ? "%.1f GB" : "%.0f MB", gb >= 0.1 ? gb : gb * 1000.0);
+            const std::string where = !out.where.empty() ? out.where : std::string("the cluster");
+            return "step " + Step::number(index) + "'s data is held on " + where + ", and exporting it here downloads all of it to this computer first: " +
+                   size + " (as float32)";
         }
     } // namespace
 
@@ -730,6 +799,195 @@ namespace sirius::app {
                              {"frames", r.frames},
                              {"bytes", r.bytes}};
              }});
+        // --- looking at an output, and writing one out -----------------------------
+        // These three were a session's alone until the window could not write
+        // a reconstruction out at all, which is why a three-front comparison
+        // had to read the window off a screenshot. They live here, so there is
+        // one probe, one statistics and one export_result for every front;
+        // what only a host knows -- which step, how to get its output,
+        // progress, cancellation -- comes from OutputAccess (tool_api.hpp).
+        add({"probe", "Read the values of every channel at one voxel of a step's output, and the label there with its statistics.",
+             obj({{"step", inspectStepParam()},
+                  {"x", {{"type", "integer"}, {"description", "Column"}}},
+                  {"y", {{"type", "integer"}, {"description", "Row"}}},
+                  {"z", {{"type", "integer"}, {"description", "Plane (default the middle)"}}},
+                  {"t", {{"type", "integer"}, {"description", "Time point (default 0)"}}}},
+                 {"x", "y"}),
+             [this](const json& a) {
+                 const int i = inspectStep(a);
+                 const std::shared_ptr<const StepOutput> out = outputFor(i, false);
+                 const Dims5 d = out->meta.dims;
+                 if (!given(a, "x") || !given(a, "y")) invalidArg("probe needs x and y (voxels of the xy plane)");
+                 const Index x = static_cast<Index>(integerArg(a, "x", 0, 0, d.x - 1));
+                 const Index y = static_cast<Index>(integerArg(a, "y", 0, 0, d.y - 1));
+                 const Index z = static_cast<Index>(integerArg(a, "z", d.z / 2, 0, d.z - 1));
+                 const Index t = static_cast<Index>(integerArg(a, "t", 0, 0, d.t - 1));
+                 display::DisplayModel& model = displayModel();
+                 model.setOutput(out);
+                 json values = json::array();
+                 for (Index c = 0; c < d.c; ++c) {
+                     const std::optional<float> v = model.valueAt(c, t, z, y, x);
+                     const std::string label = static_cast<std::size_t>(c) < out->meta.channels.size() ? out->meta.channels[static_cast<std::size_t>(c)].label : std::string();
+                     values.push_back({{"channel", c}, {"label", label}, {"value", v ? json(*v) : json(nullptr)}});
+                 }
+                 json label = nullptr;
+                 if (const std::shared_ptr<const LabelVolume> labels = out->labels; labels && !labels->empty() && t < labels->t() && z < labels->z() &&
+                                                                                    y < labels->y() && x < labels->x()) {
+                     const std::uint32_t id = labels->at(t, z, y, x);
+                     if (id != 0) {
+                         const LabelStats* st = labels->statsT() == t ? labels->statsOf(id) : nullptr;
+                         const LabelAnnotation note = labels->annotationOf(t, id);
+                         label = {{"id", id},
+                                  {"class", st ? st->cls : note.cls},
+                                  {"voxels", st ? json(st->voxels) : json(nullptr)},
+                                  {"flags", st ? json(st->flags) : json::array()},
+                                  {"reviewed", st ? st->reviewed : note.reviewed}};
+                     }
+                 }
+                 return json{{"step", i + 1}, {"fresh", wb_.outputFresh(i)}, {"x", x}, {"y", y}, {"z", z}, {"t", t}, {"values", values}, {"label", label}};
+             }});
+        add({"statistics",
+             "Measure a step's output: per channel the exact minimum, maximum, mean, standard deviation and NaN count, percentiles, "
+             "optionally a histogram and (Load step) the saturated fraction; for labels their count, sizes, classes and flags.",
+             obj({{"step", inspectStepParam()},
+                  {"t", {{"type", {"integer", "string"}}, {"description", "A time point, or \"all\" (default 0)"}}},
+                  {"channels", intList("The channels (default all)")},
+                  {"percentiles", numberList("Default [0.1, 1, 50, 99, 99.9]")},
+                  {"histogram_bins", {{"type", "integer"}, {"description", "Bins of a histogram per channel (default 0 = none)"}}},
+                  {"labels", {{"type", "boolean"}, {"description", "Also the label statistics (default true)"}}},
+                  {"max_samples", {{"type", "integer"}, {"description", "Values the percentiles and histogram are taken from, at most (default 4194304)"}}},
+                  {"run", {{"type", "boolean"}, {"description", "Run the step first when it has no fresh output (default false)"}}}}),
+             [this](const json& a) {
+                 const int i = inspectStep(a);
+                 const std::shared_ptr<const StepOutput> out = outputFor(i, boolArg(a, "run", false));
+                 const DatasetMeta& meta = out->meta;
+                 StatisticsOptions o;
+                 if (given(a, "t") && a["t"].is_string()) {
+                     if (lower(a["t"].get<std::string>()) != "all") invalidArg("'t' is a time point or \"all\"");
+                     o.t = -1;
+                 } else {
+                     o.t = static_cast<Index>(integerArg(a, "t", 0, 0, meta.dims.t - 1));
+                 }
+                 if (given(a, "channels")) {
+                     if (!a["channels"].is_array()) invalidArg("'channels' must be a list of channel indices");
+                     for (const json& c : a["channels"]) {
+                         const json one = {{"channels", c}};
+                         o.channels.push_back(static_cast<Index>(integerArg(one, "channels", 0, 0, meta.dims.c - 1)));
+                     }
+                 }
+                 if (given(a, "percentiles")) {
+                     if (!a["percentiles"].is_array()) invalidArg("'percentiles' must be a list of numbers within 0..100");
+                     o.percentiles.clear();
+                     for (const json& pc : a["percentiles"]) {
+                         if (!pc.is_number() || pc.get<double>() < 0.0 || pc.get<double>() > 100.0) invalidArg("'percentiles' must be numbers within 0..100");
+                         o.percentiles.push_back(pc.get<double>());
+                     }
+                 }
+                 o.histogramBins = static_cast<int>(integerArg(a, "histogram_bins", 0, 0, 4096));
+                 o.maxSamples = static_cast<std::uint64_t>(integerArg(a, "max_samples", std::int64_t{1} << 22, 1000, std::int64_t{1} << 32));
+                 // what the camera clipped: the Load step of an integer type only
+                 if (i == 0) o.saturationLevel = pixelTypeMaximum(meta);
+                 const std::vector<ChannelStatistics> stats = channelStatistics(
+                     *out, o, [this](double f) { reportProgress(f, "Measuring intensities"); }, cancelledFn());
+                 json channels = json::array();
+                 bool sampled = false;
+                 for (const ChannelStatistics& st : stats) {
+                     json percentiles = json::object();
+                     for (const auto& [pc, v] : st.percentiles) percentiles[percentileKey(pc)] = v;
+                     const std::string label = static_cast<std::size_t>(st.channel) < meta.channels.size() ? meta.channels[static_cast<std::size_t>(st.channel)].label : std::string();
+                     json c = {{"channel", st.channel},
+                               {"label", label},
+                               {"min", st.min},
+                               {"max", st.max},
+                               {"mean", st.mean},
+                               {"std", st.stddev},
+                               {"count", st.count},
+                               {"nan", st.nanCount},
+                               {"percentiles", percentiles}};
+                     if (st.saturatedFraction) c["saturated_fraction"] = *st.saturatedFraction;
+                     if (!st.histogram.empty()) c["histogram"] = {{"lo", st.histLo}, {"hi", st.histHi}, {"counts", st.histogram}};
+                     sampled = sampled || st.sampled;
+                     channels.push_back(std::move(c));
+                 }
+                 json result = {{"step", i + 1},
+                                {"fresh", wb_.outputFresh(i)},
+                                {"shape", meta.shapeString()},
+                                {"t", o.t < 0 ? json("all") : json(o.t)},
+                                {"sampled", sampled},
+                                {"channels", channels}};
+                 if (boolArg(a, "labels", true) && out->labels && !out->labels->empty())
+                     result["labels"] = labelStatistics(*out->labels, o.t < 0 ? 0 : o.t, meta.voxelUm);
+                 return result;
+             }});
+        add({"export_result",
+             "Write a step's output to a file: OME-TIFF or TIFF (tiles, compression, BigTIFF, pyramid), a zarr or N5 store, or raw, "
+             "in any pixel type with a scaling rule and an optional t / z / channel range; the labels and the pipeline beside it "
+             "on request. The format follows the extension (.ome.tif, .tif, .zarr, .n5, .raw) unless named. Overwrites.",
+             obj({{"path", {{"type", "string"}, {"description", "The file or store to write"}}},
+                  {"step", inspectStepParam()},
+                  {"format", enumDesc({"ome-tiff", "tiff", "zarr", "n5", "raw"}, "The container (default from the extension)")},
+                  {"dtype", enumDesc({"uint8", "int8", "uint16", "int16", "uint32", "int32", "float32", "float64"}, "Pixel type (default float32)")},
+                  {"scaling", enumDesc({"cast", "minmax", "fixed", "percentile"}, "How values map into the pixel type (default cast)")},
+                  {"range", numberList("scaling fixed: [lo, hi]")},
+                  {"percentiles", numberList("scaling percentile: [lo, hi]")},
+                  {"t", intList("[first, end) of the time points; end -1 = to the last")},
+                  {"z", intList("[first, end) of the planes; end -1 = to the last")},
+                  {"channels", intList("The channels (default all)")},
+                  {"tiff", {{"type", "object"}, {"description", "{tiled, tile:[w, h], compression: none|lzw|deflate, level, bigtiff, ome, pyramid_levels, downsample}"}}},
+                  {"zarr", {{"type", "object"}, {"description", "{version: 2|3, chunk:[c, t, z, y, x], codec, level, shard, pyramid_levels, downsample, ome_ngff}"}}},
+                  {"include_labels", {{"type", "boolean"}, {"description", "Write the step's labels beside it (default false)"}}},
+                  {"include_pipeline", {{"type", "boolean"}, {"description", "Write <path>.pipeline.toml beside it (default false)"}}},
+                  {"labels_only", {{"type", "boolean"}, {"description", "Write only the labels, as one 32-bit TIFF (default false)"}}},
+                  {"download", {{"type", "boolean"}, {"description", "True once the user agreed to download an output that is held on the cluster; File > Export result asks them instead"}}},
+                  {"run", {{"type", "boolean"}, {"description", "Run the step first when it has no fresh output (default false)"}}}},
+                 {"path"}),
+             [this](const json& a) {
+                 // refused before anything runs
+                 if (!given(a, "path") || !a["path"].is_string() || a["path"].get<std::string>().empty())
+                     invalidArg("export_result needs 'path', the file to write");
+                 refuseNetworkPath(a["path"].get<std::string>(), "path", allowNetworkPaths_);
+                 json warnings = json::array();
+                 const int i = inspectStep(a);
+                 const std::shared_ptr<const StepOutput> out = outputFor(i, boolArg(a, "run", false));
+                 const ExportOptions o = exportOptionsFromJson(a, out->meta);
+                 const bool labelsOnly = boolArg(a, "labels_only", false);
+                 if (!labelsOnly) {
+                     if (!exportFormatAvailable(o.format))
+                         throw ToolFailure("unsupported", "this build cannot write zarr or N5 stores", "export to .ome.tif or .tif instead");
+                     if (const std::string why = validateExport(o, out->meta.dims); !why.empty()) invalidArg(why);
+                 } else {
+                     // The labels are written whole, as they are: say which options that leaves unused.
+                     std::string ignored;
+                     for (const char* key : {"dtype", "scaling", "range", "percentiles", "t", "z", "channels", "tiff", "zarr", "include_labels", "include_pipeline"})
+                         if (given(a, key)) ignored += (ignored.empty() ? "" : ", ") + std::string(key);
+                     if (!ignored.empty()) warnings.push_back("labels_only writes every label as uint32 and ignores " + ignored);
+                 }
+                 // The window asks before it downloads an output the cluster
+                 // holds, and never as a side effect of an export (App::
+                 // exportResultDialog). A tool call has nobody to ask, so the
+                 // answer is an argument, and without it nothing is read.
+                 std::optional<RemoteDownloads::Allow> allow;
+                 if (!labelsOnly && heldRemotely(*out)) {
+                     if (!boolArg(a, "download", false))
+                         throw ToolFailure("needs_download", downloadQuestion(*out, i),
+                                           "run the step on the HPC backend and export there, or call export_result again with download:true "
+                                           "once the user has agreed to the download",
+                                           {{"step", i + 1}, {"bytes", static_cast<double>(std::max<Index>(out->meta.dims.numel(), 0)) * sizeof(float)}, {"where", out->where}});
+                     allow.emplace("an export the user asked for");
+                 }
+                 json r = exportStepOutput(out, wb_.pipeline(), o, labelsOnly, progressFn("Exporting"), cancelledFn());
+                 for (const json& w : r["warnings"]) warnings.push_back(w);
+                 r.erase("warnings");
+                 if (!warnings.empty()) r["warnings"] = warnings;
+                 r["step"] = i + 1;
+                 const std::string path = r["path"].get<std::string>();
+                 wb_.logLine("Exported step " + Step::number(i) + " to " + path);
+                 wb_.recordEvent("export", {{"step", i + 1}, {"path", path}, {"format", r["format"]}, {"labels_only", labelsOnly}});
+                 actions_.push_back({ActionRecord::Kind::Run,
+                                     "Exported step " + Step::number(i) + " · " + wb_.pipeline().at(i).name + " → " + path,
+                                     "log", {}, "export_result"});
+                 return r;
+             }});
         // --- labels by step -------------------------------------------------------
         // The viewer's paint tools (brush, fill, merge, split, delete) as tool
         // calls that name the step and the time point, for the assistant, a
@@ -1124,6 +1382,56 @@ namespace sirius::app {
     }
 
     int ToolApi::resolveStep(const json& args, const char* key) const { return resolveStepIndex(wb_.pipeline(), args, key); }
+
+    ToolApi::~ToolApi() = default;
+
+    void ToolApi::releaseOutputCaches() noexcept {
+        if (model_) model_->setOutput(nullptr);
+    }
+
+    display::DisplayModel& ToolApi::displayModel() {
+        if (!model_) model_ = std::make_unique<display::DisplayModel>();
+        return *model_;
+    }
+
+    void ToolApi::reportProgress(double fraction, const std::string& message) const {
+        if (output_.progress) output_.progress(fraction, message);
+    }
+
+    std::function<void(double, const std::string&)> ToolApi::progressFn(std::string message) const {
+        if (!output_.progress) return {};
+        return [this, message](double f, const std::string& m) { reportProgress(f, m.empty() ? message : m); };
+    }
+
+    std::function<bool()> ToolApi::cancelledFn() const { return output_.cancelled; }
+
+    int ToolApi::inspectStep(const json& args) const {
+        if (args.is_object() && args.contains("step") && !args["step"].is_null()) return resolveStep(args);
+        const int i = output_.defaultStep ? output_.defaultStep() : wb_.viewedIndex();
+        // A host's rule is its own; it still has to name a step that exists.
+        if (i < 0 || i >= wb_.pipeline().size())
+            throw ToolFailure("unknown_step", "there is no step " + std::to_string(i + 1), "name the step: 1 is Load");
+        return i;
+    }
+
+    // The window's answer when no host gave one: the output the workbench
+    // holds, and the run hook (the Run button's path) when the call says run.
+    std::shared_ptr<const StepOutput> ToolApi::outputFor(int index, bool runIfNeeded) {
+        if (output_.output) return output_.output(index, runIfNeeded);
+        if (!wb_.hasDataset()) throw ToolFailure("no_dataset", "no dataset is open", "open a dataset first");
+        const std::string which = "step " + std::to_string(index + 1) + " (" + wb_.pipeline().at(index).name + ")";
+        std::shared_ptr<const StepOutput> out = wb_.output(index);
+        const bool usable = out && (out->array || out->source);
+        if (usable && (!runIfNeeded || wb_.outputFresh(index))) return out;
+        if (!runIfNeeded) throw ToolFailure("not_computed", which + " has not been computed", "run it first, or pass run:true");
+        if (!runHook_) throw ToolFailure("unsupported", "running is not available in this context");
+        const json outcome = runHook_(index);
+        if (outcome.is_object() && outcome.contains("error") && outcome["error"].is_string() && !outcome["error"].get<std::string>().empty())
+            throw ToolFailure("failed", "the run of " + which + " failed: " + outcome["error"].get<std::string>());
+        out = wb_.output(index);
+        if (!out || !(out->array || out->source)) throw ToolFailure("not_computed", which + " produced no output", "get_log says what the run did");
+        return out;
+    }
 
     int ToolApi::resolveStepIndex(const Pipeline& p, const json& args, const char* key) {
         const std::string there = " (there are " + std::to_string(p.size()) + ", 1 is Load)";
