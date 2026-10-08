@@ -1,19 +1,35 @@
 #ifndef SIRIUS_IMGUI_EXPORT_DIALOG_SUPPORT_HPP
 #define SIRIUS_IMGUI_EXPORT_DIALOG_SUPPORT_HPP
 
-// What the export, training export and preferences dialogs lay their forms
-// out with: labelled fields side by side in equal columns, a spin box with
-// a prefix inside its frame ("t 0", "level 6"), the
-// wrapped 11 px notes, and the row of actions at the bottom (Cancel, then
-// the primary action, flush right, Enter accepting as a default button does).
+// What the dialogs lay their forms out with: labelled fields side by side in
+// equal columns, a spin box with a prefix inside its frame ("t 0",
+// "level 6"), the wrapped 11 px notes, the bar of a download or a long
+// measurement, and the row of actions at the bottom.
+//
+// THERE ARE TWO ACTION ROWS, and a dialog picks between them rather than
+// writing a third:
+//   * actionRow(primary, enabled) -- Cancel (ghost) and one primary action,
+//     each as wide as its own label. The export, training export, cluster,
+//     settings editor and preferences dialogs.
+//   * buttonRow(onTop, buttons, ...) -- any number of buttons, each at least
+//     84 px, the last of them the default unless it says otherwise, with an
+//     optional checkbox ("Don't ask again") at the left of the same line. The
+//     Python-environment dialog, whose rows run from one button to three.
+// They differ in the width arithmetic (as wide as the label, against at least
+// 84 px) and in the kind of the non-primary buttons (ghost, against
+// secondary), so neither is the other with a flag and the choice between them
+// is a visual one. The model hub's two 84 px pairs are a third shape again
+// and were left alone: see the note at its own footer.
 //
 // Widths are display pixels here unless a name says otherwise; the controls
 // of widgets/controls.hpp take design pixels, which design() converts to.
 
 #include <algorithm>
 #include <cmath>
+#include <cstddef>
 #include <cstdint>
 #include <string>
+#include <vector>
 
 #include <imgui.h>
 #include <imgui_internal.h>
@@ -81,6 +97,35 @@ namespace sirius::app::gui::dialog_support {
     // An 11 px note wrapped at the rest of the line.
     inline void note(const std::string& text, ImU32 color = theme::kNeutral600) {
         widgets::textWrapped(text, 11, color, theme::Weight::Regular, ImGui::GetContentRegionAvail().x);
+    }
+
+    // The height of the bar below: 8 px on the pixel grid.
+    inline float progressBarHeight() { return theme::snap(theme::px(8)); }
+
+    // The bar of a download or a long measurement: a groove, the accent up to
+    // `fraction`, with its top at `y` and taking `rowH` of the layout. The one
+    // place the bar is drawn, so the two shapes below cannot drift apart by a
+    // pixel.
+    inline void progressBarAt(double fraction, float width, float y, float rowH) {
+        const float h = progressBarHeight();
+        const float x = ImGui::GetCursorScreenPos().x;
+        ImDrawList* dl = ImGui::GetWindowDrawList();
+        dl->AddRectFilled(ImVec2(x, y), ImVec2(x + width, y + h), theme::kNeutral300);
+        const float f = std::clamp(static_cast<float>(fraction), 0.0f, 1.0f);
+        if (f > 0.0f) dl->AddRectFilled(ImVec2(x, y), ImVec2(x + theme::snap(width * f), y + h), theme::kAccent);
+        ImGui::Dummy(ImVec2(width, rowH));
+    }
+
+    // The bar on a line of its own, as high as the bar: under the line that
+    // says what is being done, with the message below it.
+    inline void progressBar(double fraction, float width) {
+        progressBarAt(fraction, width, ImGui::GetCursorScreenPos().y, progressBarHeight());
+    }
+
+    // The bar centred in a row `rowH` high: the line it shares with the
+    // buttons beside it, which are taller than it is.
+    inline void progressBar(double fraction, float width, float rowH) {
+        progressBarAt(fraction, width, theme::snap(ImGui::GetCursorScreenPos().y + (rowH - progressBarHeight()) * 0.5f), rowH);
     }
 
     // widgets::inputInt as one item: the last item it submits is its lower
@@ -164,6 +209,71 @@ namespace sirius::app::gui::dialog_support {
             (ImGui::IsKeyPressed(ImGuiKey_Enter, false) || ImGui::IsKeyPressed(ImGuiKey_KeypadEnter, false)))
             action = Action::Accept;
         return action;
+    }
+
+    struct ButtonSpec {
+        std::string label;
+        bool enabled = true;
+        std::string tooltip;
+        bool secondary = false;   // never the default, even as the last of its row
+    };
+
+    // The buttons flush right, the last one the default (primary; Enter
+    // presses it when `onTop` -- no modal dialog is open over the one that
+    // is drawing this row, which is Dialog::onTop()) unless it is
+    // `secondary`, with an optional checkbox at the left of the same row,
+    // or above it when the row has no room for it. The index of the button
+    // pressed, else -1.
+    inline int buttonRow(bool onTop, const std::vector<ButtonSpec>& buttons, const char* checkLabel = nullptr,
+                         bool* check = nullptr) {
+        const float gap = theme::px(8);
+        std::vector<float> widths;
+        float total = 0.0f;
+        for (std::size_t i = 0; i < buttons.size(); ++i) {
+            const bool primary = i + 1 == buttons.size() && !buttons[i].secondary;
+            const theme::Weight weight = primary ? theme::Weight::ExtraBold : theme::Weight::SemiBold;
+            const float w = std::max(theme::px(84), theme::textSize(buttons[i].label, 13, weight).x + theme::px(28));
+            widths.push_back(w);
+            total += w + (i ? gap : 0.0f);
+        }
+        const float avail = ImGui::GetContentRegionAvail().x;
+        if (check) {
+            // tokenCheck's size: the 14 px box, 8 px, the 12 px label
+            const float boxH = std::max(theme::snap(theme::px(14)), theme::textSize("Ag", 12).y) + theme::px(4);
+            const float checkW = theme::snap(theme::px(14)) + theme::px(8) + theme::textSize(checkLabel, 12).x;
+            if (checkW + 2 * gap + total > avail) {
+                widgets::checkbox(checkLabel, check);
+            } else {
+                // centred on the buttons' line (widgets::button's own arithmetic)
+                const ImVec2 start = ImGui::GetCursorPos();
+                const float textH = theme::textSize("Ag", 13).y;
+                const float rowH = theme::snap(std::max(theme::px(18), textH) + 2 * theme::px(7) + 2 * theme::px(theme::kBorder));
+                ImGui::SetCursorPos(ImVec2(start.x, start.y + std::max(0.0f, std::floor((rowH - boxH) * 0.5f))));
+                widgets::checkbox(checkLabel, check);
+                ImGui::SetCursorPos(start);
+            }
+        }
+        const ImVec2 start = ImGui::GetCursorPos();
+        ImGui::SetCursorPos(ImVec2(start.x + std::max(0.0f, avail - total), start.y));
+        int pressed = -1;
+        for (std::size_t i = 0; i < buttons.size(); ++i) {
+            if (i) ImGui::SameLine(0.0f, gap);
+            const bool primary = i + 1 == buttons.size() && !buttons[i].secondary;
+            widgets::ButtonOpts o;
+            o.kind = primary ? widgets::ButtonKind::Primary : widgets::ButtonKind::Secondary;
+            o.width = design(widths[i]);
+            o.centered = true;
+            o.enabled = buttons[i].enabled;
+            o.tooltip = buttons[i].tooltip;
+            // Not while a dropdown of the dialog is open: that Enter picks its item.
+            const bool enterKey =
+                ImGui::IsKeyPressed(ImGuiKey_Enter, false) || ImGui::IsKeyPressed(ImGuiKey_KeypadEnter, false);
+            const bool enter = primary && o.enabled && onTop && !ImGui::IsAnyItemActive() &&
+                               !ImGui::IsPopupOpen("", ImGuiPopupFlags_AnyPopupId) && enterKey;
+            const std::string id = buttons[i].label + "##button" + std::to_string(i);
+            if (widgets::button(id.c_str(), o) || enter) pressed = static_cast<int>(i);
+        }
+        return pressed;
     }
 
 } // namespace sirius::app::gui::dialog_support

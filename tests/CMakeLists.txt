@@ -64,6 +64,9 @@ sirius_lib_test(otf             test_otf.cpp)
 sirius_lib_test(otf_io          test_otf_io.cpp)
 sirius_lib_test(otf_ideal       test_otf_ideal.cpp)
 sirius_lib_test(otf_select      test_otf_select.cpp)
+# the measurement writes a table and reads it back through loadOTF, so the
+# round trip through makeotf's layout is asserted rather than assumed
+sirius_lib_test(otf_measure     test_otf_measure.cpp UNITS lib/otf_io lib/tiff_io)
 sirius_lib_test(sim_reconstruction test_reconstruction.cpp
     UNITS lib/otf_io lib/otf_ideal lib/legacy_config lib/tiff_io)
 
