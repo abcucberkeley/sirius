@@ -798,14 +798,31 @@ TEST_CASE("the app service measures the user's own sparse bead field", "[otf_mea
     REQUIRE(den > 0.0);
     REQUIRE(refPeak > 0.0);
     const double scale = num / den;
+    // The DC is left out of the RESIDUAL as well as the fit, and it has to be:
+    // both tables are divided by their own order-0 DC, so that sample is 1 in
+    // both WHATEVER the scale is, and multiplying one table by s moves it off
+    // 1 by construction. My first version of this loop included it and
+    // reported a residual of 1.49 of peak, which was the DC alone
+    // (|0.4734 - 1| / 0.3531) and not a disagreement about any measured
+    // sample. That the rest then matches to float rounding under ONE scale is
+    // the structural fact the library's header states: the background enters
+    // only the kx = ky = 0 column, and modify() has replaced that column
+    // everywhere but order 0's kz = 0 -- so the background estimate can move
+    // exactly one sample of the raw table, the DC, and therefore nothing but
+    // the scale every order is divided by.
     double worst = 0.0;
     for (Eigen::Index o = 0; o < mine.dimension(0); ++o)
         for (Eigen::Index q = 0; q < mine.dimension(1); ++q)
-            for (Eigen::Index k = 0; k < mine.dimension(2); ++k)
+            for (Eigen::Index k = 0; k < mine.dimension(2); ++k) {
+                if (o == 0 && q == 0 && k == 0) continue;
                 worst = std::max(worst, std::hypot(scale * mine(o, q, k).real() - ref(o, q, 2 * k),
                                                    scale * mine(o, q, k).imag() - ref(o, q, 2 * k + 1)));
+            }
     INFO("one global scale " << scale << ", worst residual " << worst / refPeak << " of peak");
     CHECK(worst / refPeak < 1e-5);
+    // and the one sample the scale cannot carry is 1 in both
+    CHECK(std::abs(mine(0, 0, 0).real() - 1.0) < 1e-6);
+    CHECK(std::abs(ref(0, 0, 0) - 1.0f) < 1e-6f);
 
     // And the number that scale cannot move, which is what to quote off a
     // table: the reference's own band ratio, computed the same way.
