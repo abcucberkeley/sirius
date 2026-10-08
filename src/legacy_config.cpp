@@ -45,6 +45,17 @@ namespace sirius {
             }
         }
 
+        double parseDouble(const std::string& key, const std::string& v) {
+            try {
+                size_t pos = 0;
+                double out = std::stod(v, &pos);
+                if (pos != v.size()) throw std::invalid_argument(v);
+                return out;
+            } catch (const std::exception&) {
+                throw IoError("config key '" + key + "' expects a number, got: " + v);
+            }
+        }
+
         bool parseBool(const std::string& key, const std::string& v) {
             if (v == "1" || v == "true" || v == "True") return true;
             if (v == "0" || v == "false" || v == "False") return false;
@@ -81,9 +92,9 @@ namespace sirius {
                 {"wavelength", [](auto& c, auto& k, auto& v) { c.wavelengthNm = parseFloat(k, v); }},
 
                 // pixel sizes
-                {"xyres", [](auto& c, auto& k, auto& v) { c.dxy = parseFloat(k, v); }},
-                {"zres", [](auto& c, auto& k, auto& v) { c.dz = parseFloat(k, v); }},
-                {"zresPSF", [](auto& c, auto& k, auto& v) { c.dzPSF = parseFloat(k, v); }},
+                {"xyres", [](auto& c, auto& k, auto& v) { c.dxy = parseDouble(k, v); }},
+                {"zres", [](auto& c, auto& k, auto& v) { c.dz = parseDouble(k, v); }},
+                {"zresPSF", [](auto& c, auto& k, auto& v) { c.dzPSF = parseDouble(k, v); }},
 
                 // I5S / Bessel / deskew
                 {"2lenses", [](auto& c, auto& k, auto& v) { c.bTwolens = parseBool(k, v); }},

@@ -25,10 +25,14 @@ namespace sirius {
         std::vector<float> k0angles;
         float              wavelengthNm = 530.0f; // SIRIUS extension (TIFF mode)
 
-        // Pixel sizes (from ImageParams / config)
-        float dxy   = 0.1f;
-        float dz    = 0.2f;
-        float dzPSF = 0.15f;
+        // Pixel sizes (from ImageParams / config). Doubles: they are what a
+        // SIM step driven by the file reconstructs with and what a measured
+        // OTF's sampling is derived from, and a file's 0.08 is 0.08, not the
+        // 0.0799999982 a float makes of it (which then reaches the output
+        // voxel and every derived frequency step).
+        double dxy   = 0.1;
+        double dz    = 0.2;
+        double dzPSF = 0.15;
 
         // I5S / Bessel / deskew
         bool  bTwolens       = false;

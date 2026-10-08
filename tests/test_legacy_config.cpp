@@ -75,6 +75,9 @@ TEST_CASE("loadLegacyConfig parses the example config", "[legacy]") {
     REQUIRE(c.dxy == Approx(0.08f));
     REQUIRE(c.dz == Approx(0.125f));
     REQUIRE(c.dzPSF == Approx(0.125f));
+    // to the file's precision, not a float's: the SIM step reconstructs with
+    // these and derives the output voxel and the OTF sampling from them
+    CHECK(c.dxy == 0.08);
 
     REQUIRE(c.k0angles.size() == 3);
     REQUIRE(c.k0angles[0] == Approx(0.804300f));
