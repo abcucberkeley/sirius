@@ -607,6 +607,42 @@ TEST_CASE("tool gate: schemas() is the whole table, the window's --tool and the 
     }
 }
 
+TEST_CASE("tool gate: an argument no tool takes is dropped with a warning, not taken in silence", "[app][tool_gate]") {
+    Bench b({"test_gate_slow"});
+    ToolApi api(b.wb);
+    // A typo in a --tool argument was accepted in silence by the window and
+    // warned about by sirius-cli, because only the session checked.
+    const json r = api.call("set_step_enabled", {{"step", 2}, {"enabled", false}, {"enbaled", true}});
+    INFO(r.dump());
+    REQUIRE(kindOf(r).empty());
+    REQUIRE(r.contains("warnings"));
+    REQUIRE(r["warnings"].size() == 1);
+    CHECK_THAT(r["warnings"][0].get<std::string>(), ContainsSubstring("enbaled"));
+    CHECK_FALSE(b.wb.pipeline().at(1).enabled);   // and what was asked still happened
+
+    SECTION("a failure carries them too, where they explain it") {
+        const json bad = api.call("remove_step", {{"step", 99}, {"force", true}});
+        CHECK(kindOf(bad) == "unknown_step");
+        REQUIRE(bad.contains("warnings"));
+        REQUIRE(bad["warnings"].size() == 1);
+        CHECK_THAT(bad["warnings"][0].get<std::string>(), ContainsSubstring("force"));
+    }
+    SECTION("inside a parameter object it is the operation's business, not the schema's") {
+        const json ok = api.call("set_params", {{"step", 2}, {"params", {{"ticks", 3}}}});
+        REQUIRE(kindOf(ok).empty());
+        CHECK_FALSE(ok.contains("warnings"));
+        // a parameter the operation does not have is still a refusal, not a warning
+        CHECK(kindOf(api.call("set_params", {{"step", 2}, {"params", {{"tikcs", 3}}}})) == "invalid_argument");
+    }
+    SECTION("a tool that declares no properties takes anything, as it did") {
+        api.addTool({"gate_open", "Declares no properties.", json{{"type", "object"}},
+                     [](const json& a) { return json{{"saw", a.size()}}; }});
+        const json open = api.call("gate_open", {{"anything", 1}});
+        CHECK(open["saw"] == 1);
+        CHECK_FALSE(open.contains("warnings"));
+    }
+}
+
 // --- the three tools the window could not reach -----------------------------------------
 // The reason this stage exists: a SIM run driven through the window could not
 // be written out at all, so a three-front comparison had to read the window

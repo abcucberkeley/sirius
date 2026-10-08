@@ -23,7 +23,9 @@ command line: `--dataset`, `--pipeline`, `--run`, `--tool`, `--action`, `--ask`,
 compared with `sirius-cli`'s by file and by numbers rather than off a
 screenshot. `export_result` refuses `needs_download` for an output that stays
 on the cluster, as File ▸ Export result asks the user first; `download: true`
-is that answer written down.
+is that answer written down. An argument the named tool does not take is
+dropped and reported in the result's `warnings`, as it has always been in a
+session: a typo used to be taken here in silence.
 
 ## Layout of the code
 

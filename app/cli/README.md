@@ -1045,7 +1045,9 @@ worker setup [--yes] [--extras] [--package P]… [--base-python P] [--update|--r
 | `usage.cpp` | the help texts and `schema` |
 
 Everything else is in the core, so the tests reach it without a process:
-`headless*` (the tool table, runs, rendering, export), `agent_protocol`,
+`headless*` (the session's tools, runs and rendering), `tool_api` (the table
+itself, and the three tools the window drives too: `export_result`,
+`statistics`, `probe`), `agent_protocol`,
 `agent_session` and `agent_mcp` (the session and MCP servers over any
 `ToolDispatcher`, with no I/O of their own), `python_env`, `local_worker`,
 `worker_error`, `host`, `process`, `display_model`, `image_encode` and
