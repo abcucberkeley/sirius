@@ -228,6 +228,14 @@ sirius_lib_unit(otf_ideal
     SOURCES otf_ideal.cpp
     DEPENDS otf sim_parameters fft buffer constants)
 
+# Measuring one from a bead stack -- makeotf's chain for a single bead, mcSIM's
+# detection for a field -- and writing it in makeotf's layout with the sidecar
+# otf_io reads. A calibration artefact, not a pipeline operation.
+sirius_lib_unit(otf_measure
+    HEADERS sirius/otf_measure.hpp
+    SOURCES otf_measure.cpp
+    DEPENDS otf separation real_fft tiff_io errors constants)
+
 # the per-device stage implementations behind the reconstruction driver
 sirius_lib_unit(sim_backend
     HEADERS sim_internal.hpp
@@ -283,6 +291,7 @@ target_sources(sirius
             ${PROJECT_SOURCE_DIR}/include/sirius/otf.hpp
             ${PROJECT_SOURCE_DIR}/include/sirius/otf_io.hpp
             ${PROJECT_SOURCE_DIR}/include/sirius/otf_ideal.hpp
+            ${PROJECT_SOURCE_DIR}/include/sirius/otf_measure.hpp
             ${PROJECT_SOURCE_DIR}/include/sirius/preprocess.hpp
             ${PROJECT_SOURCE_DIR}/include/sirius/separation.hpp
             ${PROJECT_SOURCE_DIR}/include/sirius/sim_reconstruction.hpp
