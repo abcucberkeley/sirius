@@ -58,6 +58,31 @@ class TestSIMReconstruction(unittest.TestCase):
         again = recon.reconstruct(self.raw)
         np.testing.assert_array_equal(again, actual)
 
+    def test_no_otf_path_is_the_theoretical_otf(self):
+        # The GUI and the CLI leave the OTF field empty to mean "theoretical
+        # OTF"; the binding has to mean the same thing, through the same
+        # library function (sirius::selectOTF). Before 2026-10-08 the binding
+        # called loadOTF unconditionally, so an empty path was a failed file
+        # open and the Python front could not reconstruct without a measured
+        # OTF at all (docs/findings.md 9k.50, finding 4).
+        params = sirius.load_legacy_parameters(str(DATA / "config.txt"))
+        self.assertEqual(params.sections_per_plane(), 15)
+        self.assertEqual(params.planes(self.raw.shape[0]), 9)   # several planes: the 3D OTF
+        recon = sirius.SimReconstructor(params, "", rigor=sirius.PlanRigor.Estimate,
+                                        three_d=params.planes(self.raw.shape[0]) > 1)
+        actual = recon.reconstruct(self.raw)
+        self.assertEqual(actual.shape, self.expected.shape)
+        self.assertEqual(int(np.count_nonzero(~np.isfinite(actual))), 0)
+        self.assertGreater(float(np.max(np.abs(actual))), 0.0)
+        self.assertEqual(len(recon.last_fit.k0), params.ndirs)
+        # the default is the theoretical OTF too: otf_path is optional
+        again = sirius.SimReconstructor(params, rigor=sirius.PlanRigor.Estimate)
+        peak = float(np.max(np.abs(actual)))
+        np.testing.assert_allclose(again.reconstruct(self.raw), actual, rtol=0, atol=1e-9 * peak)
+        # (the 2D table itself -- one kz sample instead of 64 -- is checked in
+        # tests/test_otf_select.cpp; reconstructing a nine-plane stack with it
+        # is a configuration no front can ask for, so it is not asserted here)
+
     @unittest.skipUnless(sirius.cuda_available(), "no CUDA device available")
     def test_gpu_buffer_input_and_output(self):
         device = sirius.Device.cuda()

@@ -475,10 +475,117 @@ class TestSimStep(unittest.TestCase):
         p = wb._sim_parameters({"mode": "From file", "params_file": str(self.DATA / "config.txt")}, meta)
         self.assertEqual(p.nphases, 5)
 
-    def test_sim_step_needs_an_otf_file(self):
-        raw = np.zeros((15, 8, 8), np.float32)
-        with self.assertRaises(wb.NotAvailable):
-            wb.run_step("sim", {"angles": 3, "phases": 5}, raw)
+    def test_sim_step_reconstructs_with_the_theoretical_otf(self):
+        # tests/test_app_ops.cpp's "the theoretical OTF works without a file",
+        # on the same stack with the same parameters: an empty `otf` means the
+        # theoretical OTF here as it does in the GUI and the CLI, and the
+        # choice is the library's one selectOTF (sirius/otf_select.hpp).
+        # Until 2026-10-08 this raised NotAvailable, which is what made every
+        # default-OTF pipeline the application exports with export_python die
+        # on its own run_pipeline (docs/findings.md 9k.50, finding 4).
+        sirius = _sirius_extension()
+        raw = sirius.read_tiff(str(self.DATA / "raw.tif"), dtype=np.float32)
+        self.assertEqual(raw.shape, (135, 64, 64))   # 3 angles x 5 phases x 9 z
+        params = {"na": 1.42, "nimm": 1.515, "linespacing_um": 0.2035, "k0_start_angle": 46.08}
+        r = wb.run_step("sim", params, raw, {"voxel_um": [0.08, 0.08, 0.125]}, device="cpu")
+        self.assertEqual(r.array.shape, (1, 1, 9, 128, 128))   # zoomfact 2, z_zoom 1
+        self.assertEqual(int(np.count_nonzero(~np.isfinite(r.array))), 0)
+        self.assertGreater(float(np.max(np.abs(r.array))), 0.0)
+        self.assertAlmostEqual(r.meta["voxel_um"][0], 0.04, places=9)
+        # The pattern was actually fitted. A collapsed fit is the failure this
+        # pins: given an OTF that does not match the optics, cudasirecon's own
+        # findk0 returns (0, 0) and reports "spacing=inf um" (9k.49), and the
+        # reconstruction is then just the centre band stacked. The configured
+        # line spacing puts order 1 at 1 / 0.2035 / 2 = 2.457 /um, so 0.407 um;
+        # the measured-OTF run of this stack fits 0.407 um (9k.48). Ten per
+        # cent is room for the fit to move without room for a collapse.
+        fits = r.info["fits"]
+        self.assertEqual(len(fits), 1)
+        self.assertEqual(len(fits[0]["k0"]), 3)
+        for kx, ky in fits[0]["k0"]:
+            spacing = 1.0 / float(np.hypot(kx, ky))
+            self.assertGreater(spacing, 0.407 * 0.90)
+            self.assertLess(spacing, 0.407 * 1.10)
+
+    def test_the_theoretical_otf_follows_the_stacks_planes(self):
+        # The theoretical OTF is built in 3D for a stack of several planes and
+        # in 2D (one kz sample, no missing cone) for a single plane, and the
+        # application decides from the stack: session.cpp's threeD(), which is
+        # SIMParameters::planes(sections) > 1. The mirror asks the same
+        # parameters the same question rather than doing the arithmetic itself.
+        sirius = _sirius_extension()
+        meta = {"voxel_um": [0.08, 0.08, 0.125]}
+        params = {"na": 1.42, "nimm": 1.515, "linespacing_um": 0.2035, "k0_start_angle": 46.08}
+        p = wb._sim_parameters(params, meta)
+        self.assertEqual(p.sections_per_plane(), 15)      # 3 angles x 5 phases
+        self.assertEqual(p.planes(135), 9)                # tests/data/raw.tif: 3D
+        self.assertEqual(p.planes(15), 1)                 # one plane: 2D
+        self.assertEqual(p.planes(134), 0)                # not a whole number of planes
+        # both theoretical tables are reachable with no OTF file at all
+        for three_d in (True, False):
+            sirius.SimReconstructor(p, "", sirius.Device.cpu(), sirius.PlanRigor.Estimate,
+                                    three_d=three_d)
+        # and three_d is in the reconstructor cache key, as threeD is in the
+        # C++ one (session.cpp's Impl::Cache): without it a 2D stack following
+        # a 3D one would be reconstructed with the 3D stack's OTF
+        raw = sirius.read_tiff(str(self.DATA / "raw.tif"), dtype=np.float32)
+        wb.run_step("sim", params, raw, meta, device="cpu")
+        self.assertEqual([json.loads(k)["three_d"] for k in wb._sim_cache], [True])
+        # a section count that is not a whole number of planes still names the
+        # arithmetic, in the application's words
+        with self.assertRaises(ValueError) as cm:
+            wb.run_step("sim", params, np.zeros((134, 8, 8), np.float32), meta, device="cpu")
+        self.assertIn("not a multiple of angle 3 \u00d7 phase 5 = 15", str(cm.exception))
+        # a named OTF file that is not there is still an error, not a silent
+        # fall back to the theoretical OTF
+        with self.assertRaises(FileNotFoundError):
+            wb.run_step("sim", dict(params, otf=str(self.DATA / "no-such-otf.tif")),
+                        np.zeros((15, 8, 8), np.float32), meta, device="cpu")
+
+    def test_an_exported_default_sim_pipeline_runs_through_run_pipeline(self):
+        # The application's export_python writes a script whose whole body is
+        # run_pipeline(DATASET, PIPELINE) (app/core/pipeline.cpp's
+        # toPythonScript), so a pipeline the application can export has to be
+        # one this module can run. PIPELINE here is what sirius-cli's
+        # export_python actually wrote for [Load, SIM] on tests/data/raw.tif
+        # with the OTF field left empty (job 4247377 on dev f8e8211), with
+        # only the dataset path substituted. Run then, it died at step 2 with
+        # NotAvailable: "SIM reconstruction in Python needs a measured OTF
+        # file ('otf')".
+        #
+        # The backend is pinned because the three fronts default to three
+        # different ones (9k.50, finding 3): run_pipeline's own default is
+        # "auto", which is CUDA wherever torch sees a device.
+        path = str(self.DATA / "raw.tif")
+        pipeline = {
+            "version": 1,
+            "steps": [
+                {"cache": "recompute", "enabled": True, "id": 1, "kind": "load", "name": "Load",
+                 "params": {"c": 0, "page_order": "czt", "path": path,
+                            "read_as": "Lazy (chunk on demand)", "sheet_angle": 0.0,
+                            "sim_fast": False, "sim_layout": "", "sim_ndirs": 0, "sim_nphases": 0,
+                            "t": 0, "tile": 0, "voxel_x": 0.08, "voxel_y": 0.08, "voxel_z": 0.125,
+                            "z": 0}},
+                {"cache": "disk", "enabled": True, "id": 3, "kind": "sim", "name": "SIM",
+                 "params": {"angles": 3, "apodization": "Cosine", "apodize_input": "Triangle",
+                            "background": 0.0, "bleach_correction": True, "dz_psf": 0.0,
+                            "equalizez": False, "explodefact": 1.0, "filter_overlaps": True,
+                            "k0_angles": [], "k0_start_angle": 46.08, "linespacing_um": 0.2035,
+                            "mode": "Estimate", "na": 1.42, "napodize": 10, "nimm": 1.515,
+                            "no_kz0": True, "orders": 0, "otf": "", "otfcutoff": 0.006,
+                            "params_file": "", "phases": 5, "suppress_singularities": True,
+                            "suppress_zero_order": True, "suppression_radius": 10,
+                            "wavelength_nm": 510.0, "wiener": 0.001, "z_zoom": 1,
+                            "zoomfact": 2.0}},
+            ],
+        }
+        with warnings.catch_warnings():
+            warnings.simplefilter("error", wb.UnknownParameterWarning)
+            out, meta = wb.run_pipeline(path, pipeline, device="cpu")
+        self.assertEqual(out.shape, (1, 1, 9, 128, 128))
+        self.assertNotIn("skipped", meta)
+        self.assertAlmostEqual(meta["voxel_um"][0], 0.04, places=9)
+        self.assertAlmostEqual(meta["voxel_um"][2], 0.125, places=9)
 
     def test_sim_from_file_reconstructs_with_the_files_pixel_sizes(self):
         # tests/test_app_ops.cpp "SIM From file reconstructs with the file's

@@ -3633,30 +3633,41 @@ def step_sim(a: np.ndarray, params: Dict[str, Any], meta: Dict[str, Any], progre
     apodization, na, nimm, wavelength_nm, linespacing_um, k0_start_angle /
     k0_angles, ...). From file, the parameter file's pixel sizes win where
     it sets them and the metadata's fill in the rest, as in the application.
-    Needs a measured `otf` file: the theoretical OTF exists only in the
-    application."""
+    An empty `otf` (the default) is the theoretical OTF of an aberration-free
+    objective with the step's NA, immersion index and wavelength, exactly as
+    it is in the GUI and the CLI."""
     sirius = _sirius_ext()
     p = _sim_parameters(params, meta)
     otf = _str(params, "otf")
-    if not otf:
-        raise NotAvailable("SIM reconstruction in Python needs a measured OTF file ('otf'); "
-                           "the theoretical OTF is only available in the application")
-    if not os.path.exists(otf):
+    if otf and not os.path.exists(otf):
         raise FileNotFoundError(f"OTF file not found: {otf}")
-    sections = p.ndirs * p.nphases
-    if a.shape[2] % sections:
+    sections = p.sections_per_plane()
+    nz = p.planes(a.shape[2])
+    if nz == 0:
         # the words the application uses for the same arithmetic
         # (bindSimLayout, through the SIM step's validate())
         raise ValueError(f"z holds {a.shape[2]} sections, not a multiple of "
                          f"angle {p.ndirs} × phase {p.nphases} = {sections}.")
+    # No OTF file means the theoretical OTF, as it does for the GUI and the
+    # CLI; the choice itself is the library's (sirius::selectOTF), reached
+    # through SimReconstructor's empty otf_path, so there is one selection and
+    # not a Python copy of it. What Python has to supply is the stack's
+    # dimensionality, because the theoretical OTF is built in 3D for several
+    # planes and in 2D for one: session.cpp's threeD(), from the same
+    # SIMParameters::planes arithmetic as the section count above. It belongs
+    # in the cache key beside the parameters -- the C++ caches the
+    # reconstructor on (setupGeneration, threeD, device, rigor) for exactly
+    # this reason -- or a 2D stack after a 3D one would reuse the 3D OTF.
+    three_d = nz > 1
     device = resolve_device(device)
     use_cuda = device.startswith("cuda") and sirius.cuda_available()
     dev = sirius.Device.cuda(int(device.split(":")[1]) if ":" in device else 0) if use_cuda else sirius.Device.cpu()
-    key = json.dumps({"otf": os.path.abspath(otf), "dev": str(dev), "p": _params_key(p)}, sort_keys=True)
+    key = json.dumps({"otf": os.path.abspath(otf) if otf else "", "three_d": three_d,
+                      "dev": str(dev), "p": _params_key(p)}, sort_keys=True)
     recon = _sim_cache.get(key)
     if recon is None:
         _sim_cache.clear()
-        recon = sirius.SimReconstructor(p, otf, dev)
+        recon = sirius.SimReconstructor(p, otf, dev, three_d=three_d)
         _sim_cache[key] = recon
     out = None
     fits = []

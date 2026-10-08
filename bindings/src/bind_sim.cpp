@@ -8,7 +8,7 @@
 #include <nanobind/stl/vector.h>
 
 #include <sirius/legacy_config.hpp>
-#include <sirius/otf_io.hpp>
+#include <sirius/otf_select.hpp>
 #include <sirius/sim_reconstruction.hpp>
 
 #include <memory>
@@ -32,9 +32,14 @@ namespace {
 
     class PySimReconstructor {
     public:
+        // An empty otfPath is the theoretical OTF, exactly as it is for the
+        // GUI and the CLI: the choice is the library's one selectOTF, not a
+        // second one written here (app/core/session.cpp makes it the same
+        // way). `threeD` only reaches the theoretical OTF, and a raw stack
+        // decides it -- SIMParameters::planes(sections) > 1.
         PySimReconstructor(SIMParameters params, const std::string& otfPath,
-                           Device device, PlanRigor rigor)
-            : impl_(params, loadOTF(otfPath, params), device, rigor) {}
+                           Device device, PlanRigor rigor, bool threeD)
+            : impl_(params, selectOTF(otfPath, params, threeD), device, rigor) {}
 
         Device device() const noexcept { return impl_.device(); }
 
@@ -106,7 +111,15 @@ void bind_sim(nb::module_& m) {
         .def_rw("equalizez", &SIMParameters::equalizez)
         .def_rw("no_kz0", &SIMParameters::no_kz0)
         .def_rw("filter_overlaps", &SIMParameters::filter_overlaps)
-        .def("validate", &SIMParameters::validate);
+        .def("validate", &SIMParameters::validate)
+        .def("sections_per_plane", &SIMParameters::sectionsPerPlane,
+             "Frames a raw SIM stack holds per plane: ndirs * nphases.")
+        .def("planes", &SIMParameters::planes, nb::arg("sections"),
+             "Planes (nz) of a raw stack of `sections` frames, or 0 when the count is not a whole "
+             "number of planes. More than one plane is a 3D stack, which is what the theoretical "
+             "OTF's `three_d` follows.")
+        .def("resolved_orders", &SIMParameters::resolvedOrders,
+             "Orders the reconstruction separates: norders, or nphases // 2 + 1 when norders is 0.");
 
     nb::class_<SimFit>(m, "SimFit")
         .def_ro("k0", &SimFit::k0)
@@ -118,11 +131,18 @@ void bind_sim(nb::module_& m) {
 
     nb::class_<PySimReconstructor>(m, "SimReconstructor",
                                    "Reusable CPU/GPU SIM reconstructor. FFT plans and work buffers are retained "
-                                   "between calls; construct once for a time series.")
-        .def(nb::init<SIMParameters, const std::string&, Device, PlanRigor>(),
-             nb::arg("parameters"), nb::arg("otf_path"),
+                                   "between calls; construct once for a time series.\n\n"
+                                   "otf_path empty (the default) is the theoretical OTF of an aberration-free "
+                                   "objective with the parameters' NA, immersion index and emission wavelength -- "
+                                   "what the GUI and the CLI use when their OTF field is empty. three_d then picks "
+                                   "the 3D OTF (missing cone, order 1 shifted by the illumination's kz) over the "
+                                   "in-focus 2D one; it is ignored when a file is named. A raw stack decides it: "
+                                   "parameters.planes(sections) > 1.")
+        .def(nb::init<SIMParameters, const std::string&, Device, PlanRigor, bool>(),
+             nb::arg("parameters"), nb::arg("otf_path") = std::string(),
              nb::arg("device") = Device::cpu(),
-             nb::arg("rigor") = PlanRigor::Measure)
+             nb::arg("rigor") = PlanRigor::Measure,
+             nb::arg("three_d") = true)
         .def_prop_ro("device", &PySimReconstructor::device)
         .def_prop_ro("last_fit", &PySimReconstructor::lastFit,
                      nb::rv_policy::reference_internal)

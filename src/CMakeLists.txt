@@ -227,6 +227,13 @@ sirius_lib_unit(otf_ideal
     SOURCES otf_ideal.cpp
     DEPENDS otf sim_parameters fft buffer constants)
 
+# the one place that decides between a measured OTF file and the theoretical
+# OTF, so the GUI, the CLI and the Python bindings cannot decide differently
+sirius_lib_unit(otf_select
+    HEADERS sirius/otf_select.hpp
+    SOURCES otf_select.cpp
+    DEPENDS otf otf_io otf_ideal sim_parameters)
+
 # the per-device stage implementations behind the reconstruction driver
 sirius_lib_unit(sim_backend
     HEADERS sim_internal.hpp
@@ -282,6 +289,7 @@ target_sources(sirius
             ${PROJECT_SOURCE_DIR}/include/sirius/otf.hpp
             ${PROJECT_SOURCE_DIR}/include/sirius/otf_io.hpp
             ${PROJECT_SOURCE_DIR}/include/sirius/otf_ideal.hpp
+            ${PROJECT_SOURCE_DIR}/include/sirius/otf_select.hpp
             ${PROJECT_SOURCE_DIR}/include/sirius/preprocess.hpp
             ${PROJECT_SOURCE_DIR}/include/sirius/separation.hpp
             ${PROJECT_SOURCE_DIR}/include/sirius/sim_reconstruction.hpp

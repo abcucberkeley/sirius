@@ -83,7 +83,9 @@ namespace sirius::app {
         // reconstructor is built. An empty path (the default) means no
         // measured OTF: the theoretical OTF of an aberration-free objective
         // with the parameters' NA, immersion index and wavelength is used
-        // instead (sirius::idealOTF), in 3D when the stack has several planes.
+        // instead, in 3D when the stack has several planes. The choice itself
+        // is sirius::selectOTF (sirius/otf_select.hpp), which the Python
+        // bindings make the same way.
         void setOtfPath(std::string path);
         const std::string& otfPath() const noexcept;
         bool usesIdealOtf() const noexcept;

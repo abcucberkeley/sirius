@@ -303,8 +303,10 @@ snapshot of the C++ parameter tables and
   `zoomfact`, `z_zoom`, `orders`, `dz_psf`, `otfcutoff`, `background`,
   `apodize_input`, `napodize`, `suppression_radius`,
   `suppress_singularities`, `no_kz0`, `filter_overlaps`, `explodefact`,
-  `equalizez`; `dx`, `dy`, `dz` override the voxel size of `meta`. `otf` is
-  required here -- the theoretical OTF exists only in the application.
+  `equalizez`; `dx`, `dy`, `dz` override the voxel size of `meta`. An empty
+  `otf` is the theoretical OTF, as it is in the application: built in 3D when
+  the stack holds several planes and in 2D when it holds one, which is what
+  `sirius::selectOTF` decides for all three fronts.
 * `load`: `path`, `read_as`, `tile`, `page_order`, `c`, `t`, `z`,
   `voxel_x`, `voxel_y`, `voxel_z`, `sim_ndirs`, `sim_nphases`, `sim_fast`,
   `sim_layout`, `sheet_angle`. `run_pipeline` reads the dataset itself, the way the

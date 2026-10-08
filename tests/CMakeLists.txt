@@ -60,6 +60,7 @@ sirius_lib_test(separation      test_separation.cpp)
 sirius_lib_test(otf             test_otf.cpp)
 sirius_lib_test(otf_io          test_otf_io.cpp)
 sirius_lib_test(otf_ideal       test_otf_ideal.cpp)
+sirius_lib_test(otf_select      test_otf_select.cpp)
 sirius_lib_test(sim_reconstruction test_reconstruction.cpp
     UNITS lib/otf_io lib/otf_ideal lib/legacy_config lib/tiff_io)
 

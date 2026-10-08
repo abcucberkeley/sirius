@@ -67,6 +67,7 @@ Bottom to top; each line's unit may use the ones above it.
 | `otf` | — | the radially averaged table and its resampling |
 | `otf_io` | `otf`, `sim_parameters`, `tiff_io`, `mrc_io`, `errors` | reading a measured OTF, from a TIFF or a DeltaVision file |
 | `otf_ideal` | `otf`, `sim_parameters`, `fft`, `buffer`, `constants` | the theoretical OTF |
+| `otf_select` | `otf`, `otf_io`, `otf_ideal`, `sim_parameters` | the one choice between a measured OTF file and the theoretical one, so the GUI, the CLI and the bindings cannot choose differently |
 | `sim_backend` | `sim_stages`, `sim_math`, `device` | the per-device reconstruction stages |
 | `sim_reconstruction` | `sim_backend`, `separation`, `otf`, `fft`, `real_fft`, `buffer`, … | the device-agnostic driver |
 

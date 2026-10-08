@@ -65,6 +65,21 @@ namespace sirius {
         // means the same thing everywhere.
         int resolvedOrders() const noexcept { return norders > 0 ? norders : nphases / 2 + 1; }
 
+        // A raw SIM stack holds ndirs * nphases frames per plane.
+        int sectionsPerPlane() const noexcept { return ndirs * nphases; }
+
+        // Planes (nz) of a raw stack of `sections` frames, or 0 when the count
+        // is not a whole number of planes. Everything that asks how deep a raw
+        // stack is goes through this: the section-count error, and -- the
+        // reason it is here rather than in one front -- whether the
+        // theoretical OTF is built in 3D (several planes) or in 2D (one). The
+        // GUI, the CLI and the Python mirror each used to do the arithmetic
+        // themselves.
+        long long planes(long long sections) const noexcept {
+            const long long per = sectionsPerPlane();
+            return (per > 0 && sections > 0 && sections % per == 0) ? sections / per : 0;
+        }
+
         // Lateral frequency of illumination order 1, in 1/um. The configured
         // line spacing is the finest order, so a 3D pattern's order 1 sits at
         // 1/linespacing/(resolvedOrders()-1). A 2D pattern's spacing is already

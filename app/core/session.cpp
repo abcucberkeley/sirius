@@ -4,8 +4,7 @@
 
 #include <sirius/constants.hpp>
 #include <sirius/legacy_config.hpp>
-#include <sirius/otf_ideal.hpp>
-#include <sirius/otf_io.hpp>
+#include <sirius/otf_select.hpp>
 
 #include <algorithm>
 #include <cctype>
@@ -110,16 +109,13 @@ namespace sirius::app {
         };
         std::optional<Cache> cache;
 
-        Index sectionsPerZ() const noexcept {
-            return static_cast<Index>(params.ndirs) * params.nphases;
-        }
+        Index sectionsPerZ() const noexcept { return static_cast<Index>(params.sectionsPerPlane()); }
         Index inferredNz() const noexcept {
-            if (raw.empty()) return 0;
-            const Index perZ = sectionsPerZ();
-            const Index nsec = raw.dim(0);
-            return (perZ > 0 && nsec % perZ == 0) ? nsec / perZ : 0;
+            return raw.empty() ? 0 : static_cast<Index>(params.planes(static_cast<long long>(raw.dim(0))));
         }
-        // Without a stack the 3D OTF is the informative one to show.
+        // Without a stack the 3D OTF is the informative one to show. With one,
+        // it is the parameters' own arithmetic (SIMParameters::planes), which
+        // the Python mirror asks the same question of.
         bool threeD() const noexcept { return raw.empty() ? true : inferredNz() > 1; }
     };
 
@@ -163,8 +159,7 @@ namespace sirius::app {
         const bool threeD = s.threeD();
         if (s.otfCache && s.otfCache->setupGeneration == s.setupGeneration && s.otfCache->threeD == threeD)
             return s.otfCache->otf;
-        auto built = std::make_shared<const OTFRadiallyAveraged>(
-            s.otfPath.empty() ? idealOTF(s.params, threeD) : loadOTF(s.otfPath, s.params));
+        auto built = std::make_shared<const OTFRadiallyAveraged>(selectOTF(s.otfPath, s.params, threeD));
         s.otfCache = Impl::OtfCache{s.setupGeneration, threeD, built};
         return built;
     }
