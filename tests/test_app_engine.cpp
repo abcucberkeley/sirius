@@ -28,6 +28,7 @@
 #include <cstring>
 #include <filesystem>
 #include <fstream>
+#include <limits>
 #include <memory>
 #include <mutex>
 #include <string>
@@ -40,6 +41,7 @@
 #include <nlohmann/json.hpp>
 
 #include <sirius/device.hpp>
+#include <sirius/mrc_io.hpp>
 #include <sirius/tiff_io.hpp>
 
 #include "core/array_codec.hpp"
@@ -914,9 +916,22 @@ TEST_CASE("engine: a DeltaVision stack, read as openDataset shapes it", "[app][e
         decoded(w->call("dataset_view", {{"path", path}, {"kind", "xy"}, {"c", 0}, {"t", 0}, {"index", 2}, {"factor", 1}, {"region", {40, 20, 20, 10}}}), shape);
     CHECK(shape == std::vector<Index>{10, 20});
     CHECK(region[3 * 20 + 4] == tif(2, 63 - 23, 44));
+    // dataset_stats reads five whole planes (0, 33, 67, 100, 134 of 135; 64 x 64
+    // is under its subsampling threshold), and a plane's extremes do not care
+    // which way its rows run, so raw.tif gives the numbers to expect exactly.
+    float wantMin = std::numeric_limits<float>::max(), wantMax = -std::numeric_limits<float>::max();
+    for (int sampled : {0, 33, 67, 100, 134})
+        for (int y = 0; y < 64; ++y)
+            for (int x = 0; x < 64; ++x) {
+                wantMin = std::min(wantMin, tif(sampled, y, x));
+                wantMax = std::max(wantMax, tif(sampled, y, x));
+            }
     const json stats = w->call("dataset_stats", {{"path", path}, {"c", 0}, {"t", 0}}).result;
-    CHECK(stats["min"].get<double>() >= 1.0e-5);
-    CHECK(stats["max"].get<double>() <= 0.009);
+    CHECK(stats["min"].get<double>() == static_cast<double>(wantMin));
+    CHECK(stats["max"].get<double>() == static_cast<double>(wantMax));
+    // and the header's own min / max say the same of the whole stack
+    CHECK(stats["min"].get<double>() >= static_cast<double>(inspectMrc(path).minValue));
+    CHECK(stats["max"].get<double>() <= static_cast<double>(inspectMrc(path).maxValue));
 
     // several wavelengths and time points in the WZT sequence: (c, t, z) picks the right section
     TempDir dir;
@@ -1151,7 +1166,10 @@ TEST_CASE("engine: dataset replies equal the Python worker's on the same files",
         std::replace(pb.begin(), pb.end(), '\\', '/');
         CHECK(lowerOf(pa) == lowerOf(pb));
 
-        const Index c = 1, t = a["dims"][1].get<Index>() - 1, z = a["dims"][2].get<Index>() / 2;
+        // the second channel where the file has one (raw.dv holds a single
+        // wavelength, and a request for c = 1 there is out of range, not parity)
+        const Index c = std::min<Index>(1, a["dims"][0].get<Index>() - 1), t = a["dims"][1].get<Index>() - 1,
+                    z = a["dims"][2].get<Index>() / 2;
         std::vector<json> requests;
         const json base = {{"path", path}, {"c", c}, {"t", t}, {"accept", {"zlib"}}};
         json plane = base;

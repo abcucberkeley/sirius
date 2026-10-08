@@ -1,7 +1,6 @@
 #include "sirius/mrc_io.hpp"
 
 #include <algorithm>
-#include <bit>
 #include <cctype>
 #include <cstring>
 #include <filesystem>
@@ -22,7 +21,22 @@ namespace sirius {
 
         constexpr std::size_t kHeaderBytes = 1024;
         constexpr std::int16_t kDeltaVisionMagic = static_cast<std::int16_t>(0xC0A0);   // -16224 at byte 96
-        constexpr bool kHostBigEndian = std::endian::native == std::endian::big;
+        // This computer's byte order, which decides whether a header field or a
+        // sample needs its bytes reversed. The project is C++17 (cmake/
+        // ProjectOptions.cmake), where there is no std::endian: the compiler's
+        // own macro answers where it is defined (gcc, clang, MSVC's clang-cl)
+        // and the bytes of a known word answer everywhere else. Either way the
+        // answer folds to a constant.
+        inline bool hostBigEndian() noexcept {
+#if defined(__BYTE_ORDER__) && defined(__ORDER_BIG_ENDIAN__)
+            return __BYTE_ORDER__ == __ORDER_BIG_ENDIAN__;
+#else
+            const std::uint32_t one = 1;
+            unsigned char bytes[4];
+            std::memcpy(bytes, &one, sizeof one);
+            return bytes[0] == 0;
+#endif
+        }
 
         // The header's fields at their byte offsets, in the file's byte order.
         class Header {
@@ -87,7 +101,7 @@ namespace sirius {
             // Little or big: the DeltaVision magic says, else the MRC2014 machine
             // stamp, else whichever reading is plausible (little first, as every
             // file written in the last twenty years is).
-            const Header little(bytes, kHostBigEndian), big(bytes, !kHostBigEndian);
+            const Header little(bytes, hostBigEndian()), big(bytes, !hostBigEndian());
             bool fileBig = false, dv = false;
             if (little.i16(96) == kDeltaVisionMagic) {
                 dv = true;
@@ -100,7 +114,7 @@ namespace sirius {
                 else if (s0 == 0x11 && s1 == 0x11) fileBig = true;
                 else fileBig = !plausible(little) && plausible(big);
             }
-            const Header h(bytes, fileBig != kHostBigEndian);
+            const Header h(bytes, fileBig != hostBigEndian());
             if (!plausible(h)) {
                 const std::int32_t mode = h.i32(12);
                 if (!knownMode(mode) && h.i32(0) > 0 && h.i32(4) > 0 && h.i32(8) > 0)
@@ -235,7 +249,7 @@ namespace sirius {
             unsigned char bytes[kHeaderBytes];
             if (!in.read(reinterpret_cast<char*>(bytes), kHeaderBytes)) throw IoError(path + ": shorter than an MRC header (1024 bytes)");
             info = parseHeader(bytes, path, static_cast<std::uint64_t>(fs::file_size(fp, ec)));
-            swap = info.bigEndian != kHostBigEndian && bytesPerPixel(info.pixelType) > 1;
+            swap = info.bigEndian != hostBigEndian() && bytesPerPixel(info.pixelType) > 1;
             sectionBytes = static_cast<std::uint64_t>(info.width) * info.height * bytesPerPixel(info.pixelType);
         }
 

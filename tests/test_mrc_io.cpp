@@ -24,6 +24,7 @@
 
 using namespace sirius;
 using Catch::Matchers::ContainsSubstring;
+using Catch::Matchers::WithinAbs;
 using Catch::Matchers::WithinRel;
 
 namespace {
@@ -127,10 +128,11 @@ TEST_CASE("otf.dv, complex float32, reads as rows of (re, im) pairs like otf.tif
     REQUIRE(tif.dimension(0) == 3);
     REQUIRE(tif.dimension(1) == 129);
     REQUIRE(tif.dimension(2) == 130);
-    // both are normalised to 1 + 0i at the origin of order 0
+    // both are normalised to 1 + 0i at the origin of order 0 -- otf.dv's DC
+    // sample is exactly 1, otf.tif's is the float32 below it (0.99999994)
     CHECK(dv.data()[0] == 1.f);
     CHECK(dv.data()[1] == 0.f);
-    CHECK(tif(0, 0, 0) == 1.f);
+    CHECK_THAT(static_cast<double>(tif(0, 0, 0)), WithinAbs(1.0, 1e-6));
     CHECK(tif(0, 0, 1) == 0.f);
     // the sections are what the file holds, bit for bit
     std::ifstream in(kData + "/otf.dv", std::ios::binary);

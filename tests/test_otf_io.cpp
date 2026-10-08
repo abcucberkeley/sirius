@@ -170,8 +170,8 @@ TEST_CASE("loadOTF reads the DeltaVision container makeotf writes (otf.dv)", "[o
     CHECK(head.width == 130);      // 65 complex pairs
     CHECK(head.height == 129);
     CHECK(head.sections == 3);
-    CHECK_THAT(head.cell[0], WithinAbs(0.123077, 1e-6));   // dkzotf
-    CHECK_THAT(head.cell[1], WithinAbs(0.048828, 1e-6));   // dkrotf
+    CHECK_THAT(static_cast<double>(head.cell[0]), WithinAbs(0.123077, 1e-6));   // dkzotf
+    CHECK_THAT(static_cast<double>(head.cell[1]), WithinAbs(0.048828, 1e-6));   // dkrotf
 
     const OTFRadiallyAveraged otf = loadOTF(data + "/otf.dv", head.cell[1], head.cell[0]);
     const auto& d = otf.data();
