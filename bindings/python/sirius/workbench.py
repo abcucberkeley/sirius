@@ -3203,23 +3203,300 @@ def _sim_parameter_file_keys(path: str) -> _SimParameterFileKeys:
     return found
 
 
-_SIM_LAYOUT_ON_Z = re.compile(
-    r"^\s*z\s*=\s*\[\s*(?:(?:angles?|dirs?|directions?)\s*(?P<slow>\d+)\s*,\s*(?:z\s*,\s*)?"
-    r"|z\s*,\s*(?:angles?|dirs?|directions?)\s*(?P<fast>\d+)\s*,\s*)phases?\s*(?P<phases>\d+)\s*\]\s*;?\s*$", re.IGNORECASE)
+
+# --- the SIM storage layout --------------------------------------------------
+# Which file axes hold the logical SIM axes angle, phase and z, in the text the
+# Load step takes (app/core/dataset.cpp: parseSimStorage). Three mechanisms:
+#   identity        c=angle 3                 the c axis is the angle axis
+#   factorisation   z=[angle 3, z, phase 5]   one axis multiplexes several, outermost first
+#   montage         yx=3x3[angle 3, phase 3]  a grid of tiles inside every plane
+# This has to accept exactly the texts parseSimStorage accepts and canonicalise
+# them the same way, because the worker runs this mirror on the cluster nodes: a
+# layout the application opens and the mirror refuses -- or reads differently --
+# would silently reconstruct a different stack there than here.
+
+_SIM_FILE_AXIS_NAME = ("c", "t", "z", "yx")
+_SIM_FILE_AXIS_NOUN = ("channels", "time points", "sections", "rows", "columns")
+_SIM_OWN_KIND = ("c", "t", "z")
+_SIM_KIND_NAMED = {
+    "angle": "angle", "angles": "angle", "dir": "angle", "dirs": "angle",
+    "direction": "angle", "directions": "angle",
+    "phase": "phase", "phases": "phase", "z": "z", "c": "c", "t": "t",
+}
+_ASCII_DIGITS = "0123456789"
+_ASCII_LETTERS = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ"
+
+
+def _sim_tokens(text: str) -> List[str]:
+    """The layout text as tokens: identifiers, integers and the punctuation
+    = ; , [ ]. Letters and digits are separate tokens, so "3x3" reads as
+    "3 x 3" and "angle3" as "angle 3" (dataset.cpp's Tokens)."""
+    out: List[str] = []
+    i, n = 0, len(text)
+    while i < n:
+        ch = text[i]
+        if ch.isspace():
+            i += 1
+        elif ch in _ASCII_DIGITS:
+            j = i
+            while j < n and text[j] in _ASCII_DIGITS:
+                j += 1
+            out.append(text[i:j])
+            i = j
+        elif ch in _ASCII_LETTERS or ch == "_":
+            j = i
+            while j < n and (text[j] in _ASCII_LETTERS or text[j] == "_"):
+                j += 1
+            out.append(text[i:j].lower())
+            i = j
+        elif ch in "=;,[]":
+            out.append(ch)
+            i += 1
+        else:
+            raise ValueError(f'SIM layout: unexpected \'{ch}\' in "{text}"')
+    return out
+
+
+class _SimTokens:
+    def __init__(self, text: str) -> None:
+        self.items = _sim_tokens(text)
+        self.at = 0
+
+    def done(self) -> bool:
+        return self.at >= len(self.items)
+
+    def peek(self) -> str:
+        return "" if self.done() else self.items[self.at]
+
+    def next(self) -> str:
+        if self.done():
+            raise ValueError("SIM layout: the text ends early")
+        self.at += 1
+        return self.items[self.at - 1]
+
+    def expect(self, tok: str) -> None:
+        got = "the end" if self.done() else f"'{self.items[self.at]}'"
+        if self.done() or self.items[self.at] != tok:
+            raise ValueError(f"SIM layout: expected '{tok}', got {got}")
+        self.at += 1
+
+    @staticmethod
+    def is_integer(s: str) -> bool:
+        return bool(s) and all(c in _ASCII_DIGITS for c in s)
+
+
+def _sim_factor_text(f: Tuple[str, int]) -> str:
+    return f"{f[0]} {f[1]}" if f[1] > 0 else f[0]
+
+
+def _sim_factors_text(fs: Sequence[Tuple[str, int]]) -> str:
+    return ", ".join(_sim_factor_text(f) for f in fs)
+
+
+def _sim_product_text(fs: Sequence[Tuple[str, int]], product: int) -> str:
+    """"angle 3 × phase 5 = 15": the factors with an extent and their product."""
+    return " × ".join(_sim_factor_text(f) for f in fs if f[1] > 0) + f" = {product}"
+
+
+def _sim_identity_entry(fs: Sequence[Tuple[str, int]], file_axis: int) -> bool:
+    """An entry that says a file axis is itself: none, or its own kind alone."""
+    return not fs or (len(fs) == 1 and fs[0][0] == _SIM_OWN_KIND[file_axis])
+
+
+class _SimStorage:
+    """parseSimStorage's result: the factors of the c, t and z axes (extent 0 =
+    the remainder the file's length fills in), and the montage grid."""
+
+    __slots__ = ("axes", "rows", "cols", "tiles")
+
+    def __init__(self) -> None:
+        self.axes: Tuple[List[Tuple[str, int]], List[Tuple[str, int]], List[Tuple[str, int]]] = ([], [], [])
+        self.rows = 1
+        self.cols = 1
+        self.tiles: List[Tuple[str, int]] = []
+
+    def montage(self) -> bool:
+        return bool(self.tiles)
+
+    def text(self) -> str:
+        """The canonical text: entries c, t, z, yx in that order, no brackets
+        around a single factor, an axis that is itself left out."""
+        parts: List[str] = []
+        for a in range(3):
+            fs = self.axes[a]
+            if _sim_identity_entry(fs, a):
+                continue
+            body = _sim_factor_text(fs[0]) if len(fs) == 1 else "[" + _sim_factors_text(fs) + "]"
+            parts.append(f"{_SIM_FILE_AXIS_NAME[a]}={body}")
+        if self.montage():
+            parts.append(f"yx={self.rows}x{self.cols}[" + _sim_factors_text(self.tiles) + "]")
+        return "; ".join(parts)
+
+    def _extent_of(self, kind: str) -> int:
+        for fs in self.axes:
+            for k, e in fs:
+                if k == kind:
+                    return e
+        for k, e in self.tiles:
+            if k == kind:
+                return e
+        return 1
+
+    def angles(self) -> int:
+        return self._extent_of("angle")
+
+    def phases(self) -> int:
+        return self._extent_of("phase")
+
+
+def _parse_sim_factor(tk: _SimTokens) -> Tuple[str, int]:
+    name = tk.next()
+    kind = _SIM_KIND_NAMED.get(name)
+    if kind is None:
+        raise ValueError(f"SIM layout: '{name}' is not an axis (angle, phase, z, c or t)")
+    extent = 0
+    if _SimTokens.is_integer(tk.peek()):
+        extent = int(tk.next())
+        if extent < 1:
+            raise ValueError(f"SIM layout: {name} needs an extent of at least 1")
+    return kind, extent
+
+
+def _parse_sim_factors(tk: _SimTokens) -> List[Tuple[str, int]]:
+    fs: List[Tuple[str, int]] = []
+    if tk.peek() == "[":
+        tk.next()
+        while True:
+            fs.append(_parse_sim_factor(tk))
+            if tk.peek() == ",":
+                tk.next()
+                continue
+            tk.expect("]")
+            break
+    else:
+        fs.append(_parse_sim_factor(tk))
+    return fs
+
+
+def _check_sim_storage(st: _SimStorage) -> None:
+    """dataset.cpp's checkStorage: one assignment per logical axis, the kinds on
+    the axes that can hold them, the extents that have to be written down."""
+    seen: Dict[str, int] = {}
+
+    def note(f: Tuple[str, int], file_axis: int) -> None:
+        kind, extent = f
+        if seen.get(kind):
+            raise ValueError(f"SIM layout: {kind} is assigned twice")
+        seen[kind] = 1
+        own = file_axis < 3 and kind == _SIM_OWN_KIND[file_axis]
+        if kind in ("c", "t") and not own:
+            raise ValueError(f"SIM layout: {kind} can only stand on the {kind} axis")
+        if extent == 0 and not own:
+            raise ValueError(f"SIM layout: {kind} on {_SIM_FILE_AXIS_NAME[file_axis]} needs its extent "
+                             f"(how many {kind}s), e.g. {kind} 3")
+
+    for a in range(3):
+        for f in st.axes[a]:
+            note(f, a)
+    for f in st.tiles:
+        note(f, 3)
+    if st.rows < 1 or st.cols < 1:
+        raise ValueError("SIM layout: the montage grid needs at least 1 x 1 tiles")
+    if not seen.get("angle") and not seen.get("phase"):
+        raise ValueError("SIM layout: a layout names angle or phase at least once")
+
+
+def _parse_sim_storage(text: str) -> _SimStorage:
+    """The layout text, parsed exactly as app/core/dataset.cpp parses it.
+    Raises ValueError naming what is wrong (std::invalid_argument there)."""
+    tk = _SimTokens(text)
+    if tk.done():
+        raise ValueError("SIM layout: empty")
+    st = _SimStorage()
+    given = [False, False, False, False]
+    while True:
+        axis = tk.next()
+        which = _SIM_FILE_AXIS_NAME.index(axis) if axis in _SIM_FILE_AXIS_NAME else -1
+        if which < 0:
+            raise ValueError(f"SIM layout: '{axis}' is not a file axis (c, t, z or yx)")
+        if given[which]:
+            raise ValueError(f"SIM layout: {axis} is given twice")
+        given[which] = True
+        tk.expect("=")
+        if which == 3:
+            rows = cols = None
+            if _SimTokens.is_integer(tk.peek()):
+                rows = int(tk.next())
+                x = tk.next()
+                if x != "x" or not _SimTokens.is_integer(tk.peek()):
+                    raise ValueError("SIM layout: the montage grid is written rows x cols, e.g. yx=3x3[angle 3, phase 3]")
+                cols = int(tk.next())
+            if tk.peek() != "[":
+                raise ValueError("SIM layout: a montage lists its factors in brackets, e.g. yx=3x3[angle 3, phase 3]")
+            st.tiles = _parse_sim_factors(tk)
+            for kind, extent in st.tiles:
+                if extent == 0:
+                    raise ValueError(f"SIM layout: {kind} in the montage needs its extent")
+            if rows is not None:
+                st.rows, st.cols = rows, int(cols or 1)
+            else:
+                st.rows = st.tiles[0][1]
+                st.cols = 1
+                for f in st.tiles[1:]:
+                    st.cols *= f[1]
+            n = 1
+            for _, extent in st.tiles:
+                if extent > 0:
+                    n *= extent
+            if st.rows * st.cols != n:
+                raise ValueError(f"SIM layout: the montage {st.rows}x{st.cols} has {st.rows * st.cols} tiles, "
+                                 f"but {_sim_product_text(st.tiles, n)}.")
+        else:
+            st.axes[which][:] = _parse_sim_factors(tk)
+        if tk.done():
+            break
+        tk.expect(";")
+        if tk.done():
+            break   # a trailing ';'
+    _check_sim_storage(st)
+    return st
+
+
+def _sim_layout_from_text(text: str) -> Dict[str, Any]:
+    """The meta["sim"] of a layout text, as SimLayout::fromText builds it: the
+    canonical text, the angle and phase counts it names, and the fast-SI flag a
+    z-packed layout mirrors so a reader of the shorthand fields sees the same
+    stack. Raises ValueError when the text does not read."""
+    st = _parse_sim_storage(text)
+    z = st.axes[2]
+    fast = (not st.montage() and _sim_identity_entry(st.axes[0], 0) and _sim_identity_entry(st.axes[1], 1)
+            and len(z) == 3 and z[0][0] == "z" and z[1][0] == "angle" and z[2][0] == "phase")
+    return {"present": True, "layout": st.text(), "ndirs": st.angles(), "nphases": st.phases(), "fast_si": fast}
 
 
 def _sim_layout_on_z(layout: str) -> Optional[Tuple[int, int, bool]]:
-    """(ndirs, nphases, fast_si) of a storage layout that packs everything on
-    the z axis in one of the two orders the reconstructor reads --
-    "z=[angle 3, z, phase 5]" or the fast-SI "z=[z, angle 3, phase 5]" --
-    else None: the angles on the channels or a montage are gathered by the
-    application's SIM step (app/core/ops/sim.cpp), not here."""
-    m = _SIM_LAYOUT_ON_Z.match(layout or "")
-    if not m:
+    """(ndirs, nphases, fast_si) of a storage layout that leaves every frame on
+    the z axis in one of the two orders the reconstructor reads -- angle → z →
+    phase ("z=[angle 3, z, phase 5]", the z extent written out or not, absent
+    for a single plane) or the fast-SI z → angle → phase -- else None: the
+    angles on the channel axis or a montage are gathered into a stack by the
+    application's SIM step (app/core/ops/sim.cpp), not here. The text settles
+    this for every layout the step accepts, which is what SimFrames::
+    libraryOrder() decides from the bound extents."""
+    if not layout:
         return None
-    if m.group("slow") is not None:
-        return int(m.group("slow")), int(m.group("phases")), False
-    return int(m.group("fast")), int(m.group("phases")), True
+    try:
+        st = _parse_sim_storage(layout)
+    except ValueError:
+        return None
+    if st.montage() or not _sim_identity_entry(st.axes[0], 0) or not _sim_identity_entry(st.axes[1], 1):
+        return None
+    kinds = [k for k, _ in st.axes[2]]
+    if kinds in (["angle", "z", "phase"], ["angle", "phase"]):
+        return st.angles(), st.phases(), False
+    if kinds == ["z", "angle", "phase"]:
+        return st.angles(), st.phases(), True
+    return None
 
 
 def _sim_parameters(params: Dict[str, Any], meta: Dict[str, Any]):
@@ -3365,7 +3642,10 @@ def step_sim(a: np.ndarray, params: Dict[str, Any], meta: Dict[str, Any], progre
         raise FileNotFoundError(f"OTF file not found: {otf}")
     sections = p.ndirs * p.nphases
     if a.shape[2] % sections:
-        raise ValueError(f"{a.shape[2]} sections is not a multiple of angles × phases = {sections}")
+        # the words the application uses for the same arithmetic
+        # (bindSimLayout, through the SIM step's validate())
+        raise ValueError(f"z holds {a.shape[2]} sections, not a multiple of "
+                         f"angle {p.ndirs} × phase {p.nphases} = {sections}.")
     device = resolve_device(device)
     use_cuda = device.startswith("cuda") and sirius.cuda_available()
     dev = sirius.Device.cuda(int(device.split(":")[1]) if ":" in device else 0) if use_cuda else sirius.Device.cpu()
@@ -4192,22 +4472,30 @@ def run_pipeline(dataset_path: str, pipeline: Any, progress: ProgressFn = None, 
     lp = _prepare_params(_LOAD, load_params, None)
     order = _str(lp, "page_order", "czt")   # "" is not "czt" to load.cpp either: it still passes a page order
     counts = [_int(lp, k, 0) or None for k in ("c", "t", "z")]
+    # the SIM storage layout before the file is opened, as load.cpp's validate()
+    # checks the text before the Load step runs
+    sim_meta: Optional[Dict[str, Any]] = None
+    if _str(lp, "sim_layout"):
+        # the general storage layout (load.cpp's sim_layout): the canonical text
+        # for step_sim to read the order from, and the angle and phase counts the
+        # layout itself names -- whatever axes it puts them on. A text that does
+        # not read is an error here; the application reports it from the Load
+        # step's validate(), which the mirror has no channel for
+        sim_meta = _sim_layout_from_text(_str(lp, "sim_layout"))
+        nd, nph = _int(lp, "sim_ndirs", 0), _int(lp, "sim_nphases", 0)
+        if nd > 0 and nph > 0 and (sim_meta["ndirs"] != nd or sim_meta["nphases"] != nph):
+            raise ValueError(f"The SIM storage layout {sim_meta['layout']} holds {sim_meta['ndirs']} angles × "
+                             f"{sim_meta['nphases']} phases; SIM angles and phases say {nd} × {nph}. "
+                             "Set those to 0 or make them agree.")
+    elif _int(lp, "sim_ndirs", 0) > 0 and _int(lp, "sim_nphases", 0) > 0:
+        sim_meta = {"present": True, "ndirs": _int(lp, "sim_ndirs", 0), "nphases": _int(lp, "sim_nphases", 0),
+                    "fast_si": _bool(lp, "sim_fast", False)}
     array, meta = load_dataset(dataset_path, order, counts[0], counts[1], counts[2],
                                progress=lambda f, m: _progress(progress, 0.0, m))
     voxel = [_float(lp, k, 0.0) for k in ("voxel_x", "voxel_y", "voxel_z")]
     meta["voxel_um"] = [v if v > 0 else cur for v, cur in zip(voxel, meta["voxel_um"])]
-    if _str(lp, "sim_layout"):
-        # the general storage layout (load.cpp's sim_layout): the counts it
-        # names, and the text itself for step_sim to read the order from
-        layout = _str(lp, "sim_layout")
-        packed = _sim_layout_on_z(layout)
-        meta["sim"] = {"present": True, "layout": layout,
-                       "ndirs": packed[0] if packed else _int(lp, "sim_ndirs", 0),
-                       "nphases": packed[1] if packed else _int(lp, "sim_nphases", 0),
-                       "fast_si": bool(packed[2]) if packed else False}
-    elif _int(lp, "sim_ndirs", 0) > 0 and _int(lp, "sim_nphases", 0) > 0:
-        meta["sim"] = {"present": True, "ndirs": _int(lp, "sim_ndirs", 0), "nphases": _int(lp, "sim_nphases", 0),
-                       "fast_si": _bool(lp, "sim_fast", False)}
+    if sim_meta is not None:
+        meta["sim"] = sim_meta
     labels: Optional[np.ndarray] = None
     skipped: List[str] = []
     n = max(len(steps), 1)

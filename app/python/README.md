@@ -311,10 +311,15 @@ snapshot of the C++ parameter tables and
   application's Load step does: `page_order` and the counts shape the TIFF
   pages (a count left at 0 keeps the OME / ImageJ metadata's), length units
   and resolution tags give the voxel size, and the voxel and SIM parameters
-  then override the metadata. A `sim_layout` that packs everything on z
-  (`z=[angle 3, z, phase 5]`, or the fast-SI `z=[z, angle 3, phase 5]`) runs
-  here; one that puts the angles on the channels or tiles a montage is
-  gathered only by the application's SIM step, and `sim` says so.
+  then override the metadata. `sim_layout` is read by the same parser as the
+  application's (`parseSimStorage`), so it accepts and canonicalises exactly
+  the same texts and takes the angle and phase counts from the layout itself,
+  whatever axes it puts them on; a text that does not read is an error naming
+  what is wrong, and a `sim_ndirs` / `sim_nphases` beside it that disagrees is
+  refused as the Load step refuses it. A layout that packs everything on z
+  (`z=[angle 3, z, phase 5]`, or the fast-SI `z=[z, angle 3, phase 5]`) is
+  reconstructed here; one that puts the angles on the channels or tiles a
+  montage is gathered only by the application's SIM step, and `sim` says so.
 
 Kinds the Python side does not implement (`decon`, `deskew`, `volrec`,
 `stitch`, `register`) are reported as unsupported; the application runs

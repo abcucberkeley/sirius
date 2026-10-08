@@ -188,6 +188,24 @@ TEST_CASE("Load validates its path and describes the raw SIM stack", "[app][ops]
     CHECK_FALSE(load.validate(p, DatasetMeta{}).ok());
 
     p.set("path", (kData / "raw.tif").string());
+    // without any SIM parameter the same file is a plain stack: no layout, and
+    // nothing said about an acquisition the file does not describe. annotate()
+    // keys on the output meta's layout rather than on the parameters, so this
+    // is the case that pins it -- a plain file must read as it always did
+    {
+        const DatasetMeta plainMeta = load.outputMeta(p, DatasetMeta{});
+        CHECK_FALSE(plainMeta.sim.present);
+        CHECK(plainMeta.sim.isShorthand());   // and no storage text either
+        INFO("acquisition: " << plainMeta.acquisition);
+        CHECK(plainMeta.acquisition.find("phase images per plane") == std::string::npos);
+        CHECK(load.validate(p, DatasetMeta{}).ok());
+        CHECK(load.summary(p, DatasetMeta{}).find("phase images per plane") == std::string::npos);
+        Progress plainProg;
+        const StepOutput plainOut = load.run(StepInput{}, p, plainProg.ctx);
+        CHECK_FALSE(plainOut.meta.sim.present);
+        CHECK(plainOut.meta.acquisition.find("phase images per plane") == std::string::npos);
+        CHECK(plainOut.meta.acquisition == plainMeta.acquisition);
+    }
     p.set("sim_ndirs", std::int64_t{3});
     p.set("sim_nphases", std::int64_t{5});
     p.set("voxel_x", 0.08);

@@ -1111,6 +1111,20 @@ TEST_CASE("headless: the option parsers refuse what they cannot honour", "[app][
     CHECK(g.sim->ndirs == 3);
     CHECK_THROWS_AS(openOptionsFromJson({{"sim", {{"layout", 3}}}}), ToolFailure);
     CHECK_THROWS_AS(openOptionsFromJson({{"sim", "z=[angle 3, z, phase 5]; z=phase 3"}}), ToolFailure);
+    // a layout and the shorthand counts beside it state the same thing twice
+    // and can contradict each other: taking the layout and dropping the counts
+    // made the disagreement invisible, so the whole object is refused
+    for (const json both : {json{{"layout", "z=[angle 3, z, phase 5]"}, {"ndirs", 3}},
+                            json{{"layout", "z=[angle 3, z, phase 5]"}, {"nphases", 5}},
+                            json{{"layout", "z=[angle 3, z, phase 5]"}, {"fast", true}},
+                            json{{"layout", "c=angle 3; z=phase 3"}, {"ndirs", 9}, {"nphases", 2}}}) {
+        INFO(both.dump());
+        CHECK_THROWS_AS(openOptionsFromJson({{"sim", both}}), ToolFailure);
+    }
+    // a null beside it is not a count given
+    const OpenOptions n = openOptionsFromJson({{"sim", {{"layout", "c=angle 3; z=phase 3"}, {"ndirs", nullptr}}}});
+    REQUIRE(n.sim);
+    CHECK(n.sim->storage == "c=angle 3; z=phase 3");
 
     DatasetMeta meta;
     meta.dims = Dims5{2, 1, 4, 8, 8};

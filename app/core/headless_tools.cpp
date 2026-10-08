@@ -217,6 +217,14 @@ namespace sirius::app {
                 fromLayoutText(it->get<std::string>());
             } else if (it->is_object() && it->contains("layout") && !(*it)["layout"].is_null()) {
                 if (!(*it)["layout"].is_string()) invalid("'sim.layout' must be a string");
+                // a layout and the shorthand counts beside it state the same
+                // thing twice and can contradict each other; taking the layout
+                // and dropping the rest made the disagreement invisible
+                for (const char* k : {"ndirs", "nphases", "fast"})
+                    if (it->contains(k) && !(*it)[k].is_null())
+                        invalid(std::string("'sim' gives both a layout and '") + k + "'",
+                                "either {\"layout\": \"z=[angle 3, z, phase 5]\"} or {\"ndirs\": 3, \"nphases\": 5}, not both: "
+                                "the layout already says how many angles and phases the file holds");
                 fromLayoutText((*it)["layout"].get<std::string>());
             } else if (it->is_object()) {
                 sim.present = true;

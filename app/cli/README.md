@@ -522,7 +522,7 @@ serve (`sirius-cli tools` prints it). Rules they share:
 
 | tool | arguments (* = required) | returns | hints | during a run |
 | --- | --- | --- | --- | --- |
-| `open_dataset` | `path`*, `page_order`, `c`, `t`, `z`, `voxel_um` [x,y,z], `sim` ({ndirs, nphases, fast}, {layout: "c=angle 3; z=phase 3"}, a layout text, or false), `tile`, `full_load` | DatasetInfo + `workspace` | | |
+| `open_dataset` | `path`*, `page_order`, `c`, `t`, `z`, `voxel_um` [x,y,z], `sim` ({ndirs, nphases, fast}, {layout: "c=angle 3; z=phase 3"}, a layout text, or false; a layout and the counts together are refused, since the layout already names them), `tile`, `full_load` | DatasetInfo + `workspace` | | |
 | `dataset_info` | `path` (probe that file; else the open dataset) + the open options | DatasetInfo | RO | yes (with `path`) |
 | `load_pipeline` | `path`*, `dataset` | `{workspace, pipeline_path, steps, dataset, missing_kinds, plugins_loaded}` | | |
 | `save_pipeline` | `path`* | `{path}` | DE | yes |

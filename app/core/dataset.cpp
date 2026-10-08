@@ -120,6 +120,14 @@ namespace sirius::app {
             return s;
         }
 
+        // An entry that says a file axis is itself: no entry at all, or its own
+        // kind alone ("c=c 2"). The canonical text leaves it out -- the file's
+        // own length states the extent -- and bindSimLayout puts it back so the
+        // arithmetic has every axis.
+        bool isIdentityEntry(const std::vector<SimFactor>& fs, int fileAxis) {
+            return fs.empty() || (fs.size() == 1 && fs[0].axis == kOwnKind[fileAxis]);
+        }
+
         std::string factorText(const SimFactor& f) {
             std::string t = simAxisName(f.axis);
             if (f.extent > 0) t += " " + std::to_string(f.extent);
@@ -338,7 +346,9 @@ namespace sirius::app {
         };
         for (int a = 0; a < 3; ++a) {
             const std::vector<SimFactor>& fs = axes[static_cast<std::size_t>(a)];
-            if (fs.empty()) continue;
+            // the identity is what leaving the entry out says, so a bound
+            // layout reads back as the layout that was written down
+            if (isIdentityEntry(fs, a)) continue;
             entry(kFileAxisName[a], fs.size() == 1 ? factorText(fs[0]) : "[" + factorsText(fs) + "]");
         }
         if (montage()) entry("yx", std::to_string(rows) + "x" + std::to_string(cols) + "[" + factorsText(tiles) + "]");
@@ -437,8 +447,8 @@ namespace sirius::app {
         // the fast-SI flag mirrors a z-packed layout in that order, so a reader
         // of the shorthand fields sees the same stack the storage describes
         const std::vector<SimFactor>& z = st.axes[2];
-        l.fastSi = !st.montage() && st.axes[0].empty() && st.axes[1].empty() && z.size() == 3 && z[0].axis == SimAxis::Z &&
-                   z[1].axis == SimAxis::Angle && z[2].axis == SimAxis::Phase;
+        l.fastSi = !st.montage() && isIdentityEntry(st.axes[0], 0) && isIdentityEntry(st.axes[1], 1) && z.size() == 3 &&
+                   z[0].axis == SimAxis::Z && z[1].axis == SimAxis::Angle && z[2].axis == SimAxis::Phase;
         return l;
     }
 

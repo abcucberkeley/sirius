@@ -16,6 +16,7 @@
 #include <set>
 #include <stdexcept>
 #include <string>
+#include <utility>
 
 #include "core/dataset.hpp"
 
@@ -59,6 +60,40 @@ TEST_CASE("SIM layout: the shorthand expands into the z-packed text and back", "
         CHECK(SimLayout::fromText("z = phase 3 ; c = angle 3").storage == "c=angle 3; z=phase 3");
         CHECK(SimLayout::fromText("yx=[angle 3, phase 3]").storage == "yx=3x3[angle 3, phase 3]");
         CHECK(SimLayout::fromText("yx = 3 x 5 [ angle 3 , phase 5 ]").storage == "yx=3x5[angle 3, phase 5]");
+    }
+    SECTION("an axis that is itself is left out of the text, written down or not") {
+        // the canonical text has to be the one a user writes, so that a layout
+        // bound to a dataset -- where bindSimLayout gives every axis a factor,
+        // c and t included -- reads back as what was written. Without that the
+        // text of a bound raw.tif layout grew a "c=c 1; t=t 1;" prefix.
+        CHECK(SimLayout::fromText("c=c 2; z=[angle 3, z, phase 5]").storage == "z=[angle 3, z, phase 5]");
+        CHECK(SimLayout::fromText("t=t 4; c=angle 3; z=phase 3").storage == "c=angle 3; z=phase 3");
+        // and the fast-SI mirror still sees a z-packed layout through it
+        CHECK(SimLayout::fromText("c=c 2; z=[z, angle 3, phase 5]").fastSi);
+        // a factor beside its own kind is not the identity and stays
+        CHECK(SimLayout::fromText("c=[c 2, angle 3]; z=phase 5").storage == "c=[c 2, angle 3]; z=phase 5");
+        // the three real shapes: the bound layout's text is a layout again --
+        // the remainders filled in, nothing else added -- and it binds to the
+        // same frames, so the text can be written down and reopened
+        const std::pair<const char*, Dims5> real[3] = {{"z=[angle 3, z, phase 5]", Dims5{1, 1, 135, 64, 64}},
+                                                       {"c=angle 3; z=phase 3", Dims5{3, 1, 3, 64, 64}},
+                                                       {"yx=3x3[angle 3, phase 3]", Dims5{1, 1, 1, 192, 192}}};
+        for (const auto& [text, dims] : real) {
+            INFO(text);
+            const SimLayout layout = SimLayout::fromText(text);
+            CHECK(simStorageOf(layout).text() == text);   // unbound: already canonical
+            const SimFrames f = bindSimLayout(layout, dims);
+            const std::string bound = f.storage.text();
+            CHECK(bound.find("c=c") == std::string::npos);
+            CHECK(bound.find("t=t") == std::string::npos);
+            const SimFrames again = bindSimLayout(SimLayout::fromText(bound), dims);
+            CHECK(again.storage.text() == bound);
+            CHECK(again.angles == f.angles);
+            CHECK(again.phases == f.phases);
+            CHECK(again.nz == f.nz);
+            CHECK(again.tileY == f.tileY);
+            CHECK(again.frameOf({1, 2, 0, 0, 0}) == f.frameOf({1, 2, 0, 0, 0}));
+        }
     }
     SECTION("the parser names what is wrong") {
         CHECK_THROWS_WITH(SimLayout::fromText(""), ContainsSubstring("empty"));

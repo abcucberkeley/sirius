@@ -105,7 +105,11 @@ namespace sirius::app {
         std::vector<SimFactor> tiles;                 // across the tile number, outermost first
         bool montage() const noexcept { return !tiles.empty(); }
         // Canonical text: entries c, t, z, yx in that order, one space after
-        // commas and semicolons, no brackets around a single factor.
+        // commas and semicolons, no brackets around a single factor. An axis
+        // that is itself is left out: no entry, or its own kind alone (the
+        // "c=c 2" the file's own length already states). So the text of a
+        // layout bound to a dataset -- SimFrames::storage, where every axis
+        // carries a factor -- is the layout that was written down.
         std::string text() const;
         // The angle / phase extent it names (1 when it names none).
         Index angles() const noexcept;
