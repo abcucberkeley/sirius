@@ -220,7 +220,8 @@ sirius_lib_unit(otf
 sirius_lib_unit(otf_io
     HEADERS sirius/otf_io.hpp
     SOURCES otf_io.cpp
-    DEPENDS otf sim_parameters tiff_io mrc_io errors)
+    DEPENDS otf sim_parameters tiff_io mrc_io errors
+    LINK tomlplusplus::tomlplusplus)
 
 sirius_lib_unit(otf_ideal
     HEADERS sirius/otf_ideal.hpp

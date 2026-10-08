@@ -142,3 +142,108 @@ TEST_CASE("idealOTF rejects unphysical inputs", "[otf][ideal]") {
     bad.lateralSamples = 15;
     REQUIRE_THROWS_AS(idealOTF(lowNaParams(), false, bad), std::invalid_argument);
 }
+
+// --------------------------------------------------------------------------
+// The illumination's axial component as a stated parameter
+// (SIMParameters::illumination_has_axial_component).
+//
+// The order-1 shift above models THREE-BEAM interference: the two first
+// diffraction orders beat against the undiffracted central beam, so the
+// illumination is modulated in z and the side band's support is displaced
+// along kz. A TWO-BEAM pattern has no central beam, its intensity is
+// 1 + m cos(2 pi k0 . r + phi) with no z term, and its order-1 band therefore
+// rides the plain widefield OTF. The iSOAR2 stacks and the lab's mmmSIM
+// calibration data are that case; cudasirecon's 3-angle 5-phase test stack is
+// not. The cases below pin the default (three-beam, so no existing result
+// moves) and the new setting separately.
+// --------------------------------------------------------------------------
+
+TEST_CASE("idealOtfShiftsOrderOne states the rule in one place", "[otf][ideal][axial]") {
+    SIMParameters p = lowNaParams();   // norders 3
+    REQUIRE(p.illumination_has_axial_component);          // the default
+    CHECK(idealOtfShiftsOrderOne(p, /*threeD=*/true));
+    // a 2D table has one kz plane, so there is nowhere to shift to
+    CHECK_FALSE(idealOtfShiftsOrderOne(p, /*threeD=*/false));
+    // one order resolved means there is no order 1 at all
+    SIMParameters one = p;
+    one.norders = 1;
+    CHECK_FALSE(idealOtfShiftsOrderOne(one, true));
+    // and the stated parameter, which is the point of this change
+    SIMParameters twoBeam = p;
+    twoBeam.illumination_has_axial_component = false;
+    CHECK_FALSE(idealOtfShiftsOrderOne(twoBeam, true));
+    // two orders alone does NOT turn it off: a 5-phase three-beam stack
+    // reconstructed with norders = 2 still has an axial component
+    SIMParameters twoOrders = p;
+    twoOrders.norders = 2;
+    CHECK(idealOtfShiftsOrderOne(twoOrders, true));
+}
+
+TEST_CASE("a 3D two-beam table's order 1 is the plain widefield OTF", "[otf][ideal][axial]") {
+    // The isoar acquisition's shape: 1 direction, 3 phases -> 2 orders, 3D.
+    SIMParameters p = lowNaParams();
+    p.na = 1.35;
+    p.nimm = 1.405;
+    p.wavelength_nm = 604.0;
+    p.nphases = 3;
+    p.norders = 0;            // -> 2
+    p.linespacing_um = 0.491;
+    p.dz_psf = 0.1;
+    IdealOtfOptions opts;
+    opts.lateralSamples = 128;
+    opts.axialSamples = 32;
+    REQUIRE(p.resolvedOrders() == 2);
+
+    SIMParameters threeBeam = p;                                  // the default
+    SIMParameters twoBeam = p;
+    twoBeam.illumination_has_axial_component = false;
+    const auto shifted = idealOTF(threeBeam, true, opts).data();
+    const auto plain = idealOTF(twoBeam, true, opts).data();
+    REQUIRE(shifted.dimension(0) == 2);
+    REQUIRE(plain.dimension(0) == 2);
+
+    // two-beam: order 1 IS order 0, sample for sample, not merely close
+    for (Eigen::Index ir = 0; ir < plain.dimension(1); ++ir)
+        for (Eigen::Index iz = 0; iz < plain.dimension(2); ++iz) {
+            INFO("ir " << ir << " iz " << iz);
+            REQUIRE(plain(1, ir, iz) == plain(0, ir, iz));
+        }
+    // order 0 is untouched by the parameter: the widefield OTF is the
+    // widefield OTF whichever way the sample was illuminated
+    for (Eigen::Index ir = 0; ir < plain.dimension(1); ++ir)
+        for (Eigen::Index iz = 0; iz < plain.dimension(2); ++iz)
+            REQUIRE(plain(0, ir, iz) == shifted(0, ir, iz));
+    // and the two settings really do differ on order 1 for this acquisition,
+    // so the parameter is not a no-op here
+    double diff = 0.0;
+    for (Eigen::Index ir = 0; ir < plain.dimension(1); ++ir)
+        for (Eigen::Index iz = 0; iz < plain.dimension(2); ++iz)
+            diff += std::abs(plain(1, ir, iz) - shifted(1, ir, iz));
+    CHECK(diff > 1e-3);
+    // the three-beam table's order 1 peaks off kz = 0; the two-beam one peaks
+    // at kz = 0, where the widefield OTF does
+    Eigen::Index peakShifted = 0, peakPlain = 0;
+    for (Eigen::Index iz = 0; iz < 32; ++iz) {
+        if (std::abs(shifted(1, 0, iz)) > std::abs(shifted(1, 0, peakShifted))) peakShifted = iz;
+        if (std::abs(plain(1, 0, iz)) > std::abs(plain(1, 0, peakPlain))) peakPlain = iz;
+    }
+    CHECK(peakShifted != 0);
+    CHECK(peakPlain == 0);
+    CHECK_THAT(plain(1, 0, 0).real(), WithinAbs(1.0, 1e-9));   // DC of the widefield OTF
+}
+
+TEST_CASE("the axial-component parameter leaves a 2D table alone", "[otf][ideal][axial]") {
+    // A 2D table's orders are all the widefield OTF already, so the parameter
+    // has nothing to change and must change nothing.
+    SIMParameters p = lowNaParams();
+    SIMParameters twoBeam = p;
+    twoBeam.illumination_has_axial_component = false;
+    const auto a = idealOTF(p, false).data();
+    const auto b = idealOTF(twoBeam, false).data();
+    REQUIRE(a.dimension(0) == b.dimension(0));
+    REQUIRE(a.dimension(1) == b.dimension(1));
+    REQUIRE(a.dimension(2) == b.dimension(2));
+    for (Eigen::Index o = 0; o < a.dimension(0); ++o)
+        for (Eigen::Index ir = 0; ir < a.dimension(1); ++ir)
+            REQUIRE(a(o, ir, 0) == b(o, ir, 0));
+}

@@ -5,6 +5,7 @@
 #include <cstdio>
 #include <filesystem>
 #include <fstream>
+#include <iterator>
 #include <limits>
 #include <string>
 
@@ -246,6 +247,7 @@ TEST_CASE("TOML round-trip preserves every serialized field", "[params][toml]") 
     in.equalizez = true;   // default false
     in.no_kz0 = false;  // default true
     in.filter_overlaps = false;  // default true
+    in.illumination_has_axial_component = false;  // default true
     in.phase_steps = std::vector<double>{0.0, 0.5, 1.0, 1.5, 2.0, 2.5, 3.0};   // length nphases
     in.force_mod_amp = std::vector<double>{1.0, 0.4};                            // length norders
 
@@ -281,6 +283,7 @@ TEST_CASE("TOML round-trip preserves every serialized field", "[params][toml]") 
     REQUIRE(out.equalizez == in.equalizez);
     REQUIRE(out.no_kz0 == in.no_kz0);
     REQUIRE(out.filter_overlaps == in.filter_overlaps);
+    REQUIRE(out.illumination_has_axial_component == in.illumination_has_axial_component);
 
     REQUIRE(out.k0_angles.has_value());
     REQUIRE(out.k0_angles->size() == in.k0_angles->size());
@@ -349,4 +352,46 @@ TEST_CASE("loadParameters throws on malformed TOML", "[params][toml]") {
 TEST_CASE("loadParameters validates after parsing", "[params][toml]") {
     TempFile tf(".toml", "[optics]\nndirs = 0\n");
     REQUIRE_THROWS_AS(loadParameters(tf.str()), std::runtime_error);
+}
+
+TEST_CASE("illumination_has_axial_component defaults to three-beam and is read from a file",
+          "[params][toml][axial]") {
+    SECTION("the default is the behaviour SIRIUS has always had") {
+        // Three-beam: order 1 gets the axial shift. Changing this default
+        // would move every existing 3D result, so it is pinned here.
+        const SIMParameters def;
+        CHECK(def.illumination_has_axial_component);
+    }
+    SECTION("a file that does not mention it keeps the default") {
+        // Every cudasirecon config and every TOML written before today is
+        // this case, so they all keep three-beam.
+        TempFile tf(".toml", "[optics]\nnphases = 3\n");
+        const SIMParameters out = loadParameters(tf.str());
+        CHECK(out.illumination_has_axial_component);
+        CHECK(out.resolvedOrders() == 2);   // 2 orders alone does NOT turn it off
+    }
+    SECTION("a two-beam acquisition says so explicitly") {
+        TempFile tf(".toml", "[optics]\nnphases = 3\nillumination_has_axial_component = false\n");
+        const SIMParameters out = loadParameters(tf.str());
+        CHECK_FALSE(out.illumination_has_axial_component);
+    }
+    SECTION("0 and 1 work as well as false and true") {
+        // toml++'s node::value<bool>() converts an integer node (toml.hpp,
+        // "int -> bool"), so a hand-written file in cudasirecon's 0/1 habit
+        // means what it looks like rather than silently keeping the default.
+        TempFile tf0(".toml", "[optics]\nillumination_has_axial_component = 0\n");
+        CHECK_FALSE(loadParameters(tf0.str()).illumination_has_axial_component);
+        TempFile tf1(".toml", "[optics]\nillumination_has_axial_component = 1\n");
+        CHECK(loadParameters(tf1.str()).illumination_has_axial_component);
+    }
+    SECTION("it survives a save and load as a TOML boolean") {
+        SIMParameters in;
+        in.illumination_has_axial_component = false;
+        TempFile tf(".toml");
+        saveParameters(tf.str(), in);
+        std::ifstream f(tf.path);
+        const std::string text{std::istreambuf_iterator<char>(f), std::istreambuf_iterator<char>()};
+        CHECK_THAT(text, Catch::Matchers::ContainsSubstring("illumination_has_axial_component = false"));
+        CHECK_FALSE(loadParameters(tf.str()).illumination_has_axial_component);
+    }
 }

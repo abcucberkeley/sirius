@@ -12,6 +12,13 @@
 
 namespace sirius {
 
+    // The one place that decides whether order 1 is shifted along kz. See
+    // otf_ideal.hpp for why the illumination's axial component is a stated
+    // parameter rather than something read off the order count.
+    bool idealOtfShiftsOrderOne(const SIMParameters& p, bool threeD) noexcept {
+        return threeD && p.resolvedOrders() > 1 && p.illumination_has_axial_component;
+    }
+
     OTFRadiallyAveraged idealOTF(const SIMParameters& p, bool threeD, const IdealOtfOptions& opts) {
         using Cplx = std::complex<double>;
         p.validate();
@@ -94,7 +101,10 @@ namespace sirius {
                 for (int iz = 0; iz < nzotf; ++iz)
                     table(order, ir, iz) = radial[static_cast<std::size_t>(ir) * nzotf + iz];
 
-        if (threeD && norders > 1) {
+        // A two-beam pattern (illumination_has_axial_component false) is a
+        // pure lateral sinusoid, so its order-1 band rides the plain widefield
+        // OTF: the table built above is already right and nothing is shifted.
+        if (idealOtfShiftsOrderOne(p, threeD)) {
             // First illumination order of the three-beam pattern: lateral
             // frequency k1 (the line spacing refers to the finest, highest
             // order) and the axial frequency of its interference with the

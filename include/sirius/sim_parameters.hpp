@@ -28,10 +28,61 @@ namespace sirius {
         double nimm = 1.33;   // immersion refractive index (>= na)
         double wavelength_nm = 510.;   // emission wavelength (nm)
         std::optional<std::vector<double>> k0_angles; // null, derive from k0_start_angles
+        // Whether the illumination intensity is modulated along z as well as
+        // laterally -- whether the pattern carries an AXIAL COMPONENT. It is
+        // a property of how the beams were launched, so it is stated here and
+        // never inferred.
+        //
+        // TRUE (the default, and what SIRIUS has always assumed) is
+        // three-beam illumination: both first diffraction orders AND the
+        // undiffracted central beam reach the sample, each side band
+        // interferes with the central beam, and the pattern is modulated in z
+        // at the axial frequency kz1 = kex - sqrt(kex^2 - k1^2). idealOTF then
+        // builds order 1 as the mean of the widefield OTF shifted by +-kz1,
+        // which is where a 3D-SIM side band's support actually sits.
+        // Acquisitions with this value: cudasirecon's own 3-angle 5-phase
+        // stack (tests/data/raw.tif, 3 orders), and 3D-SIM on a commercial
+        // scope generally.
+        //
+        // FALSE is two-beam illumination: the central beam is blocked or only
+        // two beams are launched, the two side beams interfere with each other
+        // alone, and the pattern is a pure lateral sinusoid, constant along z
+        // (illum = 1 + m cos(2 pi k0 . r + phi), no z term). Its order-1 band
+        // is then the PLAIN WIDEFIELD OTF, unshifted. Acquisitions with this
+        // value: the iSOAR2 2-beam 3-phase stacks (Data/iSOAR2_nvme2, and the
+        // 2026-04-21 configs' ndirs 1 x nphases 3), the lab's mmmSIM
+        // calibration and phantom stacks, and 2D / TIRF-SIM.
+        //
+        // NOT DERIVED FROM THE ORDER COUNT, deliberately. A 3-phase stack
+        // resolves two orders and is usually two-beam, but a 5-phase
+        // three-beam stack reconstructed with norders = 2 is not, and deciding
+        // from the order count would silently change results that already
+        // exist. It affects only the THEORETICAL OTF (idealOTF): a measured
+        // OTF carries whatever axial structure its bead stack had, so nothing
+        // here touches it.
+        bool illumination_has_axial_component = true;
         // Absolute phase of each raw frame, radians, length nphases. Empty: equal steps 2πj/nphases.
         std::optional<std::vector<double>> phase_steps;
-        // Modulation amplitudes that replace the fitted ones. Length norders (every direction)
-        // or ndirs * norders (per direction, direction-major). Empty: fit them.
+        // A magnitude FLOOR under the fitted modulation amplitudes, not a
+        // replacement for them: this is cudasirecon's `forcemodamp`
+        // (cudaSirecon.cpp, "force modamp's amplitude to be a value user
+        // provided"), and matching it matters because forcemodamp=0.5 is in
+        // the configs the user runs daily. Its rules, all four of which SIRIUS
+        // used to get wrong:
+        //   * SIDE BANDS ONLY. The loop runs order = 1 .. norders-1; order 0
+        //     is the widefield band and is never touched.
+        //   * A FLOOR. An order whose fitted magnitude already exceeds its
+        //     value is left exactly as fitted.
+        //   * THE FITTED PHASE SURVIVES. The complex amplitude is scaled by
+        //     floor/|amp|, so only its magnitude changes.
+        //   * ONE GATE FOR THE WHOLE FEATURE: the first entry of the list
+        //     being <= 0 switches it off, whatever the later entries say.
+        // Four lengths are accepted. norders-1 and ndirs*(norders-1) are
+        // cudasirecon's own, listing the side bands alone (and norders-1 is
+        // what a 3-phase config's single value is); norders and
+        // ndirs*norders are SIRIUS's older spelling, whose leading entry is
+        // order 0's and is ignored except as the gate. Per direction, the
+        // layout is direction-major. Empty: fit everything.
         std::optional<std::vector<double>> force_mod_amp;
 
         // Pixel sizes (um) in the sample plane
@@ -58,6 +109,13 @@ namespace sirius {
         bool equalizez = false; // ref = equalizez ? S[sidx(0, 0, 0)] : S[sidx(0, 0, z)]; where S(d, p, z) is plane sums over (ny, nx)
         bool no_kz0 = true;
         bool filter_overlaps = true;
+        // Fit the pattern vector, or take it as given. False is cudasirecon's
+        // `searchforvector=0`: skip the cross-correlation search and the
+        // angle/magnitude refinement, keep k0 exactly as k0_angles (or
+        // k0_start_angle) and linespacing_um state it, and fit only each
+        // order's modulation amplitude and phase against order 0
+        // (cudaSirecon.cpp:319, the "assume k0 vector known" branch).
+        bool search_pattern_vector = true;
 
         // The orders the reconstruction separates and assembles: norders, or
         // nphases / 2 + 1 when norders is 0. Everything that consumes the
@@ -108,6 +166,13 @@ namespace sirius {
             const int denom = resolvedOrders() - 1;
             return k / static_cast<double>(denom < 1 ? 1 : denom);
         }
+
+        // The magnitude floor forced onto direction `dir`'s order `order`, or
+        // 0 when none applies -- and 0 is a no-op, because a magnitude is
+        // never below it. One place decides what a force_mod_amp list of each
+        // accepted length means, so the reconstruction does not have to, and a
+        // dir or order out of range answers 0 rather than reading past the end.
+        double forcedModAmpFloor(int dir, int order) const noexcept;
 
         // Throws std::runtime_error on invalid parameters
         void validate() const;
