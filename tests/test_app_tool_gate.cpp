@@ -682,7 +682,7 @@ TEST_CASE("tool gate: an argument no tool takes is dropped with a warning, not t
     // A typo in a --tool argument was accepted in silence by the window and
     // warned about by sirius-cli, because only the session checked.
     // The key is "call_warnings", not "warnings": "warnings" is a documented
-    // reply field of get_step, get_diagnostics and validate_pipeline, and the
+    // reply field of get_step, get_diagnostics and `validate`, and the
     // note about the call has to be told apart from the step's own
     // (docs/findings.md 9k.52, finding B).
     const json r = api.call("set_step_enabled", {{"step", 2}, {"enabled", false}, {"enbaled", true}});

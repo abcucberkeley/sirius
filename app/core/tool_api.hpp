@@ -105,14 +105,17 @@ namespace sirius::app {
         nlohmann::json contextSnapshot() const;
         std::string systemPrompt() const;
 
-        // What probe, statistics and export_result need that only the host
-        // knows: which step a call that names no step means, that step's
-        // output (running it first when the call says run), and the progress
-        // and cancellation of the long read that follows. A field left empty
-        // is the application's answer instead -- the viewed step, the output
-        // the workbench already holds (run through the run hook above), no
-        // progress and no cancellation -- so the window needs none of this
-        // and a session (core/headless.hpp) sets all four.
+        // What probe, statistics, export_result and get_diagnostics need that
+        // only the host knows: that step's output (running it first when the
+        // call says run), and the progress and cancellation of the long read
+        // that follows. A field left empty is the application's answer
+        // instead -- the output the workbench already holds (run through the
+        // run hook above), no progress and no cancellation -- so the window
+        // needs none of this and a session (core/headless.hpp) sets all
+        // three. WHICH step a call that names none means is NOT here: that is
+        // one rule for every front (defaultStepIndex below), and a host
+        // having one of its own is what finding C of docs/findings.md 9k.52
+        // was.
         struct OutputAccess {
             std::function<std::shared_ptr<const StepOutput>(int index, bool runIfNeeded)> output;
             std::function<void(double fraction, const std::string& message)> progress;

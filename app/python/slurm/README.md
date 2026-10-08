@@ -140,7 +140,9 @@ operation set changes incompatibly, so an engine built from a nearby commit
 keeps serving. An engine built before `ops_generation` existed reports only a
 hash; it is served when that hash is this build's own or one
 `kAcceptedOlderOpsSchemas` names (with the reason). Either way a refusal says
-which of the two sides is the older one and gives the fix for that side. The build's `python/` folder (the `sirius_worker` package of that
+which of the two sides is the older one and gives the fix for that side.
+
+The build's `python/` folder (the `sirius_worker` package of that
 commit) is the worker's code, so the checkout on the cluster is not needed
 then; its `lib/` (nvTIFF, nvCOMP) goes in front of the image's library path.
 Building one, inside the worker image on a node (latents'

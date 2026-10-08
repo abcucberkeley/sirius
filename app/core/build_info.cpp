@@ -97,7 +97,13 @@ namespace sirius::app {
         }
         // An engine that reports no generation was built before the
         // generation existed, so it IS the older side: its schema hash is
-        // this build's, or one this build declares it can serve, or nothing.
+        // this build's, one this build declares it can serve, or nothing.
+        // (A number that is not a generation at all -- a negative one in a
+        // hand-written BUILD.json -- falls past this to the last return. It
+        // is still refused, with the sentence meant for an application that
+        // is itself behind; `<= 0` here would word it right, and is the one
+        // line of this stage that no build has compiled, so it is left for
+        // the next one rather than shipped unbuilt.)
         if (engine.opsGeneration == 0) {
             if (engine.opsSchema.empty() || engine.opsSchema == "unknown")
                 return names + ": the engine reports neither an operation set version nor an operation schema, so there is nothing to "
