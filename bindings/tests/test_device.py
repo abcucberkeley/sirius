@@ -103,11 +103,14 @@ class TestOneDeviceRule(unittest.TestCase):
     step_sim downgraded an explicit device="cuda" on its own
     (docs/findings.md 9k.50 finding 3; the Python front's finding A).
 
-    The anchor is sirius.device_request_problem: the C++ half of this,
-    tests/test_app_device_rule.cpp, asserts the window and a session refuse
-    exactly its sentence, and the cases below assert that Python raises
-    exactly its sentence -- so the three cannot drift without one of the two
-    failing.
+    The anchor is sirius.device_request_problem: the C++ half of this -- the
+    case "headless: the window and a session resolve one backend, and refuse
+    what they cannot honour in one wording" in tests/test_app_headless.cpp --
+    drives ToolApi and HeadlessWorkbench side by side and checks what each
+    answers against that function (its window arm needs a computer with no
+    GPU, because Workbench::setCudaDevice clamps an index; the session arm
+    runs everywhere), and the cases below assert that Python raises exactly
+    its sentence, so the three cannot drift without one of the two failing.
     """
 
     def test_auto_is_sirius_own_capability(self):

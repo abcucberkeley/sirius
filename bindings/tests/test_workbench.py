@@ -599,6 +599,8 @@ class TestSimStep(unittest.TestCase):
         measured = wb.run_step("sim", dict(base, otf=str(self.DATA / "otf.tif")), raw, meta, device="cpu")
         theoretical = wb.run_step("sim", base, raw, meta, device="cpu")          # otf absent: theoretical
         empty = wb.run_step("sim", dict(base, otf=""), raw, meta, device="cpu")  # and empty: the same
+        # exactly, not nearly: both make the same cache key, so this is the
+        # same reconstructor and the same FFT plans
         np.testing.assert_array_equal(empty.array, theoretical.array)
         # the two are genuinely different reconstructions, which is what makes
         # a silent fall-back to the theoretical one a wrong result and not a
@@ -606,10 +608,17 @@ class TestSimStep(unittest.TestCase):
         rel = (np.max(np.abs(measured.array - theoretical.array)) / np.max(np.abs(measured.array)))
         self.assertGreater(rel, 0.01)
         # the aliases the application's older exports used still name the file
+        peak = float(np.max(np.abs(measured.array)))
         for key in ("otf_path", "otf_file"):
             with self.subTest(key=key):
                 r = wb.run_step("sim", dict(base, **{key: str(self.DATA / "otf.tif")}), raw, meta, device="cpu")
-                np.testing.assert_array_equal(r.array, measured.array)
+                # not assert_array_equal: the theoretical runs above cleared
+                # the reconstructor cache, so this builds new FFTW plans, and
+                # PlanRigor::Measure picks its algorithm by what the machine
+                # was doing at the time -- bit identity across two plannings
+                # is not something SIRIUS offers (docs/findings.md 9k.50,
+                # finding 3). The bar is the 1e-4 of the regression test.
+                np.testing.assert_allclose(r.array, measured.array, rtol=0, atol=1e-4 * peak)
         # and a misspelling is refused, naming the key and what sim takes
         for key in ("otf_pth", "otfpath", "OTF"):
             with self.subTest(key=key):

@@ -3810,8 +3810,7 @@ def resolve_device(device: str = "auto", *, torch_tensors: bool = False) -> str:
     """The device a step runs on, by the one rule every front resolves it by:
     ``"auto"`` (or ``""``) is the GPU when SIRIUS has one and the CPU
     otherwise, and an explicit ``"cuda"`` / ``"cuda:N"`` this build or this
-    computer cannot honour is an ERROR rather than a quiet downgrade. Returns
-    the canonical spelling, ``"cpu"`` or ``"cuda:N"``.
+    computer cannot honour is an ERROR rather than a quiet downgrade.
 
     The capability asked is SIRIUS's own -- ``sirius.cuda_available``, which
     is what the window's Workbench constructor and sirius-cli's

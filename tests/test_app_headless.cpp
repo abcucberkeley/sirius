@@ -338,13 +338,18 @@ TEST_CASE("headless: the window and a session resolve one backend, and refuse wh
     // Python front's finding A).
     //
     // The anchor of all three is sirius::deviceRequestProblem. This case
-    // pins the two C++ fronts against it; bindings/tests/test_device.py's
-    // TestOneDeviceRule pins resolve_device against the same function, so the
-    // three cannot drift apart without one of the two failing.
+    // drives the window (ToolApi) and a session (HeadlessWorkbench) side by
+    // side and checks what each answers against that function;
+    // bindings/tests/test_device.py's TestOneDeviceRule checks resolve_device
+    // against the same function, so the three cannot drift apart without one
+    // of the two failing.
     //
-    // It asserts on a GPU machine and on a CPU-only one, by asking for a GPU
-    // INDEX past the last one: unhonourable either way, so neither arm is a
-    // skip on the a100 nodes these tests run on.
+    // It asserts on a GPU machine and on a CPU-only one. An INDEX past the
+    // last GPU is unhonourable either way, so the session's arm is never a
+    // skip on the a100 nodes these tests run on; the window's own refusal
+    // needs a computer with no GPU, because Workbench::setCudaDevice clamps
+    // an index and leaves it only availability to refuse (the section below
+    // measures the clamp rather than assuming it).
     const int count = cudaDeviceCount();
     const int absent = std::max(count, 1) + 99;
     const std::string why = deviceRequestProblem(Device::cuda(absent));
@@ -356,29 +361,36 @@ TEST_CASE("headless: the window and a session resolve one backend, and refuse wh
     ToolApi api(gui);
     Fixture f;
 
-    SECTION("a GPU index past the last one is refused by both, with that sentence") {
+    SECTION("a GPU index past the last one is refused by the session, in those words") {
+        // Only the session can be put in this state. Workbench::setCudaDevice
+        // CLAMPS an index to the GPUs this computer has (min(index, n - 1)),
+        // so the window's set_backend only ever has an honourable index to
+        // check and its refusal is the availability one below. Measured here
+        // rather than changed: that clamp is what keeps a preference saved on
+        // a four-GPU machine from failing on a one-GPU machine, and the GUI
+        // offers only the GPUs it found.
         gui.setCudaDevice(absent);
-        const json w = api.call("set_backend", {{"backend", "CUDA"}});
-        INFO("window " << w.dump());
-        CHECK(w.value("error", std::string()) == why);
-        CHECK(w.value("error_kind", std::string()) == "unsupported");
-        // and the window did NOT change the backend behind that refusal
-        CHECK(gui.backend() != Backend::Cuda);
+        CHECK(gui.cudaDevice() == std::max(count - 1, 0));
 
         const agent::ToolResult s = f.call("set_backend", {{"backend", "cuda"}, {"cuda_device", absent}});
         INFO("session " << s.error.code << ": " << s.error.message);
         CHECK_FALSE(s.ok);
         CHECK(s.error.message == why);
         CHECK(s.error.code == "unsupported");
-        // the two fronts said the same sentence, which is the point
-        CHECK(s.error.message == w.value("error", std::string()));
+        // and it refused BEFORE changing anything: an index this computer
+        // does not have is not left behind on the workbench
+        CHECK(f.ok("list_devices")["cuda_device"] != absent);
     }
 
     SECTION("the CPU is honoured by both, and says nothing") {
         CHECK(deviceRequestProblem(Device::cpu()).empty());
+        // the two fronts spell the backend differently in their replies -- the
+        // window's enum is {CUDA, CPU, HPC} and the session's {cpu, cuda,
+        // hpc}, each as its own schema declares it -- so what is compared is
+        // the backend they ended up on, not the string
         CHECK(api.call("set_backend", {{"backend", "CPU"}}).value("backend", std::string()) == "CPU");
         CHECK(gui.backend() == Backend::Cpu);
-        CHECK(f.ok("set_backend", {{"backend", "cpu"}})["backend"] == "CPU");
+        CHECK(f.ok("set_backend", {{"backend", "cpu"}})["backend"] == "cpu");
     }
 
     SECTION("a GPU this computer has is honoured by both; one it has none of is refused by both") {
@@ -386,15 +398,22 @@ TEST_CASE("headless: the window and a session resolve one backend, and refuse wh
             CHECK(deviceRequestProblem(Device::cuda(0)).empty());
             CHECK(api.call("set_backend", {{"backend", "CUDA"}}).value("backend", std::string()) == "CUDA");
             CHECK(gui.backend() == Backend::Cuda);
-            CHECK(f.ok("set_backend", {{"backend", "cuda"}})["backend"] == "CUDA");
+            CHECK(f.ok("set_backend", {{"backend", "cuda"}})["backend"] == "cuda");
         } else {
+            // The window's half of the finding: this used to answer
+            // {"backend":"CUDA"} and the run then fell back to the CPU.
             const std::string none = deviceRequestProblem(Device::cuda(0));
             REQUIRE_FALSE(none.empty());
-            CHECK(api.call("set_backend", {{"backend", "CUDA"}}).value("error", std::string()) == none);
+            const json w = api.call("set_backend", {{"backend", "CUDA"}});
+            INFO("window " << w.dump());
+            CHECK(w.value("error", std::string()) == none);
+            CHECK(w.value("error_kind", std::string()) == "unsupported");
             CHECK(gui.backend() != Backend::Cuda);
             const agent::ToolResult s = f.call("set_backend", {{"backend", "cuda"}});
             CHECK_FALSE(s.ok);
             CHECK(s.error.message == none);
+            // the one sentence, from both fronts
+            CHECK(s.error.message == w.value("error", std::string()));
         }
     }
 
@@ -407,7 +426,7 @@ TEST_CASE("headless: the window and a session resolve one backend, and refuse wh
         CHECK((gui.backend() == Backend::Cuda) == cudaAvailable());
         Fixture autoF([](HeadlessOptions& o) { o.backend = "auto"; });
         const std::string backend = autoF.ok("list_devices")["backend"];
-        CHECK(backend == (cudaAvailable() ? "CUDA" : "CPU"));
+        CHECK(backend == (cudaAvailable() ? "cuda" : "cpu"));
     }
 }
 
