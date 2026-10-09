@@ -310,6 +310,24 @@ TEST_CASE("engine: the build identity names the commit, the op schema and the AP
         mute.opsGeneration = 0;
         mute.opsSchema.clear();
         CHECK_THAT(engineMismatch(b, mute), Catch::Matchers::ContainsSubstring("neither an operation set version nor an operation schema"));
+
+        // A number that is not a generation at all -- a hand-written
+        // BUILD.json with a negative one. It was refused either way; what was
+        // wrong was the sentence, which told the user to update this
+        // APPLICATION because the engine "names an operation set version".
+        // Read as "reports none", it is the engine that is behind, and the
+        // hash decides as it does for every pre-generation engine.
+        BuildInfo nonsense = b;
+        nonsense.opsGeneration = -3;
+        nonsense.opsSchema = "0123456789abcdef";
+        const std::string why = engineMismatch(b, nonsense);
+        REQUIRE_FALSE(why.empty());
+        CHECK_THAT(why, Catch::Matchers::ContainsSubstring("The engine is the older side"));
+        CHECK_THAT(why, !Catch::Matchers::ContainsSubstring("This application is the older side"));
+        // and a negative generation does not get past the hash check either
+        BuildInfo nonsenseButKnown = nonsense;
+        nonsenseButKnown.opsSchema = b.opsSchema;
+        CHECK(engineMismatch(b, nonsenseButKnown).empty());
     }
 }
 
