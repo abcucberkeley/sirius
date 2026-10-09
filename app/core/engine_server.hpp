@@ -6,7 +6,8 @@
 // is the Python worker's superset -- the same frames, handshake and replies
 // (core/rpc_server.hpp) -- plus an "engine" block in its hello:
 //
-//   "engine": {"build", "version", "commit", "dirty", "ops_schema", "api"   (core/build_info.hpp)
+//   "engine": {"build", "version", "commit", "dirty", "ops_schema",
+//              "ops_generation", "api"                     (core/build_info.hpp)
 //              "cuda": {"devices": [{"index", "name", "memory_gb"}], "nvtiff"},
 //              "cpu_threads", "view_cache_used", "cache_used", "scratch",
 //              "session" (this process's: every output handle starts with it),

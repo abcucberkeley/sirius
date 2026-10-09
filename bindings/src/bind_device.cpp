@@ -3,6 +3,7 @@
 
 #include <sirius/device.hpp>
 
+#include <optional>
 #include <sstream>
 #include <stdexcept>
 
@@ -10,18 +11,13 @@ namespace nb = nanobind;
 using namespace sirius;
 
 namespace {
-    // "cpu", "cuda", "cuda:1" -> Device
+    // "cpu", "cuda", "cuda:1" -> Device, through the library's one parser
+    // (sirius::deviceFromString) rather than a second copy here: a front that
+    // parses device strings its own way is how the three fronts came to
+    // disagree about what a device request means.
     Device parseDevice(const std::string& s) {
-        if (s == "cpu") return Device::cpu();
-        if (s == "cuda") return Device::cuda(0);
-        if (s.rfind("cuda:", 0) == 0) {
-            try {
-                return Device::cuda(std::stoi(s.substr(5)));
-            } catch (const std::exception&) {
-                throw std::invalid_argument("invalid device string: " + s);
-            }
-        }
-        throw std::invalid_argument("invalid device string: '" + s + "' (expected 'cpu', 'cuda' or 'cuda:N')");
+        if (const std::optional<Device> d = deviceFromString(s)) return *d;
+        throw std::invalid_argument(deviceRequestProblem(s));
     }
 } // namespace
 
@@ -74,6 +70,14 @@ void bind_device(nb::module_& m) {
     m.def("built_with_nvtiff", &builtWithNvTiff, "True when GPU TIFF decoding (nvTIFF) was compiled in.");
     m.def("cuda_device_count", &cudaDeviceCount, "Number of usable CUDA devices (0 without CUDA).");
     m.def("cuda_available", &cudaAvailable, "True when at least one CUDA device is usable.");
+    m.def("device_request_problem", static_cast<std::string (*)(const std::string&)>(&deviceRequestProblem), nb::arg("spec"),
+          "Empty when a request for `spec` (\"cpu\", \"cuda\", \"cuda:N\") can be honoured by this build on this "
+          "computer, otherwise the one sentence every front says about it. sirius.workbench.resolve_device raises "
+          "exactly this text, and the window and sirius-cli refuse a backend with it, so the three fronts say the "
+          "same thing about the same request.");
+    m.def("default_device", &defaultDevice,
+          "The device a request that names none resolves to: the first GPU when there is one, else the CPU. This is "
+          "what \"auto\" means on every front -- SIRIUS's own CUDA support, never torch's.");
     m.def("device_properties", &deviceProperties, nb::arg("device"),
           "Name, compute capability and memory of a CUDA device.");
     m.def("synchronize_device", &synchronizeDevice, nb::arg("device"));

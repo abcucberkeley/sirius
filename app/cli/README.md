@@ -200,7 +200,7 @@ the executor's cache lives in the process: iterative work belongs in
 
 | command | does | `result` |
 | --- | --- | --- |
-| `version` | nothing | `{name, version, build:{build, version, commit, dirty, ops_schema, api}, schema, protocols:{session, mcp:[…]}, features:{cuda, cuda_devices, zarr, export_formats, readable_extensions}, paths:{executable_dir, help, worker, python_env}}` |
+| `version` | nothing | `{name, version, build:{build, version, commit, dirty, ops_schema, ops_generation, api}, schema, protocols:{session, mcp:[…]}, features:{cuda, cuda_devices, zarr, export_formats, readable_extensions}, paths:{executable_dir, help, worker, python_env}}` |
 | `devices` | the `list_devices` tool | `{backend, cuda_available, cuda_device, devices:[{index, name, memory_gb, compute}]}` |
 | `info <dataset> [open options] [--open]` | `dataset_info`: probes the file; `--open` opens it (lazily), which also fills `metadata_summary` and `dims_from_metadata` (null without it) | DatasetInfo |
 | `ops [kind…] [--group G] [--detail] [--plugins]` | `list_operations`; with one kind and `--detail`, `describe_operation` | `{operations:[…]}`, or the description |
@@ -445,9 +445,13 @@ makes stay in the scratch directory, which a one-shot command removes (unless
 
 - Keys are sorted. NaN and infinity become `null`, with a warning. Paths are
   absolute, with forward slashes.
-- `warnings` collects what did not stop the command: an unknown argument
-  name that was ignored, a stale output that was used, a value that could not
-  be written as a number.
+- `warnings` (of the envelope) collects what did not stop the command: an
+  unknown argument name that was ignored, a stale output that was used, a
+  value that could not be written as a number. It also carries what the
+  command itself reported as a warning -- a step's validation warnings, a
+  diagnostics' own -- and those stay in `result` as well: `get_step`,
+  `get_diagnostics` and `call validate` document a `warnings` array of their
+  own and it is not moved out of the reply (docs/findings.md 9k.52).
 
 | exit | meaning | `error.code` |
 | --- | --- | --- |

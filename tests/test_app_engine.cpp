@@ -206,17 +206,27 @@ TEST_CASE("engine: the build identity names the commit, the op schema and the AP
     CHECK_FALSE(b.commit.empty());
     CHECK(b.opsSchema.size() == 64);
     CHECK(b.api == kEngineApiVersion);
+    CHECK(b.opsGeneration == kOpsGeneration);
+    CHECK(b.opsGeneration > 0);
     const BuildInfo back = buildInfoFromJson(toJson(b));
     CHECK(back.build == b.build);
     CHECK(back.commit == b.commit);
     CHECK(back.dirty == b.dirty);
     CHECK(back.opsSchema == b.opsSchema);
     CHECK(back.api == b.api);
+    CHECK(back.opsGeneration == b.opsGeneration);
 
     SECTION("the hash is the committed snapshot's, and the snapshot is what the registry exports") {
         // Fails when an operation's parameters changed and op_schema.json was
         // not regenerated (tests/test_app_schema.cpp says how): an engine
         // built from such a tree would claim the old schema.
+        //
+        // WHEN THIS FAILS, there are two things to do, not one: regenerate
+        // the snapshot, and then decide whether the change makes an engine of
+        // the previous operation set unable to serve. If it does, bump
+        // kOpsGeneration (core/build_info.hpp). If it does not -- wording, a
+        // label, a range, a parameter nothing reads -- leave the generation
+        // alone, and every engine already installed keeps serving.
         registerBuiltinOperations();
         const std::string live = operationSchemas().dump(2) + "\n";
         INFO("regenerate bindings/python/sirius/op_schema.json: SIRIUS_OP_SCHEMA_OUT=... test_app_schema");
@@ -230,18 +240,94 @@ TEST_CASE("engine: the build identity names the commit, the op schema and the AP
         other.dirty = true;
         CHECK(engineMismatch(b, other).empty());
     }
-    SECTION("other operations or another API are refused, with both builds named") {
+    SECTION("the operation SET is the key, so a schema hash of its own is not a mismatch") {
+        // The schema hash covers help text, labels, units and ranges, so it
+        // moves when nothing about what an operation means has moved. Such an
+        // engine serves (docs/findings.md 9k.52, finding A).
         BuildInfo other = b;
         other.build = "0.1.0+g1a2b3c4";
         other.opsSchema = std::string(64, 'a');
-        const std::string m = engineMismatch(b, other);
+        CHECK(engineMismatch(b, other).empty());
+    }
+    SECTION("an engine built before the generation existed is judged by its hash") {
+        BuildInfo old = b;
+        old.build = "0.1.0+g1a2b3c4";
+        old.opsGeneration = 0;   // it reports none
+        CHECK(engineMismatch(b, old).empty());   // its hash is this build's
+
+        // the hash in force before `bake` was deleted: accepted, with the
+        // reason recorded beside it
+        REQUIRE(sizeof(kAcceptedOlderOpsSchemas) / sizeof(kAcceptedOlderOpsSchemas[0]) >= 1u);
+        for (const AcceptedOpsSchema& a : kAcceptedOlderOpsSchemas) {
+            INFO(a.hash << ": " << a.why);
+            CHECK(std::string(a.hash).size() == 64);
+            CHECK_FALSE(std::string(a.why).empty());
+            CHECK(std::string(a.hash) != b.opsSchema);   // not this build's own
+            CHECK(acceptedOlderOpsSchema(a.hash) == &a);
+            BuildInfo installed = b;
+            installed.build = "0.1.0+gearlier";
+            installed.opsGeneration = 0;
+            installed.opsSchema = a.hash;
+            CHECK(engineMismatch(b, installed).empty());
+        }
+        CHECK(acceptedOlderOpsSchema(b.opsSchema) == nullptr);
+        CHECK(acceptedOlderOpsSchema("") == nullptr);
+        CHECK(acceptedOlderOpsSchema("unknown") == nullptr);
+
+        // and one whose hash is neither: refused, and told it is the old side
+        old.opsSchema = std::string(64, 'a');
+        const std::string m = engineMismatch(b, old);
         CHECK_THAT(m, Catch::Matchers::ContainsSubstring("0.1.0+g1a2b3c4"));
         CHECK_THAT(m, Catch::Matchers::ContainsSubstring(b.build));
-        CHECK_THAT(m, Catch::Matchers::ContainsSubstring("operations differ"));
-        other = b;
-        other.api = b.api + 1;
-        CHECK_THAT(engineMismatch(b, other), Catch::Matchers::ContainsSubstring("engine API"));
+        CHECK_THAT(m, Catch::Matchers::ContainsSubstring("The engine is the older side"));
+    }
+    SECTION("a refusal says which of the two sides is older, and the fix for that side") {
+        // generation 0 means "says none", so an older ENGINE generation is
+        // read against a newer application, not by decrementing this one
+        BuildInfo ahead = b;
+        ahead.build = "0.1.0+gahead";
+        ahead.opsGeneration = b.opsGeneration + 4;
+        CHECK_THAT(engineMismatch(ahead, b), Catch::Matchers::ContainsSubstring("The engine is the older side"));
+        CHECK_THAT(engineMismatch(ahead, b), Catch::Matchers::ContainsSubstring("operation sets differ"));
+
+        BuildInfo newer = b;
+        newer.build = "0.1.0+gnew";
+        newer.opsGeneration = b.opsGeneration + 1;
+        CHECK_THAT(engineMismatch(b, newer), Catch::Matchers::ContainsSubstring("This application is the older side"));
+        CHECK_THAT(engineMismatch(b, newer), Catch::Matchers::ContainsSubstring("operation sets differ"));
+
+        BuildInfo oldApi = b;
+        oldApi.api = b.api - 1;
+        CHECK_THAT(engineMismatch(b, oldApi), Catch::Matchers::ContainsSubstring("engine method sets"));
+        CHECK_THAT(engineMismatch(b, oldApi), Catch::Matchers::ContainsSubstring("The engine is the older side"));
+        BuildInfo newApi = b;
+        newApi.api = b.api + 1;
+        CHECK_THAT(engineMismatch(b, newApi), Catch::Matchers::ContainsSubstring("This application is the older side"));
+
+        // nothing at all came back: refused, and it is not read as compatible
         CHECK_FALSE(engineMismatch(b, buildInfoFromJson(json::object())).empty());
+        BuildInfo mute = b;
+        mute.opsGeneration = 0;
+        mute.opsSchema.clear();
+        CHECK_THAT(engineMismatch(b, mute), Catch::Matchers::ContainsSubstring("neither an operation set version nor an operation schema"));
+
+        // A number that is not a generation at all -- a hand-written
+        // BUILD.json with a negative one. It was refused either way; what was
+        // wrong was the sentence, which told the user to update this
+        // APPLICATION because the engine "names an operation set version".
+        // Read as "reports none", it is the engine that is behind, and the
+        // hash decides as it does for every pre-generation engine.
+        BuildInfo nonsense = b;
+        nonsense.opsGeneration = -3;
+        nonsense.opsSchema = "0123456789abcdef";
+        const std::string why = engineMismatch(b, nonsense);
+        REQUIRE_FALSE(why.empty());
+        CHECK_THAT(why, Catch::Matchers::ContainsSubstring("The engine is the older side"));
+        CHECK_THAT(why, !Catch::Matchers::ContainsSubstring("This application is the older side"));
+        // and a negative generation does not get past the hash check either
+        BuildInfo nonsenseButKnown = nonsense;
+        nonsenseButKnown.opsSchema = b.opsSchema;
+        CHECK(engineMismatch(b, nonsenseButKnown).empty());
     }
 }
 
@@ -1064,6 +1150,7 @@ TEST_CASE("engine: sirius-cli serve announces, takes its token from a file and s
     CHECK(a["device"] == "cpu");
     CHECK(a["engine"]["build"] == buildInfo().build);
     CHECK(a["engine"]["ops_schema"] == buildInfo().opsSchema);
+    CHECK(a["engine"]["ops_generation"] == kOpsGeneration);
     CHECK(a["engine"]["api"] == kEngineApiVersion);
     CHECK(waitUntil([&] { return !fs::exists(fs::u8path(tokenFile)); }, std::chrono::seconds(5)));   // read, then deleted
 

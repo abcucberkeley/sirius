@@ -607,39 +607,141 @@ TEST_CASE("tool gate: schemas() is the whole table, the window's --tool and the 
     }
 }
 
+TEST_CASE("tool gate: one default-step rule, and the viewed step is not it", "[app][tool_gate]") {
+    // probe, statistics, export_result and get_diagnostics became one
+    // implementation for all three fronts, and kept two default-step rules:
+    // the window answered the step it was VIEWING, a session the last
+    // computed one, so the same argument-free call measured a different step
+    // in each (docs/findings.md 9k.52, finding C). ToolApi::defaultStepIndex
+    // is now the only rule, and it reads only state both fronts have.
+    Bench b({"test_gate_slow", "test_gate_slow", "test_gate_slow"});
+    ToolApi api(b.wb);
+    REQUIRE(b.wb.pipeline().size() == 4);
+
+    // nothing has run: Load, which always has an output
+    CHECK(ToolApi::defaultStepIndex(b.wb) == 0);
+    CHECK(b.wb.lastRunTarget() == 0);
+
+    GateSlowOp::release = true;
+    const auto runTo = [&](int target) {
+        const std::shared_ptr<RunJob> job = b.wb.createRun(target);
+        REQUIRE(job);
+        job->execute();
+        b.wb.finishRun(job);
+        REQUIRE(job->succeeded());
+    };
+
+    runTo(3);   // the whole pipeline
+    CHECK(ToolApi::defaultStepIndex(b.wb) == 3);
+    CHECK(b.wb.lastRunTarget() == b.wb.pipeline().at(3).id);
+
+    // A run to an EARLIER step is what the default follows, though the later
+    // step still holds its output: "the step the last run produced".
+    runTo(1);
+    CHECK(b.wb.lastRunTarget() == b.wb.pipeline().at(1).id);
+    CHECK(ToolApi::defaultStepIndex(b.wb) == 1);
+    REQUIRE(b.wb.output(3));
+
+    // The viewed step no longer decides, in either direction.
+    b.wb.view(3);
+    REQUIRE(b.wb.viewedIndex() == 3);
+    CHECK(ToolApi::defaultStepIndex(b.wb) == 1);
+    b.wb.view(0);
+    REQUIRE(b.wb.viewedIndex() == 0);
+    CHECK(ToolApi::defaultStepIndex(b.wb) == 1);
+
+    // and the tools that share the rule say the same step
+    const json stats = api.call("statistics", json::object());
+    INFO(stats.dump());
+    REQUIRE(kindOf(stats).empty());
+    CHECK(stats["step"] == 2);
+    const json probe = api.call("probe", {{"x", 0}, {"y", 0}});
+    REQUIRE(kindOf(probe).empty());
+    CHECK(probe["step"] == 2);
+    const json diag = api.call("get_diagnostics", json::object());
+    REQUIRE(kindOf(diag).empty());
+    CHECK(diag["step"] == 2);
+
+    // the schema says the rule rather than naming a front
+    int described = 0;
+    for (const json& t : api.schemas()) {
+        const json& f = t["function"];
+        if (f["name"] != "statistics" && f["name"] != "probe" && f["name"] != "get_diagnostics") continue;
+        const std::string d = f["parameters"]["properties"]["step"]["description"].get<std::string>();
+        INFO(f["name"] << ": " << d);
+        CHECK(d.find("the last run produced") != std::string::npos);
+        CHECK(d.find("in a session") == std::string::npos);
+        ++described;
+    }
+    CHECK(described == 3);
+}
+
 TEST_CASE("tool gate: an argument no tool takes is dropped with a warning, not taken in silence", "[app][tool_gate]") {
     Bench b({"test_gate_slow"});
     ToolApi api(b.wb);
     // A typo in a --tool argument was accepted in silence by the window and
     // warned about by sirius-cli, because only the session checked.
+    // The key is "call_warnings", not "warnings": "warnings" is a documented
+    // reply field of get_step, get_diagnostics and `validate`, and the
+    // note about the call has to be told apart from the step's own
+    // (docs/findings.md 9k.52, finding B).
     const json r = api.call("set_step_enabled", {{"step", 2}, {"enabled", false}, {"enbaled", true}});
     INFO(r.dump());
     REQUIRE(kindOf(r).empty());
-    REQUIRE(r.contains("warnings"));
-    REQUIRE(r["warnings"].size() == 1);
-    CHECK_THAT(r["warnings"][0].get<std::string>(), ContainsSubstring("enbaled"));
+    REQUIRE(r.contains("call_warnings"));
+    REQUIRE(r["call_warnings"].size() == 1);
+    CHECK_THAT(r["call_warnings"][0].get<std::string>(), ContainsSubstring("enbaled"));
     CHECK_FALSE(b.wb.pipeline().at(1).enabled);   // and what was asked still happened
 
     SECTION("a failure carries them too, where they explain it") {
         const json bad = api.call("remove_step", {{"step", 99}, {"force", true}});
         CHECK(kindOf(bad) == "unknown_step");
-        REQUIRE(bad.contains("warnings"));
-        REQUIRE(bad["warnings"].size() == 1);
-        CHECK_THAT(bad["warnings"][0].get<std::string>(), ContainsSubstring("force"));
+        REQUIRE(bad.contains("call_warnings"));
+        REQUIRE(bad["call_warnings"].size() == 1);
+        CHECK_THAT(bad["call_warnings"][0].get<std::string>(), ContainsSubstring("force"));
     }
     SECTION("inside a parameter object it is the operation's business, not the schema's") {
         const json ok = api.call("set_params", {{"step", 2}, {"params", {{"ticks", 3}}}});
         REQUIRE(kindOf(ok).empty());
-        CHECK_FALSE(ok.contains("warnings"));
-        // a parameter the operation does not have is still a refusal, not a warning
-        CHECK(kindOf(api.call("set_params", {{"step", 2}, {"params", {{"tikcs", 3}}}})) == "invalid_argument");
+        CHECK_FALSE(ok.contains("call_warnings"));
+        // A parameter the operation does not have is still a refusal, not a
+        // warning -- and the sentence matters, because the Python mirror has
+        // to refuse the same key in the same words and cannot call this
+        // function (the bindings link the library, not app/core). The two
+        // literals are what keeps them together:
+        // bindings/tests/test_workbench_schema.py's
+        // test_unknown_key_is_refused_as_the_window_and_a_session_refuse_it
+        // asserts the same clause. Until 2026-10-08 Python only WARNED, so a
+        // misspelled `otf` key there warned and then reconstructed with the
+        // theoretical OTF -- a different reconstruction that looks like a
+        // successful run.
+        const json bad = api.call("set_params", {{"step", 2}, {"params", {{"tikcs", 3}}}});
+        CHECK(kindOf(bad) == "invalid_argument");
+        CHECK_THAT(bad.value("error", std::string()), ContainsSubstring("unknown parameter 'tikcs' for test_gate_slow"));
+        CHECK_THAT(bad.value("hint", std::string()), ContainsSubstring("the parameters of test_gate_slow are"));
     }
     SECTION("a tool that declares no properties takes anything, as it did") {
         api.addTool({"gate_open", "Declares no properties.", json{{"type", "object"}},
                      [](const json& a) { return json{{"saw", a.size()}}; }});
         const json open = api.call("gate_open", {{"anything", 1}});
         CHECK(open["saw"] == 1);
-        CHECK_FALSE(open.contains("warnings"));
+        CHECK_FALSE(open.contains("call_warnings"));
+    }
+    SECTION("a tool's own `warnings` is a reply field and is left where it is") {
+        // The dropped-argument note must not be put in the same array: a host
+        // that moves the note out of the answer would take the field with it.
+        api.addTool({"gate_warner", "Reports a warning of its own.",
+                     json{{"type", "object"}, {"properties", {{"step", json{{"type", "integer"}}}}}},
+                     [](const json&) {
+                         return json{{"value", 1}, {"warnings", json::array({"the step's own warning"})}};
+                     }});
+        const json w = api.call("gate_warner", {{"step", 2}, {"stpe", 3}});
+        REQUIRE(w.contains("warnings"));
+        REQUIRE(w["warnings"].size() == 1);
+        CHECK(w["warnings"][0] == "the step's own warning");
+        REQUIRE(w.contains("call_warnings"));
+        REQUIRE(w["call_warnings"].size() == 1);
+        CHECK_THAT(w["call_warnings"][0].get<std::string>(), ContainsSubstring("stpe"));
     }
 }
 

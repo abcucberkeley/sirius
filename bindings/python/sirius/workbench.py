@@ -27,8 +27,19 @@ with exactly the keys, defaults and choices of the C++ operation's parameter
 table (``app/core/ops/*.cpp``), and ``bindings/tests/test_workbench_schema.py``
 checks those declarations against a snapshot of the C++ tables
 (``op_schema.json``). Older key spellings are accepted through each spec's
-aliases; a key a step does not understand raises an
-:class:`UnknownParameterWarning` instead of being ignored.
+aliases; a key a step does not understand raises :class:`UnknownParameter`,
+as the window and a session refuse one (``ToolApi``'s ``callerSpec``) rather
+than running the step with something other than what was asked.
+
+The compute device is resolved by one rule on every front, and it is
+SIRIUS's own: ``auto`` is the GPU when SIRIUS has one and the CPU otherwise
+(``sirius.default_device``), and an explicit request this build or this
+computer cannot honour is an error, not a quiet downgrade
+(``sirius.device_request_problem``). It used to be resolved here by asking
+``torch.cuda.is_available()``, which is a different question and answered
+"no" in the worker image -- where there is no torch but there is a GPU and a
+CUDA-enabled extension -- so every Python reconstruction there ran on the CPU
+with nothing saying so (docs/findings.md 9k.50 finding 3).
 """
 
 from __future__ import annotations
@@ -50,8 +61,10 @@ __all__ = [
     "Cancelled",
     "NotAvailable",
     "RemovedStep",
+    "SimLayoutWarning",
     "StepResult",
     "StepSpec",
+    "UnknownParameter",
     "UnknownParameterWarning",
     "load_dataset",
     "load_model",
@@ -91,9 +104,31 @@ class Cancelled(RuntimeError):
     """Raised inside a step when the caller's cancel callback fired."""
 
 
+class UnknownParameter(ValueError):
+    """A step was given a parameter key no step of that kind takes -- a typo,
+    or a key from another step. Refused rather than ignored, because the step
+    would otherwise run with something other than what was asked and nothing
+    would say so: the window and a session refuse the same key in the same
+    words (``ToolApi``'s ``callerSpec``). The message names the key and lists
+    what the step does take."""
+
+
+class SimLayoutWarning(UserWarning):
+    """A dataset declares angle and phase counts that are not the SIM step's.
+    The dataset does not say how the frames are stored, so the step's own
+    counts are used and the reconstruction goes ahead -- the SIM operation's
+    validate() puts exactly this sentence in its warnings and runs too. When
+    the dataset DOES state a storage layout the same disagreement is an error
+    (:class:`ValueError`, ``sirius.sim_layout_counts_problem``), because then
+    the frames cannot be gathered at all."""
+
+
 class UnknownParameterWarning(UserWarning):
-    """A step received parameter keys it does not understand; they are
-    ignored, but never silently (see :func:`_prepare_params`)."""
+    """A step was given a key SIRIUS used to have and no longer does (the
+    Contrast step's ``bake``, say). Dropped with this warning rather than
+    refused, so that a pipeline or a script exported by an older SIRIUS still
+    runs: each one is listed by name in a spec's ``translate`` hook, which is
+    what makes it different from the typo :class:`UnknownParameter` is for."""
 
 
 # --------------------------------------------------------------------------
@@ -254,8 +289,29 @@ def _prepare_params(spec: StepSpec, params: Optional[Dict[str, Any]],
         spec.translate(p, meta)
     unknown = sorted(k for k in p if k not in spec.known())
     if unknown:
-        warnings.warn(f"step '{spec.kind}': unknown parameter(s) {', '.join(unknown)} ignored; "
-                      f"it takes {', '.join(spec.keys) or 'no parameters'}", UnknownParameterWarning, stacklevel=3)
+        # Refused, not warned about. The window and a session refuse an
+        # unknown STEP parameter (app/core/tool_api.cpp's callerSpec: "the
+        # step would run with something other than what was asked, and
+        # nothing would say so"); only an unknown TOOL ARGUMENT is dropped
+        # with a warning there, which is a different thing. A warning here
+        # was the same silence one front further on: `otf_pth=...` warned and
+        # then reconstructed with the THEORETICAL OTF, which looks like a
+        # successful run and is a different reconstruction (the Python front's
+        # finding D). An empty `otf` still means the theoretical OTF -- that
+        # is what the empty OTF field means in the GUI and the CLI too -- but
+        # a key the caller misspelled does not.
+        #
+        # The first clause is word for word callerSpec's, so one condition has
+        # one wording across the three fronts (docs/findings.md 9k.50, finding
+        # 5). What follows is Python's, because this spec also accepts the
+        # older spellings in `aliases` and the Python-only keys in `extra`,
+        # which the C++ table has no names for.
+        also = sorted(set(spec.aliases) | set(spec.extra))
+        raise UnknownParameter(
+            f"unknown parameter '{unknown[0]}' for {spec.kind}"
+            + (" (and " + ", ".join(repr(k) for k in unknown[1:]) + ")" if len(unknown) > 1 else "")
+            + f"; the parameters of {spec.kind} are {', '.join(spec.keys) or 'none'}"
+            + (f" (it also accepts {', '.join(also)})" if also else ""))
     for k, d in spec.defaults.items():
         if p.get(k) is None:
             p[k] = list(d) if isinstance(d, list) else d
@@ -3486,8 +3542,8 @@ def _sim_layout_from_text(text: str) -> Dict[str, Any]:
     return {"present": True, "layout": st.text(), "ndirs": st.angles(), "nphases": st.phases(), "fast_si": fast}
 
 
-def _sim_layout_on_z(layout: str) -> Optional[Tuple[int, int, bool]]:
-    """(ndirs, nphases, fast_si) of a storage layout that leaves every frame on
+def _sim_layout_on_z(layout: str) -> Optional[Tuple[int, int, bool, str]]:
+    """(ndirs, nphases, fast_si, canonical text) of a storage layout that leaves every frame on
     the z axis in one of the two orders the reconstructor reads -- angle → z →
     phase ("z=[angle 3, z, phase 5]", the z extent written out or not, absent
     for a single plane) or the fast-SI z → angle → phase -- else None: the
@@ -3504,10 +3560,14 @@ def _sim_layout_on_z(layout: str) -> Optional[Tuple[int, int, bool]]:
     if st.montage() or not _sim_identity_entry(st.axes[0], 0) or not _sim_identity_entry(st.axes[1], 1):
         return None
     kinds = [k for k, _ in st.axes[2]]
+    # The counts are always written out for angle and phase: checkStorage
+    # only lets an axis's OWN kind take the remainder (z on z), so these are
+    # the counts bindSimLayout would bind, not a parse that still needs the
+    # file's length.
     if kinds in (["angle", "z", "phase"], ["angle", "phase"]):
-        return st.angles(), st.phases(), False
+        return st.angles(), st.phases(), False, st.text()
     if kinds == ["z", "angle", "phase"]:
-        return st.angles(), st.phases(), True
+        return st.angles(), st.phases(), True, st.text()
     return None
 
 
@@ -3571,7 +3631,29 @@ def _sim_parameters(params: Dict[str, Any], meta: Dict[str, Any]):
         if packed is None:
             raise NotAvailable(f"the SIM storage layout '{sim['layout']}' (angles on the channels, or a montage) is "
                                "gathered into a stack only by the SIRIUS application's SIM step; run it there")
-        p.fast_si = packed[2]
+        angles, phases, fast, text = packed
+        # The layout's COUNTS, not only its order. They were parsed and thrown
+        # away, so this mirror reconstructed a layout-versus-parameter
+        # mismatch -- with the step's own angles and phases, against frames
+        # stored in a different grid -- where the SIM operation's validate()
+        # refuses the pipeline outright (the Python front's finding C). The
+        # sentence is the library's one (sirius::simLayoutCountsProblem), so
+        # the window, a session and this read the same words; `text` is the
+        # canonical form, which is what SimLayout::text() quotes there.
+        why = sirius.sim_layout_counts_problem(text, angles, phases, p.ndirs, p.nphases)
+        if why:
+            raise ValueError(why)
+        p.fast_si = fast
+    elif sim.get("present"):
+        # No layout: the dataset says what it holds but not how it is stored,
+        # so the step's own counts are used and the run goes ahead -- with the
+        # same warning the operation's validate() adds (the shorthand branch
+        # of app/core/ops/sim.cpp). It reaches a session and sirius-cli
+        # through the step's warnings; here it is a Python warning.
+        note = sirius.sim_declared_counts_note(int(sim.get("ndirs") or 0), int(sim.get("nphases") or 0),
+                                               p.ndirs, p.nphases)
+        if note and sim.get("ndirs") and sim.get("nphases"):
+            warnings.warn(f"step 'sim': {note}", SimLayoutWarning, stacklevel=4)
     # The pixel sizes: the file's where it sets them, the stack's otherwise,
     # as sim.cpp's buildParameters has it since 2026-10-08. A cudasirecon
     # config's xyres / zres are the pixel sizes it reconstructs a TIFF stack
@@ -3635,7 +3717,7 @@ def _to_numpy(result) -> np.ndarray:
 
 @_step(_SIM)
 def step_sim(a: np.ndarray, params: Dict[str, Any], meta: Dict[str, Any], progress: ProgressFn = None,
-             cancelled: CancelFn = None, device: str = "cpu") -> StepResult:
+             cancelled: CancelFn = None, device: str = "auto") -> StepResult:
     """Structured illumination reconstruction of a raw stack whose z axis holds
     angles * phases * nz sections, with the application's SIM step parameters
     (mode: Estimate | Manual | From file (params_file); angles, phases, wiener,
@@ -3644,7 +3726,11 @@ def step_sim(a: np.ndarray, params: Dict[str, Any], meta: Dict[str, Any], progre
     it sets them and the metadata's fill in the rest, as in the application.
     An empty `otf` (the default) is the theoretical OTF of an aberration-free
     objective with the step's NA, immersion index and wavelength, exactly as
-    it is in the GUI and the CLI."""
+    it is in the GUI and the CLI; a MISSPELLED otf key is refused
+    (UnknownParameter) rather than silently meaning the same thing.
+    `device` is "auto" as it is for `run_step`, resolved by `resolve_device`'s
+    one rule -- it was "cpu" here, so a direct call reconstructed on the CPU
+    whatever the caller's pipeline asked for."""
     sirius = _sirius_ext()
     p = _sim_parameters(params, meta)
     otf = _str(params, "otf")
@@ -3667,9 +3753,13 @@ def step_sim(a: np.ndarray, params: Dict[str, Any], meta: Dict[str, Any], progre
     # reconstructor on (setupGeneration, threeD, device, rigor) for exactly
     # this reason -- or a 2D stack after a 3D one would reuse the 3D OTF.
     three_d = nz > 1
+    # resolve_device has already refused a GPU this build or this computer
+    # cannot give, so there is nothing left to fall back from: `and
+    # cuda_available()` here was the downgrade that made an explicit
+    # device="cuda" reconstruct on the CPU without a word.
     device = resolve_device(device)
-    use_cuda = device.startswith("cuda") and sirius.cuda_available()
-    dev = sirius.Device.cuda(int(device.split(":")[1]) if ":" in device else 0) if use_cuda else sirius.Device.cpu()
+    dev = sirius.Device(device)
+    use_cuda = dev.is_cuda
     key = json.dumps({"otf": os.path.abspath(otf) if otf else "", "three_d": three_d,
                       "dev": str(dev), "p": _params_key(p)}, sort_keys=True)
     recon = _sim_cache.get(key)
@@ -3716,15 +3806,85 @@ def _torch():
     return torch
 
 
-def resolve_device(device: str = "auto") -> str:
-    """'auto' -> 'cuda' when torch sees a GPU, else 'cpu'."""
-    device = (device or "auto").lower()
-    if device == "auto":
-        try:
-            return "cuda" if _torch().cuda.is_available() else "cpu"
-        except NotAvailable:
-            return "cpu"
-    return device
+def resolve_device(device: str = "auto", *, torch_tensors: bool = False) -> str:
+    """The device a step runs on, by the one rule every front resolves it by:
+    ``"auto"`` (or ``""``) is the GPU when SIRIUS has one and the CPU
+    otherwise, and an explicit ``"cuda"`` / ``"cuda:N"`` this build or this
+    computer cannot honour is an ERROR rather than a quiet downgrade.
+
+    The capability asked is SIRIUS's own -- ``sirius.cuda_available``, which
+    is what the window's Workbench constructor and sirius-cli's
+    ``--backend auto`` ask -- and the refusal is the library's one sentence
+    (``sirius.device_request_problem``), the same one the window's
+    ``set_backend`` and sirius-cli's ``--backend cuda`` report. Until
+    2026-10-08 this function asked ``torch.cuda.is_available()`` instead: a
+    different question, answered "no" in the SIRIUS worker image, which has
+    no torch but does have a GPU and a CUDA-enabled extension. Every Python
+    SIM reconstruction there ran on the CPU, and ``step_sim`` additionally
+    downgraded an explicit ``device="cuda"`` to the CPU on its own.
+
+    The answer keeps the spelling the caller used -- a bare ``"cuda"`` stays
+    ``"cuda"`` and does not grow an index the caller did not ask for -- so
+    that what the worker reports as its device is what it was started with.
+
+    ``torch_tensors=True`` is for the steps that place a TORCH tensor (the
+    segmentation models): the answer is narrowed to what torch can use here,
+    because torch's GPUs are not SIRIUS's. ``"auto"`` then falls back to the
+    CPU, which is what the application does for a step whose backend has no
+    usable device (``StepContext::deviceForVolume``, and the step's row is
+    tagged "CPU (no GPU path)"); an EXPLICIT request torch cannot honour is
+    refused, because the caller asked for a GPU and would otherwise be told
+    nothing.
+    """
+    spec = (device or "auto").strip().lower()
+    explicit = spec not in ("", "auto")
+    if spec == "hpc":
+        # A front-level backend, not a device: the cluster node is reached by
+        # the application (sirius-cli --hpc), and this process runs the step
+        # here or not at all. It used to pass straight through and then
+        # compare False against "cuda", so device="hpc" ran on the CPU.
+        raise NotAvailable("'hpc' is a backend of the SIRIUS application, not a device: this process runs the "
+                           "step here. Use 'cpu', 'cuda', 'cuda:N' or 'auto'.")
+    try:
+        ext = _sirius_ext()
+    except NotAvailable:
+        ext = None
+    if ext is not None:
+        if explicit:
+            why = ext.device_request_problem(spec)
+            if why:
+                raise NotAvailable(why)
+            resolved = "cuda" if spec == "gpu" else spec
+        else:
+            resolved = "cuda" if ext.default_device().is_cuda else "cpu"
+    else:
+        # No compiled extension -- a bare interpreter running this file, which
+        # is how the worker loads it on a node without the wheel. SIRIUS's own
+        # capability cannot be asked, and nothing here reaches a GPU except
+        # through torch, so for a torch step torch's answer is the only one
+        # there is and for anything else the answer is the CPU. The spellings
+        # are the library parser's; this is the one place that cannot call it.
+        canonical = {"cpu": "cpu", "cuda": "cuda", "gpu": "cuda"}.get(spec)
+        if canonical is None and spec.startswith("cuda:") and spec[5:].isdigit():
+            canonical = spec
+        if explicit and canonical is None:
+            raise NotAvailable(f"'{device}' is not a device (expected cpu, cuda or cuda:N)")
+        if not torch_tensors:
+            if not explicit or canonical == "cpu":
+                return "cpu"
+            raise NotAvailable(f"this process has no compiled sirius extension, so it cannot use {canonical}: "
+                               "install the sirius package, or ask for device 'cpu'")
+        resolved = canonical or ("cuda" if _torch().cuda.is_available() else "cpu")
+    if not torch_tensors or not resolved.startswith("cuda"):
+        return resolved
+    # The narrowing for a torch tensor: torch's GPUs are not SIRIUS's.
+    if bool(_torch().cuda.is_available()):
+        return resolved
+    if explicit:
+        seen = f"this build sees {ext.cuda_device_count()} CUDA device(s)" if ext is not None else "SIRIUS was not asked"
+        raise NotAvailable(f"torch cannot use {resolved} on this computer, so a model cannot run there ({seen}). "
+                           "Install a CUDA build of torch, or ask for device 'cpu'.")
+    return "cpu"
 
 
 # Loaded models by (file, device), each with the file's (mtime, size) when it
@@ -3838,7 +3998,9 @@ def load_model(path: str, device: str = "auto", progress: ProgressFn = None):
         family, _ = _family_of(path)
         raise NotAvailable(f"'{path}' is a {family} model family spec: it returns labels through the worker "
                            "(sirius_worker.models.run_family), not a loadable tensor model")
-    device = resolve_device(device)
+    # the model is placed as a torch tensor unless it is an ONNX file, whose
+    # GPU is onnxruntime's provider rather than torch's
+    device = resolve_device(device, torch_tensors=not path.strip().lower().endswith(".onnx"))
     spec = path.strip()
     known = _hf_spec_files.get(spec)
     if known is not None:
@@ -3940,7 +4102,7 @@ def model_info(path: str, device: str = "cpu") -> Dict[str, Any]:
         return info
     torch = _torch()
     info["format"] = "TorchScript"
-    dev = resolve_device(device)
+    dev = resolve_device(device, torch_tensors=True)
     probe = torch.zeros((1, 1, 16, 32, 32), dtype=torch.float32, device=dev)
     info["input_shape"] = [1, 1, -1, -1, -1]
     with torch.no_grad():
@@ -4028,7 +4190,7 @@ def tiled_inference(volume: np.ndarray, model, tile: Sequence[int] = (32, 256, 2
     windows: Dict[Tuple[Tuple[bool, ...], Tuple[bool, ...]], np.ndarray] = {}
     is_onnx = isinstance(model, _OnnxModel)
     torch = None if is_onnx else _torch()
-    dev = resolve_device(device)
+    dev = resolve_device(device, torch_tensors=not is_onnx)
     acc: Optional[np.ndarray] = None
     weight = np.zeros(shape, dtype=np.float32)
     for i, (z0, y0, x0) in enumerate(tiles):
@@ -4482,6 +4644,9 @@ def run_pipeline(dataset_path: str, pipeline: Any, progress: ProgressFn = None, 
     NotAvailable, or are skipped with their kinds in meta["skipped"] when
     strict is False. A step of a kind SIRIUS no longer has (``_REMOVED``)
     raises RemovedStep, or with strict False is skipped with a warning.
+    `device` is resolved once for the whole pipeline by `resolve_device`'s one
+    rule, so a GPU this build or this computer cannot give fails the call
+    rather than becoming a skipped step.
     """
     if isinstance(pipeline, str):
         pipeline = json.loads(pipeline)
@@ -4518,6 +4683,12 @@ def run_pipeline(dataset_path: str, pipeline: Any, progress: ProgressFn = None, 
     meta["voxel_um"] = [v if v > 0 else cur for v, cur in zip(voxel, meta["voxel_um"])]
     if sim_meta is not None:
         meta["sim"] = sim_meta
+    # Resolved once, before any step runs, and for the whole pipeline. A
+    # device this build or this computer cannot honour has to fail the CALL:
+    # resolved inside a step it would be a NotAvailable, which strict=False
+    # turns into a skipped step and a result -- the silence this is here to
+    # remove.
+    device = resolve_device(device)
     labels: Optional[np.ndarray] = None
     skipped: List[str] = []
     n = max(len(steps), 1)

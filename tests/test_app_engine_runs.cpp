@@ -447,9 +447,13 @@ TEST_CASE("engine runs: no engine, another engine, files of this computer: refus
         CHECK(py.runGate().enabled);
     }
 
-    // an engine whose operations are another SIRIUS's
+    // an engine whose operations are another SIRIUS's. The operation SET is
+    // what is compared (ops_generation, core/build_info.hpp): a schema hash
+    // of its own is not a mismatch, so the hash moves here with the
+    // generation that makes it one.
     RemoteConfig other = engineConfig(ep);
     other.engine["ops_schema"] = "0000";
+    other.engine["ops_generation"] = 99;
     other.engine["build"] = "0.0.9+gdeadbee";
     wb.setRemoteConfig(other);
     CHECK_FALSE(wb.createRun());

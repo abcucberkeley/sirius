@@ -2,11 +2,37 @@
 
 from __future__ import annotations
 
+import importlib.util
+import sys
 import unittest
+from pathlib import Path
 
 import numpy as np
 
 import sirius
+
+DATA = Path(__file__).resolve().parents[2] / "tests" / "data"
+
+
+def _workbench():
+    """The workbench module of THIS source tree, never an installed copy --
+    the same loader bindings/tests/test_parity.py uses."""
+    here = Path(__file__).resolve().parents[2] / "bindings" / "python" / "sirius" / "workbench.py"
+    try:
+        import sirius.workbench as wb  # type: ignore
+
+        if Path(wb.__file__).resolve() == here:
+            return wb
+    except Exception:  # noqa: BLE001
+        pass
+    name = "sirius_workbench_under_test"
+    if name in sys.modules:
+        return sys.modules[name]
+    spec = importlib.util.spec_from_file_location(name, here)
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[name] = module
+    spec.loader.exec_module(module)  # type: ignore[union-attr]
+    return module
 
 
 def _gpu_or_skip(test: unittest.TestCase) -> sirius.Device:
@@ -61,6 +87,122 @@ class TestDevice(unittest.TestCase):
         self.assertIn("DeviceProperties", repr(p))
         with self.assertRaises(RuntimeError):
             sirius.device_properties(sirius.Device.cpu())
+
+
+class TestOneDeviceRule(unittest.TestCase):
+    """One rule, one wording, on all three fronts.
+
+    The window (Workbench's constructor and ToolApi's set_backend), the
+    command line (sirius-cli --backend) and this mirror
+    (sirius.workbench.resolve_device) each used to decide for themselves what
+    "auto" means and what to do with a request they cannot honour, and they
+    did not agree: the C++ fronts asked SIRIUS's own cuda_available() while
+    the Python mirror asked torch.cuda.is_available(). In the worker image --
+    no torch, but a GPU and a CUDA-enabled extension -- that made every
+    Python reconstruction run on the CPU with nothing saying so, and
+    step_sim downgraded an explicit device="cuda" on its own
+    (docs/findings.md 9k.50 finding 3; the Python front's finding A).
+
+    The anchor is sirius.device_request_problem: the C++ half of this -- the
+    case "headless: the window and a session resolve one backend, and refuse
+    what they cannot honour in one wording" in tests/test_app_headless.cpp --
+    drives ToolApi and HeadlessWorkbench side by side and checks what each
+    answers against that function (its window arm needs a computer with no
+    GPU, because Workbench::setCudaDevice clamps an index; the session arm
+    runs everywhere), and the cases below assert that Python raises exactly
+    its sentence, so the three cannot drift without one of the two failing.
+    """
+
+    def test_auto_is_sirius_own_capability(self):
+        wb = _workbench()
+        expected = "cuda" if sirius.cuda_available() else "cpu"
+        self.assertEqual(wb.resolve_device("auto"), expected)
+        self.assertEqual(wb.resolve_device(""), expected)
+        self.assertEqual(wb.resolve_device(None), expected)
+        # the same capability the C++ fronts start from (they carry a Backend,
+        # not a device string, so the comparison is the capability)
+        self.assertEqual(sirius.default_device().is_cuda, sirius.cuda_available())
+
+    def test_auto_does_not_ask_torch(self):
+        """The failure itself: a torch that sees no GPU must not make SIRIUS's
+        GPU disappear, and no torch at all must not either."""
+        if not sirius.cuda_available():
+            self.skipTest("no CUDA device: there is no GPU for torch to hide")
+        wb = _workbench()
+        import types
+
+        fake = types.ModuleType("torch")
+        fake.cuda = types.SimpleNamespace(is_available=lambda: False)
+        saved = sys.modules.get("torch")
+        sys.modules["torch"] = fake
+        try:
+            self.assertEqual(wb.resolve_device("auto"), "cuda")
+            self.assertEqual(wb.resolve_device("cuda"), "cuda")
+        finally:
+            if saved is None:
+                del sys.modules["torch"]
+            else:
+                sys.modules["torch"] = saved
+
+    def test_a_request_that_cannot_be_honoured_is_refused_in_the_librarys_words(self):
+        wb = _workbench()
+        # An index past the last GPU is unhonourable whether or not this
+        # computer has a GPU, so this case runs on every machine -- which is
+        # the point: the a100 nodes HAVE CUDA, so a "no CUDA" case alone would
+        # only ever skip here.
+        far = f"cuda:{max(sirius.cuda_device_count(), 1) + 99}"
+        why = sirius.device_request_problem(far)
+        self.assertTrue(why, "an index past the last GPU has to be a problem")
+        with self.assertRaises(wb.NotAvailable) as cm:
+            wb.resolve_device(far)
+        self.assertEqual(str(cm.exception), why)
+        # and the spec that is not a device at all
+        self.assertTrue(sirius.device_request_problem("tpu"))
+        with self.assertRaises(wb.NotAvailable) as cm:
+            wb.resolve_device("tpu")
+        self.assertEqual(str(cm.exception), sirius.device_request_problem("tpu"))
+
+    def test_an_honourable_request_is_honoured_and_canonicalised(self):
+        wb = _workbench()
+        self.assertEqual(sirius.device_request_problem("cpu"), "")
+        self.assertEqual(wb.resolve_device("cpu"), "cpu")
+        self.assertEqual(wb.resolve_device("CPU"), "cpu")
+        if sirius.cuda_available():
+            self.assertEqual(sirius.device_request_problem("cuda"), "")
+            # the caller's own spelling is kept; "gpu" is the one alias, as
+            # the application's backendFromString takes it
+            self.assertEqual(wb.resolve_device("cuda"), "cuda")
+            self.assertEqual(wb.resolve_device("gpu"), "cuda")
+            self.assertEqual(wb.resolve_device("cuda:0"), "cuda:0")
+        else:
+            self.assertTrue(sirius.device_request_problem("cuda"))
+            with self.assertRaises(wb.NotAvailable):
+                wb.resolve_device("cuda")
+
+    def test_hpc_is_a_backend_not_a_device(self):
+        """It used to pass straight through and then compare False against
+        "cuda", so `device="hpc"` ran on the CPU in silence."""
+        wb = _workbench()
+        with self.assertRaises(wb.NotAvailable) as cm:
+            wb.resolve_device("hpc")
+        self.assertIn("backend of the SIRIUS application", str(cm.exception))
+
+    def test_a_sim_step_runs_where_it_was_told_to(self):
+        """The consequence, end to end: the device in the result is the device
+        asked for, and an explicit GPU this computer does not have is an error
+        instead of a CPU run reported as success."""
+        wb = _workbench()
+        raw = sirius.read_tiff(str(DATA / "raw.tif"), dtype=np.float32)
+        meta = {"voxel_um": [0.08, 0.08, 0.125]}
+        params = {"na": 1.42, "nimm": 1.515, "linespacing_um": 0.2035, "k0_start_angle": 46.08}
+        self.assertEqual(wb.run_step("sim", params, raw, meta, device="cpu").info["device"], "cpu")
+        if sirius.cuda_available():
+            # info["device"] is the DEVICE it ran on, which names its
+            # index: str(sirius.Device)
+            self.assertEqual(wb.run_step("sim", params, raw, meta, device="cuda").info["device"], "cuda:0")
+        far = f"cuda:{max(sirius.cuda_device_count(), 1) + 99}"
+        with self.assertRaises(wb.NotAvailable):
+            wb.run_step("sim", params, raw, meta, device=far)
 
 
 class TestBuffer(unittest.TestCase):

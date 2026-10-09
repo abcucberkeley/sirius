@@ -2461,6 +2461,12 @@ namespace sirius::app {
             char buf[32];
             std::snprintf(buf, sizeof buf, "%.1f s", job->seconds());
             logLine(std::string("Run finished in ") + buf);
+            // What an argument-free probe, statistics, export_result or
+            // get_diagnostics means by "the step" (ToolApi::defaultStepIndex).
+            // The job's own snapshot names the target, so a pipeline edited
+            // while the run went on cannot shift it.
+            const int t = job->target();
+            if (t >= 0 && t < job->pipeline().size()) lastRunTarget_ = job->pipeline().at(t).id;
         } else {
             logLine("Run " + (job->wasCancelled() ? std::string("cancelled") : "failed: " + job->error()));
         }

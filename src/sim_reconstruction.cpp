@@ -834,4 +834,23 @@ namespace sirius {
         return impl_->run(raw);
     }
 
+    // --- the sentences every front says about the counts --------------------
+
+    std::string simLayoutCountsProblem(const std::string& layoutText, int layoutAngles, int layoutPhases,
+                                       int stepAngles, int stepPhases) {
+        if (layoutAngles == stepAngles && layoutPhases == stepPhases) return "";
+        // the multiplication sign the application's validation messages use
+        return "The dataset's layout " + layoutText + " holds " + std::to_string(layoutAngles) +
+               " angles × " + std::to_string(layoutPhases) + " phases; the step uses " +
+               std::to_string(stepAngles) + " × " + std::to_string(stepPhases) +
+               ". They have to agree for the frames to be gathered.";
+    }
+
+    std::string simDeclaredCountsNote(int datasetAngles, int datasetPhases, int stepAngles, int stepPhases) {
+        if (datasetAngles == stepAngles && datasetPhases == stepPhases) return "";
+        return "The dataset declares " + std::to_string(datasetAngles) + " angles × " +
+               std::to_string(datasetPhases) + " phases; the step uses " + std::to_string(stepAngles) +
+               " × " + std::to_string(stepPhases) + ".";
+    }
+
 } // namespace sirius

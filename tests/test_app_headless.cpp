@@ -29,8 +29,11 @@
 #include <sirius/buffer.hpp>
 #include <sirius/tiff_io.hpp>
 
+#include <sirius/device.hpp>
+
 #include "core/array_source.hpp"
 #include "core/headless.hpp"
+#include "core/tool_api.hpp"
 #include "core/host.hpp"
 #include "core/labels.hpp"
 
@@ -322,6 +325,111 @@ TEST_CASE("headless: the GUI's pipeline and the session's are the same pipeline 
     }
 }
 
+TEST_CASE("headless: the window and a session resolve one backend, and refuse what they cannot honour in one wording",
+          "[app][headless]") {
+    // The user's requirement is that the window, the command line and the
+    // Python bindings behave the same (docs/findings.md 9k.50). For the
+    // compute backend they did not: the window's set_backend ACCEPTED a CUDA
+    // request on a computer with no GPU and the run then fell back to the CPU
+    // (Workbench::run checks cudaAvailable() again), so the window answered
+    // "backend: CUDA" for a run that was not on one; a session refused it; and
+    // the Python mirror asked torch instead of SIRIUS and silently used the
+    // CPU in the worker image, which has no torch (9k.50 finding 3, and the
+    // Python front's finding A).
+    //
+    // The anchor of all three is sirius::deviceRequestProblem. This case
+    // drives the window (ToolApi) and a session (HeadlessWorkbench) side by
+    // side and checks what each answers against that function;
+    // bindings/tests/test_device.py's TestOneDeviceRule checks resolve_device
+    // against the same function, so the three cannot drift apart without one
+    // of the two failing.
+    //
+    // It asserts on a GPU machine and on a CPU-only one. An INDEX past the
+    // last GPU is unhonourable either way, so the session's arm is never a
+    // skip on the a100 nodes these tests run on; the window's own refusal
+    // needs a computer with no GPU, because Workbench::setCudaDevice clamps
+    // an index and leaves it only availability to refuse (the section below
+    // measures the clamp rather than assuming it).
+    const int count = cudaDeviceCount();
+    const int absent = std::max(count, 1) + 99;
+    const std::string why = deviceRequestProblem(Device::cuda(absent));
+    REQUIRE_FALSE(why.empty());
+    CHECK_THAT(why, ContainsSubstring("does not exist"));
+
+    TempDir guiScratch{"gui_backend"};
+    Workbench gui(guiScratch.path);
+    ToolApi api(gui);
+    Fixture f;
+
+    SECTION("a GPU index past the last one is refused by the session, in those words") {
+        // Only the session can be put in this state. Workbench::setCudaDevice
+        // CLAMPS an index to the GPUs this computer has (min(index, n - 1)),
+        // so the window's set_backend only ever has an honourable index to
+        // check and its refusal is the availability one below. Measured here
+        // rather than changed: that clamp is what keeps a preference saved on
+        // a four-GPU machine from failing on a one-GPU machine, and the GUI
+        // offers only the GPUs it found.
+        gui.setCudaDevice(absent);
+        CHECK(gui.cudaDevice() == std::max(count - 1, 0));
+
+        const agent::ToolResult s = f.call("set_backend", {{"backend", "cuda"}, {"cuda_device", absent}});
+        INFO("session " << s.error.code << ": " << s.error.message);
+        CHECK_FALSE(s.ok);
+        CHECK(s.error.message == why);
+        CHECK(s.error.code == "unsupported");
+        // and it refused BEFORE changing anything: an index this computer
+        // does not have is not left behind on the workbench
+        CHECK(f.ok("list_devices")["cuda_device"] != absent);
+    }
+
+    SECTION("the CPU is honoured by both, and says nothing") {
+        CHECK(deviceRequestProblem(Device::cpu()).empty());
+        // the two fronts spell the backend differently in their replies -- the
+        // window's enum is {CUDA, CPU, HPC} and the session's {cpu, cuda,
+        // hpc}, each as its own schema declares it -- so what is compared is
+        // the backend they ended up on, not the string
+        CHECK(api.call("set_backend", {{"backend", "CPU"}}).value("backend", std::string()) == "CPU");
+        CHECK(gui.backend() == Backend::Cpu);
+        CHECK(f.ok("set_backend", {{"backend", "cpu"}})["backend"] == "cpu");
+    }
+
+    SECTION("a GPU this computer has is honoured by both; one it has none of is refused by both") {
+        if (cudaAvailable()) {
+            CHECK(deviceRequestProblem(Device::cuda(0)).empty());
+            CHECK(api.call("set_backend", {{"backend", "CUDA"}}).value("backend", std::string()) == "CUDA");
+            CHECK(gui.backend() == Backend::Cuda);
+            CHECK(f.ok("set_backend", {{"backend", "cuda"}})["backend"] == "cuda");
+        } else {
+            // The window's half of the finding: this used to answer
+            // {"backend":"CUDA"} and the run then fell back to the CPU.
+            const std::string none = deviceRequestProblem(Device::cuda(0));
+            REQUIRE_FALSE(none.empty());
+            const json w = api.call("set_backend", {{"backend", "CUDA"}});
+            INFO("window " << w.dump());
+            CHECK(w.value("error", std::string()) == none);
+            CHECK(w.value("error_kind", std::string()) == "unsupported");
+            CHECK(gui.backend() != Backend::Cuda);
+            const agent::ToolResult s = f.call("set_backend", {{"backend", "cuda"}});
+            CHECK_FALSE(s.ok);
+            CHECK(s.error.message == none);
+            // the one sentence, from both fronts
+            CHECK(s.error.message == w.value("error", std::string()));
+        }
+    }
+
+    SECTION("the rule for a request that names nothing is the same on both, and it is SIRIUS's own") {
+        // Workbench's constructor starts on CUDA when SIRIUS has a GPU and on
+        // the CPU otherwise, which is what defaultDevice() says and what
+        // sirius-cli's --backend auto inherits. Python's "auto" is the same
+        // function (sirius.default_device).
+        CHECK(defaultDevice().isCuda() == cudaAvailable());
+        CHECK((gui.backend() == Backend::Cuda) == cudaAvailable());
+        Fixture autoF([](HeadlessOptions& o) { o.backend = "auto"; });
+        const std::string backend = autoF.ok("list_devices")["backend"];
+        CHECK(backend == (cudaAvailable() ? "cuda" : "cpu"));
+    }
+}
+
 TEST_CASE("headless: the Load step reports the histogram the launch screen used to take from a Contrast step", "[app][headless]") {
     // Removing the default Contrast step took away the only source of the
     // launch screen's histogram cell, which the diagnostics body draws for a
@@ -444,6 +552,38 @@ TEST_CASE("headless: open_dataset describes raw.tif", "[app][headless]") {
         REQUIRE(r.ok);
         REQUIRE(r.warnings.size() == 1);
         CHECK_THAT(r.warnings[0], ContainsSubstring("verbose"));
+        CHECK_FALSE(r.value.contains("call_warnings"));   // moved out, not left in the answer
+    }
+    SECTION("get_step and get_diagnostics keep the `warnings` array their callers read") {
+        // Their descriptions name it ("parameters, summary, validation errors
+        // and warnings"; "summary, facts, table, curves, histograms,
+        // warnings"; `validate`'s "each step's errors and warnings"), the
+        // window's --tool has always returned it, and the session erased it
+        // along with the note about the call. Both kinds now
+        // reach the session's warnings, and the reply field stays
+        // (docs/findings.md 9k.52, finding B).
+        const json step = f.ok("get_step", {{"step", 1}});
+        REQUIRE(step.contains("warnings"));
+        CHECK(step["warnings"].is_array());
+        const json diag = f.ok("get_diagnostics", {{"step", 1}});
+        REQUIRE(diag.contains("warnings"));
+        CHECK(diag["warnings"].is_array());
+        const json validated = f.ok("validate");
+        REQUIRE(validated.contains("steps"));
+        REQUIRE(validated["steps"].is_array());
+        REQUIRE_FALSE(validated["steps"].empty());
+        CHECK(validated["steps"][0].contains("warnings"));
+
+        // and the call's own note still arrives where a client looks for it,
+        // without taking the field with it
+        const agent::ToolResult r = f.call("get_step", {{"step", 1}, {"verbsoe", true}});
+        REQUIRE(r.ok);
+        CHECK(r.value.contains("warnings"));
+        CHECK_FALSE(r.value.contains("call_warnings"));
+        bool said = false;
+        for (const std::string& w : r.warnings)
+            if (w.find("verbsoe") != std::string::npos) said = true;
+        CHECK(said);
     }
 }
 

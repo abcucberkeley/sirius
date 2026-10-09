@@ -105,16 +105,18 @@ namespace sirius::app {
         nlohmann::json contextSnapshot() const;
         std::string systemPrompt() const;
 
-        // What probe, statistics and export_result need that only the host
-        // knows: which step a call that names no step means, that step's
-        // output (running it first when the call says run), and the progress
-        // and cancellation of the long read that follows. A field left empty
-        // is the application's answer instead -- the viewed step, the output
-        // the workbench already holds (run through the run hook above), no
-        // progress and no cancellation -- so the window needs none of this
-        // and a session (core/headless.hpp) sets all four.
+        // What probe, statistics, export_result and get_diagnostics need that
+        // only the host knows: that step's output (running it first when the
+        // call says run), and the progress and cancellation of the long read
+        // that follows. A field left empty is the application's answer
+        // instead -- the output the workbench already holds (run through the
+        // run hook above), no progress and no cancellation -- so the window
+        // needs none of this and a session (core/headless.hpp) sets all
+        // three. WHICH step a call that names none means is NOT here: that is
+        // one rule for every front (defaultStepIndex below), and a host
+        // having one of its own is what finding C of docs/findings.md 9k.52
+        // was.
         struct OutputAccess {
-            std::function<int()> defaultStep;
             std::function<std::shared_ptr<const StepOutput>(int index, bool runIfNeeded)> output;
             std::function<void(double fraction, const std::string& message)> progress;
             std::function<bool()> cancelled;
@@ -146,6 +148,20 @@ namespace sirius::app {
         // name or kind. Throws ToolFailure: "unknown_step" for a step there
         // is not, "invalid_argument" for a value missing or of another type.
         static int resolveStepIndex(const Pipeline& p, const nlohmann::json& args, const char* key = "step");
+
+        // THE default-step rule, the one probe, statistics, export_result and
+        // get_diagnostics use when a call names no step. One rule, here, for
+        // every front: the window, sirius-cli and the MCP session used to
+        // disagree -- the window answered the step it was VIEWING, which a
+        // session has no equivalent of (nothing but add_step and
+        // load_pipeline move it there, so it is usually a step with no
+        // output at all), while a session answered the last computed one
+        // (docs/findings.md 9k.50's requirement, 9k.51, and 9k.52 finding C).
+        // The rule: the step the last successful run produced while it still
+        // exists and still has an output, else the last enabled step that has
+        // one, else Load. It never names a step without an output, so an
+        // argument-free call cannot fail with not_computed.
+        static int defaultStepIndex(const Workbench& wb);
         nlohmann::json stepJson(int index) const;
         void noteAction(ActionRecord r);
         // Whether a Path parameter (add_step, set_params) or a directory a
@@ -156,7 +172,7 @@ namespace sirius::app {
     private:
         void add(ToolSpec t);
         int resolveStep(const nlohmann::json& args, const char* key = "step") const;   // throws with a message
-        // The step an inspecting tool means: args[step], else OutputAccess::defaultStep.
+        // The step an inspecting tool means: args[step], else defaultStepIndex.
         int inspectStep(const nlohmann::json& args) const;
         // That step's output, through OutputAccess::output when the host gave one.
         std::shared_ptr<const StepOutput> outputFor(int index, bool runIfNeeded);

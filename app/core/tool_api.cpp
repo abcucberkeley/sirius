@@ -6,6 +6,7 @@
 #include "core/statistics.hpp"
 #include "core/training_export.hpp"
 
+#include <sirius/device.hpp>       // set_backend asks the library whether a CUDA request can be honoured
 #include <sirius/tiff_io.hpp>
 
 #include <algorithm>
@@ -170,12 +171,13 @@ namespace sirius::app {
             return {{"type", {"integer", "string"}},
                     {"description", "Step number as shown in the operations list (1 = Load, 2 = second step, ...) or a step name"}};
         }
-        // The step probe, statistics and export_result look at. The default is
-        // the host's rule, so it is named rather than left to be guessed.
+        // The step probe, statistics, export_result and get_diagnostics look
+        // at. ONE rule for every front (ToolApi::defaultStepIndex), so the
+        // description can state it instead of naming a front.
         json inspectStepParam() {
             return {{"type", {"integer", "string"}},
-                    {"description", "The step by number (1 = Load) or by name; default the viewed step in the application, "
-                                    "the last computed step in a session"}};
+                    {"description", "The step by number (1 = Load) or by name; default the step the last run produced, "
+                                    "else the last computed step"}};
         }
         json obj(std::initializer_list<std::pair<const std::string, json>> props, std::vector<std::string> required = {}) {
             json properties = json::object();
@@ -643,10 +645,15 @@ namespace sirius::app {
                  return json{{"ok", true}, {"view", wb_.viewState().toJson()}};
              }});
         add({"get_diagnostics",
-             "Diagnostics of a step (default: the selected one): summary, table, facts, curves, histograms, warnings.",
-             obj({{"step", stepParam()}}),
+             "Diagnostics of a step (default: the last computed): summary, table, facts, curves, histograms, warnings.",
+             obj({{"step", inspectStepParam()}}),
              [this](const json& a) {
-                 const int i = a.contains("step") ? resolveStep(a) : wb_.selectedIndex();
+                 // One default-step rule, as for probe, statistics and
+                 // export_result: the session replaces this tool with one
+                 // that used `inspectStep`, so an argument-free call named a
+                 // different step in the window than in a session
+                 // (docs/findings.md 9k.52, finding C).
+                 const int i = inspectStep(a);
                  const Diagnostics d = wb_.diagnosticsOf(i);
                  json j = {{"step", i + 1}, {"summary", d.summary}, {"footer", d.footer}, {"warnings", d.warnings}};
                  json facts = json::object();
@@ -713,6 +720,16 @@ namespace sirius::app {
              [this](const json& a) {
                  auto b = backendFromString(a.value("backend", ""));
                  if (!b) throw std::invalid_argument("backend must be CUDA, CPU or HPC");
+                 // A CUDA request this computer cannot honour was accepted
+                 // here and then quietly run on the CPU (Workbench's run()
+                 // falls back when cudaAvailable() is false), so the window
+                 // answered "backend: CUDA" for a run that was not on a GPU.
+                 // A session has always refused it; the Python mirror now
+                 // does too, and all three say the library's one sentence
+                 // (sirius::deviceRequestProblem).
+                 if (*b == Backend::Cuda)
+                     if (const std::string why = deviceRequestProblem(Device::cuda(std::max(wb_.cudaDevice(), 0))); !why.empty())
+                         throw ToolFailure("unsupported", why, "set_backend CPU");
                  std::optional<HpcDevice> d;
                  if (a.contains("hpc_device")) {
                      d = a["hpc_device"].is_string() ? hpcDeviceFromString(a["hpc_device"].get<std::string>()) : std::nullopt;
@@ -1397,13 +1414,19 @@ namespace sirius::app {
                 r.revAfter = after;
             }
         }
-        // What was dropped goes with the answer, failure or value, in the same
-        // "warnings" array a tool reports its own in; a host moves them where
-        // its clients look (HeadlessWorkbench::call).
+        // What was dropped goes with the answer, failure or value, under
+        // "call_warnings": a note about the CALL, which a host moves where
+        // its clients look (HeadlessWorkbench::call). Not "warnings", which
+        // is a documented reply field of get_step, get_diagnostics and
+        // `validate` -- a note about the call used to be put there and
+        // the host then erased the key, so those tools lost their field for
+        // every session and every sirius-cli caller while the window's --tool
+        // kept it (docs/findings.md 9k.52, finding B). No tool declares
+        // "call_warnings" in a reply of its own; it is this layer's.
         if (!stripped.empty() && result.is_object()) {
-            if (result.contains("warnings") && result["warnings"].is_array())
-                for (const json& w : result["warnings"]) stripped.push_back(w);
-            result["warnings"] = std::move(stripped);
+            if (result.contains("call_warnings") && result["call_warnings"].is_array())
+                for (const json& w : result["call_warnings"]) stripped.push_back(w);
+            result["call_warnings"] = std::move(stripped);
         }
         return result;
     }
@@ -1432,10 +1455,24 @@ namespace sirius::app {
 
     std::function<bool()> ToolApi::cancelledFn() const { return output_.cancelled; }
 
+    int ToolApi::defaultStepIndex(const Workbench& wb) {
+        const Pipeline& p = wb.pipeline();
+        // the target of the last run while it is still there with an output
+        if (const StepId id = wb.lastRunTarget(); id != 0) {
+            const int i = p.indexOf(id);
+            if (i >= 0 && i < p.size() && wb.output(i)) return i;
+        }
+        // else the last enabled step that has one; else Load, which always does
+        for (int i = p.size() - 1; i > 0; --i)
+            if (p.at(i).enabled && wb.output(i)) return i;
+        return 0;
+    }
+
     int ToolApi::inspectStep(const json& args) const {
         if (args.is_object() && args.contains("step") && !args["step"].is_null()) return resolveStep(args);
-        const int i = output_.defaultStep ? output_.defaultStep() : wb_.viewedIndex();
-        // A host's rule is its own; it still has to name a step that exists.
+        const int i = defaultStepIndex(wb_);
+        // The rule reads the pipeline, so this cannot fire; it is kept so that
+        // a future rule cannot name a step that is not there in silence.
         if (i < 0 || i >= wb_.pipeline().size())
             throw ToolFailure("unknown_step", "there is no step " + std::to_string(i + 1), "name the step: 1 is Load");
         return i;

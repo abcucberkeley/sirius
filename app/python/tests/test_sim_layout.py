@@ -27,8 +27,12 @@ wb = workbench()
 #   cudasirecon raw.tif              135 sections of 3 angles x 5 phases x 9 z on z
 #   mcSIM synthetic_microtubules      c3 z3, the angle on the channel axis
 #   OpenSIM sim01z4.tif               a 3 x 3 montage of tiles inside the plane
+# The last column is _sim_layout_on_z's answer: (ndirs, nphases, fast_si,
+# canonical text) for a layout the reconstructor can read as it stands, else
+# None. The counts are in it because step_sim has to CHECK them against the
+# step's own, not only read the order off it (the Python front's finding C).
 REAL_LAYOUTS = [
-    ("z=[angle 3, z, phase 5]", 3, 5, False, (3, 5, False)),
+    ("z=[angle 3, z, phase 5]", 3, 5, False, (3, 5, False, "z=[angle 3, z, phase 5]")),
     ("c=angle 3; z=phase 3", 3, 3, False, None),
     ("yx=3x3[angle 3, phase 3]", 3, 3, False, None),
 ]
@@ -68,10 +72,13 @@ class TestSimStorageText(unittest.TestCase):
         # the review found this: the mirror used to match a bare 'z' only, so a
         # layout the application accepted was refused here and the worker fell
         # back to the shorthand counts
-        self.assertEqual(wb._sim_layout_on_z("z=[angle 3, z 9, phase 5]"), (3, 5, False))
-        self.assertEqual(wb._sim_layout_on_z("z=[z 9, angle 3, phase 5]"), (3, 5, True))
-        self.assertEqual(wb._sim_layout_on_z("z=[angle 3, phase 5]"), (3, 5, False))   # one plane
-        self.assertEqual(wb._sim_layout_on_z("c=c 2; z=[angle 3, z, phase 5]"), (3, 5, False))
+        self.assertEqual(wb._sim_layout_on_z("z=[angle 3, z 9, phase 5]"), (3, 5, False, "z=[angle 3, z 9, phase 5]"))
+        self.assertEqual(wb._sim_layout_on_z("z=[z 9, angle 3, phase 5]"), (3, 5, True, "z=[z 9, angle 3, phase 5]"))
+        self.assertEqual(wb._sim_layout_on_z("z=[angle 3, phase 5]"), (3, 5, False, "z=[angle 3, phase 5]"))   # one plane
+        # the c axis is itself, so the canonical text drops it: the sentence a
+        # count mismatch is refused with quotes the same string the
+        # application's SimLayout::text() quotes
+        self.assertEqual(wb._sim_layout_on_z("c=c 2; z=[angle 3, z, phase 5]"), (3, 5, False, "z=[angle 3, z, phase 5]"))
 
     def test_the_orders_the_reconstructor_cannot_read_are_gathered_by_the_app(self):
         for text in ["c=angle 3; z=phase 3", "yx=3x3[angle 3, phase 3]",

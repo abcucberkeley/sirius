@@ -124,13 +124,25 @@ The image is a stable runtime (Python, numpy, torch, the compiled `sirius`
 package); SIRIUS's engine changes with every commit. With *Engine builds
 folder* set, the engine comes from `<folder>/<commit>/bin/sirius-cli`, each
 build with its `<folder>/<commit>/BUILD.json` (`{"build", "commit",
-"ops_schema", "api", ...}`, what `sirius-cli --version --json` prints). The
-checks list the builds there and pick the one of the application's own
-commit, else the newest whose operations and engine API are the same
-(`core/build_info.hpp`'s `engineMismatch`); that folder is bound into the
-image. `BUILD.json` may name the schema hash `ops_schema` or `schema_hash`
-(or both). When none fits, the checks say so and name the application's
-commit. The build's `python/` folder (the `sirius_worker` package of that
+"ops_schema", "ops_generation", "api", ...}`, what `sirius-cli --version
+--json` prints). The checks list the builds there and pick the one of the
+application's own commit, else the newest whose operations and engine API are
+the same (`core/build_info.hpp`'s `engineMismatch`); that folder is bound into
+the image. `BUILD.json` may name the schema hash `ops_schema` or
+`schema_hash` (or both). When none fits, the checks say so and name the
+application's commit.
+
+**What has to match is `ops_generation`, not the schema hash.** The hash
+covers help text and labels too, so it moves when nothing about what an
+operation means has moved, and an engine refused for such a difference would
+have to be rebuilt for nothing. `ops_generation` is bumped only when the
+operation set changes incompatibly, so an engine built from a nearby commit
+keeps serving. An engine built before `ops_generation` existed reports only a
+hash; it is served when that hash is this build's own or one
+`kAcceptedOlderOpsSchemas` names (with the reason). Either way a refusal says
+which of the two sides is the older one and gives the fix for that side.
+
+The build's `python/` folder (the `sirius_worker` package of that
 commit) is the worker's code, so the checkout on the cluster is not needed
 then; its `lib/` (nvTIFF, nvCOMP) goes in front of the image's library path.
 Building one, inside the worker image on a node (latents'

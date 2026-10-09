@@ -10,8 +10,11 @@
 # The operation schema hash is SHA-256 of the committed snapshot of every
 # operation's parameters (bindings/python/sirius/op_schema.json, line endings
 # normalised), which tests/test_app_engine.cpp holds equal to what the
-# registry exports. The header is rewritten only when its text changes, so an
-# unchanged tree recompiles nothing.
+# registry exports. It is the build's IDENTITY, not the application/engine
+# compatibility key -- that is kOpsGeneration in app/core/build_info.hpp,
+# which is a hand-maintained C++ constant and so is not written here. The
+# header is rewritten only when its text changes, so an unchanged tree
+# recompiles nothing.
 
 if(NOT DEFINED OUTPUT OR NOT DEFINED SOURCE_DIR)
     message(FATAL_ERROR "BuildInfo.cmake: OUTPUT and SOURCE_DIR are required")

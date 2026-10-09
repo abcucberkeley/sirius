@@ -251,10 +251,29 @@ every key below is the `key` of a `ParamSpec` in the matching
 `app/core/ops/*.cpp`, and the defaults are the C++ defaults. A few older
 Python-only spellings are still accepted as aliases (see the docstrings in
 `workbench.py`), but the canonical key always wins; **any key that is
-neither is reported through an `UnknownParameterWarning` naming the step**
-instead of being ignored. `bindings/python/sirius/op_schema.json` is a
-snapshot of the C++ parameter tables and
-`bindings/tests/test_workbench_schema.py` fails if the two drift apart.
+neither is REFUSED with an `UnknownParameter` naming the step**, as the
+window and a session refuse one (`ToolApi`'s `callerSpec`) rather than
+running the step with something other than what was asked. It used to be a
+warning, and a misspelled `otf` key therefore warned and then reconstructed
+with the theoretical OTF -- a different reconstruction that looks like a
+successful run. The one exception is a key a previous SIRIUS declared and
+this one does not (the Contrast step's `bake`): each is named in its spec's
+`translate` hook and dropped with an `UnknownParameterWarning`, so a
+pipeline or an exported script on disk still runs.
+`bindings/python/sirius/op_schema.json` is a snapshot of the C++ parameter
+tables and `bindings/tests/test_workbench_schema.py` fails if the two drift
+apart.
+
+The compute device is one rule on every front, and it is SIRIUS's own:
+`"auto"` is a GPU when `sirius.cuda_available()` finds one and the CPU
+otherwise, and an explicit `"cuda"` / `"cuda:N"` this build or this computer
+cannot honour is an error carrying `sirius.device_request_problem`'s
+sentence -- the same sentence the window's `set_backend` and sirius-cli's
+`--backend cuda` report. `resolve_device` asked `torch.cuda.is_available()`
+until 2026-10-08, which is a different question and answered "no" in this
+worker's own image, so every Python SIM reconstruction there ran on the CPU
+with nothing saying so. A step that places a *torch* tensor narrows the
+answer to what torch can use, because torch's GPUs are not SIRIUS's.
 
 * `einsum`: `keep` (the axes that survive, e.g. `czyx`), `reduction`
   (`sum` | `mean` | `max` | `min`). `maxproj`: `axis` (`z` | `t` | `c`).

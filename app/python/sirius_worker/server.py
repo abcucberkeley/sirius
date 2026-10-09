@@ -417,7 +417,25 @@ class WorkerServer:
     # --- capabilities ----------------------------------------------------------
 
     def resolved_device(self) -> str:
-        return workbench().resolve_device(self.device)
+        return self._resolve(self.device)
+
+    def _resolve(self, text: str) -> str:
+        """resolve_device's answer, or the request as asked when it refuses.
+
+        Since 2026-10-08 resolve_device asks SIRIUS's OWN CUDA support rather
+        than torch's and refuses a GPU it cannot give, which is what the
+        window and sirius-cli do (the Python front's finding A). This worker's
+        question is wider: cuda_available() is true when EITHER torch or the
+        sirius package finds a GPU, and a node without the wheel runs torch
+        models on a GPU with no extension to ask. So a refusal here is not the
+        end of it -- the caller checks cuda_available() for itself -- and the
+        text stands as asked.
+        """
+        wb = workbench()
+        try:
+            return wb.resolve_device(text)
+        except wb.NotAvailable:
+            return str(text or "auto").strip().lower()
 
     # Whether this process can compute on a GPU (cuda_available), asked once.
     _cuda: Optional[bool] = None
@@ -447,10 +465,12 @@ class WorkerServer:
         text = str(requested or "").strip().lower()
         if not text or text == "auto":
             return self.resolved_device()
-        device = workbench().resolve_device(text)
-        if device.startswith("cuda") and not self.cuda_available():
+        # This worker's own answer first, and its own words: it is the wider
+        # question (torch's GPUs or the sirius package's), and it is the one
+        # whose message tells the user to reconnect with GPUs >= 1.
+        if text.startswith("cuda") and not self.cuda_available():
             raise ValueError(NO_GPU_IN_JOB if os.environ.get("SLURM_JOB_ID") else NO_GPU_HERE)
-        return device
+        return self._resolve(text)
 
     def decode_device(self, requested: Any = None) -> str:
         """Where a cluster dataset's TIFF pages are decoded: the device a

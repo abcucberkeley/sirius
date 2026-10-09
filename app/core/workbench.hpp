@@ -586,6 +586,14 @@ namespace sirius::app {
         std::shared_ptr<RunJob> activeRun() const noexcept { return activeRun_; }
         void cancelRun();
         const RunRefusal& lastRunRefusal() const noexcept { return lastRunRefusal_; }
+        // The step the last run that succeeded produced, by id; 0 before any
+        // run of this dataset. Kept here rather than in a host so that the
+        // one default-step rule (ToolApi::defaultStepIndex) gives the same
+        // answer in the window, in sirius-cli and in a session: the window's
+        // Run button and a session's `run` tool both end at finishRun().
+        // A step that has since been removed or lost its output is not a
+        // default: the rule checks both, so the id needs no invalidating.
+        StepId lastRunTarget() const noexcept { return lastRunTarget_; }
         // Why the last loadPlugins() found none: its message ("" after one
         // that reached the worker, never after a refused one), and the
         // worker start failure behind it.
@@ -756,6 +764,7 @@ namespace sirius::app {
         std::vector<PluginInfo> plugins_;
         std::vector<std::string> pluginDirs_;
         RunRefusal lastRunRefusal_;
+        StepId lastRunTarget_ = 0;
         std::string pluginError_;
         std::optional<WorkerStartError> pluginWorkerFailure_;
         std::string workerHint_;
