@@ -529,6 +529,99 @@ class TestSimStep(unittest.TestCase):
         corr = float(np.corrcoef(q.array[0, 0].ravel(), expected.ravel())[0, 1])
         self.assertGreater(corr, 0.8)   # 0.8169 measured; the C++ case's own threshold
 
+    def test_a_declared_layout_is_read_whole_or_refused(self):
+        """step_sim parsed the dataset's SIM storage layout for its fast-SI
+        flag and threw away the angle and phase counts it had just read, so
+        this mirror reconstructed a layout-versus-parameter mismatch that the
+        C++ SIM step refuses outright (app/core/ops/sim.cpp's validate: "They
+        have to agree for the frames to be gathered"). The sentence is the
+        library's one, so the three fronts refuse it in the same words (the
+        Python front's finding C).
+        """
+        sirius = _sirius_extension()
+        raw = sirius.read_tiff(str(self.DATA / "raw.tif"), dtype=np.float32)
+        meta = {"voxel_um": [0.08, 0.08, 0.125]}
+        params = {"mode": "From file", "params_file": str(self.DATA / "config.txt")}
+        layout = wb._sim_layout_from_text("z=[angle 3, z, phase 5]")
+        self.assertEqual((layout["ndirs"], layout["nphases"]), (3, 5))
+
+        # the layout the file's 3 x 5 agrees with: it runs, and the fast-SI
+        # flag is still read off the order as it was before
+        ok = wb.run_step("sim", params, raw, dict(meta, sim=layout), device="cpu")
+        self.assertEqual(ok.array.shape, (1, 1, 9, 128, 128))
+        self.assertFalse(ok.meta["sim"]["fast_si"])
+        fast = wb._sim_layout_from_text("z=[z 9, angle 3, phase 5]")
+        self.assertTrue(wb._sim_parameters(wb._prepare_params(wb.step_spec("sim"), params, None),
+                                           dict(meta, sim=fast)).fast_si)
+
+        # and the one it does not: 5 x 3 on z is 15 sections per plane too, so
+        # nothing else catches this -- the stack reconstructs, with the frames
+        # taken in the wrong grid.
+        crossed = wb._sim_layout_from_text("z=[angle 5, z, phase 3]")
+        with self.assertRaises(ValueError) as cm:
+            wb.run_step("sim", params, raw, dict(meta, sim=crossed), device="cpu")
+        self.assertEqual(str(cm.exception),
+                         sirius.sim_layout_counts_problem("z=[angle 5, z, phase 3]", 5, 3, 3, 5))
+        self.assertIn("They have to agree for the frames to be gathered.", str(cm.exception))
+
+    def test_declared_counts_without_a_layout_warn_and_run(self):
+        """The weaker case, and the application's own answer to it: the
+        dataset says what it holds but not how it is stored, so the step's
+        counts are used, the run goes ahead and a warning says so (the
+        shorthand branch of the same validate())."""
+        sirius = _sirius_extension()
+        raw = sirius.read_tiff(str(self.DATA / "raw.tif"), dtype=np.float32)
+        meta = {"voxel_um": [0.08, 0.08, 0.125], "sim": {"present": True, "ndirs": 5, "nphases": 3, "fast_si": False}}
+        params = {"mode": "From file", "params_file": str(self.DATA / "config.txt")}
+        with self.assertWarns(wb.SimLayoutWarning) as cm:
+            r = wb.run_step("sim", params, raw, meta, device="cpu")
+        self.assertEqual(r.array.shape, (1, 1, 9, 128, 128))        # it RAN
+        self.assertIn(sirius.sim_declared_counts_note(5, 3, 3, 5), str(cm.warning))
+        # agreeing counts say nothing
+        with warnings.catch_warnings():
+            warnings.simplefilter("error", wb.SimLayoutWarning)
+            agree = dict(meta, sim={"present": True, "ndirs": 3, "nphases": 5, "fast_si": False})
+            wb.run_step("sim", params, raw, agree, device="cpu")
+
+    def test_an_empty_otf_is_theoretical_but_a_misspelled_one_is_refused(self):
+        """An OTF deliberately left empty means the theoretical OTF -- that is
+        what the empty OTF field means in the GUI and the CLI. A key the
+        caller misspelled used to mean the same thing after a warning, so a
+        run that was meant to use a measured OTF came back looking like a
+        success (the Python front's finding D). The window and a session
+        refuse the key instead of running (ToolApi's callerSpec), and so does
+        this.
+        """
+        sirius = _sirius_extension()
+        raw = sirius.read_tiff(str(self.DATA / "raw.tif"), dtype=np.float32)
+        meta = {"voxel_um": [0.08, 0.08, 0.125]}
+        base = {"mode": "From file", "params_file": str(self.DATA / "config.txt")}
+        measured = wb.run_step("sim", dict(base, otf=str(self.DATA / "otf.tif")), raw, meta, device="cpu")
+        theoretical = wb.run_step("sim", base, raw, meta, device="cpu")          # otf absent: theoretical
+        empty = wb.run_step("sim", dict(base, otf=""), raw, meta, device="cpu")  # and empty: the same
+        np.testing.assert_array_equal(empty.array, theoretical.array)
+        # the two are genuinely different reconstructions, which is what makes
+        # a silent fall-back to the theoretical one a wrong result and not a
+        # cosmetic difference
+        rel = (np.max(np.abs(measured.array - theoretical.array)) / np.max(np.abs(measured.array)))
+        self.assertGreater(rel, 0.01)
+        # the aliases the application's older exports used still name the file
+        for key in ("otf_path", "otf_file"):
+            with self.subTest(key=key):
+                r = wb.run_step("sim", dict(base, **{key: str(self.DATA / "otf.tif")}), raw, meta, device="cpu")
+                np.testing.assert_array_equal(r.array, measured.array)
+        # and a misspelling is refused, naming the key and what sim takes
+        for key in ("otf_pth", "otfpath", "OTF"):
+            with self.subTest(key=key):
+                with self.assertRaises(wb.UnknownParameter) as cm:
+                    wb.run_step("sim", dict(base, **{key: str(self.DATA / "otf.tif")}), raw, meta, device="cpu")
+                self.assertIn(f"unknown parameter '{key}' for sim", str(cm.exception))
+                self.assertIn("otf", str(cm.exception))
+        # a named OTF that is not there is still a hard failure, not a quiet
+        # theoretical run
+        with self.assertRaises(FileNotFoundError):
+            wb.run_step("sim", dict(base, otf=str(self.DATA / "not_an_otf.tif")), raw, meta, device="cpu")
+
     def test_the_theoretical_otf_follows_the_stacks_planes(self):
         # The theoretical OTF is built in 3D for a stack of several planes and
         # in 2D (one kz sample, no missing cone) for a single plane, and the
@@ -750,12 +843,24 @@ class TestSimStep(unittest.TestCase):
 
 
 class TestParameters(unittest.TestCase):
-    def test_unknown_keys_warn_and_are_ignored(self):
+    def test_unknown_keys_are_refused_and_name_what_the_step_takes(self):
         a = np.ones((1, 2, 2, 4, 4), np.float32)
+        with self.assertRaises(wb.UnknownParameter) as cm:
+            wb.run_step("bleach", {"mode": "Match mean", "to_the_moon": 1}, a)
+        self.assertIn("unknown parameter 'to_the_moon' for bleach", str(cm.exception))
+        self.assertIn("the parameters of bleach are", str(cm.exception))
+        # the keys it does take are still accepted, and so are its aliases
+        self.assertEqual(wb.run_step("bleach", {"mode": "Match mean"}, a).array.shape, a.shape)
+
+    def test_a_key_sirius_used_to_have_is_dropped_with_a_warning_instead(self):
+        """The one case that is NOT a typo: a key a previous SIRIUS declared,
+        which a pipeline or an exported script on disk still carries. Each one
+        is named in its spec's translate hook, so an older file keeps running
+        where a misspelling is refused."""
+        a = np.ones((1, 1, 2, 4, 4), np.float32)
         with self.assertWarns(wb.UnknownParameterWarning) as cm:
-            r = wb.run_step("bleach", {"mode": "Match mean", "to_the_moon": 1}, a)
-        self.assertIn("bleach", str(cm.warning))
-        self.assertIn("to_the_moon", str(cm.warning))
+            r = wb.run_step("contrast", {"bake": True}, a)
+        self.assertIn("bake is no longer a parameter", str(cm.warning))
         self.assertEqual(r.array.shape, a.shape)
 
     def test_canonical_key_wins_over_an_alias(self):

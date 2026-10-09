@@ -134,6 +134,35 @@ namespace sirius {
     // the code that implements it. It was declared here, so the OTF code had
     // to include this header and the two units formed a cycle.
 
+    // --- what a declared storage layout and the step's own counts say -------
+    //
+    // A dataset can state how its raw SIM frames are stored ("z=[angle 3, z,
+    // phase 5]"), and the step also carries an angle and a phase count. When
+    // the two disagree the frames cannot be gathered, and the SIM operation
+    // refuses the pipeline. The Python mirror parsed the same layout, used it
+    // only for the fast-SI flag and threw the counts away, so it reconstructed
+    // a mismatch the application refuses outright -- with whatever the step's
+    // angles and phases happened to be (the Python front's finding C).
+    //
+    // These two live in the library, not in app/core/dataset.hpp beside
+    // SimLayout, for the same reason simImageSizeProblem does: the Python
+    // bindings link the library and not the application, so a sentence only
+    // the application can produce becomes a second copy in Python that drifts
+    // (docs/findings.md 9k.50, finding 5). They take the counts rather than a
+    // SimLayout so that both sides can call them.
+
+    // "" when a declared layout's counts are the step's; otherwise the one
+    // sentence every front refuses the pipeline with. `layoutText` is the
+    // layout as the dataset states it.
+    std::string simLayoutCountsProblem(const std::string& layoutText, int layoutAngles, int layoutPhases,
+                                       int stepAngles, int stepPhases);
+
+    // "" when a dataset's declared angle and phase counts are the step's;
+    // otherwise the one sentence every front WARNS with. This is the weaker
+    // case: the dataset says what it holds but not how it is stored, so the
+    // step's own counts are used and the run goes ahead.
+    std::string simDeclaredCountsNote(int datasetAngles, int datasetPhases, int stepAngles, int stepPhases);
+
 } // namespace sirius
 
 #endif // SIRIUS_SIM_RECONSTRUCTION_HPP

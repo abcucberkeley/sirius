@@ -506,7 +506,11 @@ namespace sirius::app {
         if (backend == "cpu") {
             wb.setBackend(Backend::Cpu);
         } else if (backend == "cuda") {
-            if (!cudaAvailable()) throw ToolFailure("unsupported", "no CUDA device is available on this computer", "use --backend cpu, or auto");
+            // The library's sentence, not this file's: the window's
+            // set_backend and the Python mirror's resolve_device refuse the
+            // same request with the same words (sirius::deviceRequestProblem).
+            if (const std::string why = deviceRequestProblem(Device::cuda(std::max(options.cudaDevice, 0))); !why.empty())
+                throw ToolFailure("unsupported", why, "use --backend cpu, or auto");
             wb.setBackend(Backend::Cuda);
         } else if (backend == "hpc") {
             if (!options.hpc) throw ToolFailure("invalid_argument", "the hpc backend needs the endpoint to run on", "start sirius-cli with --hpc host:port");
@@ -1326,7 +1330,6 @@ namespace sirius::app {
         if (b == "cpu") {
             backend = Backend::Cpu;
         } else if (b == "cuda") {
-            if (!cudaAvailable()) throw ToolFailure("unsupported", "no CUDA device is available on this computer", "use backend cpu");
             backend = Backend::Cuda;
         } else if (b == "hpc") {
             // D27: the endpoint is fixed when the server starts, never by a tool
@@ -1340,16 +1343,35 @@ namespace sirius::app {
             hpcDevice = hpcDeviceFromString(requiredString(a, "hpc_device"));
             if (!hpcDevice) invalid("'hpc_device' must be gpu or cpu");
         }
+        // The GPU the request names: the one given here, else the one this
+        // server is already on.
+        int cudaDevice = wb.cudaDevice();
+        bool named = false;   // the request names a single GPU, rather than "all" or none
         if (has(a, "cuda_device")) {
             const json& v = a["cuda_device"];
             if (v.is_string() && lower(v.get<std::string>()) == "all") {
-                wb.setCudaDevice(Workbench::kAllCudaDevices);
+                cudaDevice = Workbench::kAllCudaDevices;
             } else {
-                const int count = cudaDeviceCount();
-                const std::int64_t device = integerArg(a, "cuda_device", 0, 0, std::max(count - 1, 0));
-                wb.setCudaDevice(static_cast<int>(device));
+                cudaDevice = static_cast<int>(integerArg(a, "cuda_device", 0, 0, std::numeric_limits<int>::max()));
+                named = true;
             }
         }
+        // A GPU this build or this computer cannot give is refused BEFORE the
+        // backend changes, and refused in the library's one sentence -- the
+        // same sentence --backend cuda, the window's set_backend and the
+        // Python mirror's resolve_device report, so one condition has one
+        // wording on every front (docs/findings.md 9k.50, finding 5). It
+        // replaces a "'cuda_device' must be within 0..N" of this file's own,
+        // which said the same thing in different words and only when the
+        // index was given; naming a GPU that does not exist is wrong whatever
+        // the backend in hand is.
+        if (named || (backend == Backend::Cuda && cudaDevice >= 0))
+            if (const std::string why = deviceRequestProblem(Device::cuda(std::max(cudaDevice, 0))); !why.empty())
+                throw ToolFailure("unsupported", why, "use backend cpu");
+        if (backend == Backend::Cuda && cudaDevice < 0)   // "all": there has to be at least one
+            if (const std::string why = deviceRequestProblem(Device::cuda(0)); !why.empty())
+                throw ToolFailure("unsupported", why, "use backend cpu");
+        if (has(a, "cuda_device")) wb.setCudaDevice(cudaDevice);
         wb.setBackend(backend);
         if (hpcDevice) wb.setHpcDevice(*hpcDevice);
         syncWorkerDevice();

@@ -6,6 +6,7 @@
 #include "core/statistics.hpp"
 #include "core/training_export.hpp"
 
+#include <sirius/device.hpp>       // set_backend asks the library whether a CUDA request can be honoured
 #include <sirius/tiff_io.hpp>
 
 #include <algorithm>
@@ -719,6 +720,16 @@ namespace sirius::app {
              [this](const json& a) {
                  auto b = backendFromString(a.value("backend", ""));
                  if (!b) throw std::invalid_argument("backend must be CUDA, CPU or HPC");
+                 // A CUDA request this computer cannot honour was accepted
+                 // here and then quietly run on the CPU (Workbench's run()
+                 // falls back when cudaAvailable() is false), so the window
+                 // answered "backend: CUDA" for a run that was not on a GPU.
+                 // A session has always refused it; the Python mirror now
+                 // does too, and all three say the library's one sentence
+                 // (sirius::deviceRequestProblem).
+                 if (*b == Backend::Cuda)
+                     if (const std::string why = deviceRequestProblem(Device::cuda(std::max(wb_.cudaDevice(), 0))); !why.empty())
+                         throw ToolFailure("unsupported", why, "set_backend CPU");
                  std::optional<HpcDevice> d;
                  if (a.contains("hpc_device")) {
                      d = a["hpc_device"].is_string() ? hpcDeviceFromString(a["hpc_device"].get<std::string>()) : std::nullopt;

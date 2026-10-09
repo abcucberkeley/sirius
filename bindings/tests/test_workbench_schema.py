@@ -139,10 +139,30 @@ class TestOperationSchema(unittest.TestCase):
                 warnings.simplefilter("error", wb.UnknownParameterWarning)
                 wb._prepare_params(spec, params, wb._default_meta(a))
 
-    def test_unknown_key_warns(self):
+    def test_unknown_key_is_refused_as_the_window_and_a_session_refuse_it(self):
+        # The window and a session answer "unknown parameter 'bogus' for
+        # meant" and run nothing (app/core/tool_api.cpp's callerSpec); this
+        # used to warn and run the step with its defaults, which is the same
+        # silence the C++ comment there was written against. The first clause
+        # is pinned on both sides: tests/test_app_tool_gate.cpp has the C++
+        # half, and these two literals are what keeps the wordings together.
         a = np.zeros((1, 1, 2, 4, 4), np.float32)
-        with self.assertWarns(wb.UnknownParameterWarning):
+        with self.assertRaises(wb.UnknownParameter) as cm:
             wb.run_step("meant", {"bogus": 1}, a)
+        self.assertIn("unknown parameter 'bogus' for meant", str(cm.exception))
+        self.assertTrue(issubclass(wb.UnknownParameter, ValueError))
+
+    def test_every_kind_refuses_a_key_it_does_not_take(self):
+        """Not only the one kind above: a parameter no step takes is refused by
+        every kind, and the message lists what that kind does take."""
+        a = np.zeros((1, 1, 2, 4, 4), np.float32)
+        for kind, spec in wb._SPECS.items():
+            with self.subTest(kind=kind):
+                params = {p["key"]: p["default"] for p in self.ops[kind]["params"]}
+                params["not_a_parameter_of_anything"] = 1
+                with self.assertRaises(wb.UnknownParameter) as cm:
+                    wb._prepare_params(spec, params, wb._default_meta(a))
+                self.assertIn(f"unknown parameter 'not_a_parameter_of_anything' for {kind}", str(cm.exception))
 
 
 class TestPromptObjects(unittest.TestCase):

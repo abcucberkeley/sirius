@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <cctype>
 #include <utility>
 
 #ifdef SIRIUS_HAS_CUDA
@@ -74,15 +75,48 @@ namespace sirius {
 
     bool cudaAvailable() noexcept { return cudaDeviceCount() > 0; }
 
-    void requireDevice(Device d) {
-        if (d.isCpu()) return;
+    std::optional<Device> deviceFromString(const std::string& spec) {
+        std::string l;
+        l.reserve(spec.size());
+        for (const char c : spec) l += static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+        if (l == "cpu") return Device::cpu();
+        if (l == "cuda" || l == "gpu") return Device::cuda(0);
+        if (l.rfind("cuda:", 0) != 0) return std::nullopt;
+        const std::string tail = l.substr(5);
+        // std::stoi would take "0abc" and "  3"; a device ordinal is digits
+        if (tail.empty() || tail.find_first_not_of("0123456789") != std::string::npos) return std::nullopt;
+        try {
+            return Device::cuda(std::stoi(tail));
+        } catch (const std::exception&) {   // out_of_range on a 40-digit index
+            return std::nullopt;
+        }
+    }
+
+    std::string deviceRequestProblem(Device d) {
+        if (d.isCpu()) return "";
         if (!builtWithCuda())
-            throw std::runtime_error("SIRIUS was built without CUDA support (SIRIUS_ENABLE_CUDA=OFF); "
-                                     "cannot use " +
-                                     toString(d));
-        if (d.index < 0 || d.index >= cudaDeviceCount())
-            throw std::runtime_error("CUDA device " + toString(d) + " does not exist (" +
-                                     std::to_string(cudaDeviceCount()) + " device(s) visible)");
+            return "SIRIUS was built without CUDA support (SIRIUS_ENABLE_CUDA=OFF); cannot use " + toString(d);
+        const int n = cudaDeviceCount();
+        if (n <= 0) return "no CUDA device is available on this computer";
+        if (d.index < 0 || d.index >= n)
+            return "CUDA device " + toString(d) + " does not exist (" + std::to_string(n) + " device(s) visible)";
+        return "";
+    }
+
+    std::string deviceRequestProblem(const std::string& spec) {
+        const std::optional<Device> d = deviceFromString(spec);
+        if (!d) return "'" + spec + "' is not a device (expected cpu, cuda or cuda:N)";
+        return deviceRequestProblem(*d);
+    }
+
+    Device defaultDevice() noexcept { return cudaAvailable() ? Device::cuda(0) : Device::cpu(); }
+
+    void requireDevice(Device d) {
+        // The same three sentences every front says, so a library call, a
+        // tool call and a Python call report one condition in one wording
+        // (docs/findings.md 9k.50, finding 5).
+        if (const std::string why = deviceRequestProblem(d); !why.empty())
+            throw std::runtime_error(why);
     }
 
     DeviceProperties deviceProperties(Device d) {

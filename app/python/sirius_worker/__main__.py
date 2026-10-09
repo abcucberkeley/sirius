@@ -147,7 +147,8 @@ def main(argv=None) -> int:
                         help="close an authenticated connection that sends nothing for this many seconds "
                              "(default 3600; 0 never)")
     parser.add_argument("--device", default="auto", type=_device,
-                        help="where models run: auto (cuda when torch sees a GPU), cpu, cuda, or cuda:N for one GPU")
+                        help="where steps and models run: auto (a GPU when SIRIUS's own CUDA support finds one, "
+                             "else torch's for a torch model, else the CPU), cpu, cuda, or cuda:N for one GPU")
     # Package installation (the `install` method: pip / conda in this
     # interpreter) is a privileged operation, so it is opt-in. The desktop
     # application passes this for the worker it starts on the user's own

@@ -29,8 +29,11 @@
 #include <sirius/buffer.hpp>
 #include <sirius/tiff_io.hpp>
 
+#include <sirius/device.hpp>
+
 #include "core/array_source.hpp"
 #include "core/headless.hpp"
+#include "core/tool_api.hpp"
 #include "core/host.hpp"
 #include "core/labels.hpp"
 
@@ -319,6 +322,92 @@ TEST_CASE("headless: the GUI's pipeline and the session's are the same pipeline 
         CHECK(guiSteps[1]["step"] == 2);
         INFO("session " << core(sessionSteps).dump(1) << "\nGUI     " << core(guiSteps).dump(1));
         CHECK(core(guiSteps) == core(sessionSteps));
+    }
+}
+
+TEST_CASE("headless: the window and a session resolve one backend, and refuse what they cannot honour in one wording",
+          "[app][headless]") {
+    // The user's requirement is that the window, the command line and the
+    // Python bindings behave the same (docs/findings.md 9k.50). For the
+    // compute backend they did not: the window's set_backend ACCEPTED a CUDA
+    // request on a computer with no GPU and the run then fell back to the CPU
+    // (Workbench::run checks cudaAvailable() again), so the window answered
+    // "backend: CUDA" for a run that was not on one; a session refused it; and
+    // the Python mirror asked torch instead of SIRIUS and silently used the
+    // CPU in the worker image, which has no torch (9k.50 finding 3, and the
+    // Python front's finding A).
+    //
+    // The anchor of all three is sirius::deviceRequestProblem. This case
+    // pins the two C++ fronts against it; bindings/tests/test_device.py's
+    // TestOneDeviceRule pins resolve_device against the same function, so the
+    // three cannot drift apart without one of the two failing.
+    //
+    // It asserts on a GPU machine and on a CPU-only one, by asking for a GPU
+    // INDEX past the last one: unhonourable either way, so neither arm is a
+    // skip on the a100 nodes these tests run on.
+    const int count = cudaDeviceCount();
+    const int absent = std::max(count, 1) + 99;
+    const std::string why = deviceRequestProblem(Device::cuda(absent));
+    REQUIRE_FALSE(why.empty());
+    CHECK_THAT(why, ContainsSubstring("does not exist"));
+
+    TempDir guiScratch{"gui_backend"};
+    Workbench gui(guiScratch.path);
+    ToolApi api(gui);
+    Fixture f;
+
+    SECTION("a GPU index past the last one is refused by both, with that sentence") {
+        gui.setCudaDevice(absent);
+        const json w = api.call("set_backend", {{"backend", "CUDA"}});
+        INFO("window " << w.dump());
+        CHECK(w.value("error", std::string()) == why);
+        CHECK(w.value("error_kind", std::string()) == "unsupported");
+        // and the window did NOT change the backend behind that refusal
+        CHECK(gui.backend() != Backend::Cuda);
+
+        const agent::ToolResult s = f.call("set_backend", {{"backend", "cuda"}, {"cuda_device", absent}});
+        INFO("session " << s.error.code << ": " << s.error.message);
+        CHECK_FALSE(s.ok);
+        CHECK(s.error.message == why);
+        CHECK(s.error.code == "unsupported");
+        // the two fronts said the same sentence, which is the point
+        CHECK(s.error.message == w.value("error", std::string()));
+    }
+
+    SECTION("the CPU is honoured by both, and says nothing") {
+        CHECK(deviceRequestProblem(Device::cpu()).empty());
+        CHECK(api.call("set_backend", {{"backend", "CPU"}}).value("backend", std::string()) == "CPU");
+        CHECK(gui.backend() == Backend::Cpu);
+        CHECK(f.ok("set_backend", {{"backend", "cpu"}})["backend"] == "CPU");
+    }
+
+    SECTION("a GPU this computer has is honoured by both; one it has none of is refused by both") {
+        if (cudaAvailable()) {
+            CHECK(deviceRequestProblem(Device::cuda(0)).empty());
+            CHECK(api.call("set_backend", {{"backend", "CUDA"}}).value("backend", std::string()) == "CUDA");
+            CHECK(gui.backend() == Backend::Cuda);
+            CHECK(f.ok("set_backend", {{"backend", "cuda"}})["backend"] == "CUDA");
+        } else {
+            const std::string none = deviceRequestProblem(Device::cuda(0));
+            REQUIRE_FALSE(none.empty());
+            CHECK(api.call("set_backend", {{"backend", "CUDA"}}).value("error", std::string()) == none);
+            CHECK(gui.backend() != Backend::Cuda);
+            const agent::ToolResult s = f.call("set_backend", {{"backend", "cuda"}});
+            CHECK_FALSE(s.ok);
+            CHECK(s.error.message == none);
+        }
+    }
+
+    SECTION("the rule for a request that names nothing is the same on both, and it is SIRIUS's own") {
+        // Workbench's constructor starts on CUDA when SIRIUS has a GPU and on
+        // the CPU otherwise, which is what defaultDevice() says and what
+        // sirius-cli's --backend auto inherits. Python's "auto" is the same
+        // function (sirius.default_device).
+        CHECK(defaultDevice().isCuda() == cudaAvailable());
+        CHECK((gui.backend() == Backend::Cuda) == cudaAvailable());
+        Fixture autoF([](HeadlessOptions& o) { o.backend = "auto"; });
+        const std::string backend = autoF.ok("list_devices")["backend"];
+        CHECK(backend == (cudaAvailable() ? "CUDA" : "CPU"));
     }
 }
 

@@ -12,6 +12,7 @@
 #include <sirius/sim_reconstruction.hpp>
 
 #include <memory>
+#include <optional>
 #include <stdexcept>
 #include <string>
 #include <utility>
@@ -30,16 +31,34 @@ namespace {
         return Shape(dims.begin(), dims.end());
     }
 
+    // `threeD` reaches the theoretical OTF only, and the DATA decides it:
+    // SIMParameters::planes(sections) > 1, which is session.cpp's threeD().
+    // The constructor is handed parameters, not a stack, so it cannot derive
+    // the value -- and a default of either parity is a guess that silently
+    // builds the wrong OTF (a 2D stack got the 3D theoretical OTF, missing
+    // cone and all, that no front would have chosen for it: the Python
+    // front's finding B). So it is REQUIRED exactly where it means something
+    // -- no OTF file -- and ignored, as the library ignores it, when a file
+    // is named.
+    bool resolveThreeD(const std::string& otfPath, std::optional<bool> threeD) {
+        if (threeD) return *threeD;
+        if (!otfPath.empty()) return false;   // a file's table; the flag is not read
+        throw std::invalid_argument(
+            "SimReconstructor: three_d has to be given when no OTF file is named, because the theoretical OTF is "
+            "built in 3D for a stack of several planes and in 2D for one, and parameters alone do not say which "
+            "this is. Pass three_d=parameters.planes(sections) > 1, where sections is the raw stack's z extent "
+            "(sirius.workbench.step_sim does exactly that).");
+    }
+
     class PySimReconstructor {
     public:
         // An empty otfPath is the theoretical OTF, exactly as it is for the
         // GUI and the CLI: the choice is the library's one selectOTF, not a
         // second one written here (app/core/session.cpp makes it the same
-        // way). `threeD` only reaches the theoretical OTF, and a raw stack
-        // decides it -- SIMParameters::planes(sections) > 1.
+        // way).
         PySimReconstructor(SIMParameters params, const std::string& otfPath,
-                           Device device, PlanRigor rigor, bool threeD)
-            : impl_(params, selectOTF(otfPath, params, threeD), device, rigor) {}
+                           Device device, PlanRigor rigor, std::optional<bool> threeD)
+            : impl_(params, selectOTF(otfPath, params, resolveThreeD(otfPath, threeD)), device, rigor) {}
 
         Device device() const noexcept { return impl_.device(); }
 
@@ -134,6 +153,18 @@ void bind_sim(nb::module_& m) {
           "sentence every front says about them. Either parity reconstructs; only the minimum is "
           "refused. SimReconstructor raises this same text as a ValueError.");
 
+    m.def("sim_layout_counts_problem", &simLayoutCountsProblem, nb::arg("layout_text"), nb::arg("layout_angles"),
+          nb::arg("layout_phases"), nb::arg("step_angles"), nb::arg("step_phases"),
+          "Empty when a dataset's declared storage layout holds the angles and phases the step uses, otherwise the "
+          "one sentence every front refuses the pipeline with. The SIM operation's validate() and "
+          "sirius.workbench.step_sim raise this same text, so a mismatch reads the same in the window, in a session "
+          "and in Python.");
+    m.def("sim_declared_counts_note", &simDeclaredCountsNote, nb::arg("dataset_angles"), nb::arg("dataset_phases"),
+          nb::arg("step_angles"), nb::arg("step_phases"),
+          "Empty when a dataset's declared angle and phase counts are the step's, otherwise the one sentence every "
+          "front WARNS with -- the weaker case, where the dataset says what it holds but not how it is stored, so "
+          "the step's own counts are used and the run goes ahead.");
+
     m.def("load_parameters", &loadParameters, nb::arg("path"));
     m.def("save_parameters", &saveParameters, nb::arg("path"), nb::arg("parameters"));
     m.def("load_legacy_parameters", [](const std::string& path) { return fromLegacy(loadLegacyConfig(path)); }, nb::arg("path"));
@@ -145,13 +176,15 @@ void bind_sim(nb::module_& m) {
                                    "objective with the parameters' NA, immersion index and emission wavelength -- "
                                    "what the GUI and the CLI use when their OTF field is empty. three_d then picks "
                                    "the 3D OTF (missing cone, order 1 shifted by the illumination's kz) over the "
-                                   "in-focus 2D one; it is ignored when a file is named. A raw stack decides it: "
-                                   "parameters.planes(sections) > 1.")
-        .def(nb::init<SIMParameters, const std::string&, Device, PlanRigor, bool>(),
+                                   "in-focus 2D one, and has to be given, because the DATA decides it and the "
+                                   "parameters do not say: parameters.planes(sections) > 1, with sections the raw "
+                                   "stack's z extent. It is ignored, and so may be left out, when an OTF file is "
+                                   "named.")
+        .def(nb::init<SIMParameters, const std::string&, Device, PlanRigor, std::optional<bool>>(),
              nb::arg("parameters"), nb::arg("otf_path") = std::string(),
              nb::arg("device") = Device::cpu(),
              nb::arg("rigor") = PlanRigor::Measure,
-             nb::arg("three_d") = true)
+             nb::arg("three_d") = nb::none())
         .def_prop_ro("device", &PySimReconstructor::device)
         .def_prop_ro("last_fit", &PySimReconstructor::lastFit,
                      nb::rv_policy::reference_internal)

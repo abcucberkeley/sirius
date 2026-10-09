@@ -704,8 +704,21 @@ TEST_CASE("tool gate: an argument no tool takes is dropped with a warning, not t
         const json ok = api.call("set_params", {{"step", 2}, {"params", {{"ticks", 3}}}});
         REQUIRE(kindOf(ok).empty());
         CHECK_FALSE(ok.contains("call_warnings"));
-        // a parameter the operation does not have is still a refusal, not a warning
-        CHECK(kindOf(api.call("set_params", {{"step", 2}, {"params", {{"tikcs", 3}}}})) == "invalid_argument");
+        // A parameter the operation does not have is still a refusal, not a
+        // warning -- and the sentence matters, because the Python mirror has
+        // to refuse the same key in the same words and cannot call this
+        // function (the bindings link the library, not app/core). The two
+        // literals are what keeps them together:
+        // bindings/tests/test_workbench_schema.py's
+        // test_unknown_key_is_refused_as_the_window_and_a_session_refuse_it
+        // asserts the same clause. Until 2026-10-08 Python only WARNED, so a
+        // misspelled `otf` key there warned and then reconstructed with the
+        // theoretical OTF -- a different reconstruction that looks like a
+        // successful run.
+        const json bad = api.call("set_params", {{"step", 2}, {"params", {{"tikcs", 3}}}});
+        CHECK(kindOf(bad) == "invalid_argument");
+        CHECK_THAT(bad.value("error", std::string()), ContainsSubstring("unknown parameter 'tikcs' for test_gate_slow"));
+        CHECK_THAT(bad.value("hint", std::string()), ContainsSubstring("the parameters of test_gate_slow are"));
     }
     SECTION("a tool that declares no properties takes anything, as it did") {
         api.addTool({"gate_open", "Declares no properties.", json{{"type", "object"}},

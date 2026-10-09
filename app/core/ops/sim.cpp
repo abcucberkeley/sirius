@@ -408,14 +408,19 @@ namespace sirius::app {
                 // word one condition three ways again
                 if (const std::string why = simImageSizeProblem(nx, ny, frames && frames->storage.montage()); !why.empty())
                     v.errors.push_back(why);
-                if (frames && !layout.isShorthand() && (frames->angles != p.ndirs || frames->phases != p.nphases))
-                    v.errors.push_back("The dataset's layout " + layout.text() + " holds " + std::to_string(frames->angles) + " angles × " +
-                                       std::to_string(frames->phases) + " phases; the step uses " + std::to_string(p.ndirs) + " × " +
-                                       std::to_string(p.nphases) + ". They have to agree for the frames to be gathered.");
-                if (input.sim.present && layout.isShorthand() && (input.sim.ndirs != p.ndirs || input.sim.nphases != p.nphases))
-                    v.warnings.push_back("The dataset declares " + std::to_string(input.sim.ndirs) + " angles × " +
-                                         std::to_string(input.sim.nphases) + " phases; the step uses " +
-                                         std::to_string(p.ndirs) + " × " + std::to_string(p.nphases) + ".");
+                // the library's wording again, because the Python mirror has
+                // to refuse the same mismatch in the same words and links the
+                // library, not this (the Python front's finding C)
+                if (frames && !layout.isShorthand())
+                    if (const std::string why = simLayoutCountsProblem(layout.text(), static_cast<int>(frames->angles),
+                                                                       static_cast<int>(frames->phases), p.ndirs, p.nphases);
+                        !why.empty())
+                        v.errors.push_back(why);
+                if (input.sim.present && layout.isShorthand())
+                    if (const std::string note = simDeclaredCountsNote(static_cast<int>(input.sim.ndirs),
+                                                                       static_cast<int>(input.sim.nphases), p.ndirs, p.nphases);
+                        !note.empty())
+                        v.warnings.push_back(note);
                 if (input.rgb) v.errors.push_back("SIM reconstruction needs raw channels, not an RGB merge.");
                 return v;
             }

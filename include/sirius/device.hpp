@@ -3,6 +3,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <optional>
 #include <string>
 
 #include "sirius/errors.hpp"
@@ -52,6 +53,42 @@ namespace sirius {
     bool builtWithNvTiff() noexcept;    // compiled with nvTIFF support
     int  cudaDeviceCount() noexcept;    // 0 without CUDA, without a driver, or without GPUs
     bool cudaAvailable() noexcept;      // cudaDeviceCount() > 0
+
+    // --- what a front may ask for ----------------------------------------
+    //
+    // One rule for every front. The window, the command line and the Python
+    // bindings each used to decide for themselves what "auto" means and what
+    // to do with a request they cannot honour, and they did not agree: the
+    // window and sirius-cli asked cudaAvailable() while the Python mirror
+    // asked `torch.cuda.is_available()` -- so in the worker image, which has
+    // numpy and the compiled extension but no torch, every Python
+    // reconstruction ran on the CPU with nothing saying so, and an explicit
+    // `device="cuda"` was quietly downgraded instead of refused
+    // (docs/findings.md 9k.50 finding 3, and the Python front's finding A).
+    // torch's view of the GPUs is not SIRIUS's: SIRIUS's own kernels are what
+    // a SIM reconstruction runs on.
+
+    // "cpu", "cuda", "cuda:N" -- and "gpu" for "cuda:0", which the
+    // application's backend names already accept (backendFromString) -- as a
+    // Device; nullopt for anything else. Case-insensitive.
+    std::optional<Device> deviceFromString(const std::string& spec);
+
+    // "" when a request for `spec` can be honoured by THIS build on THIS
+    // computer; otherwise the one sentence every front says about it. Three
+    // conditions, one sentence each, in one place: the spec is not a device,
+    // the build has no CUDA, the computer has no such CUDA device.
+    // requireDevice throws exactly this text, so there is one wording and not
+    // one per front. The Device overload is for a front that has already
+    // parsed one (Workbench's backend plus its GPU index); the string
+    // overload also reports a spec that is not a device at all.
+    std::string deviceRequestProblem(Device d);
+    std::string deviceRequestProblem(const std::string& spec);
+
+    // The rule for a request that names no device: the GPU when there is one,
+    // else the CPU. Workbench's constructor and sirius-cli's --backend auto
+    // have always done this; `resolve_device` in the Python mirror now does
+    // the same instead of asking torch.
+    Device defaultDevice() noexcept;
 
     struct DeviceProperties {
         std::string name;
